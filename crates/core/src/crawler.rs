@@ -68,9 +68,10 @@ pub struct CrawlConfig {
     pub indexers: Vec<String>,
     /// Max relays touched per run (server 30, phone 8).
     pub max_relays: usize,
-    /// Slots of `max_relays` reserved for relays not yet proven useful (never tried first, then
-    /// least recently looked at), so discovered relays get crawled instead of starving behind the
-    /// top yielders. Clamped to `max_relays`; see `select_relays` (D30).
+    /// Slots of `max_relays` kept out of the top yielders and rotated through every other relay
+    /// (never tried first, then least recently looked at), so discovered relays and lesser
+    /// yielders get crawled instead of starving behind the top ones. Clamped to `max_relays`; see
+    /// `select_relays` (D30, D31).
     pub explore_relays: usize,
     /// Wall-clock budget for one run.
     pub budget: Duration,
@@ -229,12 +230,13 @@ pub async fn crawl_once<S: Store + ?Sized>(
 /// publishers (stored as "nip65" on the way).
 /// 1. Up to `max_relays - explore_relays` proven relays (`events_found > 0`), ranked by past yield,
 ///    then by how many publishers list them as write relays.
-/// 2. Every other slot (so at least `explore_relays`) rotates through relays with no events yet,
-///    least recently looked at first: `next_try_at` is the last ok run for a reachable relay, the
-///    end of its backoff for a failing one, and 0 for one never tried. Ties: seeds in config order,
-///    then most listed. Fresh installs therefore start with the seeds, and seeds beyond the cap
-///    are reached by the rotation instead of being cut forever.
-/// 3. Slots still free go to the next proven relays.
+/// 2. Every other slot (so at least `explore_relays`) rotates through all remaining candidates,
+///    zero-yield relays and the proven ones below the cutoff alike, least recently looked at
+///    first: `next_try_at` is the last ok run for a reachable relay, the end of its backoff for a
+///    failing one, and 0 for one never tried. Ties: higher yield, seeds in config order, then
+///    most listed. Fresh installs therefore start with the seeds, newly discovered relays go
+///    before anything already crawled, and neither seeds past the cap nor proven relays outside
+///    the top yielders are cut forever (D31).
 pub async fn select_relays<S: Store + ?Sized>(
     store: &S,
     cfg: &CrawlConfig,
@@ -302,19 +304,22 @@ pub async fn select_relays<S: Store + ?Sized>(
             url.clone(),
         ));
     }
-    let (mut proven, mut fresh): (Vec<_>, Vec<_>) = cands.into_iter().partition(|c| c.0 > 0);
+    let (mut proven, mut rotation): (Vec<_>, Vec<_>) = cands.into_iter().partition(|c| c.0 > 0);
     proven.sort_by(|a, b| b.0.cmp(&a.0).then(b.3.cmp(&a.3)).then(a.4.cmp(&b.4)));
-    fresh.sort_by(|a, b| {
+    let exploit = cfg.max_relays - cfg.explore_relays.min(cfg.max_relays);
+    // The proven tail rotates with the zero-yield relays: lifetime yield only grows when a relay
+    // is crawled, so a relay left below the cutoff could never climb back (D31).
+    let tail = proven.split_off(exploit.min(proven.len()));
+    rotation.extend(tail);
+    rotation.sort_by(|a, b| {
         a.1.cmp(&b.1)
+            .then(b.0.cmp(&a.0))
             .then(a.2.cmp(&b.2))
             .then(b.3.cmp(&a.3))
             .then(a.4.cmp(&b.4))
     });
 
-    let exploit = cfg.max_relays - cfg.explore_relays.min(cfg.max_relays);
-    let mut proven = proven.into_iter().map(|c| c.4);
-    let mut out: Vec<String> = proven.by_ref().take(exploit).collect();
-    out.extend(fresh.into_iter().map(|c| c.4).chain(proven));
+    let mut out: Vec<String> = proven.into_iter().chain(rotation).map(|c| c.4).collect();
     out.truncate(cfg.max_relays);
     Ok(out)
 }

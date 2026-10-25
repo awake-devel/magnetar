@@ -607,6 +607,56 @@ async fn proven_relays_fill_unused_explore_slots_and_vice_versa() {
 }
 
 #[tokio::test]
+async fn proven_relays_below_the_cutoff_still_rotate() {
+    // The review case: 3 exploit slots, 4 proven relays, 10 zero-yield relays that connect fine
+    // every pass. p3 must not be starved by the never-ending supply of zero-yield relays.
+    let store = MemStore::default();
+    let proven: Vec<String> = (0..4).map(|i| format!("wss://p{i}.example.com")).collect();
+    for (url, found) in proven.iter().zip([100, 50, 10, 1]) {
+        store.upsert_relay(url, "hint").await.unwrap();
+        crawled(&store, url, true, found, 10).await;
+    }
+    for i in 0..10 {
+        store
+            .upsert_relay(&format!("wss://z{i}.example.com"), "hint")
+            .await
+            .unwrap();
+    }
+    let c = sel_cfg(&[], 5, 2);
+    let p3 = &proven[3];
+    let mut picks = Vec::new();
+    let mut t = 100;
+    for pass in 0..50 {
+        let sel = select_relays(&store, &c, t).await.unwrap();
+        assert_capped(&sel, 5);
+        assert_eq!(sel[..3], proven[..3], "pass {pass}: top yielders first");
+        if sel.contains(p3) {
+            picks.push(pass);
+        }
+        for url in &sel {
+            crawled(&store, url, true, 0, t).await;
+        }
+        t += 100;
+    }
+    // 11 relays share 2 rotating slots: the 10 never tried go first (passes 0-4), then p3, which
+    // was looked at longest ago, then everyone in turn (one turn every 5-6 passes).
+    assert_eq!(picks[0], 5, "{picks:?}");
+    assert!(
+        picks.windows(2).all(|w| w[1] - w[0] <= 6),
+        "p3 starved: {picks:?}"
+    );
+    assert!(picks.len() >= 8, "{picks:?}");
+
+    // A relay discovered later still goes before anything already crawled.
+    store
+        .upsert_relay("wss://new.example.com", "nip65")
+        .await
+        .unwrap();
+    let sel = select_relays(&store, &c, t).await.unwrap();
+    assert_eq!(sel[3], "wss://new.example.com", "{sel:?}");
+}
+
+#[tokio::test]
 async fn select_skips_disabled_backed_off_and_private_rows() {
     let store = MemStore::default();
     for (url, source) in [

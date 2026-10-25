@@ -27,7 +27,7 @@ magnetar-server --version
 | `MAGNETAR_CRAWL_INTERVAL_SECS` | `900` | |
 | `MAGNETAR_SEED_RELAYS` | built-in list | comma-separated `wss://` URLs |
 | `MAGNETAR_CRAWL_MAX_RELAYS` | `30` | Relays crawled per run, seeds included (min 1) |
-| `MAGNETAR_CRAWL_EXPLORE_RELAYS` | `10` | Of those, at least this many go to relays with no events yet, least recently looked at first, so newly discovered relays and seeds past the cap get crawled (D30). Clamped to the max |
+| `MAGNETAR_CRAWL_EXPLORE_RELAYS` | `10` | Of those, at least this many stay out of the top yielders and rotate through every other relay, never tried first, then least recently looked at, so newly discovered relays, seeds past the cap and lesser yielders all get crawled (D30, D31). Clamped to the max |
 | `RUST_LOG` | `info` (Termux env) | tracing `EnvFilter` syntax, e.g. `info,magnetar_core=debug` |
 
 The Termux setup also writes these:
