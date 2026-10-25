@@ -101,13 +101,12 @@ pub async fn notify_saved_searches(store: &PgStore, cfg: &Config) {
     let Some(ntfy) = ntfy_config(store, cfg).await else {
         return;
     };
-    for (search, new) in hits.iter().filter(|(_, h)| !h.is_empty()) {
-        let n = new.len();
-        let msg = format!("{n} new result{}", if n == 1 { "" } else { "s" });
-        let title = format!("Magnetar: {}", search.name);
-        if let Err(e) = notify::ntfy_publish(&ntfy, &title, &msg, None).await {
-            tracing::warn!("ntfy for {:?}: {e}", search.name);
-        }
+    // One message per poll, not per search: ntfy.sh allows 250 a day (D32).
+    let Some((title, msg, click)) = notify::format_digest(&hits) else {
+        return;
+    };
+    if let Err(e) = notify::ntfy_publish(&ntfy, &title, &msg, click.as_deref()).await {
+        tracing::warn!("ntfy: {e}");
     }
 }
 

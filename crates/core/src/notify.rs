@@ -77,7 +77,29 @@ pub async fn ntfy_publish(
     Ok(())
 }
 
-/// (title, message, click) for one saved search's new hits: one notification per search per poll.
+/// (title, message, click) for every saved search's new hits of one poll: a single notification
+/// per poll however many searches matched, so the 15-min notifier sends at most 96 a day, within
+/// ntfy.sh's 250 (D32). One matching search keeps the `format_hits` form; `None` if nothing is new.
+pub fn format_digest(
+    hits: &[(SavedSearch, Vec<TorrentSummary>)],
+) -> Option<(String, String, Option<String>)> {
+    let hits: Vec<_> = hits.iter().filter(|(_, h)| !h.is_empty()).collect();
+    match hits.as_slice() {
+        [] => None,
+        [(s, h)] => Some(format_hits(s, h)),
+        many => {
+            let total: usize = many.iter().map(|(_, h)| h.len()).sum();
+            let title = format!("{total} new results in {} saved searches", many.len());
+            let mut message = String::new();
+            for (s, h) in many {
+                message.push_str(&format!("• {}: {}\n", s.name, h.len()));
+            }
+            Some((title, message.trim_end().to_string(), None))
+        }
+    }
+}
+
+/// (title, message, click) for one saved search's new hits.
 pub fn format_hits(s: &SavedSearch, hits: &[TorrentSummary]) -> (String, String, Option<String>) {
     let title = match hits.len() {
         1 => format!("{}: 1 new result", s.name),
