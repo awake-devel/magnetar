@@ -5,11 +5,13 @@ pub mod config;
 pub mod daemons;
 pub mod discovery;
 pub mod filter;
+pub mod media;
 pub mod relay;
 mod search;
 pub mod selftest;
 pub mod server;
 pub mod store;
+pub mod tmdb;
 
 pub use api::{AppState, router};
 pub use store::PgStore;

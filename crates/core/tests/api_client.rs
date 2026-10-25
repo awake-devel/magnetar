@@ -34,6 +34,9 @@ fn summary() -> TorrentSummary {
         rank: 0.5,
         pinned: false,
         hidden: false,
+        media_title: None,
+        media_year: None,
+        media_kind: None,
     }
 }
 
@@ -92,6 +95,7 @@ fn detail() -> TorrentDetail {
             trust: 41,
         }],
         comments: vec![],
+        media: None,
     }
 }
 

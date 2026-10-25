@@ -61,8 +61,25 @@ pub async fn test_db() -> Option<TestDb> {
         .await
         .unwrap();
     let store = PgStore::from_pool(pool);
+    contract_media_tables(&store).await;
     store.migrate().await.expect("migrate");
     Some(TestDb { store, url, schema })
+}
+
+/// TEST-ONLY: the enrichment contract tables (`media`, `torrent_media`) belong to the
+/// enrich/imdb migration, which this branch does not have yet. Create a mirror of the contract
+/// before migrating, unless a migration in this build already creates `media`.
+async fn contract_media_tables(store: &PgStore) {
+    let owned = magnetar_server::store::MIGRATOR
+        .iter()
+        .any(|m| m.sql.as_str().contains("CREATE TABLE media "));
+    if !owned {
+        store
+            .pool()
+            .execute(include_str!("contract_media.sql"))
+            .await
+            .expect("contract media tables");
+    }
 }
 
 impl Drop for TestDb {

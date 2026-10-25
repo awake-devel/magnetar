@@ -55,6 +55,9 @@ impl HitRow {
             rank: self.rank,
             pinned: false,
             hidden: false,
+            media_title: None,
+            media_year: None,
+            media_kind: None,
         }
     }
 }

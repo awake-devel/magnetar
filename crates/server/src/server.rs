@@ -10,6 +10,7 @@ use tokio::sync::watch;
 use crate::api::{self, AppState};
 use crate::config::Config;
 use crate::store::PgStore;
+use crate::tmdb::{self, Tmdb, TmdbConfig};
 use crate::{daemons, discovery};
 
 /// Grace period for daemons after the HTTP server stopped.
@@ -69,12 +70,26 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
         None
     };
 
+    let tmdb = match TmdbConfig::from_config(&cfg) {
+        Some(c) => {
+            tracing::info!(
+                "TMDB on: langs {:?}, {} req/s, images in {}",
+                c.langs,
+                c.rps,
+                c.image_dir.display()
+            );
+            Some(Tmdb::new(c, store.pool().clone())?)
+        }
+        None => None,
+    };
+
     let (stop_tx, stop_rx) = watch::channel(false);
     let state = AppState::new(store.clone(), &token)
         .with_shutdown(stop_rx.clone())
-        .with_downloader(downloader.clone());
+        .with_downloader(downloader.clone())
+        .with_tmdb(tmdb.clone());
     let cfg = Arc::new(cfg);
-    let daemons = vec![
+    let mut daemons = vec![
         tokio::spawn(daemons::crawler_loop(
             store.clone(),
             cfg.clone(),
@@ -93,6 +108,13 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
             stop_rx.clone(),
         )),
     ];
+    if let Some(t) = &tmdb {
+        daemons.extend(t.spawn_workers(stop_rx.clone()));
+        daemons.push(tokio::spawn(tmdb::prefetch_loop(
+            t.clone(),
+            stop_rx.clone(),
+        )));
+    }
 
     let listener = tokio::net::TcpListener::bind(cfg.bind)
         .await

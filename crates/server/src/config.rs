@@ -81,6 +81,26 @@ pub struct Config {
     /// Comma-separated hex pubkeys of trusted NIP-66 monitors (default: built-in list, D36).
     #[arg(long, env = "MAGNETAR_NIP66_TRUSTED", value_delimiter = ',')]
     pub nip66_trusted: Vec<String>,
+    /// TMDB API read access token (or v3 key) for posters/overviews; unset = TMDB off (D42).
+    #[arg(long, env = "MAGNETAR_TMDB_TOKEN", hide_env_values = true)]
+    pub tmdb_token: Option<String>,
+    /// Comma-separated TMDB languages, preferred first.
+    #[arg(
+        long,
+        env = "MAGNETAR_TMDB_LANGS",
+        value_delimiter = ',',
+        default_value = "en-US,fr-FR"
+    )]
+    pub tmdb_langs: Vec<String>,
+    /// Poster cache (default `$XDG_CACHE_HOME/magnetar/images` or ~/.cache/magnetar/images).
+    #[arg(long, env = "MAGNETAR_IMAGE_CACHE_DIR")]
+    pub image_cache_dir: Option<PathBuf>,
+    /// TMDB requests per second (token bucket, bursts of up to 5).
+    #[arg(long, env = "MAGNETAR_TMDB_RPS", default_value_t = 20)]
+    pub tmdb_rps: u32,
+    /// Background TMDB prefetch of recently matched media per hour; 0 = only on detail views.
+    #[arg(long, env = "MAGNETAR_TMDB_PREFETCH_PER_HOUR", default_value_t = 60)]
+    pub tmdb_prefetch_per_hour: u32,
 }
 
 impl Config {
@@ -117,6 +137,17 @@ impl Config {
         self.download_dir
             .clone()
             .unwrap_or_else(|| Self::home().join("Downloads").join("magnetar"))
+    }
+
+    pub fn image_cache_dir(&self) -> PathBuf {
+        self.image_cache_dir.clone().unwrap_or_else(|| {
+            std::env::var_os("XDG_CACHE_HOME")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .unwrap_or_else(|| Self::home().join(".cache"))
+                .join("magnetar")
+                .join("images")
+        })
     }
 
     /// `$XDG_STATE_HOME/magnetar` or `~/.local/state/magnetar`.

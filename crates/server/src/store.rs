@@ -1104,6 +1104,9 @@ impl Store for PgStore {
             rank: 0.0,
             pinned: false,
             hidden: false,
+            media_title: None,
+            media_year: None,
+            media_kind: None,
         };
         let events = rows
             .iter()
@@ -1130,6 +1133,7 @@ impl Store for PgStore {
             trust,
             events,
             comments: comments.into_iter().map(Into::into).collect(),
+            media: None,
         }))
     }
 

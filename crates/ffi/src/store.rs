@@ -803,6 +803,9 @@ impl SqliteStore {
                     rank: r.get::<_, f64>(11)? as f32,
                     pinned: r.get(12)?,
                     hidden: r.get(13)?,
+                    media_title: None,
+                    media_year: None,
+                    media_kind: None,
                 })
             })
             .db()?
@@ -949,6 +952,9 @@ impl SqliteStore {
             rank: 0.0,
             pinned,
             hidden,
+            media_title: None,
+            media_year: None,
+            media_kind: None,
         };
         let events = rows
             .iter()
@@ -975,6 +981,7 @@ impl SqliteStore {
             trust,
             events,
             comments,
+            media: None,
         }))
     }
 

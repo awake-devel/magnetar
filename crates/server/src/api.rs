@@ -25,6 +25,12 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::store::{PgStore, json_u8};
+use crate::tmdb::Tmdb;
+
+/// Longest a poster request waits for a first download from TMDB.
+pub const POSTER_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+/// Posters are revalidated by ETag after this.
+pub const POSTER_MAX_AGE: u32 = 7 * 86400;
 
 pub const BODY_LIMIT: usize = 8 << 20;
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -40,6 +46,8 @@ pub struct AppState {
     pub liveness: Arc<LivenessConfig>,
     /// Flips to true on shutdown; long-lived WebSocket sessions watch it.
     pub shutdown: watch::Receiver<bool>,
+    /// TMDB decoration (D42); None when `MAGNETAR_TMDB_TOKEN` is unset.
+    pub tmdb: Option<Arc<Tmdb>>,
 }
 
 impl AppState {
@@ -53,6 +61,7 @@ impl AppState {
             crawler: Arc::default(),
             liveness: Arc::default(),
             shutdown: rx,
+            tmdb: None,
         }
     }
 
@@ -63,6 +72,11 @@ impl AppState {
 
     pub fn with_downloader(mut self, d: Option<Arc<Downloader>>) -> Self {
         self.downloader = d;
+        self
+    }
+
+    pub fn with_tmdb(mut self, t: Option<Arc<Tmdb>>) -> Self {
+        self.tmdb = t;
         self
     }
 }
@@ -169,6 +183,7 @@ pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/v1/search", get(search_get).post(search_post))
         .route("/api/v1/torrents/{infohash}", get(torrent))
+        .route("/api/v1/media/{id}/poster", get(media_poster))
         .route(
             "/api/v1/torrents/{infohash}/liveness",
             post(refresh_liveness),
@@ -306,11 +321,59 @@ async fn torrent(
     Path(infohash): Path<String>,
 ) -> ApiResult<Json<TorrentDetail>> {
     let ih = infohash_param(&infohash)?;
-    st.store
-        .torrent_detail(&ih, magnetar_core::now())
+    let now = magnetar_core::now();
+    let mut d = st
+        .store
+        .torrent_detail(&ih, now)
         .await?
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found("unknown infohash"))
+        .ok_or_else(|| ApiError::not_found("unknown infohash"))?;
+    crate::media::fill_if_missing(st.store.pool(), &mut d).await;
+    // Cached TMDB fields only; anything missing is fetched in the background (D42).
+    if let (Some(t), Some(m)) = (&st.tmdb, d.media.as_mut()) {
+        t.decorate(m, now).await;
+    }
+    Ok(Json(d))
+}
+
+/// `GET /api/v1/media/{id}/poster`: the cached TMDB poster (w342), never a redirect to TMDB.
+async fn media_poster(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let t = st
+        .tmdb
+        .as_ref()
+        .ok_or_else(|| ApiError::not_found("TMDB is not configured"))?;
+    let found = tokio::time::timeout(POSTER_FETCH_TIMEOUT, t.poster(id, magnetar_core::now()))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::GATEWAY_TIMEOUT, "timeout", "poster download"))??;
+    let (img, file) = found.ok_or_else(|| ApiError::not_found("no poster"))?;
+    let etag = format!("\"{}\"", img.sha256);
+    let cache = format!("private, max-age={POSTER_MAX_AGE}");
+    let matches = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|t| t.trim() == etag || t.trim() == "*"));
+    if matches {
+        return Ok((
+            StatusCode::NOT_MODIFIED,
+            [(header::ETAG, etag), (header::CACHE_CONTROL, cache)],
+        )
+            .into_response());
+    }
+    let bytes = tokio::fs::read(&file)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, img.content_type),
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, cache),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 async fn refresh_liveness(
