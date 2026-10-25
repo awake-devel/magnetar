@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Cleartext HTTP only for the Termux server on this phone. A server reached over
+  Tailscale should use HTTPS (`tailscale cert`); to allow plain HTTP to a tailnet
+  host instead, add its MagicDNS name or 100.x address as another <domain>.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>
