@@ -616,6 +616,60 @@ async fn relay_event_ok_prefixes() {
     );
 }
 
+/// Only connections with an open REQ hold a live receiver (D33): an upload-only connection
+/// (phone sync) cannot lag behind the broadcast however many EVENTs it sends.
+#[tokio::test]
+async fn relay_live_feed_only_while_subscribed() {
+    let Some(db) = test_db().await else { return };
+    let base = spawn_server(&db.store).await;
+    let keys = nostr::prelude::Keys::generate();
+    let torrent = |n: u64| {
+        signed(
+            &keys,
+            2003,
+            vec![
+                vec!["title".into(), format!("Live {n}")],
+                vec!["x".into(), ih(1000 + n)],
+            ],
+            "",
+        )
+    };
+    let mut ws = ws_connect(&base).await;
+    // More uploads than the broadcast holds (1024), each answered before the next.
+    for n in 0..1100 {
+        let ev = torrent(n);
+        send(&mut ws, json!(["EVENT", ev])).await;
+        assert_eq!(recv(&mut ws).await, json!(["OK", ev.id, true, ""]));
+    }
+    assert_eq!(db.store.live_receivers(), 0);
+
+    send(&mut ws, json!(["REQ", "a", {"kinds": [2003], "limit": 1}])).await;
+    assert_eq!(recv(&mut ws).await[0], "EVENT");
+    assert_eq!(recv(&mut ws).await, json!(["EOSE", "a"]));
+    send(&mut ws, json!(["REQ", "b", {"ids": [hex64(0xbeef)]}])).await;
+    assert_eq!(recv(&mut ws).await, json!(["EOSE", "b"]));
+    assert_eq!(db.store.live_receivers(), 1);
+
+    // Live push still works, including for this connection's own EVENT.
+    let ev = torrent(5000);
+    send(&mut ws, json!(["EVENT", ev])).await;
+    let mut msgs = [recv(&mut ws).await, recv(&mut ws).await];
+    msgs.sort_by_key(|m| m[0].as_str().unwrap().to_string());
+    assert_eq!((&msgs[0][0], &msgs[0][1]), (&json!("EVENT"), &json!("a")));
+    assert_eq!(msgs[0][2]["id"], ev.id);
+    assert_eq!(msgs[1][0], "OK");
+
+    // CLOSE has no reply: a duplicate EVENT's OK proves both were handled.
+    send(&mut ws, json!(["CLOSE", "a"])).await;
+    send(&mut ws, json!(["EVENT", ev])).await;
+    assert_eq!(recv(&mut ws).await[0], "OK");
+    assert_eq!(db.store.live_receivers(), 1);
+    send(&mut ws, json!(["CLOSE", "b"])).await;
+    send(&mut ws, json!(["EVENT", ev])).await;
+    assert_eq!(recv(&mut ws).await[0], "OK");
+    assert_eq!(db.store.live_receivers(), 0);
+}
+
 /// NIP-77 interop with nostr-sdk as the oracle: Down (server → client) then Up (client → server).
 #[tokio::test]
 async fn negentropy_interop_nostr_sdk() {

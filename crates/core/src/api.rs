@@ -41,8 +41,18 @@ pub struct BatchResponse {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct CrawlerStatus {
     pub running: bool,
+    /// Unix time the last pass ended.
     pub last_run: Option<i64>,
     pub last_report: Option<crate::crawler::CrawlReport>,
+    /// Passes finished (ok or failed) since the server started.
+    #[serde(default)]
+    pub passes: u64,
+    /// Error of the last pass, None if it succeeded.
+    #[serde(default)]
+    pub last_error: Option<String>,
+    /// Unix time the next pass is due, while the loop is pausing.
+    #[serde(default)]
+    pub next_run: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

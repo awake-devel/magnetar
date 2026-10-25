@@ -1,7 +1,8 @@
 //! `/relay`: a small NIP-01 + NIP-77 relay over our store (ARCHITECTURE.md §6, negentropy.md §5).
 //!
 //! REQ is answered from SQL, then the subscription stays open and receives newly stored events
-//! from `PgStore::subscribe`. EVENT goes through `core::ingest` (D5). NEG-* sessions are served
+//! from `PgStore::subscribe`. A connection holds that live receiver only while it has an open
+//! REQ (D33), so upload-only connections (phone sync) never buffer the broadcast. EVENT goes through `core::ingest` (D5). NEG-* sessions are served
 //! by `core::sync::NegResponder` over (created_at, id) items selected in SQL.
 
 use std::collections::HashMap;
@@ -13,6 +14,7 @@ use futures::{SinkExt, StreamExt};
 use magnetar_core::model::RawEvent;
 use magnetar_core::sync::NegResponder;
 use serde_json::{Value, json};
+use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::api::{AppState, ingest_one};
@@ -57,6 +59,8 @@ fn event_msg(sub: &str, ev: &RawEvent) -> String {
 struct Session {
     st: AppState,
     subs: HashMap<String, Vec<Filter>>,
+    /// Live feed, Some only while `subs` is non-empty.
+    live_rx: Option<Receiver<RawEvent>>,
     negs: HashMap<String, NegResponder>,
     stats: SessionStats,
 }
@@ -69,11 +73,16 @@ struct SessionStats {
     accepted: u32,
     duplicates: u32,
     rejected: u32,
+    /// Live events this connection's subscriptions missed because it read too slowly.
+    live_dropped: u64,
 }
 
 impl SessionStats {
     fn log_close(&self) {
-        if self.neg_sessions == 0 && self.accepted + self.duplicates + self.rejected == 0 {
+        if self.neg_sessions == 0
+            && self.accepted + self.duplicates + self.rejected == 0
+            && self.live_dropped == 0
+        {
             return;
         }
         tracing::info!(
@@ -82,20 +91,39 @@ impl SessionStats {
             accepted = self.accepted,
             duplicates = self.duplicates,
             rejected = self.rejected,
+            live_dropped = self.live_dropped,
             "relay: connection closed"
         );
+    }
+
+    /// One warning per connection; the total goes into the close line.
+    fn lagged(&mut self, n: u64) {
+        if self.live_dropped == 0 {
+            tracing::warn!(
+                "relay: subscriber too slow, {n} live events not pushed (they are stored; \
+                 further drops are counted in the close line)"
+            );
+        }
+        self.live_dropped += n;
+    }
+}
+
+/// Next live event, or pending forever while the connection has no open REQ.
+async fn next_live(live: &mut Option<Receiver<RawEvent>>) -> Result<RawEvent, RecvError> {
+    match live {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
     }
 }
 
 async fn serve(socket: WebSocket, st: AppState) {
     let (mut tx, mut rx) = socket.split();
-    // Subscribe before answering any REQ so nothing stored meanwhile is missed.
-    let mut live = st.store.subscribe();
     let mut shutdown = st.shutdown.clone();
     let mut watching = true;
     let mut session = Session {
         st,
         subs: HashMap::new(),
+        live_rx: None,
         negs: HashMap::new(),
         stats: SessionStats::default(),
     };
@@ -107,10 +135,10 @@ async fn serve(socket: WebSocket, st: AppState) {
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
             },
-            ev = live.recv() => match ev {
+            ev = next_live(&mut session.live_rx) => match ev {
                 Ok(ev) => session.live(&ev),
                 Err(RecvError::Lagged(n)) => {
-                    tracing::warn!("relay subscriber lagged, {n} live events dropped");
+                    session.stats.lagged(n);
                     Vec::new()
                 }
                 Err(RecvError::Closed) => break,
@@ -155,7 +183,7 @@ impl Session {
             Some("REQ") => self.req(&msg).await,
             Some("CLOSE") => {
                 if let Some(sub) = sub_id(msg.get(1)) {
-                    self.subs.remove(&sub);
+                    self.remove_sub(&sub);
                 }
                 Vec::new()
             }
@@ -205,6 +233,13 @@ impl Session {
         json!(["OK", r.id, r.accepted, r.message]).to_string()
     }
 
+    fn remove_sub(&mut self, sub: &str) {
+        self.subs.remove(sub);
+        if self.subs.is_empty() {
+            self.live_rx = None;
+        }
+    }
+
     async fn req(&mut self, msg: &[Value]) -> Vec<String> {
         let Some(sub) = sub_id(msg.get(1)) else {
             return vec![notice("invalid: bad subscription id")];
@@ -214,19 +249,23 @@ impl Session {
             Ok(f) if f.is_empty() => return vec![closed(&sub, "invalid: no filters")],
             Ok(f) => f,
             Err(e) => {
-                self.subs.remove(&sub);
+                self.remove_sub(&sub);
                 return vec![closed(&sub, &e)];
             }
         };
         if !self.subs.contains_key(&sub) && self.subs.len() >= MAX_SUBSCRIPTIONS {
             return vec![closed(&sub, "blocked: too many subscriptions")];
         }
+        // Subscribe before the SQL query so nothing stored meanwhile is missed.
+        if self.live_rx.is_none() {
+            self.live_rx = Some(self.st.store.subscribe());
+        }
         let mut events: Vec<RawEvent> = Vec::new();
         for f in &filters {
             match self.st.store.query_events(f).await {
                 Ok(evs) => events.extend(evs),
                 Err(e) => {
-                    self.subs.remove(&sub);
+                    self.remove_sub(&sub);
                     return vec![closed(&sub, &format!("error: {e}"))];
                 }
             }

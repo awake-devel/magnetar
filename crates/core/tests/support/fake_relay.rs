@@ -16,6 +16,8 @@ pub struct Behaviour {
     pub page_clamp: usize,
     /// 1-based global REQ numbers answered with CLOSED instead of events.
     pub closed_reqs: Vec<usize>,
+    /// The CLOSED message for `closed_reqs`.
+    pub closed_reason: &'static str,
     pub notice_on_connect: bool,
     /// Accept REQs but never answer them.
     pub silent: bool,
@@ -26,6 +28,7 @@ impl Default for Behaviour {
         Self {
             page_clamp: 100,
             closed_reqs: Vec::new(),
+            closed_reason: "rate-limited: slow down",
             notice_on_connect: true,
             silent: false,
         }
@@ -136,7 +139,7 @@ async fn serve(
                     continue;
                 }
                 if b.closed_reqs.contains(&n) {
-                    ws.send(text(json!(["CLOSED", sub, "rate-limited: slow down"])))
+                    ws.send(text(json!(["CLOSED", sub, b.closed_reason])))
                         .await?;
                     continue;
                 }

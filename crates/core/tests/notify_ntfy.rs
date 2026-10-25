@@ -5,7 +5,9 @@ mod trust_support;
 
 use magnetar_core::Error;
 use magnetar_core::model::SavedSearch;
-use magnetar_core::notify::{NtfyConfig, format_hits, ntfy_publish, poll_saved_searches};
+use magnetar_core::notify::{
+    NtfyConfig, format_digest, format_hits, ntfy_publish, poll_saved_searches,
+};
 use magnetar_core::query::SearchQuery;
 use serde_json::json;
 use trust_support::{MemStore, summary};
@@ -196,5 +198,32 @@ fn hit_formatting() {
     assert_eq!(title, "ubuntu: 12 new results");
     assert_eq!(msg.lines().count(), 11);
     assert!(msg.ends_with("… and 2 more"));
+    assert_eq!(click, None);
+}
+
+#[test]
+fn digest_is_one_message_per_poll() {
+    let a = saved(1, "ubuntu", true);
+    let b = saved(2, "debian", true);
+    let c = saved(3, "arch", true);
+    let hit = |h: &str, t: &str| summary(&h.repeat(40), t, 1);
+    assert_eq!(format_digest(&[]), None);
+    assert_eq!(format_digest(&[(a.clone(), vec![])]), None);
+
+    // A single matching search reads like `format_hits`, empty ones are left out.
+    let one = vec![hit("a", "Ubuntu 24.04")];
+    assert_eq!(
+        format_digest(&[(a.clone(), one.clone()), (b.clone(), vec![])]),
+        Some(format_hits(&a, &one))
+    );
+
+    let (title, msg, click) = format_digest(&[
+        (a, one),
+        (b, vec![hit("b", "Debian 13"), hit("c", "Debian 12")]),
+        (c, vec![]),
+    ])
+    .unwrap();
+    assert_eq!(title, "3 new results in 2 saved searches");
+    assert_eq!(msg, "• ubuntu: 1\n• debian: 2");
     assert_eq!(click, None);
 }

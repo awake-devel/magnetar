@@ -6,6 +6,9 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
+/// Shortest periodic crawl interval; 1..59 s are raised to this (0 is continuous mode).
+pub const MIN_CRAWL_INTERVAL: Duration = Duration::from_secs(60);
+
 #[derive(Parser, Debug)]
 #[command(
     name = "magnetar-server",
@@ -57,6 +60,7 @@ pub struct Config {
     /// Start the librqbit download engine with `serve`.
     #[arg(long, env = "MAGNETAR_DOWNLOADS", default_value_t = true, action = clap::ArgAction::Set)]
     pub downloads: bool,
+    /// Pause between crawl passes; 0 = continuous (back to back, see `crawl_interval`).
     #[arg(long, env = "MAGNETAR_CRAWL_INTERVAL_SECS", default_value_t = 900)]
     pub crawl_interval_secs: u64,
     /// Relays crawled per pass.
@@ -78,8 +82,12 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("DATABASE_URL is not set"))
     }
 
-    pub fn crawl_interval(&self) -> Duration {
-        Duration::from_secs(self.crawl_interval_secs.max(60))
+    /// Periodic mode: the pause between passes, at least [`MIN_CRAWL_INTERVAL`]. None means
+    /// continuous mode (`MAGNETAR_CRAWL_INTERVAL_SECS=0`), where the crawler loop picks its own
+    /// short pause (D32).
+    pub fn crawl_interval(&self) -> Option<Duration> {
+        (self.crawl_interval_secs > 0)
+            .then(|| Duration::from_secs(self.crawl_interval_secs).max(MIN_CRAWL_INTERVAL))
     }
 
     pub fn seed_relays(&self) -> Vec<String> {
@@ -133,5 +141,23 @@ mod tests {
         assert_eq!(cli.config.seed_relays(), vec!["wss://a", "wss://b"]);
         assert!(!cli.config.downloads);
         assert!(Cli::try_parse_from(["magnetar-server", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn crawl_interval_modes() {
+        let at = |secs: &str| {
+            Cli::try_parse_from(["magnetar-server", "--crawl-interval-secs", secs, "serve"])
+                .unwrap()
+                .config
+                .crawl_interval()
+        };
+        let default = Cli::try_parse_from(["magnetar-server", "serve"]).unwrap();
+        assert_eq!(
+            default.config.crawl_interval(),
+            Some(Duration::from_secs(900))
+        );
+        assert_eq!(at("0"), None);
+        assert_eq!(at("5"), Some(MIN_CRAWL_INTERVAL));
+        assert_eq!(at("3600"), Some(Duration::from_secs(3600)));
     }
 }

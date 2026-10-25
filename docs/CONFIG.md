@@ -22,13 +22,18 @@ magnetar-server --version
 | `MAGNETAR_API_TOKEN` | none (required for `serve`) | `Authorization: Bearer <token>` on everything except `GET /health`. The `/relay` WebSocket also accepts `?token=` |
 | `MAGNETAR_ROOT_NPUB` | unset | npub or hex. The root of the web of trust. Can also be set via `PUT /api/v1/settings/trust` |
 | `MAGNETAR_NTFY_URL` | unset (Termux env: `https://ntfy.sh`) | Root URL. Publishing uses the JSON form (`POST <root>/`) |
-| `MAGNETAR_NTFY_TOPIC` | unset (Termux env: random `magnetar-<24 hex>`) | Topics are public secrets. ntfy.sh allows 250 messages a day, and Magnetar sends one per saved search per poll |
+| `MAGNETAR_NTFY_TOPIC` | unset (Termux env: random `magnetar-<24 hex>`) | Topics are public secrets. ntfy.sh allows 250 messages a day; Magnetar sends at most one per poll (every 15 min, so ≤ 96 a day) covering all saved searches with new hits (D34) |
 | `MAGNETAR_DOWNLOAD_DIR` | Termux env: `~/storage/downloads/magnetar` if `termux-setup-storage` was run, else `~/magnetar/downloads` | librqbit output for server downloads |
-| `MAGNETAR_CRAWL_INTERVAL_SECS` | `900` | |
+| `MAGNETAR_CRAWL_INTERVAL_SECS` | `900` | Pause between crawl passes, at least 60. `0` = continuous: passes run back to back with a 30 s pause (120 s after a failed pass or when every relay is backed off). Use it on an always-on Linux server; keep 900 on a phone. Indexer metadata and saved-search notifications still run at most every 15 min (ARCHITECTURE.md D32) |
+| `MAGNETAR_CRAWL_MAX_RELAYS` | `30` | Relays crawled per pass (at least 1). Seeds come first, then the best-yielding stored relays |
+| `MAGNETAR_CRAWL_EXPLORE_RELAYS` | `10` | Of `MAGNETAR_CRAWL_MAX_RELAYS`, slots kept for relays with no events yet: never-tried first, then the one whose last success is oldest. This is how newly discovered relays (NIP-65 lists, relay hints, kind-3 maps) get crawled. `0` disables exploration |
 | `MAGNETAR_SEED_RELAYS` | built-in list | comma-separated `wss://` URLs |
 | `MAGNETAR_CRAWL_MAX_RELAYS` | `30` | Relays crawled per run, seeds included (min 1) |
-| `MAGNETAR_CRAWL_EXPLORE_RELAYS` | `10` | Of those, at least this many stay out of the top yielders and rotate through every other relay, never tried first, then least recently looked at, so newly discovered relays, seeds past the cap and lesser yielders all get crawled (D30, D31). Clamped to the max |
+| `MAGNETAR_CRAWL_EXPLORE_RELAYS` | `10` | Of those, at least this many stay out of the top yielders and rotate through every other relay, never tried first, then least recently looked at, so newly discovered relays, seeds past the cap and lesser yielders all get crawled (D32, D33). Clamped to the max |
 | `RUST_LOG` | `info` (Termux env) | tracing `EnvFilter` syntax, e.g. `info,magnetar_core=debug` |
+
+`GET /api/v1/stats` reports the crawler under `crawler`: `running`, `last_run` (unix end time of
+the last pass), `last_report`, `passes` since start, `last_error` and `next_run` (while pausing).
 
 The Termux setup also writes these:
 

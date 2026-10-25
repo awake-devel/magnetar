@@ -274,6 +274,43 @@ async fn budget_backoff_and_disabled_relays() {
     assert_eq!(r.relays_tried, 0, "{r:?}");
 }
 
+/// A relay that refuses every REQ (NIP-01 `restricted:`) is backed off like a dead one, so a
+/// continuous crawl does not revisit it every pass (D34).
+#[tokio::test]
+async fn refusing_relay_backs_off() {
+    let refusing = FakeRelay::start(
+        vec![torrent(&Keys::generate(), 1, now() - 10)],
+        Behaviour {
+            closed_reqs: (1..=50).collect(),
+            closed_reason: "restricted: not a member",
+            ..Behaviour::default()
+        },
+    )
+    .await;
+    let store = MemStore::default();
+    let c = cfg(&[&refusing.url]);
+    let r = crawl_once(&store, &c).await.unwrap();
+    assert_eq!((r.relays_tried, r.relays_ok), (1, 0), "{r:?}");
+    // The first backfill REQ and its one retry; then nothing more is asked of it this run.
+    assert_eq!(refusing.reqs().len(), 2);
+    assert!(
+        r.errors
+            .iter()
+            .any(|e| e.contains("restricted: not a member")),
+        "{:?}",
+        r.errors
+    );
+    let info = store.relay(&refusing.url).unwrap();
+    assert_eq!(info.consecutive_failures, 1);
+    assert!(info.next_try_at > now());
+    assert!(info.last_ok.is_none());
+
+    // The next pass skips it.
+    let r = crawl_once(&store, &c).await.unwrap();
+    assert_eq!(r.relays_tried, 0, "{r:?}");
+    assert_eq!(refusing.state.lock().unwrap().connections, 1);
+}
+
 #[tokio::test]
 async fn metadata_hints_and_discovery() {
     let root = Keys::generate();
@@ -411,7 +448,7 @@ async fn live_crawl_oxtr_and_nos_lol() {
     assert!(store.torrent_count() > 0);
 }
 
-// ---- relay selection (D30)
+// ---- relay selection (D32)
 
 /// Pretend `url` was crawled at `at` with `found` new events (ok) or failed.
 async fn crawled(store: &MemStore, url: &str, ok: bool, found: u64, at: i64) {

@@ -59,6 +59,11 @@ const MAX_TARGET_PAGES: usize = 5;
 /// Extra time given to a relay task past the deadline before it is dropped.
 const GRACE: Duration = Duration::from_secs(3);
 const CLOSED_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// CLOSED prefixes that refuse us rather than one filter (NIP-01 `blocked`, `rate-limited`,
+/// `restricted`; NIP-42 `auth-required`). Asking again soon only adds traffic the relay already
+/// declined, so such a visit backs off like a failure (D34). `error:`/`invalid:`/`unsupported:`
+/// are about the filter (strfry rejects unknown filter items that way) and stay soft.
+const REFUSALS: &[&str] = &["blocked", "rate-limited", "restricted", "auth-required"];
 const MAX_ERRORS: usize = 50;
 const MAX_HINTS: usize = 500;
 
@@ -71,7 +76,7 @@ pub struct CrawlConfig {
     /// Slots of `max_relays` kept out of the top yielders and rotated through every other relay
     /// (never tried first, then least recently looked at), so discovered relays and lesser
     /// yielders get crawled instead of starving behind the top ones. Clamped to `max_relays`; see
-    /// `select_relays` (D30, D31).
+    /// `select_relays` (D32, D33).
     pub explore_relays: usize,
     /// Wall-clock budget for one run.
     pub budget: Duration,
@@ -192,13 +197,17 @@ pub async fn crawl_once<S: Store + ?Sized>(
         .await;
 
     for run in runs.iter().filter(|r| r.attempted) {
-        let ok = run.connected && run.fatal.is_none();
+        let ok = run.ok();
         {
             let mut r = ctx.report.lock().unwrap();
             r.relays_tried += 1;
             r.relays_ok += u32::from(ok);
         }
-        let err = run.fatal.as_deref().or(run.note.as_deref());
+        let err = run
+            .fatal
+            .as_deref()
+            .or(run.refused.as_deref())
+            .or(run.note.as_deref());
         if let Err(e) = store
             .record_relay_result(&run.url, ok, if ok { None } else { err }, run.found, now)
             .await
@@ -225,7 +234,7 @@ pub async fn crawl_once<S: Store + ?Sized>(
     Ok(report)
 }
 
-/// The relays of one run (D30): at most `max_relays`, no duplicates, disabled or backed-off relays
+/// The relays of one run (D32): at most `max_relays`, no duplicates, disabled or backed-off relays
 /// skipped. Candidates are the seeds, every stored relay and the NIP-65 write relays of the top
 /// publishers (stored as "nip65" on the way).
 /// 1. Up to `max_relays - explore_relays` proven relays (`events_found > 0`), ranked by past yield,
@@ -236,7 +245,7 @@ pub async fn crawl_once<S: Store + ?Sized>(
 ///    failing one, and 0 for one never tried. Ties: higher yield, seeds in config order, then
 ///    most listed. Fresh installs therefore start with the seeds, newly discovered relays go
 ///    before anything already crawled, and neither seeds past the cap nor proven relays outside
-///    the top yielders are cut forever (D31).
+///    the top yielders are cut forever (D33).
 pub async fn select_relays<S: Store + ?Sized>(
     store: &S,
     cfg: &CrawlConfig,
@@ -308,7 +317,7 @@ pub async fn select_relays<S: Store + ?Sized>(
     proven.sort_by(|a, b| b.0.cmp(&a.0).then(b.3.cmp(&a.3)).then(a.4.cmp(&b.4)));
     let exploit = cfg.max_relays - cfg.explore_relays.min(cfg.max_relays);
     // The proven tail rotates with the zero-yield relays: lifetime yield only grows when a relay
-    // is crawled, so a relay left below the cutoff could never climb back (D31).
+    // is crawled, so a relay left below the cutoff could never climb back (D33).
     let tail = proven.split_off(exploit.min(proven.len()));
     rotation.extend(tail);
     rotation.sort_by(|a, b| {
@@ -333,6 +342,10 @@ struct RelayRun {
     fatal: Option<String>,
     /// Non-fatal trouble (CLOSED, timeouts).
     note: Option<String>,
+    /// The relay refused us (a `REFUSALS` CLOSED): no more REQs this run, and backoff.
+    refused: Option<String>,
+    /// A page went unanswered for the full `PAGE_TIMEOUT`.
+    timed_out: bool,
     found: u64,
     new_torrents: Vec<String>,
 }
@@ -346,10 +359,31 @@ impl RelayRun {
             connected: false,
             fatal: None,
             note: None,
+            refused: None,
+            timed_out: false,
             found: 0,
             new_torrents: Vec::new(),
         }
     }
+
+    /// Whether this visit resets the relay's backoff. Besides connect and protocol failures, a
+    /// refusal and a timeout that brought nothing new count as failures: otherwise continuous
+    /// mode would revisit a relay that keeps saying no every pass (D34).
+    fn ok(&self) -> bool {
+        self.connected
+            && self.fatal.is_none()
+            && self.refused.is_none()
+            && !(self.timed_out && self.found == 0)
+    }
+}
+
+/// True for a `closed: <prefix>: …` stop reason whose prefix is one of `REFUSALS`. Prefixes are
+/// matched case-insensitively (strfry sends `ERROR:` upper-case, nostr-nips.md §1.5).
+fn is_refusal(reason: &str) -> bool {
+    reason
+        .strip_prefix("closed: ")
+        .and_then(|m| m.split_once(':'))
+        .is_some_and(|(p, _)| REFUSALS.contains(&p.trim().to_ascii_lowercase().as_str()))
 }
 
 /// The swept streams per relay: (cursor kind, base filter).
@@ -464,11 +498,18 @@ impl<'a, S: Store + ?Sized> Ctx<'a, S> {
         match h {
             Halt::Soft(msg) => {
                 tracing::debug!(relay = %run.url, %msg, "sweep stopped");
-                let budget = msg == "budget";
-                if !budget {
-                    run.note = Some(msg);
+                if msg == "budget" {
+                    return true;
                 }
-                budget
+                if is_refusal(&msg) {
+                    self.error(&run.url, &msg);
+                    run.refused = Some(msg);
+                    run.conn = None;
+                    return true;
+                }
+                run.timed_out |= msg == "timeout";
+                run.note = Some(msg);
+                false
             }
             Halt::Hard(msg) => {
                 self.error(&run.url, &msg);
@@ -905,8 +946,9 @@ impl Pager {
             if left < Duration::from_secs(1) {
                 return Ok(Step::Stopped("budget".into(), Vec::new()));
             }
+            let wait = left.min(PAGE_TIMEOUT);
             let page = conn
-                .fetch_page_multi(self.filters(), left.min(PAGE_TIMEOUT))
+                .fetch_page_multi(self.filters(), wait)
                 .await
                 .map_err(|e| Halt::Hard(e.to_string()))?;
             if let Some(msg) = &page.closed {
@@ -925,7 +967,13 @@ impl Pager {
                 return Ok(Step::Stopped(msg, self.fresh(page.events)));
             }
             if page.timed_out {
-                return Ok(Step::Stopped("timeout".into(), self.fresh(page.events)));
+                // A wait cut short by the crawl deadline says nothing about the relay.
+                let reason = if wait < PAGE_TIMEOUT {
+                    "budget"
+                } else {
+                    "timeout"
+                };
+                return Ok(Step::Stopped(reason.into(), self.fresh(page.events)));
             }
             break page;
         };
@@ -988,6 +1036,45 @@ mod tests {
                 ("wss://relay.example.com".to_string(), "hint"),
                 ("wss://nos.lol".to_string(), "kind3"),
             ]
+        );
+    }
+
+    #[test]
+    fn refusals_by_prefix() {
+        for r in [
+            "closed: rate-limited: slow down",
+            "closed: RESTRICTED: not a member",
+            "closed: auth-required: we can't serve DMs to unauthenticated users",
+            "closed: blocked: your IP",
+        ] {
+            assert!(is_refusal(r), "{r}");
+        }
+        for r in [
+            "closed: ERROR: bad req: unrecognised filter item: search",
+            "closed: unsupported: #K",
+            "closed: rate limited",
+            "timeout",
+            "page cap",
+        ] {
+            assert!(!is_refusal(r), "{r}");
+        }
+    }
+
+    #[test]
+    fn soft_trouble_verdict() {
+        let mut run = RelayRun::new("wss://r.example".into());
+        run.connected = true;
+        assert!(run.ok());
+        run.note = Some("closed: error: bad filter".into());
+        assert!(run.ok(), "a filter-level CLOSED is no reason to back off");
+        run.timed_out = true;
+        assert!(!run.ok(), "timed out and brought nothing new");
+        run.found = 3;
+        assert!(run.ok(), "slow but productive");
+        run.refused = Some("closed: rate-limited: slow down".into());
+        assert!(
+            !run.ok(),
+            "a refusal backs off even after a productive page"
         );
     }
 
