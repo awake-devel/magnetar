@@ -173,6 +173,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/torrents/{infohash}/liveness",
             post(refresh_liveness),
         )
+        .route("/api/v1/media/{id}/torrents", get(media_torrents))
         .route("/api/v1/events/batch", post(batch))
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/relays", get(relays).put(set_relay))
@@ -285,6 +286,18 @@ async fn search_post(
     body: Result<Json<SearchQuery>, JsonRejection>,
 ) -> ApiResult<Json<SearchPage>> {
     let Json(q) = body?;
+    Ok(Json(st.store.search(&q, magnetar_core::now()).await?))
+}
+
+/// Torrents linked to one media row (D40): the search query string applies (sort, limit, …);
+/// `q` narrows within the title's releases.
+async fn media_torrents(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    RawQuery(raw): RawQuery,
+) -> ApiResult<Json<SearchPage>> {
+    let mut q = parse_search_query(raw.as_deref())?;
+    q.text = format!("media:{id} {}", q.text);
     Ok(Json(st.store.search(&q, magnetar_core::now()).await?))
 }
 

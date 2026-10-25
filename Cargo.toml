@@ -40,6 +40,10 @@ data-encoding = "2.11"
 librqbit = { version = "9.0.1", default-features = false, features = ["rust-tls"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 anyhow = "1"
+parse-torrent-title = "=2.0.2"
+unicode-normalization = "=0.1.26"
+flate2 = "=1.1.10"
+httpdate = "=1.0.3"
 
 [profile.release]
 opt-level = 3

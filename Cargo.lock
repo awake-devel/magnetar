@@ -1231,6 +1231,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastjs-regex"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c6cd0242330c1d0d16d1a2fc30925256f0b4a0830ee2d5e15e2b2c18ce31d66"
+dependencies = [
+ "regex",
+ "regex-syntax",
+ "regress",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2487,6 +2498,7 @@ dependencies = [
  "librqbit",
  "negentropy",
  "nostr",
+ "parse-torrent-title",
  "percent-encoding",
  "rand 0.9.5",
  "reqwest",
@@ -2499,6 +2511,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tracing",
+ "unicode-normalization",
  "url",
  "webpki-roots 1.0.11",
 ]
@@ -2528,8 +2541,10 @@ dependencies = [
  "async-trait",
  "axum",
  "clap",
+ "flate2",
  "futures",
  "hex",
+ "httpdate",
  "magnetar-core",
  "nostr",
  "nostr-memory",
@@ -2916,6 +2931,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "parse-torrent-title"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d532a63200aa9bbf7290921f01cd21925c928e0fdd539f2dff09b6aded1b2f0"
+dependencies = [
+ "aho-corasick",
+ "chrono",
+ "fastjs-regex",
+ "indexmap 2.14.2",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3277,6 +3307,15 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "regress"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32eef8b209c3c1c15dbad02c1f30f9539f00dc7253e0cbcdaae442a50a09d7c1"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "reqwest"

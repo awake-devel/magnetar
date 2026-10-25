@@ -1,6 +1,8 @@
 //! Search SQL (ARCHITECTURE.md §5, rust-crates.md §9): eligible events are filtered first, then
 //! grouped by infohash with one canonical event (highest trust, then earliest).
 
+use magnetar_core::enrich::MIN_DISPLAY_CONFIDENCE;
+use magnetar_core::enrich::ids::split_media_token;
 use magnetar_core::model::{Liveness, TorrentSummary, npub};
 use magnetar_core::query::{MIN_PREFIX_CHARS, SearchQuery, Sort, pg_tsquery};
 use sqlx::{FromRow, Postgres, QueryBuilder};
@@ -24,6 +26,9 @@ pub(crate) struct HitRow {
     leechers: Option<i32>,
     best_peers: Option<i32>,
     expires_at: Option<i64>,
+    media_title: Option<String>,
+    media_year: Option<i32>,
+    media_kind: Option<String>,
 }
 
 impl HitRow {
@@ -55,6 +60,9 @@ impl HitRow {
             rank: self.rank,
             pinned: false,
             hidden: false,
+            media_title: self.media_title,
+            media_year: self.media_year,
+            media_kind: self.media_kind.and_then(|k| k.parse().ok()),
         }
     }
 }
@@ -69,7 +77,9 @@ pub(crate) fn dead(l: &Liveness, now: i64) -> Option<bool> {
 
 /// `WITH elig, grp, canon, hits` — everything up to the final SELECT.
 fn push_hits_cte(qb: &mut QueryBuilder<Postgres>, q: &SearchQuery, min_trust: u8) {
-    let text = q.text.trim().to_lowercase();
+    // `imdb:tt…` / `tmdb:movie:N` / `media:N` … select one title's torrents (D40).
+    let (text, media) = split_media_token(&q.text);
+    let text = text.trim().to_lowercase();
     let tsq = pg_tsquery(&text);
     qb.push("WITH elig AS (SELECT t.event_id, t.infohash, t.pubkey, t.created_at, t.trust, ");
     qb.push("t.title, t.category, t.total_size, t.file_count, t.pow_bits, t.source_url, ");
@@ -113,6 +123,9 @@ fn push_hits_cte(qb: &mut QueryBuilder<Postgres>, q: &SearchQuery, min_trust: u8
     }
     if let Some(until) = q.until {
         qb.push(" AND t.created_at <= ").push_bind(until);
+    }
+    if let Some(m) = &media {
+        crate::enrich::push_media_filter(qb, m);
     }
     if let Some(tsq) = &tsq {
         qb.push(" AND (t.search_tsv @@ to_tsquery('simple', ")
@@ -167,19 +180,24 @@ pub(crate) fn count_query(q: &SearchQuery, now: i64, min_trust: u8) -> QueryBuil
 pub(crate) fn hits_query(q: &SearchQuery, now: i64, min_trust: u8) -> QueryBuilder<Postgres> {
     let mut qb = QueryBuilder::new("");
     push_hits_cte(&mut qb, q, min_trust);
-    qb.push("SELECT * FROM hits");
+    qb.push(
+        "SELECT h.*, m.title AS media_title, m.year AS media_year, m.kind AS media_kind \
+         FROM hits h LEFT JOIN torrent_media tm ON tm.infohash = h.infohash AND tm.confidence >= ",
+    )
+    .push_bind(MIN_DISPLAY_CONFIDENCE)
+    .push(" LEFT JOIN media m ON m.id = tm.media_id");
     push_hit_filters(&mut qb, q, now);
     let dir = if q.descending { "DESC" } else { "ASC" };
     let order = match q.effective_sort() {
         // Relevance is always best-first; `descending` only orders the other sorts.
-        Sort::Relevance => "rank DESC, created_at DESC".to_string(),
-        Sort::Date => format!("created_at {dir}"),
-        Sort::Size => format!("total_size {dir} NULLS LAST, created_at DESC"),
-        Sort::Seeders => format!("best_peers {dir} NULLS LAST, created_at DESC"),
+        Sort::Relevance => "h.rank DESC, h.created_at DESC".to_string(),
+        Sort::Date => format!("h.created_at {dir}"),
+        Sort::Size => format!("h.total_size {dir} NULLS LAST, h.created_at DESC"),
+        Sort::Seeders => format!("h.best_peers {dir} NULLS LAST, h.created_at DESC"),
     };
     qb.push(" ORDER BY ")
         .push(order)
-        .push(", infohash ASC LIMIT ");
+        .push(", h.infohash ASC LIMIT ");
     qb.push_bind(i64::from(q.effective_limit()));
     qb.push(" OFFSET ").push_bind(i64::from(q.offset));
     qb

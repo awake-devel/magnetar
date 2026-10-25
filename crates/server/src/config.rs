@@ -36,6 +36,15 @@ pub enum Command {
     },
     /// Check DB, DNS, TLS (NIP-11 of a seed relay) and UDP (tracker connect).
     Selftest,
+    /// Refresh the IMDb datasets if due, link every pending torrent, print a JSON report.
+    Enrich {
+        /// Re-import the datasets even if unchanged.
+        #[arg(long)]
+        reimport: bool,
+        /// Forget every non-manual link check first (full rematch).
+        #[arg(long)]
+        rematch: bool,
+    },
 }
 
 #[derive(Args, Debug, Clone)]
@@ -89,6 +98,18 @@ pub struct Config {
     /// Comma-separated hex pubkeys of trusted NIP-66 monitors (default: built-in list, D36).
     #[arg(long, env = "MAGNETAR_NIP66_TRUSTED", value_delimiter = ',')]
     pub nip66_trusted: Vec<String>,
+    /// Offline IMDb identification from the non-commercial datasets (D40).
+    #[arg(long, env = "MAGNETAR_IMDB", default_value_t = true, action = clap::ArgAction::Set)]
+    pub imdb: bool,
+    /// Also import title.akas (~450 MB download) for localised titles.
+    #[arg(long, env = "MAGNETAR_IMDB_AKAS", default_value_t = false, action = clap::ArgAction::Set)]
+    pub imdb_akas: bool,
+    /// Where dataset downloads live (default <state dir>/datasets).
+    #[arg(long, env = "MAGNETAR_DATASET_DIR")]
+    pub dataset_dir: Option<PathBuf>,
+    /// Conditional re-download + re-import of the IMDb datasets every N hours.
+    #[arg(long, env = "MAGNETAR_IMDB_REFRESH_HOURS", default_value_t = 168)]
+    pub imdb_refresh_hours: u64,
 }
 
 impl Config {
@@ -125,6 +146,13 @@ impl Config {
         self.download_dir
             .clone()
             .unwrap_or_else(|| Self::home().join("Downloads").join("magnetar"))
+    }
+
+    /// `MAGNETAR_DATASET_DIR`, else `<state dir>/datasets` (D40).
+    pub fn dataset_dir(&self) -> PathBuf {
+        self.dataset_dir
+            .clone()
+            .unwrap_or_else(|| self.state_dir().join("datasets"))
     }
 
     /// `$XDG_STATE_HOME/magnetar` or `~/.local/state/magnetar`.

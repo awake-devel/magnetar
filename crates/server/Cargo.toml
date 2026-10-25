@@ -13,7 +13,7 @@ name = "magnetar-server"
 path = "src/main.rs"
 
 [dependencies]
-magnetar-core = { workspace = true, features = ["downloads"] }
+magnetar-core = { workspace = true, features = ["downloads", "enrich"] }
 sqlx.workspace = true
 axum.workspace = true
 tokio.workspace = true
@@ -31,6 +31,9 @@ anyhow.workspace = true
 nostr.workspace = true
 rand.workspace = true
 url.workspace = true
+flate2.workspace = true
+httpdate.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
 tokio-tungstenite.workspace = true

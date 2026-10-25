@@ -56,6 +56,7 @@ fix one of them in the same change.
 | D38 | Native Linux deployment without Docker: `scripts/build-linux.sh <x86_64\|aarch64>` builds a **static musl** `magnetar-server` inside `rust:1.99-alpine` (musl is Alpine's native libc, so ring and librqbit's aws-lc (D28) compile with plain gcc and link statically; `--native` uses the host's cargo + `musl-gcc`); native per-arch only, aarch64 on an arm64 CI runner, no QEMU. Output `dist/magnetar-server-<arch>-linux` is rejected unless it has no ELF interpreter and no `NEEDED`. `scripts/install-linux.sh` (POSIX sh: dash, busybox ash) installs as the user into `~/.local` from `MAGNETAR_BINARY` or a release asset checked against `SHA256SUMS` (missing entry = abort), writes `~/.config/magnetar/server.env` (600, random token, existing keys kept), and takes Postgres from `DATABASE_URL`, else a `postgres:18` container (`--restart unless-stopped`, named volume, 127.0.0.1:54320), else prints distro steps. `scripts/magnetar-ctl` (generalised laptop `magnetar-host`) runs the server as a `setsid nohup` process with pid/log in `~/.local/state/magnetar`; `tailscale serve` only with `MAGNETAR_TAILSCALE_SERVE=1`. No systemd/OpenRC/cron entries are installed: docs/LINUX.md shows optional examples | verified 2026-10-25: x86_64 build `static-pie linked`, install + up/health/restart/down in debian:bookworm and alpine:3.22, docker-DB path, release download + checksum mismatch from a local mirror; aarch64 not built locally |
 | D38a | Review fixes to the native Linux path. `magnetar-ctl update`: the caller's `MAGNETAR_VERSION` wins over the one `server.env` saved at install (else saved, else `latest`), so a pinned prerelease moves only when asked. The pid file is trusted only while `/proc/<pid>/cmdline` is `<bin> serve` (argv, not `/proc/<pid>/exe`, which reads `(deleted)` after `update` replaced the binary); a stale pid is dropped, never signalled. State dir 700, `server.log` 600 (debug logs carry `?token=` URIs; librqbit session lives there). `tailscale serve` uses `--set-path=/`; `up` will not replace a foreign handler at `/` of that port, `stop-all` removes only `/` and only if it still proxies to this server. `build-linux.sh --native` stops early when rustc has no std for `<arch>-unknown-linux-musl` (Alpine's `rust` package has only `<arch>-alpine-linux-musl`): rustup is required. Installer refuses a fresh `server.env` against an existing DB container (unknown password) unless `MAGNETAR_DB_PASSWORD` is given; LINUX.md lists what a second instance really needs (`XDG_STATE_HOME`, since the server ignores `MAGNETAR_STATE_DIR`) | verified 2026-10-25 on x86_64: update version precedence (stub installer), stale pid owned by a `sleep` left alone by up/down, stop after the binary was replaced, modes 700/600, `serve status --json` parsing against a stub `tailscale` (own / foreign / other-port fixtures); real `tailscale serve --set-path` not run (production serve config untouched); Alpine `rust` guard in alpine:3.22; DB guard with a throwaway container |
 | D39 | **Deployable anywhere; Termux removed.** The server targets are Docker Compose (`compose.yml`, image `ghcr.io/awake-devel/magnetar`, D37) and a static Linux binary (`scripts/build-linux.sh`, D38) on any Linux PC/VPS, Synology NAS (x86_64), Raspberry Pi (arm64) and Mac/Windows via Docker Desktop. The phone is a client only and reaches the server over the network, typically `https://<host>.<tailnet>.ts.net` via `tailscale serve`; Tailscale is optional (reverse proxy or LAN work too). Deleted: `scripts/termux-*.sh`, `scripts/termux-docker-test/`, `scripts/build-termux.sh`, `docs/TERMUX.md` (history in `docs/research/termux.md` and the v0.1.0 notes). Supersedes D24, amends D20 and the pool cap of §9 (5 was the phantom-process budget; now `MAGNETAR_DB_POOL`, D37). No systemd units, timers or udev rules are installed by anything in the repo. **App:** default server URL is empty (offline only) instead of `http://127.0.0.1:8787`. **Cleartext:** `network_security_config.xml` permits cleartext globally and Settings warns when an `http://` URL points at a host where it would travel readable (anything but loopback, `fd7a:115c:a1e0::/48` and `*.ts.net`: Tailscale encrypts those and they do not resolve or route without the tunnel). `100.64.0.0/10` warns with its own text ("only while Tailscale is connected"): it is also RFC 6598 carrier-grade NAT, sent in clear by the carrier when the tunnel is down, and the check sees the address, not the tunnel. Rejected: cleartext only to loopback. Reasons: (1) the server host is typed in at runtime and a network security config can only list hosts at build time, so loopback-only meant rebuilding the APK for a LAN NAS; (2) every server request comes from the Rust client (reqwest, tokio-tungstenite) on native sockets, which the platform does not hold to that file, so loopback-only was never enforced for them (verified 2026-10-25 on an API 37 x86_64 emulator: a debug APK with the old loopback-only config reached `http://10.0.2.2:18787` for `/health`, `/api/v1/settings/trust` and `/api/v1/search`, Status showed Healthy, no cleartext error in logcat); (3) plain HTTP over a tailnet is already encrypted. HTTPS stays the documented default (docs/DEPLOY.md). **CI** (`.github/workflows/`): `ci.yml` fmt + clippy `-D warnings` + tests against a `postgres:18` service on push/PR, plus an amd64 image build without push; `docker.yml` builds each arch natively (ubuntu-24.04, ubuntu-24.04-arm; no QEMU), pushes by digest and merges one manifest list: `X.Y.Z` for a tag, `latest` only for a tag without prerelease part, `edge` for every push to `main` (lets a NAS or Pi test main before a release without building on the device; nothing pins it by accident since `latest` and versions never move to main); `release.yml` builds `magnetar-server-{x86_64,aarch64}-linux` on the matching runners, checks tag = Cargo version and `--version`, writes `SHA256SUMS` (merged, so other assets' lines survive) and attaches them to the tag's release, creating it as a draft if missing. Actions pinned to full commit SHAs. `scripts/release.sh` (dry run by default) builds and signs the APK locally (the key never goes to CI), uploads it with `compose.yml`, `.env.example` and `docker/tailscale-serve.json` (flat, as `tailscale-serve.json`: compose's `tailscale` profile mounts it, so a checkout-less install needs it; `--build` still needs a checkout), merges `SHA256SUMS` and publishes the draft | user request 2026-10-25; Android `NetworkSecurityPolicy.isCleartextTrafficPermitted()` reference ("there's no expectation that the Socket API will honor this flag"), read 2026-10-25; docker/metadata-action v6.2.0 `src/meta.ts` (no `latest` for semver prereleases) |
+| D40 | Metadata enrichment, IMDb part (server only, docs/ENRICHMENT.md): shared tables `media` (lazily created, one row per identified title, unique external ids) + `torrent_media` (one link per infohash: method `itag`/`desc_link`/`offline_title`/`api_search`/`manual`, confidence, `matcher_version`). (a) Strong IDs first, every category, confidence 1.0 (0.9 when a description holds conflicting links of one kind; the first link wins): NIP-35 `i` tags and description links to IMDb/TMDB/TVDB/MAL/AniList/AniDB; a TMDB/MAL-only id gets a torrent-titled media row for D41/D42 to fill; only `i` tags and a description's main link (IMDb, else earliest) choose a row; other links are adopted (added where free, or their IMDb-less row merged) only through agreed pairs (`enrich_id_pairs`: one IMDb id ever, and deliberate or matching titles), and an id seen next to two IMDb ids is a template that is removed and relinked; `anime` rows with an anime id are D41's (linked as is, never merged or refreshed from IMDb). (b) Otherwise, `video` only: `parse-torrent-title` =2.0.2 on the name, then the largest video file (DHT input), exact normalised-title lookup in the IMDb non-commercial datasets (basics + ratings + packed episodes, optional akas), ranked type > year (series run counts as exact) > votes; prefix and pg_trgm fallbacks capped below 0.6. Links under 0.5 are stored but never shown (`MIN_DISPLAY_CONFIDENCE`). (c) Anime is left to D41 except strong IDs; `manual` is never overwritten. (d) Datasets: conditional GET, streamed COPY into UNLOGGED staging tables, atomic swap, refresh every `MAGNETAR_IMDB_REFRESH_HOURS`. (e) Nothing enriched is published to Nostr (IMDb non-commercial terms) and the phone never talks to IMDb/TMDB. Search token `imdb:tt…` / `tmdb:movie:N` / `mal:N` / `media:N`; `GET /api/v1/media/{id}/torrents` | metadata-enrichment.md; measured in docs/ENRICHMENT.md §4 |
 
 ---
 
@@ -104,6 +105,9 @@ core/src/
   relay.rs          RelayConn: WS client (REQ/EOSE/CLOSED/NOTICE/AUTH/OK, NEG-*) [nostr]
   crawler.rs        Crawler<S: Store>: discovery, pagination, cursors          [nostr]
   nip66.rs          NIP-66 relay discovery from monitor events (D35)            [nostr]
+  enrich/ids.rs     strong IDs from i tags + description links, search tokens (D40) [imdb]
+  enrich/parse.rs   release-name parsing, parse-torrent-title (feature `enrich`)  [imdb]
+  enrich/imdb_match.rs  IMDb candidate ranking (feature `enrich`)               [imdb]
   wot.rs            follow/mute/report extraction from kinds 3/10000/30007/1984/10002 [trust-sync]
   trust.rs          score computation (pure) + TrustEngine<S>                  [trust-sync]
   sync.rs           negentropy initiator (Up) + batch fallback, SyncSource trait [trust-sync]
@@ -248,6 +252,9 @@ pub struct TorrentSummary {
     pub trust: u8, pub pow_bits: u8, pub publisher_count: u32,
     pub source_url: Option<String>, pub rank: f32,
     pub pinned: bool, pub hidden: bool,                    // phone-local flags (server always false)
+    #[serde(default)] pub media_title: Option<String>,     // D40, only links ≥ MIN_DISPLAY_CONFIDENCE
+    #[serde(default)] pub media_year: Option<i32>,
+    #[serde(default)] pub media_kind: Option<MediaKind>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TorrentDetail {
@@ -257,6 +264,17 @@ pub struct TorrentDetail {
     pub magnet: String, pub liveness: Option<Liveness>, pub trust: TrustScore,
     pub events: Vec<EventRef>,            // every event that published this infohash
     pub comments: Vec<Comment>,
+    #[serde(default)] pub media: Option<MediaInfo>,        // D40
+}
+#[serde(rename_all = "snake_case")] pub enum MediaKind { Movie, Series, Anime }
+pub struct MediaInfo {
+    pub media_id: i64, pub kind: MediaKind, pub title: String, pub original_title: Option<String>,
+    pub year: Option<i32>, pub end_year: Option<i32>, pub genres: Vec<String>, pub rating: Option<f32>,
+    pub votes: Option<u32>, pub runtime_min: Option<i32>,
+    pub season: Option<i32>, pub episode: Option<i32>,     // of this torrent
+    pub imdb: Option<String>, pub tmdb: Option<(MediaKind, u32)>, pub mal: Option<u32>, pub anilist: Option<u32>,
+    pub method: String, pub confidence: f32,
+    pub overview: Option<String>, pub poster: Option<String>,  // D42; poster = "/api/v1/media/{id}/poster"
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct EventRef { pub event_id: Hex32, pub pubkey: Hex32, pub npub: String, pub created_at: i64, pub title: String, pub trust: u8 }
@@ -377,6 +395,7 @@ Auth: `Authorization: Bearer <MAGNETAR_API_TOKEN>` on everything except `GET /he
 | `GET /api/v1/search` | `SearchQuery` as query string: `q, cat` (repeatable/comma), `min_size, max_size, since, until, min_seeders, hide_dead, min_trust, sort, desc, limit, offset` | `SearchPage` |
 | `POST /api/v1/search` | `SearchQuery` JSON | `SearchPage` |
 | `GET /api/v1/torrents/{infohash}` | | `TorrentDetail` / 404 |
+| `GET /api/v1/media/{id}/torrents` | search query string (`sort`, `limit`, `q`, …) | `SearchPage` of the torrents linked to one media row (D40) |
 | `POST /api/v1/torrents/{infohash}/liveness` | | `Liveness` (forces a check now) |
 | `POST /api/v1/events/batch` | `{"events":[RawEvent...]}` (≤ 500) | `{"results":[{"id":..,"accepted":bool,"duplicate":bool,"message":".."}]}` |
 | `GET /api/v1/stats` | | `StoreStats` + `{"crawler":{"running":bool,"last_run":i64,"last_report":CrawlReport,"passes":u64,"last_error":str,"next_run":i64}}` |
@@ -506,10 +525,13 @@ Env/config: `DATABASE_URL`, `MAGNETAR_BIND` (default `127.0.0.1:8787`), `MAGNETA
 serve), `MAGNETAR_ROOT_NPUB`, `MAGNETAR_NTFY_URL`, `MAGNETAR_NTFY_TOPIC`, `MAGNETAR_DOWNLOAD_DIR`,
 `MAGNETAR_CRAWL_INTERVAL_SECS` (default 900, 0 = continuous, D32), `MAGNETAR_CRAWL_MAX_RELAYS` (30),
 `MAGNETAR_CRAWL_EXPLORE_RELAYS` (10), `MAGNETAR_SEED_RELAYS` (comma), `MAGNETAR_NIP66` (default true),
-`MAGNETAR_NIP66_MONITORS` (comma), `MAGNETAR_NIP66_TRUSTED` (comma), `MAGNETAR_DB_POOL` (10, D37), `RUST_LOG`.
+`MAGNETAR_NIP66_MONITORS` (comma), `MAGNETAR_NIP66_TRUSTED` (comma), `MAGNETAR_IMDB` (default true),
+`MAGNETAR_IMDB_AKAS` (false), `MAGNETAR_DATASET_DIR` (`<state dir>/datasets`), `MAGNETAR_IMDB_REFRESH_HOURS` (168), `MAGNETAR_DB_POOL` (10, D37), `RUST_LOG`.
+`magnetar-server enrich [--reimport] [--rematch]` refreshes the datasets, links everything due and prints a JSON report (D40).
 `serve` runs: API + relay endpoint, crawler loop, liveness loop (batch of due infohashes every 5 min),
 trust recompute (on graph_version change, else every 6 h), saved-search notifier (after a crawl, at most every 15 min), NIP-66
-relay discovery (startup, then every 6 h; D35).
+relay discovery (startup, then every 6 h; D35), enrichment (new torrents within a minute, dataset refresh check
+after the first drain, then every `MAGNETAR_IMDB_REFRESH_HOURS`; D40).
 sqlx pool size `MAGNETAR_DB_POOL` (D37; the old cap of 5 was the Termux phantom-process budget, D39). `selftest` checks DB, DNS, TLS (fetch NIP-11 of a seed relay), UDP.
 
 Seed relays (nostr-nips.md §4.5): `wss://nostr.oxtr.dev, wss://relay.nostr.net, wss://nos.lol,
