@@ -58,6 +58,33 @@ struct Session {
     st: AppState,
     subs: HashMap<String, Vec<Filter>>,
     negs: HashMap<String, NegResponder>,
+    stats: SessionStats,
+}
+
+/// What a connection did, logged when it closes (phone sync = NEG session + EVENT uploads).
+#[derive(Default)]
+struct SessionStats {
+    neg_sessions: u32,
+    neg_rounds: u32,
+    accepted: u32,
+    duplicates: u32,
+    rejected: u32,
+}
+
+impl SessionStats {
+    fn log_close(&self) {
+        if self.neg_sessions == 0 && self.accepted + self.duplicates + self.rejected == 0 {
+            return;
+        }
+        tracing::info!(
+            neg_sessions = self.neg_sessions,
+            neg_rounds = self.neg_rounds,
+            accepted = self.accepted,
+            duplicates = self.duplicates,
+            rejected = self.rejected,
+            "relay: connection closed"
+        );
+    }
 }
 
 async fn serve(socket: WebSocket, st: AppState) {
@@ -70,6 +97,7 @@ async fn serve(socket: WebSocket, st: AppState) {
         st,
         subs: HashMap::new(),
         negs: HashMap::new(),
+        stats: SessionStats::default(),
     };
     loop {
         let out = tokio::select! {
@@ -98,10 +126,12 @@ async fn serve(socket: WebSocket, st: AppState) {
         };
         for m in out {
             if tx.send(Message::Text(m.into())).await.is_err() {
+                session.stats.log_close();
                 return;
             }
         }
     }
+    session.stats.log_close();
     let _ = tx.send(Message::Close(None)).await;
 }
 
@@ -117,7 +147,11 @@ impl Session {
             return vec![notice("invalid: message is not a JSON array")];
         };
         match msg.first().and_then(Value::as_str) {
-            Some("EVENT") => vec![self.event(msg.get(1)).await],
+            Some("EVENT") => {
+                let reply = self.event(msg.get(1)).await;
+                self.count_ok(&reply);
+                vec![reply]
+            }
             Some("REQ") => self.req(&msg).await,
             Some("CLOSE") => {
                 if let Some(sub) = sub_id(msg.get(1)) {
@@ -135,6 +169,21 @@ impl Session {
             }
             Some(other) => vec![notice(&format!("unsupported: message type {other}"))],
             None => vec![notice("invalid: missing message type")],
+        }
+    }
+
+    fn count_ok(&mut self, reply: &str) {
+        let Ok(Value::Array(ok)) = serde_json::from_str::<Value>(reply) else {
+            return;
+        };
+        match (
+            ok.get(2).and_then(Value::as_bool),
+            ok.get(3).and_then(Value::as_str),
+        ) {
+            (Some(true), Some(m)) if m.starts_with("duplicate:") => self.stats.duplicates += 1,
+            (Some(true), _) => self.stats.accepted += 1,
+            (Some(false), _) => self.stats.rejected += 1,
+            _ => {}
         }
     }
 
@@ -233,12 +282,17 @@ impl Session {
         if items.len() > MAX_NEG_ITEMS {
             return neg_err(&sub, "blocked: this query is too big");
         }
+        let items_len = items.len();
         let mut neg = match NegResponder::new(items) {
             Ok(n) => n,
             Err(e) => return neg_err(&sub, &format!("error: {e}")),
         };
+        let n_items = items_len;
         match neg.reconcile_hex(initial) {
             Ok(reply) => {
+                tracing::info!(sub = %sub, items = n_items, "relay: NEG-OPEN");
+                self.stats.neg_sessions += 1;
+                self.stats.neg_rounds += 1;
                 self.negs.insert(sub.clone(), neg);
                 json!(["NEG-MSG", sub, reply]).to_string()
             }
@@ -256,7 +310,10 @@ impl Session {
             _ => Err(magnetar_core::Error::Invalid("bad hex".into())),
         };
         Some(match reply {
-            Ok(reply) => json!(["NEG-MSG", sub, reply]).to_string(),
+            Ok(reply) => {
+                self.stats.neg_rounds += 1;
+                json!(["NEG-MSG", sub, reply]).to_string()
+            }
             Err(e) => {
                 self.negs.remove(&sub);
                 neg_err(&sub, &format!("invalid: {e}"))
