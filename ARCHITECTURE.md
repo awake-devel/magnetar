@@ -24,7 +24,7 @@ fix one of them in the same change.
 | D7 | Kind 2004 accepted only if it references (e/E tag) a known 2003; kind 1111 with `K=2003` ingested as comment too | nostr-nips.md §2.5 |
 | D8 | Pagination: `until = min(created_at)` (inclusive, dedup), strictly decreasing, stop on a page with 0 new events; never trust "page < limit" | nostr-nips.md §1.7 |
 | D9 | Cursors per (relay, kind): `newest_seen` (forward, overlap 1 h) + `backfill_until` (history not finished) | nostr-nips.md §1.7 |
-| D10 | Relay discovery: seed list ∪ NIP-65 lists of publishers ∪ kind-3 legacy maps ∪ tag hints; own normalizer; oversized lists (>50 r) penalised and not used | wot-relays.md §3, §5 |
+| D10 | Relay discovery: seed list ∪ NIP-65 lists of publishers ∪ kind-3 legacy maps ∪ tag hints ∪ NIP-66 monitors (D35); own normalizer; oversized lists (>50 r) penalised and not used | wot-relays.md §3, §5 |
 | D11 | Postgres search: generated `tsvector` (`simple` on title/files with separator regexp, `english` on description) + `pg_trgm` `<%` word_similarity fallback | rust-crates.md §9 |
 | D12 | SQLite search: FTS5 external content, `unicode61 remove_diacritics 2 separators '._-[]()'`, sanitized query tokens | rust-crates.md §5 |
 | D13 | NIP-77: own relay side (axum WS + `negentropy` 0.5.2), own initiator on phone; frame limit 60 000; max 500 000 items per NEG-OPEN | negentropy.md §1, §5 |
@@ -49,6 +49,8 @@ fix one of them in the same change.
 | D32 | Continuous crawling: `MAGNETAR_CRAWL_INTERVAL_SECS=0` runs passes back to back with a fixed 30 s pause (120 s after a failed pass or one with no relay to try, so an instant pass never hot-spins); 1–59 is raised to 60, default stays 900 for phone servers. Each pass keeps the 600 s budget, relay backoff is unchanged (`next_try_at` is absolute time, 300 s doubling to 24 h, so a failing relay is skipped by `select_relays` however often passes run; what counts as failing is in D34). Indexer metadata and the saved-search notifier run at most every 15 min in every mode (the notifier is watermarked, so skipped polls only batch hits; the ntfy.sh limit is kept by D34's one message per poll). 30 s rather than less: a steady-state pass already reconnects to up to 30 public relays and re-reads the 1 h forward overlap, so a shorter pause mostly adds connection churn against relay rate limits while kind 2003 arrives slowly | measured: first pass on the laptop took 457 s (45 942 inserted, 10 relays ok) |
 | D33 | `/relay` connections take a live broadcast receiver only while they have an open REQ, and drop it at the last CLOSE. Before, every connection subscribed at connect, so an upload-only phone sync (NEG + ~4.4k EVENTs, no REQ) sat behind the 1024-slot channel while its own and the crawler's ingests filled it and logged dozens of "subscriber lagged" warnings. Nothing was lost: lag only skips live pushes to open REQs, every event is already stored. Real lag now warns once per connection and the total is in the close line (`live_dropped`) | server.log 2026-10-25: 579 lag warnings during one upload connection (`accepted=2267 duplicates=2141`); `crates/core/src/sync.rs` sends no REQ |
 | D34 | Soft crawl trouble that still backs off: a final CLOSED (after the one retry) whose prefix is `blocked`, `rate-limited`, `restricted` (NIP-01) or `auth-required` (NIP-42), case-insensitive, records the visit as a failure even if it inserted events, and nothing more is asked of that relay in the run; a page unanswered for the full 20 s `PAGE_TIMEOUT` is a failure when the visit inserted nothing. A timeout cut short by the crawl deadline counts as budget, not timeout. `error:`/`invalid:`/`unsupported:` CLOSEDs stay soft: they reject one filter (strfry: `ERROR: bad req: unrecognised filter item`), not us. Before, every CLOSED or timeout reset `consecutive_failures` and `next_try_at = now`, so continuous mode (D32) revisited a refusing relay every ~30 s. The saved-search notifier sends **one** ntfy message per poll (`notify::format_digest`; a lone matching search keeps the `format_hits` form): per-search messages exceeded ntfy.sh's 250/day with 3 always-matching searches (3 × 96 polls), now at most 96/day. Supersedes D25's "one message per saved search per poll" | NIP-01 (`CLOSED` prefixes) and NIP-42 (`auth-required:` on REQ), nostr-protocol/nips master, read 2026-10-25; nostr-nips.md §1.5; termux.md §4 (250/day) |
+| D35 | NIP-66 relay discovery (server only, every 6 h): kind 10166 from monitor relays → announced monitor set; kind 30166 **by those authors only**, last 7 days, pages of 500 (D8); verify each; `d` normalized with `normalize_relay(url,false)`; drop non-clearnet (`n` ≠ clearnet, .onion/.i2p/.loki), hex-pubkey `d`, and any relay that **any** monitor tags `R auth` / `R payment`; insert ≤ 2000 new per run as source `nip66`, most monitors first. `N` tags ignored (crawler needs neither NIP-50 nor 77). Defaults relaypag.es, monitorlizard.nostr1.com, relay.nostr.watch, nos.lol, relay.damus.io | nip66.md |
+| D36 | NIP-66 trust (amends D35): anyone can publish a 10166, so announcements alone are not trusted. (a) A built-in **trusted monitor** list (`DEFAULT_TRUSTED_MONITORS`: every announced monitor with > 100 30166 in 7 days on 2026-10-25; env `MAGNETAR_NIP66_TRUSTED`) is always queried in its **own** `authors` filter, before and with a page budget separate from the other announced ("open") monitors, so fresh sybil 10166s cannot evict it (ordering by 10166 recency would: the real fleet's are 80–130 days old). (b) Open monitors: ≤ 250 per filter, ranked by monitor relays carrying the announcement then recency, ≤ 10 pages per relay. (c) An open monitor's `R auth`/`payment` only counts for relays no trusted monitor reports. (d) Relays reported by open monitors only rank after trusted-reported ones and are capped at 100 inserts per run. (e) Each 30166 is verified once across relays and reduced to (monitor, created_at, verdict) right after its page: no event bodies are held during a run | nip66.md §6 |
 
 ---
 
@@ -93,6 +95,7 @@ core/src/
   relayurl.rs       relay URL normalizer                                       [nostr]
   relay.rs          RelayConn: WS client (REQ/EOSE/CLOSED/NOTICE/AUTH/OK, NEG-*) [nostr]
   crawler.rs        Crawler<S: Store>: discovery, pagination, cursors          [nostr]
+  nip66.rs          NIP-66 relay discovery from monitor events (D35)            [nostr]
   wot.rs            follow/mute/report extraction from kinds 3/10000/30007/1984/10002 [trust-sync]
   trust.rs          score computation (pure) + TrustEngine<S>                  [trust-sync]
   sync.rs           negentropy initiator (Up) + batch fallback, SyncSource trait [trust-sync]
@@ -201,7 +204,7 @@ pub struct TrustScore {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RelayInfo {
-    pub url: String, pub source: String,          // "seed" | "nip65" | "kind3" | "hint" | "manual"
+    pub url: String, pub source: String,          // "seed" | "nip65" | "kind3" | "hint" | "nip66" | "manual"
     pub enabled: bool, pub last_ok: Option<i64>, pub last_err: Option<String>,
     pub consecutive_failures: u32, pub next_try_at: i64,
     pub events_found: u64, pub supports_neg: Option<bool>,
@@ -493,10 +496,12 @@ core feature `downloads` so core stays light when it is off.
 CLI: `magnetar-server serve | migrate | crawl-once [--seconds N] | selftest | --version`.
 Env/config: `DATABASE_URL`, `MAGNETAR_BIND` (default `127.0.0.1:8787`), `MAGNETAR_API_TOKEN` (required for
 serve), `MAGNETAR_ROOT_NPUB`, `MAGNETAR_NTFY_URL`, `MAGNETAR_NTFY_TOPIC`, `MAGNETAR_DOWNLOAD_DIR`,
-`MAGNETAR_CRAWL_INTERVAL_SECS` (default 900, 0 = continuous, D30), `MAGNETAR_CRAWL_MAX_RELAYS` (30),
-`MAGNETAR_CRAWL_EXPLORE_RELAYS` (10), `MAGNETAR_SEED_RELAYS` (comma), `RUST_LOG`.
+`MAGNETAR_CRAWL_INTERVAL_SECS` (default 900, 0 = continuous, D32), `MAGNETAR_CRAWL_MAX_RELAYS` (30),
+`MAGNETAR_CRAWL_EXPLORE_RELAYS` (10), `MAGNETAR_SEED_RELAYS` (comma), `MAGNETAR_NIP66` (default true),
+`MAGNETAR_NIP66_MONITORS` (comma), `MAGNETAR_NIP66_TRUSTED` (comma), `RUST_LOG`.
 `serve` runs: API + relay endpoint, crawler loop, liveness loop (batch of due infohashes every 5 min),
-trust recompute (on graph_version change, else every 6 h), saved-search notifier (after a crawl, at most every 15 min).
+trust recompute (on graph_version change, else every 6 h), saved-search notifier (after a crawl, at most every 15 min), NIP-66
+relay discovery (startup, then every 6 h; D35).
 sqlx pool ≤ 5 (Termux phantom-process budget). `selftest` checks DB, DNS, TLS (fetch NIP-11 of a seed relay), UDP.
 
 Seed relays (nostr-nips.md §4.5): `wss://nostr.oxtr.dev, wss://relay.nostr.net, wss://nos.lol,

@@ -12,6 +12,7 @@ pub mod liveness;
 pub mod magnet;
 pub mod model;
 pub mod nip35;
+pub mod nip66;
 pub mod notify;
 pub mod pow;
 pub mod query;

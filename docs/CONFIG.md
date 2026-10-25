@@ -6,7 +6,7 @@ The authoritative definition is ARCHITECTURE.md §4 (setting keys), §8.1 (`FfiC
 ## Server: `magnetar-server`
 
 ```
-magnetar-server serve                 # API + /relay endpoint + crawler, liveness, trust, notifier loops
+magnetar-server serve                 # API + /relay endpoint + crawler, liveness, trust, notifier, NIP-66 loops
 magnetar-server migrate               # apply sqlx migrations (idempotent)
 magnetar-server crawl-once [--seconds N]
 magnetar-server selftest              # DB, DNS, TLS (NIP-11 of a seed relay), UDP
@@ -28,8 +28,9 @@ magnetar-server --version
 | `MAGNETAR_CRAWL_MAX_RELAYS` | `30` | Relays crawled per pass (at least 1). Seeds come first, then the best-yielding stored relays |
 | `MAGNETAR_CRAWL_EXPLORE_RELAYS` | `10` | Of `MAGNETAR_CRAWL_MAX_RELAYS`, slots kept for relays with no events yet: never-tried first, then the one whose last success is oldest. This is how newly discovered relays (NIP-65 lists, relay hints, kind-3 maps) get crawled. `0` disables exploration |
 | `MAGNETAR_SEED_RELAYS` | built-in list | comma-separated `wss://` URLs |
-| `MAGNETAR_CRAWL_MAX_RELAYS` | `30` | Relays crawled per run, seeds included (min 1) |
-| `MAGNETAR_CRAWL_EXPLORE_RELAYS` | `10` | Of those, at least this many stay out of the top yielders and rotate through every other relay, never tried first, then least recently looked at, so newly discovered relays, seeds past the cap and lesser yielders all get crawled (D32, D33). Clamped to the max |
+| `MAGNETAR_NIP66` | `true` | NIP-66 relay discovery with `serve`: at startup, then every 6 h, new relays from monitor events are added with source `nip66` (ARCHITECTURE.md D35) |
+| `MAGNETAR_NIP66_MONITORS` | `wss://relaypag.es, wss://monitorlizard.nostr1.com, wss://relay.nostr.watch, wss://nos.lol, wss://relay.damus.io` | comma-separated relays queried for kind 10166/30166 monitor events |
+| `MAGNETAR_NIP66_TRUSTED` | built-in list of 12 monitor pubkeys (`nip66::DEFAULT_TRUSTED_MONITORS`) | comma-separated hex pubkeys of trusted NIP-66 monitors. They get their own request and page budget, and only relays they report escape the cap of 100 new relays per run from other announced monitors (ARCHITECTURE.md D36) |
 | `RUST_LOG` | `info` (Termux env) | tracing `EnvFilter` syntax, e.g. `info,magnetar_core=debug` |
 
 `GET /api/v1/stats` reports the crawler under `crawler`: `running`, `last_run` (unix end time of

@@ -72,6 +72,15 @@ pub struct Config {
     /// Comma-separated seed relays (overrides the `crawl.seed_relays` setting).
     #[arg(long, env = "MAGNETAR_SEED_RELAYS", value_delimiter = ',')]
     pub seed_relays: Vec<String>,
+    /// NIP-66 relay discovery from monitor events, every 6 h with `serve`.
+    #[arg(long, env = "MAGNETAR_NIP66", default_value_t = true, action = clap::ArgAction::Set)]
+    pub nip66: bool,
+    /// Comma-separated relays holding NIP-66 monitor events (default: built-in list).
+    #[arg(long, env = "MAGNETAR_NIP66_MONITORS", value_delimiter = ',')]
+    pub nip66_monitors: Vec<String>,
+    /// Comma-separated hex pubkeys of trusted NIP-66 monitors (default: built-in list, D36).
+    #[arg(long, env = "MAGNETAR_NIP66_TRUSTED", value_delimiter = ',')]
+    pub nip66_trusted: Vec<String>,
 }
 
 impl Config {
