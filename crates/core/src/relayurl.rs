@@ -6,8 +6,33 @@ use url::{Host, Url};
 
 pub const MAX_RELAY_URL_LEN: usize = 255;
 
+/// TLDs that never resolve publicly: special-use or private-use names (RFC 6761 test/invalid/
+/// example, RFC 9476 alt, ICANN's .internal, the never-delegated home/corp/mail) and common LAN
+/// suffixes. None is in the IANA root zone (tlds-alpha-by-domain.txt 2026102500); `arpa` is, but
+/// only for infrastructure (home.arpa, in-addr.arpa). Seen live: `ws://apollo.home:3355` in a
+/// NIP-65 list.
+const PRIVATE_TLDS: &[&str] = &[
+    "alt",
+    "arpa",
+    "corp",
+    "example",
+    "gateway",
+    "home",
+    "internal",
+    "intranet",
+    "invalid",
+    "lan",
+    "localdomain",
+    "mail",
+    "priv",
+    "private",
+    "router",
+    "test",
+    "workgroup",
+];
+
 /// ws/wss only, no userinfo, lowercase host, default port dropped, no query/fragment, trailing
-/// slashes stripped, ≤255 chars, no localhost/.local/private IPs, onion only if allowed.
+/// slashes stripped, ≤255 chars, no localhost/.local/private TLDs/private IPs, onion only if allowed.
 pub fn normalize_relay(raw: &str, allow_onion: bool) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() || raw.len() > 2 * MAX_RELAY_URL_LEN || raw.contains(char::is_whitespace) {
@@ -39,6 +64,9 @@ pub fn normalize_relay(raw: &str, allow_onion: bool) -> Option<String> {
                 return None;
             }
             if d.ends_with(".onion") && !allow_onion {
+                return None;
+            }
+            if PRIVATE_TLDS.contains(&d.rsplit('.').next().unwrap_or_default()) {
                 return None;
             }
         }
@@ -145,6 +173,11 @@ mod tests {
             "ws://[::1]:7777",
             "ws://[fd00::1]",
             "ws://printer.local",
+            "ws://apollo.home:3355",
+            "wss://nas.lan",
+            "wss://relay.corp.internal",
+            "ws://pi.home.arpa",
+            "wss://relay.test",
             "wss://relay",
             "wss://relay .com",
             "wss://nos.lol,wss://x.com",
