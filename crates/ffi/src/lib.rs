@@ -611,16 +611,20 @@ impl Magnetar {
         Ok(self.inner.store.set_relay_enabled_sync(url, enabled)?)
     }
 
+    /// Ok(false) when the server is unreachable or unhealthy. `GET /health` needs no token, so a
+    /// healthy server is also asked one authenticated question: a rejected token is an error
+    /// (`Server{401}`), not "reachable".
     pub async fn server_health(&self) -> Result<bool, FfiError> {
         let Some(api) = self.inner.api() else {
             return Ok(false);
         };
         self.run(move |_| async move {
-            Ok(api
-                .health()
-                .await
-                .map(|h| h.status == "ok")
-                .unwrap_or(false))
+            match api.health().await {
+                Ok(h) if h.status == "ok" => {}
+                _ => return Ok(false),
+            }
+            api.trust_settings().await?;
+            Ok(true)
         })
         .await
     }
