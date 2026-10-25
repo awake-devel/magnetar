@@ -121,7 +121,10 @@ async fn fake_relay(
     dup_msg: HashSet<String>,
 ) -> FakeRelay {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}/relay?token=s3cr%2Bt", listener.local_addr().unwrap());
+    let url = format!(
+        "ws://{}/relay?token=s3cr%2Bt",
+        listener.local_addr().unwrap()
+    );
     let received = Arc::new(Mutex::new(Vec::new()));
     let queries = Arc::new(Mutex::new(Vec::new()));
     // id -> negentropy item of every event the relay holds (grows with accepted EVENTs).
@@ -169,7 +172,11 @@ async fn fake_relay(
                         }
                         "NEG-MSG" => {
                             let r = neg.as_mut().unwrap();
-                            vec![json!(["NEG-MSG", v[1], r.reconcile_hex(v[2].as_str().unwrap()).unwrap()])]
+                            vec![json!([
+                                "NEG-MSG",
+                                v[1],
+                                r.reconcile_hex(v[2].as_str().unwrap()).unwrap()
+                            ])]
                         }
                         "NEG-CLOSE" => {
                             neg = None;
@@ -230,7 +237,10 @@ async fn fake_batch(reject: HashSet<String>, dup: HashSet<String>) -> api_suppor
                 },
             })
             .collect();
-        (200, serde_json::to_string(&BatchResponse { results }).unwrap())
+        (
+            200,
+            serde_json::to_string(&BatchResponse { results }).unwrap(),
+        )
     })
     .await
 }
@@ -257,7 +267,10 @@ async fn negentropy_upload_marks_only_ok_true() {
     assert_eq!(r.method, "negentropy");
     assert_eq!(r.error, None);
     assert_eq!(r.have, 40, "phone-only ids 0..40");
-    assert_eq!(r.need_ignored, 19, "server-only 60..80 minus the evicted 70");
+    assert_eq!(
+        r.need_ignored, 19,
+        "server-only 60..80 minus the evicted 70"
+    );
     assert_eq!(r.failed, 3);
     // 40 have − 3 rejected − 2 duplicate-on-OK = 35 accepted;
     // 40..60 were unsynced but already on the server → re-sent, OK duplicate.
@@ -275,12 +288,21 @@ async fn negentropy_upload_marks_only_ok_true() {
     assert_eq!(relay.queries.lock().unwrap().as_slice(), ["token=s3cr%2Bt"]);
     let received = relay.received.lock().unwrap().clone();
     assert_eq!(received.len(), 60);
-    assert!(!received.contains(&all[70].id), "evicted body is never sent");
+    assert!(
+        !received.contains(&all[70].id),
+        "evicted body is never sent"
+    );
 
     // Second run: only the 3 rejected rows are still unsynced and nothing else differs.
     let r = sync_up(&src, &relay.url, &api).await.unwrap();
     assert_eq!(
-        (r.method.as_str(), r.have, r.uploaded, r.duplicates, r.failed),
+        (
+            r.method.as_str(),
+            r.have,
+            r.uploaded,
+            r.duplicates,
+            r.failed
+        ),
         ("negentropy", 3, 0, 0, 3)
     );
     assert_eq!(src.synced().len(), 57);
@@ -298,8 +320,14 @@ async fn neg_err_falls_back_to_batch() {
 
     let r = sync_up(&src, &relay.url, &api).await.unwrap();
     assert_eq!(r.method, "batch");
-    assert!(r.error.as_deref().unwrap().contains("NEG-ERR: blocked"), "{r:?}");
-    assert_eq!((r.have, r.uploaded, r.duplicates, r.failed), (1_200, 1_188, 10, 2));
+    assert!(
+        r.error.as_deref().unwrap().contains("NEG-ERR: blocked"),
+        "{r:?}"
+    );
+    assert_eq!(
+        (r.have, r.uploaded, r.duplicates, r.failed),
+        (1_200, 1_188, 10, 2)
+    );
     let posts = http.requests();
     assert_eq!(posts.len(), 3, "1 200 events in chunks of ≤ 500");
     let synced = src.synced();

@@ -34,7 +34,11 @@ fn reconciles_20k_vs_25k_exactly() {
     let mut rounds = 0;
     loop {
         let reply = resp.reconcile_hex(&msg).unwrap();
-        assert!(reply.len() / 2 <= FRAME_SIZE_LIMIT as usize, "frame {}", reply.len() / 2);
+        assert!(
+            reply.len() / 2 <= FRAME_SIZE_LIMIT as usize,
+            "frame {}",
+            reply.len() / 2
+        );
         rounds += 1;
         assert!(rounds < 50, "no convergence");
         match neg
@@ -102,8 +106,9 @@ async fn live_negentropy_oxtr() {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
-    let connector =
-        tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(magnetar_core::http::tls_config()));
+    let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(
+        magnetar_core::http::tls_config(),
+    ));
     let cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(16 << 20))
         .max_frame_size(Some(16 << 20));
@@ -134,7 +139,10 @@ async fn live_negentropy_oxtr() {
         let bytes = hex::decode(v[2].as_str().unwrap()).unwrap();
         max_frame = max_frame.max(bytes.len());
         rounds += 1;
-        match neg.reconcile_with_ids(&bytes, &mut have, &mut need).unwrap() {
+        match neg
+            .reconcile_with_ids(&bytes, &mut have, &mut need)
+            .unwrap()
+        {
             Some(next) => {
                 let m = serde_json::json!(["NEG-MSG", "live", hex::encode(next)]);
                 ws.send(Message::text(m.to_string())).await.unwrap();

@@ -80,7 +80,15 @@ fn dd840e43_like_one_d2_follower_profile_age_is_21() {
 
 #[test]
 fn follow_d2_curve() {
-    let table = [(0, 0), (1, 11), (2, 20), (3, 26), (5, 36), (10, 46), (40, 50)];
+    let table = [
+        (0, 0),
+        (1, 11),
+        (2, 20),
+        (3, 26),
+        (5, 36),
+        (10, 46),
+        (40, 50),
+    ];
     for (n2, pts) in table {
         assert_eq!(follow_d2_points(n2), pts, "n2={n2}");
     }
@@ -88,7 +96,16 @@ fn follow_d2_curve() {
 
 #[test]
 fn pow_bonus_table() {
-    let table = [(0, 0), (7, 0), (8, 0), (9, 1), (16, 12), (21, 20), (24, 25), (31, 25)];
+    let table = [
+        (0, 0),
+        (7, 0),
+        (8, 0),
+        (9, 1),
+        (16, 12),
+        (21, 20),
+        (24, 25),
+        (31, 25),
+    ];
     for (bits, bonus) in table {
         assert_eq!(pow_bonus(bits), bonus, "bits={bits}");
     }
@@ -141,11 +158,20 @@ fn d1_with_comments_capped_at_10() {
     assert_eq!(s.score, 90);
     assert_eq!(
         codes(&s),
-        vec![("FOLLOW_D1", 70), ("COMMENTS", 10), ("PROFILE", 5), ("AGE", 5)]
+        vec![
+            ("FOLLOW_D1", 70),
+            ("COMMENTS", 10),
+            ("PROFILE", 5),
+            ("AGE", 5)
+        ]
     );
     let comments = &s.factors[1];
     assert_eq!(comments.evidence, vec![pk(5), pk(6), pk(7), pk(8)]);
-    assert!(comments.detail.starts_with("4 people"), "{}", comments.detail);
+    assert!(
+        comments.detail.starts_with("4 people"),
+        "{}",
+        comments.detail
+    );
 
     i.wot_commenters = vec![pk(5)];
     assert!(codes(&compute(&i)).contains(&("COMMENTS", 3)));
@@ -219,7 +245,10 @@ fn burst_rules() {
     let s = compute(&i);
     assert_eq!(codes(&s), vec![("BURST", -10), ("PROFILE", 5)]);
     assert_eq!(s.score, 0);
-    assert_eq!(s.factors[0].detail, "published 201 torrents within one hour");
+    assert_eq!(
+        s.factors[0].detail,
+        "published 201 torrents within one hour"
+    );
     i.stats.is_bridge = true;
     assert_eq!(codes(&compute(&i)), vec![("PROFILE", 5)]);
     i.stats.is_bridge = false;

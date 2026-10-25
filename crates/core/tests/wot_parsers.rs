@@ -83,7 +83,12 @@ fn follows_from_real_kind3() {
     assert_eq!(follows_of(big).len(), 1785);
     // Many real clients add a self-follow (aef25970… from 91bea5cd…, a publisher).
     let selfy = by_id(&evs, "aef259706530");
-    assert!(selfy.tags.iter().any(|t| t[0] == "p" && t[1] == selfy.pubkey));
+    assert!(
+        selfy
+            .tags
+            .iter()
+            .any(|t| t[0] == "p" && t[1] == selfy.pubkey)
+    );
     assert!(!follows_of(selfy).contains(&selfy.pubkey));
 }
 
@@ -189,7 +194,10 @@ fn profile_names() {
 
 #[test]
 fn not_a_relay_list() {
-    assert_eq!(relay_list_of(&ev(1, vec![vec!["r", "wss://x.com"]], "")), (vec![], false));
+    assert_eq!(
+        relay_list_of(&ev(1, vec![vec!["r", "wss://x.com"]], "")),
+        (vec![], false)
+    );
     // kind 3 without a JSON map (the normal case) has no relay list.
     assert_eq!(relay_list_of(&ev(3, vec![], "")), (vec![], false));
     assert_eq!(relay_list_of(&ev(3, vec![], "hello")), (vec![], false));
@@ -265,7 +273,10 @@ fn kind3_legacy_relay_map_fallback() {
     assert!(!oversized);
     assert_eq!(list.len(), 14);
     assert!(list.contains(&entry("wss://relay.damus.io", true, true)));
-    let with_map = evs.iter().filter(|e| !relay_list_of(e).0.is_empty()).count();
+    let with_map = evs
+        .iter()
+        .filter(|e| !relay_list_of(e).0.is_empty())
+        .count();
     assert!(with_map >= 10, "{with_map}");
 
     let e = ev(
@@ -310,8 +321,9 @@ async fn live_purplepages_wot_lists() {
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
-    let connector =
-        tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(magnetar_core::http::tls_config()));
+    let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(
+        magnetar_core::http::tls_config(),
+    ));
     let cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(16 << 20));
     let (mut ws, _) = tokio_tungstenite::connect_async_tls_with_config(

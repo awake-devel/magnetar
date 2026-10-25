@@ -18,8 +18,10 @@ fn pk(n: u8) -> String {
 fn graph() -> MemStore {
     let s = MemStore::default();
     s.with(|i| {
-        i.settings
-            .insert(keys::TRUST_ROOT.into(), serde_json::to_string(&pk(0xaa)).unwrap());
+        i.settings.insert(
+            keys::TRUST_ROOT.into(),
+            serde_json::to_string(&pk(0xaa)).unwrap(),
+        );
         i.follows
             .insert(pk(0xaa), vec![pk(1), pk(2), pk(3), pk(0xaa)]);
         i.follows.insert(pk(1), vec![pk(0x10), pk(0x11)]);
@@ -56,10 +58,19 @@ async fn scores_from_graph() {
     let s = graph();
     let p = score_publisher(&s, &pk(0x10), NOW).await.unwrap();
     // n2 = 2 → 20, COMMENTS 3 (only A), PROFILE 5, AGE 5; stranger signals ignored.
-    let codes: Vec<(&str, i32)> = p.factors.iter().map(|f| (f.code.as_str(), f.delta)).collect();
+    let codes: Vec<(&str, i32)> = p
+        .factors
+        .iter()
+        .map(|f| (f.code.as_str(), f.delta))
+        .collect();
     assert_eq!(
         codes,
-        vec![("FOLLOW_D2", 20), ("PROFILE", 5), ("AGE", 5), ("COMMENTS", 3)]
+        vec![
+            ("FOLLOW_D2", 20),
+            ("PROFILE", 5),
+            ("AGE", 5),
+            ("COMMENTS", 3)
+        ]
     );
     assert_eq!(p.score, 33);
     assert_eq!(p.factors[0].evidence, vec![pk(1), pk(2)]);
@@ -68,7 +79,11 @@ async fn scores_from_graph() {
     assert_eq!(s.get_trust(&pk(0x10)).await.unwrap(), Some(p));
 
     let q = score_publisher(&s, &pk(0x11), NOW).await.unwrap();
-    let codes: Vec<(&str, i32)> = q.factors.iter().map(|f| (f.code.as_str(), f.delta)).collect();
+    let codes: Vec<(&str, i32)> = q
+        .factors
+        .iter()
+        .map(|f| (f.code.as_str(), f.delta))
+        .collect();
     assert_eq!(
         codes,
         vec![("MUTED_D1", -20), ("REPORTED", -15), ("FOLLOW_D2", 11)]
@@ -88,9 +103,12 @@ async fn scores_from_graph() {
 #[tokio::test]
 async fn root_setting_accepts_npub_and_uppercase_input_pubkey() {
     let s = graph();
-    s.set_setting(keys::TRUST_ROOT, &serde_json::to_string(&npub(&pk(0xaa))).unwrap())
-        .await
-        .unwrap();
+    s.set_setting(
+        keys::TRUST_ROOT,
+        &serde_json::to_string(&npub(&pk(0xaa))).unwrap(),
+    )
+    .await
+    .unwrap();
     let p = score_publisher(&s, &pk(0x10).to_uppercase(), NOW)
         .await
         .unwrap();

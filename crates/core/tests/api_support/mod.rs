@@ -42,7 +42,9 @@ impl FakeHttp {
 }
 
 /// Serve on 127.0.0.1:<random>; `handler` returns (status, JSON body).
-pub async fn serve(handler: impl Fn(&Recorded) -> (u16, String) + Send + Sync + 'static) -> FakeHttp {
+pub async fn serve(
+    handler: impl Fn(&Recorded) -> (u16, String) + Send + Sync + 'static,
+) -> FakeHttp {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let requests = Arc::new(Mutex::new(Vec::new()));
