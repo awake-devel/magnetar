@@ -6,7 +6,7 @@ mod support;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use magnetar_core::crawler::{CrawlConfig, METADATA_KINDS, crawl_once};
+use magnetar_core::crawler::{CrawlConfig, METADATA_KINDS, crawl_once, select_relays};
 use magnetar_core::model::*;
 use magnetar_core::store::Store;
 use nostr::prelude::Keys;
@@ -409,4 +409,325 @@ async fn live_crawl_oxtr_and_nos_lol() {
     assert!(started.elapsed() < Duration::from_secs(70));
     assert!(r.relays_ok >= 1);
     assert!(store.torrent_count() > 0);
+}
+
+// ---- relay selection (D30)
+
+/// Pretend `url` was crawled at `at` with `found` new events (ok) or failed.
+async fn crawled(store: &MemStore, url: &str, ok: bool, found: u64, at: i64) {
+    store
+        .record_relay_result(url, ok, (!ok).then_some("boom"), found, at)
+        .await
+        .unwrap();
+}
+
+fn assert_capped(sel: &[String], max: usize) {
+    assert!(sel.len() <= max, "{sel:?} exceeds {max}");
+    let unique: HashSet<&String> = sel.iter().collect();
+    assert_eq!(unique.len(), sel.len(), "duplicates in {sel:?}");
+}
+
+fn sel_cfg(seeds: &[&str], max: usize, explore: usize) -> CrawlConfig {
+    let mut c = cfg(seeds);
+    c.max_relays = max;
+    c.explore_relays = explore;
+    c
+}
+
+#[tokio::test]
+async fn select_caps_dedups_and_clamps_explore() {
+    let store = MemStore::default();
+    for i in 0..10 {
+        store
+            .upsert_relay(&format!("wss://r{i}.example.com"), "hint")
+            .await
+            .unwrap();
+    }
+    let seeds = ["wss://nos.lol", "wss://NOS.lol/", " wss://nos.lol "];
+    for (max, explore) in [(0, 0), (0, 3), (1, 0), (3, 7), (5, 5), (8, 2), (40, 100)] {
+        let sel = select_relays(&store, &sel_cfg(&seeds, max, explore), 1000)
+            .await
+            .unwrap();
+        assert_capped(&sel, max);
+        assert_eq!(
+            sel.len(),
+            max.min(11),
+            "max {max} explore {explore}: {sel:?}"
+        );
+        if max > 0 {
+            // Fresh install: nothing proven yet, the seed leads.
+            assert_eq!(sel[0], "wss://nos.lol");
+        }
+    }
+}
+
+#[tokio::test]
+async fn seeds_beyond_the_cap_are_rotated_in_not_cut() {
+    // The phone shape: 12 default seeds, 8 slots, 2 of them for exploration.
+    let store = MemStore::default();
+    let c = CrawlConfig::phone_default();
+    assert!(c.seed_relays.len() > c.max_relays);
+    let first = select_relays(&store, &c, 1000).await.unwrap();
+    assert_eq!(
+        first,
+        c.seed_relays[..8].to_vec(),
+        "fresh install: seeds in order"
+    );
+    // Half of them yield, the rest connect fine with nothing new.
+    for (i, url) in first.iter().enumerate() {
+        crawled(&store, url, true, if i % 2 == 0 { 10 } else { 0 }, 1000).await;
+    }
+    let second = select_relays(&store, &c, 2000).await.unwrap();
+    assert_capped(&second, 8);
+    // 4 proven seeds fill the 6 exploit slots as far as they go; the 4 never-tried seeds follow.
+    for url in first.iter().step_by(2).chain(&c.seed_relays[8..]) {
+        assert!(second.contains(url), "{url} missing from {second:?}");
+    }
+    let all: HashSet<&String> = first.iter().chain(&second).collect();
+    assert_eq!(all.len(), 12, "every seed crawled within two passes");
+}
+
+#[tokio::test]
+async fn top_yielders_stay_while_zero_yield_relays_rotate() {
+    let store = MemStore::default();
+    let top = ["wss://big.example.com", "wss://mid.example.com"];
+    for (url, found) in top.iter().zip([500, 20]) {
+        store.upsert_relay(url, "hint").await.unwrap();
+        crawled(&store, url, true, found, 10).await;
+    }
+    let zero: Vec<String> = (0..21)
+        .map(|i| format!("wss://z{i:02}.example.com"))
+        .collect();
+    for url in &zero {
+        store.upsert_relay(url, "hint").await.unwrap();
+    }
+    let c = sel_cfg(&[], 5, 2);
+    let mut seen: Vec<String> = Vec::new();
+    let mut t = 100;
+    // 21 zero-yield relays, 3 non-proven slots per pass (2 explore + 1 spare exploit slot).
+    for pass in 0..7 {
+        let sel = select_relays(&store, &c, t).await.unwrap();
+        assert_capped(&sel, 5);
+        assert_eq!(sel.len(), 5);
+        assert_eq!(sel[..2], top, "pass {pass}: top yielders first");
+        for url in &sel[2..] {
+            assert!(
+                !seen.contains(url),
+                "pass {pass}: {url} again before the others"
+            );
+            seen.push(url.clone());
+            crawled(&store, url, true, 0, t).await;
+        }
+        for url in &sel[..2] {
+            crawled(&store, url, true, 0, t).await;
+        }
+        t += 100;
+        if seen.len() == zero.len() {
+            break;
+        }
+    }
+    seen.sort();
+    assert_eq!(seen, zero, "all zero-yield relays tried");
+    // Second round: the least recently looked at go first again (z00.. were tried first).
+    let sel = select_relays(&store, &c, t).await.unwrap();
+    assert_eq!(
+        sel[2..],
+        [
+            "wss://z00.example.com",
+            "wss://z01.example.com",
+            "wss://z02.example.com"
+        ]
+    );
+
+    // A failing relay sits out its backoff, then queues behind relays looked at before it ended.
+    crawled(&store, "wss://z00.example.com", false, 0, t).await;
+    let backoff_end = store
+        .list_relays()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.url == "wss://z00.example.com")
+        .unwrap()
+        .next_try_at;
+    let sel = select_relays(&store, &c, t).await.unwrap();
+    assert!(
+        !sel.contains(&"wss://z00.example.com".to_string()),
+        "{sel:?}"
+    );
+    let sel = select_relays(&store, &c, backoff_end).await.unwrap();
+    assert!(
+        !sel.contains(&"wss://z00.example.com".to_string()),
+        "{sel:?}"
+    );
+    assert_eq!(
+        sel[2..],
+        [
+            "wss://z01.example.com",
+            "wss://z02.example.com",
+            "wss://z03.example.com"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn proven_relays_fill_unused_explore_slots_and_vice_versa() {
+    let store = MemStore::default();
+    let proven: Vec<String> = (0..6).map(|i| format!("wss://p{i}.example.com")).collect();
+    for (i, url) in proven.iter().enumerate() {
+        store.upsert_relay(url, "hint").await.unwrap();
+        crawled(&store, url, true, 100 - i as u64, 10).await;
+    }
+    // No exploration candidate at all: every slot goes to the ranked list.
+    let sel = select_relays(&store, &sel_cfg(&[], 4, 3), 100)
+        .await
+        .unwrap();
+    assert_eq!(sel, proven[..4]);
+    // One candidate: it takes one explore slot, the other two return to the ranked list.
+    store
+        .upsert_relay("wss://new.example.com", "hint")
+        .await
+        .unwrap();
+    let sel = select_relays(&store, &sel_cfg(&[], 4, 3), 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        sel,
+        [
+            "wss://p0.example.com",
+            "wss://new.example.com",
+            "wss://p1.example.com",
+            "wss://p2.example.com"
+        ]
+    );
+    // explore = max: only unproven relays, then proven ones as filler.
+    let sel = select_relays(&store, &sel_cfg(&[], 2, 2), 100)
+        .await
+        .unwrap();
+    assert_eq!(sel, ["wss://new.example.com", "wss://p0.example.com"]);
+}
+
+#[tokio::test]
+async fn select_skips_disabled_backed_off_and_private_rows() {
+    let store = MemStore::default();
+    for (url, source) in [
+        ("wss://ok.example.com", "hint"),
+        ("wss://off.example.com", "nip65"),
+        ("wss://down.example.com", "kind3"),
+        // Stored before the normalizer rejected private TLDs.
+        ("ws://apollo.home:3355", "nip65"),
+        ("ws://192.168.1.5:7777", "hint"),
+        // Trusted sources may point anywhere.
+        ("ws://nas.lan:7777", "manual"),
+    ] {
+        store.upsert_relay(url, source).await.unwrap();
+    }
+    store
+        .set_relay_enabled("wss://off.example.com", false)
+        .await
+        .unwrap();
+    crawled(&store, "wss://down.example.com", false, 0, 1000).await;
+    let c = sel_cfg(&["ws://127.0.0.1:7777"], 10, 2);
+    let mut sel = select_relays(&store, &c, 1000).await.unwrap();
+    sel.sort();
+    assert_eq!(
+        sel,
+        [
+            "ws://127.0.0.1:7777",
+            "ws://nas.lan:7777",
+            "wss://ok.example.com"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn nip65_relays_discovered_this_pass_are_selected() {
+    let store = MemStore::default();
+    let publisher = Keys::generate();
+    let t0 = now();
+    for ev in [
+        torrent(&publisher, 1, t0 - 100),
+        sign(
+            &publisher,
+            10002,
+            t0 - 50,
+            &[
+                &["r", "wss://fresh.example.org/"],
+                &["r", "ws://apollo.home:3355"],
+                &["r", "wss://inbox.example.org", "read"],
+            ],
+            "",
+        ),
+    ] {
+        magnetar_core::ingest::ingest_into(&store, ev, t0)
+            .await
+            .unwrap();
+    }
+    // Plenty of proven relays: exploration still makes room for the new one.
+    for i in 0..5 {
+        let url = format!("wss://p{i}.example.com");
+        store.upsert_relay(&url, "hint").await.unwrap();
+        crawled(&store, &url, true, 50, t0 - 10).await;
+    }
+    let sel = select_relays(&store, &sel_cfg(&[], 3, 1), t0)
+        .await
+        .unwrap();
+    assert_eq!(sel.len(), 3);
+    assert!(
+        sel.contains(&"wss://fresh.example.org".to_string()),
+        "{sel:?}"
+    );
+    let relays = store.list_relays().await.unwrap();
+    let known = |u: &str| relays.iter().find(|r| r.url == u).map(|r| r.source.clone());
+    assert_eq!(known("wss://fresh.example.org").as_deref(), Some("nip65"));
+    assert_eq!(known("ws://apollo.home:3355"), None);
+    assert_eq!(known("wss://inbox.example.org"), None);
+}
+
+#[tokio::test]
+async fn continuous_crawl_rotates_through_new_and_idle_relays() {
+    let publisher = Keys::generate();
+    let t0 = now();
+    let busy = FakeRelay::start(
+        (0..5)
+            .map(|i| torrent(&publisher, i, t0 - 100 - i64::from(i)))
+            .collect(),
+        Behaviour::default(),
+    )
+    .await;
+    let mut idle = Vec::new();
+    for _ in 0..4 {
+        idle.push(FakeRelay::start(Vec::new(), Behaviour::default()).await);
+    }
+    let store = MemStore::default();
+    for r in &idle {
+        // Loopback URLs only pass selection as trusted rows.
+        store.upsert_relay(&r.url, "manual").await.unwrap();
+    }
+    let mut c = cfg(&[&busy.url]);
+    c.max_relays = 3;
+    c.explore_relays = 2;
+    let conns = |r: &FakeRelay| r.state.lock().unwrap().connections;
+
+    // Pass 1: nothing proven yet; the seed leads, two idle relays fill the rest.
+    let r = crawl_once(&store, &c).await.unwrap();
+    assert_eq!(r.relays_tried, 3, "{r:?}");
+    assert_eq!(conns(&busy), 1);
+    assert_eq!(store.torrent_count(), 5);
+    // Pass 2: the busy relay is proven and stays; the two untried idle relays are next.
+    let r = crawl_once(&store, &c).await.unwrap();
+    assert_eq!(r.relays_tried, 3, "{r:?}");
+    assert_eq!(conns(&busy), 2);
+    assert!(
+        idle.iter().all(|r| conns(r) == 1),
+        "every idle relay tried once"
+    );
+
+    // A relay discovered between passes is crawled on the very next pass.
+    let late = FakeRelay::start(Vec::new(), Behaviour::default()).await;
+    store.upsert_relay(&late.url, "manual").await.unwrap();
+    let r = crawl_once(&store, &c).await.unwrap();
+    assert_eq!(r.relays_tried, 3, "{r:?}");
+    assert_eq!(conns(&busy), 3);
+    assert_eq!(conns(&late), 1);
+    assert_eq!(idle.iter().map(conns).sum::<usize>(), 5);
 }

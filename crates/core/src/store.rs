@@ -33,7 +33,8 @@ pub trait Store: Send + Sync {
     /// Insert if missing. Never changes `enabled` or a "manual" source of an existing row.
     async fn upsert_relay(&self, url: &str, source: &str) -> Result<()>;
     async fn list_relays(&self) -> Result<Vec<RelayInfo>>;
-    /// ok: reset failures, set last_ok; !ok: failures+1, next_try_at = now + backoff(failures) (max 24 h).
+    /// ok: reset failures, last_ok = next_try_at = now; !ok: failures+1,
+    /// next_try_at = now + backoff(failures) (max 24 h). `select_relays` rotates on next_try_at (D30).
     async fn record_relay_result(
         &self,
         url: &str,

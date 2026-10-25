@@ -69,8 +69,8 @@ pub struct CrawlConfig {
     /// Max relays touched per run (server 30, phone 8).
     pub max_relays: usize,
     /// Slots of `max_relays` reserved for relays not yet proven useful (never tried first, then
-    /// least recently ok), so discovered relays get crawled instead of starving behind the top
-    /// yielders. Seeds keep priority over the rest of the slots.
+    /// least recently looked at), so discovered relays get crawled instead of starving behind the
+    /// top yielders. Clamped to `max_relays`; see `select_relays` (D30).
     pub explore_relays: usize,
     /// Wall-clock budget for one run.
     pub budget: Duration,
@@ -224,9 +224,18 @@ pub async fn crawl_once<S: Store + ?Sized>(
     Ok(report)
 }
 
-/// Seeds (config order) first, then stored and discovered relays ranked by past yield and by how
-/// many publishers list them as write relays. Disabled or backed-off relays are skipped.
-async fn select_relays<S: Store + ?Sized>(
+/// The relays of one run (D30): at most `max_relays`, no duplicates, disabled or backed-off relays
+/// skipped. Candidates are the seeds, every stored relay and the NIP-65 write relays of the top
+/// publishers (stored as "nip65" on the way).
+/// 1. Up to `max_relays - explore_relays` proven relays (`events_found > 0`), ranked by past yield,
+///    then by how many publishers list them as write relays.
+/// 2. Every other slot (so at least `explore_relays`) rotates through relays with no events yet,
+///    least recently looked at first: `next_try_at` is the last ok run for a reachable relay, the
+///    end of its backoff for a failing one, and 0 for one never tried. Ties: seeds in config order,
+///    then most listed. Fresh installs therefore start with the seeds, and seeds beyond the cap
+///    are reached by the rotation instead of being cut forever.
+/// 3. Slots still free go to the next proven relays.
+pub async fn select_relays<S: Store + ?Sized>(
     store: &S,
     cfg: &CrawlConfig,
     now: i64,
@@ -237,24 +246,19 @@ async fn select_relays<S: Store + ?Sized>(
         .into_iter()
         .map(|r| (r.url.clone(), r))
         .collect();
-    let usable = |url: &str| {
-        infos
-            .get(url)
-            .is_none_or(|i| i.enabled && i.next_try_at <= now)
-    };
 
-    let mut out: Vec<String> = Vec::new();
+    // Seed URL -> config position.
+    let mut seeds: HashMap<String, usize> = HashMap::new();
     for seed in &cfg.seed_relays {
         // Seeds are trusted config: keep them even when the public-relay normalizer would not
         // (e.g. a LAN or loopback relay).
         let url = normalize_relay(seed, true).unwrap_or_else(|| seed.trim().to_string());
-        if !(url.starts_with("ws://") || url.starts_with("wss://")) || out.contains(&url) {
+        if !(url.starts_with("ws://") || url.starts_with("wss://")) || seeds.contains_key(&url) {
             continue;
         }
         store.upsert_relay(&url, "seed").await?;
-        if usable(&url) {
-            out.push(url);
-        }
+        let pos = seeds.len();
+        seeds.insert(url, pos);
     }
 
     // NIP-65 write relays of known publishers (oversized lists are already excluded by the store).
@@ -268,73 +272,50 @@ async fn select_relays<S: Store + ?Sized>(
         }
     }
     for url in freq.keys() {
-        if !infos.contains_key(url) {
+        if !infos.contains_key(url) && !seeds.contains_key(url) {
             store.upsert_relay(url, "nip65").await?;
         }
     }
 
-    let mut rest: Vec<(u64, u32, String)> = infos
-        .values()
-        .filter(|i| i.enabled && i.next_try_at <= now)
-        .map(|i| {
-            (
-                i.events_found,
-                freq.get(&i.url).copied().unwrap_or(0),
-                i.url.clone(),
-            )
-        })
-        .chain(
-            freq.iter()
-                .filter(|(u, _)| !infos.contains_key(*u))
-                .map(|(u, f)| (0, *f, u.clone())),
-        )
-        .collect();
-    rest.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
-
-    // Exploration: relays with no events yet. Never-tried ones first (most-listed first), then
-    // the ones whose last success is oldest, so continuous crawling rotates through all of them.
-    let mut explore: Vec<(bool, i64, u32, String)> = rest
-        .iter()
-        .filter(|(found, _, url)| *found == 0 && !out.contains(url))
-        .map(|(_, f, url)| {
-            let last_ok = infos.get(url).and_then(|i| i.last_ok);
-            (last_ok.is_some(), last_ok.unwrap_or(0), *f, url.clone())
-        })
-        .collect();
-    explore.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then(a.1.cmp(&b.1))
-            .then(b.2.cmp(&a.2))
-            .then(a.3.cmp(&b.3))
+    // (events_found, next_try_at, seed position, publishers listing it, url)
+    let mut cands: Vec<(u64, i64, usize, u32, String)> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for url in seeds.keys().chain(freq.keys()).chain(infos.keys()) {
+        if !seen.insert(url.as_str()) {
+            continue;
+        }
+        let info = infos.get(url);
+        if info.is_some_and(|i| !i.enabled || i.next_try_at > now) {
+            continue;
+        }
+        // Rows learned from events before the normalizer rejected them (e.g. a LAN host).
+        let trusted = seeds.contains_key(url)
+            || info.is_some_and(|i| matches!(i.source.as_str(), "seed" | "manual"));
+        if !trusted && normalize_relay(url, false).is_none() {
+            continue;
+        }
+        cands.push((
+            info.map_or(0, |i| i.events_found),
+            info.map_or(0, |i| i.next_try_at),
+            seeds.get(url).copied().unwrap_or(usize::MAX),
+            freq.get(url).copied().unwrap_or(0),
+            url.clone(),
+        ));
+    }
+    let (mut proven, mut fresh): (Vec<_>, Vec<_>) = cands.into_iter().partition(|c| c.0 > 0);
+    proven.sort_by(|a, b| b.0.cmp(&a.0).then(b.3.cmp(&a.3)).then(a.4.cmp(&b.4)));
+    fresh.sort_by(|a, b| {
+        a.1.cmp(&b.1)
+            .then(a.2.cmp(&b.2))
+            .then(b.3.cmp(&a.3))
+            .then(a.4.cmp(&b.4))
     });
-    let explore_n = cfg.explore_relays.min(cfg.max_relays).min(explore.len());
 
-    out.truncate(cfg.max_relays - explore_n);
-    for (_, _, url) in &rest {
-        if out.len() >= cfg.max_relays - explore_n {
-            break;
-        }
-        if !out.contains(url) {
-            out.push(url.clone());
-        }
-    }
-    for (_, _, _, url) in explore {
-        if out.len() >= cfg.max_relays {
-            break;
-        }
-        if !out.contains(&url) {
-            out.push(url);
-        }
-    }
-    // Too few exploration candidates left over: top up with the ranked list.
-    for (_, _, url) in rest {
-        if out.len() >= cfg.max_relays {
-            break;
-        }
-        if !out.contains(&url) {
-            out.push(url);
-        }
-    }
+    let exploit = cfg.max_relays - cfg.explore_relays.min(cfg.max_relays);
+    let mut proven = proven.into_iter().map(|c| c.4);
+    let mut out: Vec<String> = proven.by_ref().take(exploit).collect();
+    out.extend(fresh.into_iter().map(|c| c.4).chain(proven));
+    out.truncate(cfg.max_relays);
     Ok(out)
 }
 
