@@ -26,7 +26,7 @@ use crate::error::{Error, Result};
 use crate::model::TorrentFile;
 
 /// Bump when the matching logic changes, so stored `offline_title` rows are recomputed.
-pub const MATCHER_VERSION: i32 = 1;
+pub const MATCHER_VERSION: i32 = 2;
 
 /// Confidence of a match taken from an `i` tag (`mal:`, `anilist:`).
 pub const CONF_ITAG: f32 = 1.0;
@@ -545,6 +545,9 @@ pub enum MatchHow {
     SeasonRemap,
     /// Title matched the series; the absolute episode number picked a later season.
     EpisodeRemap,
+    /// Title matched the series; the release year picked the season that aired that year
+    /// (`One Punch Man (2025) - 05` is season 3).
+    YearRemap,
 }
 
 impl MatchHow {
@@ -615,7 +618,13 @@ pub struct AnimeIndex {
     series: HashMap<SeriesKey, Vec<u32>>,
     /// `"{entry}/{kind}:{id}"` for each shared id an entry owns (see [`CrossIds::owned`]).
     owned: HashSet<String>,
+    /// Latest year in the dataset: a "year" past it is part of a title (`SAC_2045`).
+    max_year: i32,
 }
+
+/// Confidence given to a title match the release contradicts (another version's year, a later
+/// season the data does not have): below the server's 0.6 floor, so it is not written.
+pub const CONF_CONTRADICTED: f32 = 0.45;
 
 /// Season-1 TV entries of a series sorted by (season, offset), with episode counts: used for
 /// absolute episode numbers.
@@ -720,6 +729,7 @@ impl AnimeIndex {
             }
         }
         let owned: HashSet<String> = owner.into_iter().map(|(k, i)| format!("{i}/{k}")).collect();
+        let max_year = entries.iter().filter_map(|e| e.year).max().unwrap_or(0);
         AnimeIndex {
             entries,
             by_title,
@@ -729,6 +739,7 @@ impl AnimeIndex {
             fribb_of,
             series,
             owned,
+            max_year,
         }
     }
 
@@ -947,13 +958,46 @@ impl AnimeIndex {
         f.season_on(f.series()?)
     }
 
+    /// Whether an entry's year fits the release year (±1: a fall show often airs into January
+    /// and releases carry either year). `None` when either year is unknown.
+    fn year_fits(&self, entry: u32, year: Option<i32>) -> Option<bool> {
+        let (y, ey) = (year?, self.entries[entry as usize].year?);
+        Some((y - ey).abs() <= 1)
+    }
+
+    /// The release year as a year: none past the dataset's last year (`SAC_2045`).
+    fn release_year(&self, r: &Release) -> Option<i32> {
+        r.year.filter(|&y| y <= self.max_year + 1)
+    }
+
     /// Pick an entry among exact title candidates, then remap to the right season / cour.
-    fn match_candidates(&self, c: &[u32], r: &Release, marked: bool) -> Option<AnimeMatch> {
+    /// Returns the match and how its year fits the release (+1 fits, 0 unknown, -2
+    /// contradicts), which [`Self::match_release`] adds to the agreement score.
+    fn match_candidates(&self, c: &[u32], r: &Release, marked: bool) -> Option<(AnimeMatch, i32)> {
         let base = self.best(c, r)?;
         let unique = c.len() == 1;
         let base_entry = &self.entries[base as usize];
         let key = self.series_of(c, base);
         let base_season = self.entry_season(base as usize);
+        let year = self.release_year(r);
+        let series_years = |k: Option<SeriesKey>| -> bool {
+            k.is_some_and(|k| {
+                self.seasonal(k)
+                    .iter()
+                    .any(|s| self.year_fits(s.entry, year) == Some(true))
+            })
+        };
+        // A remap follows the release's season or episode: its year may be the show's first
+        // year (`Black Clover (2017) S02`) or the season's; only a year no entry of the series
+        // fits contradicts it.
+        let remap_year = |e: u32| -> i32 {
+            match (self.year_fits(e, year), self.year_fits(base, year)) {
+                (Some(true), _) | (_, Some(true)) => 1,
+                (None, None) => 0,
+                _ if series_years(key) => 0,
+                _ => -2,
+            }
+        };
         let past_end = |n: Option<u32>| matches!((r.episode, n), (Some(ep), Some(n)) if ep > 0 && ep as u32 > n);
         // Season given and the matched entry is another season, or a season's later cour
         // (S01E21 of a 13-episode first cour): remap through Fribb.
@@ -964,13 +1008,17 @@ impl AnimeIndex {
             && let Some((e, ep)) = self.season_entry(k, s, r.episode)
             && e != base
         {
-            return Some(AnimeMatch {
-                entry: e as usize,
-                how: MatchHow::SeasonRemap,
-                confidence: 0.85,
-                season: Some(s),
-                episode: r.episode.map(|_| ep),
-            });
+            let y = remap_year(e);
+            return Some((
+                AnimeMatch {
+                    entry: e as usize,
+                    how: MatchHow::SeasonRemap,
+                    confidence: if y < 0 { CONF_CONTRADICTED } else { 0.85 },
+                    season: Some(s),
+                    episode: r.episode.map(|_| ep),
+                },
+                y,
+            ));
         }
         // No season, episode past the matched entry's length: absolute numbering.
         if r.season.is_none()
@@ -978,26 +1026,89 @@ impl AnimeIndex {
             && let (Some(ep), Some(k)) = (r.episode, key)
             && let Some((e, s, rel)) = self.absolute_entry(k, ep)
         {
-            return Some(AnimeMatch {
-                entry: e as usize,
-                how: MatchHow::EpisodeRemap,
-                confidence: 0.8,
-                season: Some(s),
-                episode: Some(rel),
-            });
+            let y = remap_year(e);
+            return Some((
+                AnimeMatch {
+                    entry: e as usize,
+                    how: MatchHow::EpisodeRemap,
+                    confidence: if y < 0 { CONF_CONTRADICTED } else { 0.8 },
+                    season: Some(s),
+                    episode: Some(rel),
+                },
+                y,
+            ));
         }
-        let year_ok = r.year.is_some() && base_entry.year == r.year;
-        Some(AnimeMatch {
-            entry: base as usize,
-            how: MatchHow::Title,
-            confidence: if unique || year_ok { 0.9 } else { 0.75 },
-            season: if marked {
-                r.season
-            } else {
-                base_season.or(r.season)
+        // The release year belongs to another version: the season of the series that aired
+        // that year (Erai-raws name later seasons `X (2025)`), else a contradiction. Remakes
+        // with their own entry are found through the `title year` key instead.
+        if self.year_fits(base, year) == Some(false) {
+            if !marked
+                && let Some(k) = key
+                && let Some(s) = self
+                    .seasonal(k)
+                    .into_iter()
+                    .filter(|s| {
+                        matches!(
+                            self.entries[s.entry as usize].kind,
+                            AnimeType::Tv | AnimeType::Ona
+                        ) && self.year_fits(s.entry, year) == Some(true)
+                            && r.season.is_none_or(|x| x == s.season)
+                    })
+                    .min_by_key(|s| {
+                        let ey = self.entries[s.entry as usize].year.unwrap_or(0);
+                        (year.map_or(0, |y| (y - ey).abs()), s.season, s.offset)
+                    })
+            {
+                return Some((
+                    AnimeMatch {
+                        entry: s.entry as usize,
+                        how: MatchHow::YearRemap,
+                        confidence: 0.8,
+                        season: Some(s.season),
+                        episode: r.episode.map(|ep| ep - s.offset),
+                    },
+                    1,
+                ));
+            }
+            return Some((
+                AnimeMatch {
+                    entry: base as usize,
+                    how: MatchHow::Title,
+                    confidence: CONF_CONTRADICTED,
+                    season: if marked { r.season } else { base_season },
+                    episode: r.episode,
+                },
+                -2,
+            ));
+        }
+        let y = i32::from(self.year_fits(base, year) == Some(true));
+        // An explicit later season no entry was found for (`Golden Kamuy S06E01` while the data
+        // stops at season 5, `Chainsaw Man S03E01`): the entry of another season is the wrong
+        // show, and its season must not be written over the release's.
+        let contradicted =
+            !marked && matches!((r.season, base_season), (Some(s), Some(bs)) if s >= 2 && bs != s);
+        Some((
+            AnimeMatch {
+                entry: base as usize,
+                how: MatchHow::Title,
+                confidence: if contradicted {
+                    CONF_CONTRADICTED
+                } else if unique || y > 0 {
+                    0.9
+                } else {
+                    0.75
+                },
+                season: if marked {
+                    r.season
+                } else if contradicted {
+                    None
+                } else {
+                    base_season.or(r.season)
+                },
+                episode: r.episode,
             },
-            episode: r.episode,
-        })
+            y,
+        ))
     }
 
     /// How well a match fits what the release says (season, episode range, specials).
@@ -1032,12 +1143,22 @@ impl AnimeIndex {
     /// break ties.
     pub fn match_release(&self, r: &Release) -> Option<AnimeMatch> {
         let mut best: Option<(i32, AnimeMatch)> = None;
+        let year = self.release_year(r);
         for (pos, t) in r.titles.iter().enumerate() {
             let norm = normalize(t);
             if norm.is_empty() {
                 continue;
             }
-            for (key, season, marked) in Self::title_keys(&norm, r.season) {
+            // AOD names remakes and same-title shows `X (YYYY)`; the parser took the year out
+            // of the title, so look that key up too.
+            let mut keys = Vec::new();
+            if let Some(y) = year
+                && !norm.ends_with(&format!(" {y}"))
+            {
+                keys.extend(Self::title_keys(&format!("{norm} {y}"), r.season));
+            }
+            keys.extend(Self::title_keys(&norm, r.season));
+            for (key, season, marked) in keys {
                 let Some(c) = self.by_title.get(&key) else {
                     continue;
                 };
@@ -1045,10 +1166,10 @@ impl AnimeIndex {
                     season,
                     ..r.clone()
                 };
-                let Some(mut m) = self.match_candidates(c, &rr, marked) else {
+                let Some((mut m, year_fit)) = self.match_candidates(c, &rr, marked) else {
                     continue;
                 };
-                let score = self.agreement(&m, &rr, marked) * 100 - pos as i32;
+                let score = (self.agreement(&m, &rr, marked) + year_fit) * 100 - pos as i32;
                 if pos > 0 {
                     m.confidence -= 0.03;
                 }
@@ -1058,7 +1179,7 @@ impl AnimeIndex {
             }
         }
         best.map(|(score, mut m)| {
-            if score < 0 {
+            if score < 0 && m.confidence > CONF_CONTRADICTED {
                 m.confidence -= 0.15;
             }
             m.confidence = m.confidence.clamp(0.0, 1.0);
@@ -1510,6 +1631,75 @@ mod tests {
             .match_release(&rel("Hunter x Hunter", None, Some(120), None))
             .unwrap();
         assert_eq!(mal_of(&ix, &m), 11061);
+    }
+
+    #[test]
+    fn release_year_picks_the_version() {
+        let mut entries = index().entries;
+        entries.push(aod(
+            2471,
+            "Doraemon (1979)",
+            &["Doraemon"],
+            AnimeType::Tv,
+            1787,
+            1979,
+        ));
+        entries.push(aod(8687, "Doraemon (2005)", &[], AnimeType::Tv, 800, 2005));
+        entries.push(aod(967, "Hokuto no Ken", &[], AnimeType::Tv, 109, 1984));
+        let ix = AnimeIndex::new(entries, index().fribb_of.into_iter().flatten().collect());
+        // AOD's `X (YYYY)` remake naming: the year the parser took out is looked up too.
+        let m = ix
+            .match_release(&rel("Doraemon", None, Some(180), Some(2005)))
+            .unwrap();
+        assert_eq!(mal_of(&ix, &m), 8687);
+        assert!(m.confidence >= 0.9);
+        // A year no version fits: the only candidate is another show, not written.
+        let m = ix
+            .match_release(&rel("Hokuto no Ken", None, Some(2), Some(2026)))
+            .unwrap();
+        assert_eq!(mal_of(&ix, &m), 967);
+        assert!(m.confidence < 0.6);
+        // Off by one (a fall show released in January) still fits.
+        let m = ix
+            .match_release(&rel("Hokuto no Ken", None, Some(2), Some(1985)))
+            .unwrap();
+        assert!(m.confidence >= 0.9);
+        // A later season named by its year.
+        let m = ix
+            .match_release(&rel("Golden Kamuy", None, Some(3), Some(2020)))
+            .unwrap();
+        assert_eq!(mal_of(&ix, &m), 40059);
+        assert_eq!(m.how, MatchHow::YearRemap);
+        assert_eq!(m.season, Some(3));
+        // The show's first year with an explicit later season is not a contradiction.
+        let m = ix
+            .match_release(&rel("Jujutsu Kaisen", Some(2), Some(1), Some(2020)))
+            .unwrap();
+        assert_eq!(mal_of(&ix, &m), 51009);
+        assert_eq!(m.how, MatchHow::SeasonRemap);
+        assert!(m.confidence >= 0.85);
+        // A "year" past the dataset is part of a title (`SAC_2045`).
+        let m = ix
+            .match_release(&rel("Jujutsu Kaisen", None, Some(3), Some(2045)))
+            .unwrap();
+        assert_eq!(mal_of(&ix, &m), 40748);
+        assert!(m.confidence >= 0.9);
+    }
+
+    #[test]
+    fn unknown_later_season_is_not_season_one() {
+        let ix = index();
+        for (t, s) in [("Golden Kamuy", 6), ("Jujutsu Kaisen", 5)] {
+            let m = ix.match_release(&rel(t, Some(s), Some(1), None)).unwrap();
+            assert!(m.confidence < 0.6, "{t} S{s}: {m:?}");
+            assert_eq!(m.season, None);
+        }
+        // The season named in the title is trusted as is.
+        let m = ix
+            .match_release(&rel("Golden Kamuy 4th Season", Some(4), Some(1), None))
+            .unwrap();
+        assert_eq!(mal_of(&ix, &m), 50528);
+        assert!(m.confidence >= 0.6);
     }
 
     #[test]

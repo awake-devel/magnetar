@@ -83,11 +83,16 @@ values `live-action`, `literature`, `audio`, `lossless`, `pictures`, `amv`, `man
    `anitomy-ng` 1.0.10 (MPL-2.0) gives a second title candidate and fills gaps. To these we add
    alternative titles from `(…)` groups and after ` | `. Inside brackets we split on `;`, on `,`
    without a following space, and on `, ` only when the group also holds tags like
-   `VF, FRENCH, VOSTFR` (titles contain commas: `Kanojo, Okarishimasu`).
+   `VF, FRENCH, VOSTFR` (titles contain commas: `Kanojo, Okarishimasu`). ptt reads
+   `X Season 3 - 10` as seasons 3 to 10; when anitomy-ng sees one season and an episode there, its
+   season is used.
 4. **Lookup.** We look up every title candidate as an exact normalised key: lowercase, letters
    and digits of any script, `&` read as "and", apostrophes dropped. Synthetic keys are also tried:
    the title without its season suffix (`x season 2`, `x 2nd season`, `x s2`, `x tv-2`), and for
    season S > 1 the usual sequel spellings (`x 2`, `x season 2`, `x 2nd season`, `x s2`, `x ii`).
+   With a release year Y, `x Y` is tried too: AOD names remakes and same-title shows
+   `Doraemon (2005)`, `Pokemon (2023)`, and the parser took the year out of the title. A "year"
+   past the dataset's last year is part of a title (`SAC_2045`) and is ignored.
 5. **Rank** the candidates for a key: year match, episode within the entry's count, TV over
    ONA/movie, then the Fribb season equal to the parsed one, then newest.
 6. **Remap through Fribb.**
@@ -96,12 +101,25 @@ values `live-action`, `literature`, `audio`, `lossless`, `pictures`, `amv`, `man
      `episode_offset`.
    - No season, but the episode lies past the entry's length (`Golden Kamuy - 38`): walk the
      series' TV entries in season order and add up their episode counts.
+   - The release year contradicts the matched entry (more than one year apart): take the
+     series' TV/ONA entry that aired that year (Erai-raws name later seasons
+     `One Punch Man (2025)`), method `offline_title`, reported as `yearremap`.
 7. **Score** each candidate match by how well it agrees with the release: season (+2 / −2),
-   episode in range (±1), and specials (S00) fitting OVA/special/ONA. The best wins, and earlier
-   titles break ties.
+   episode in range (±1), specials (S00) fitting OVA/special/ONA, and year (+1 fits within a
+   year, −2 contradicts). The best wins, and earlier titles break ties.
 8. **Confidence.** 0.9 for a unique key or a year match, 0.75 otherwise, 0.85 for a season remap
-   and 0.8 for an episode remap. An alternative title costs −0.03 and a disagreeing match −0.15.
-   Matches below **0.6** are not written: that bucket was 29 % precise.
+   and 0.8 for an episode or year remap. An alternative title costs −0.03 and a disagreeing
+   match −0.15. Matches below **0.6** are not written: that bucket was 29 % precise.
+   Two contradictions set the confidence to 0.45 (`CONF_CONTRADICTED`), so the match is not
+   written:
+   - **Year.** The release year fits neither the entry nor (for a remap) the matched title's
+     entry or any entry of its series, and no year remap applies: `Hokuto no Ken (2026)` when only
+     the 1984 show is in the data, `GeGeGe no Kitaro (1968)` when only the 2018 one matches the
+     spelling. A remap keeps the show's first year: `Black Clover (2017) S02` is fine.
+   - **Season.** The release states a season S ≥ 2 that no remap or season-named key found, and
+     the entry is another Fribb season: `Golden Kamuy S06E01` or `Chainsaw Man S03E01` would
+     otherwise land on season 1. The season-1 entry's season is never written over the
+     release's.
 9. **Fallback.** If nothing matched, step 2 runs again on the largest video file name.
 
 `AnimeIndex::cross_ids` gives the Fribb ids of the matched entry. Several MAL entries (seasons,
@@ -123,7 +141,7 @@ tags filtered to a fixed genre list), `rating` (median provider score, 1-10) and
 
 **`torrent_media`:**
 - `season` is the TVDB season and `episode` is the episode within the matched entry (rebased by
-  the remaps). `matcher_version` is `enrich_anime::MATCHER_VERSION` (1).
+  the remaps). `matcher_version` is `enrich_anime::MATCHER_VERSION` (2).
 - A `manual` row is never touched. Another matcher's row (its media is not `kind = 'anime'`) is
   replaced only by a strictly more confident match. This is checked before writing and again in
   the `ON CONFLICT … WHERE` clause.
@@ -133,7 +151,27 @@ tags filtered to a fixed genre list), `rating` (median provider score, 1-10) and
 **`anime_attempts`** records (infohash, dataset version, matcher version). Unmatched torrents are
 retried only when the datasets or the matcher change.
 
-## Results (measured 2026-10-25)
+## Results (measured 2026-10-25, matcher version 2)
+
+**These figures are in-sample.** The matcher was tuned on the MAL-link set below, and that set
+is not a sample of the torrents most title links come from:
+
+| Release group | MAL-link set (8,613) | holdout (711) | all anime infohashes (82,568) |
+|---|---|---|---|
+| Tsundere-Raws | 5,540 | | 5,740 |
+| Yameii | 1,452 | 462 | 2,028 |
+| Trix / Gecko | 325 / 316 | 7 (Gecko) | |
+| Erai-raws | 0 | 0 | 9,403 |
+| ToonsHub | 0 | 0 | 6,990 |
+| SubsPlease | 0 | 0 | 6,668 |
+| VARYG | 0 | 0 | 5,095 |
+| shincaps | 0 | 0 | 4,697 |
+| Doomdos, ASW, NanakoRaws, ANi | 0 | 0 | 2,551, 2,077, 1,982, 1,913 |
+
+(Group = leading `[group]` or trailing `-group`.) The truth set is 64 % Tsundere-Raws, the
+holdout is 65 % Yameii, and none of the eight largest groups of title-only torrents is in either.
+So the truth-set accuracy says how well the matcher reads Tsundere-Raws / Yameii names, not the
+precision of all title links. For that, see the stratified sample further down.
 
 Ground truth comes from production: anime torrents whose description links `myanimelist.net/anime/N`.
 That is 8,613 infohashes and 872 distinct MAL ids, mostly current-season fansub and raw
@@ -141,8 +179,8 @@ releases. We exported them with a read-only SELECT (ids, titles and largest file
 descriptions). A **holdout** set has no MAL link but has an AniDB or AniList link: 711 infohashes,
 judged by those ids, never looked at while tuning.
 
-The parser comparison uses the same matcher for every row (scratch harness `anime-eval`, linked
-against `magnetar-core`):
+The parser comparison (matcher version 1) uses the same matcher for every row (scratch harness
+`anime-eval`, linked against `magnetar-core`):
 
 | Parsing | MAL set correct | wrong | none | precision | holdout correct | precision | µs/title |
 |---|---|---|---|---|---|---|---|
@@ -160,7 +198,7 @@ against `magnetar-core`):
 - Neither parser wins alone. `parse-torrent-title` loses `[Yameii] X - S01E02 [English Dub]`
   style names (holdout 78 %), while anitomy-ng reads them. Using both titles as candidates is
   best on both sets. anitomy-ng is about 8× faster; ptt reads season ranges and years better.
-- What moved the result from 87 % to 96 %:
+- What moved the result from 87 % to 96 % (all tuned on this set):
   - alternative titles: Tsundere-Raws and Yameii put the romaji title in brackets;
   - synthetic sequel keys for shows without TVDB mapping (donghua, ONAs);
   - cour selection by episode;
@@ -170,17 +208,43 @@ against `magnetar-core`):
 with `MAGNETAR_ANIME_E2E=<dir>`). Real datasets (2026-43, Fribb `08dc828d`) are imported through
 the server code into a test schema, and the production rows are inserted as torrents:
 
-- **Accuracy, links hidden** (8,613 MAL-truth torrents with empty descriptions): **96.9 %
-  correct, 2.4 % wrong, 0.8 % none, precision 97.6 %.** By method: 6,472 title, 2,071 season
-  remap, 5 episode remap. 14 matches fell below the 0.6 floor.
-  - Precision by confidence floor: 0.60: 11/15, 0.70: 58/72, 0.75: 817/866, 0.80: 43/50,
-    0.85: 2,358/2,423, 0.90: 5,055/5,122.
+- **In-sample accuracy, links hidden** (the 8,613 MAL-truth torrents with empty descriptions):
+  96.9 % correct, 2.2 % wrong, 1.0 % none, precision 97.8 % (version 1: 96.9 / 2.4 / 0.8 %,
+  97.6 %). By method: 6,461 title, 2,065 season remap, 5 episode remap. 31 matches fell below the
+  0.6 floor.
+  - Precision by confidence floor: 0.60: 11/15, 0.70: 51/59, 0.75: 799/842, 0.80: 43/50,
+    0.85: 2,366/2,424, 0.90: 5,074/5,141.
 - **Coverage** (all 82,568 anime infohashes, links restored as bare URLs): 7,782 excluded by
-  path, 74,786 scanned, **71,448 linked (95.5 %)**.
-  - By method: 9,320 `desc_link`, 49,956 title, 10,715 season remap, 1,457 episode remap.
-  - 3,338 unmatched, 69 below the floor.
-  - 237 s for the whole set (about 3.2 ms per torrent including Postgres), after an import of about 6 s (75 s run minus 69.5 s matching in the accuracy phase).
-  - Precision on torrents without a link is not measured beyond the truth sets above.
+  path, 74,786 scanned, **71,205 linked (95.2 %)**.
+  - By method: 9,320 `desc_link`, 49,681 title, 10,768 season remap, 1,434 episode remap,
+    2 year remap.
+  - 3,581 unmatched, 318 below the floor (version 1: 69; the difference is the two
+    contradiction rules).
+  - 93 s for the whole set (about 1.2 ms per torrent including Postgres).
+- **Contradictions** (scratch probe over all 82,568 names, title matching only, links ignored):
+  title links whose release year is more than a year from the entry's went from 910 to 92, and
+  the remaining 92 are all season or episode remaps where the year is the show's first year
+  (`JoJo's Bizarre Adventure (2012) S06` to Steel Ball Run). Links that wrote season 1 (or another
+  Fribb season) over an explicit release season ≥ 2 went from 121 (version-1 matcher, same
+  parser) to 0. The other release-season / Fribb-season disagreements (419) are keys that name
+  the season themselves (`Honzuki no Gekokujou … Ryoushu no Youjo` for S04, which Fribb numbers as season 1 of its own TVDB entry); those store the
+  release's season.
+- **Out-of-sample spot check** (hand-labelled, 2026-10-25): 10 random title links (seed
+  20261025) from each of the 12 largest groups absent from the truth sets, among torrents
+  without any MAL/AniList/AniDB link. **116 / 120 judged correct (96.7 %; Wilson 95 % interval
+  about 91.7–98.7 %).** By group: Erai-raws, ToonsHub, VARYG, ASW, ANi, LoliHouse, DKB, Judas
+  10/10; SubsPlease, shincaps, Doomdos, NanakoRaws 9/10. The four misses:
+  - `Ace of Diamond Act II S2 - 10` → `Diamond no Ace: Second Season` (2015): the release
+    counts seasons of Act II, the Fribb remap took TVDB season 2 of the whole series.
+  - `Dr. Stone Science Future - 31` → `Dr. Stone: Stone Wars` E7: episode 31 counts within
+    Science Future, but the absolute-episode remap walked the series from season 1.
+  - `[Doomdos] 搜神记 - 第9话` → `Sou Shen Ji` (2006 TV) instead of the 2026 ONA: same title,
+    and no year in the name.
+  - `[shincaps] Youkoso Jitsuryoku … - 10` → season 1 (2017). It may be a rerun, but the 2026
+    4th season is more likely.
+  This is a sanity check, not a precision estimate per group: the sample is small, and it was
+  judged from titles by the agent that wrote the matcher. Remaining weak spots are new versions or sequels with the same
+  bare title and no year in the name.
 
 Remaining errors are mostly ground-truth ambiguity, where the description links the season page
 while the episode belongs to its second cour (Fire Force S03E14 to E24, Uma Musume Cinderella

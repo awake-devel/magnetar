@@ -155,10 +155,18 @@ pub fn parse_release(name: &str) -> Release {
         push_title(&mut titles, &t);
     }
     let int = |v: Option<i64>| v.and_then(|v| i32::try_from(v).ok());
+    // `X Season 3 - 10` reads as seasons 3..=10 to parse-torrent-title; anitomy-ng sees
+    // season 3, episode 10. A real range (`S01-S03`) gives anitomy no single season.
+    let seasons = p.seasons().unwrap_or_default();
+    let season = match (seasons.len(), num(ElementKind::Season)) {
+        (n, Some(s)) if n > 1 && p.episode().is_none() && num(ElementKind::Episode).is_some() => {
+            Some(s)
+        }
+        _ => int(seasons.iter().max().copied()),
+    };
     Release {
         titles,
-        season: int(p.seasons().and_then(|s| s.iter().max().copied()))
-            .or_else(|| num(ElementKind::Season)),
+        season: season.or_else(|| num(ElementKind::Season)),
         episode: int(p.episode()).or_else(|| num(ElementKind::Episode)),
         year: int(p.year().and_then(|y| y.as_int())).or_else(|| num(ElementKind::Year)),
     }
@@ -1279,6 +1287,10 @@ mod tests {
                 .any(|t| t == "Kanojo, Okarishimasu Season 5")
         );
         assert_eq!((r.season, r.episode), (Some(5), Some(4)));
+        let r = parse_release(
+            "[Erai-raws] Fumetsu no Anata e Season 3 - 10 [1080p CR WEB-DL AVC AAC][MultiSub][7ECB6534]",
+        );
+        assert_eq!((r.season, r.episode), (Some(3), Some(10)));
         let r = parse_release("[SubsPlease] Golden Kamuy - 38 (1080p) [F1434F11].mkv");
         assert_eq!(r.titles[0], "Golden Kamuy");
         assert_eq!((r.season, r.episode), (None, Some(38)));
