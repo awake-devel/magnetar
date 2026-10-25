@@ -1,0 +1,173 @@
+{
+"01a14e7f851fcac43864726d4f75a4d12224747ac6b4b02bd2e1ecc7cb93e148": [
+"v0 btih tag instead of x",
+"dtan.xyz publisher alt tag",
+"plain hand-published (no PoW, no i)",
+"pre-2024 early event"
+],
+"01d23d851c8d3bcfff42936128a8ac8970873452c1abccef97af6e24f2729187": [
+"v0 btih tag instead of x",
+"plain hand-published (no PoW, no i)",
+"pre-2024 early event"
+],
+"b29b854da4d1e6ed516d36cbce5239d306f8d88dea73aa9dbfca3cfdb85c05b9": [
+"uppercase infohash"
+],
+"d55f6029ce243c4cfae2595dd2bc9f1863aa8628e3bb735dccff7c6b19e71277": [
+"x has trailing &dn junk"
+],
+"00eb19741939c83207ce8cda512734c88e9ac98da579da992d39d7d2f60653a5": [
+"64-hex x (v2/sha256?)",
+"dtan.xyz publisher alt tag"
+],
+"000c4fc71abfc5393149e818046615706152893c3e1dc79fed855fba28f426b0": [
+"file 'name;size' single element (u2p/ygg bridge)",
+"no tracker tags",
+"ygg i-tag + l u2p.* labels"
+],
+"000d4e997afb5386bb5f381f51bac9f54c6f8417f5f56948f62479a5e00e90c9": [
+"file 'name;size' single element (u2p/ygg bridge)",
+"no tracker tags",
+"ygg i-tag + l u2p.* labels"
+],
+"0112f758211d9ff68b1dca561e5f64b8035276060da652635e3ff4045bd93c4f": [
+"file 'name;size' single element (u2p/ygg bridge)"
+],
+"000000002801a450ddc22b846778aa49bdcd78a276ee13fc8c4d927633321545": [
+"file name containing folder listing with newlines",
+"publisher sample"
+],
+"0000000095014be2da27c57d0632d1e6015cba4a0d055a8c6dd2f20d6af6902b": [
+"file name containing folder listing with newlines"
+],
+"90230a719d7dd78c5bc2e99bdbdc5965f13f2ab07e13185a2292da583a93c952": [
+"file tag with 4th element (sha256)",
+"tmdb i-tag"
+],
+"000000249e25b06e047544649588137ae76e371bca13a4c3b6e36e5237a09ad2": [
+"file size 0"
+],
+"2b860e8d9b349b6c975afbb852e87f58315282fe5d52442b3cc2d85e31b5b9c0": [
+"no file tags"
+],
+"36ef40bbd4b5875edd543b12b710dcd11c2728409531b6aaaa2b934503a6a4c6": [
+"no file tags"
+],
+"00000000ab584f4db48e1ba765d282066650e8a721f6e931f02ce067630fceff": [
+"empty content",
+"publisher sample"
+],
+"00000001421411af097cac3e910978ed8e8d52c35051f476f189feb29565f253": [
+"empty content"
+],
+"00000000610d15769b3223b4188e0242d378babcdef7e275a903589609b92b93": [
+"imdb i-tag"
+],
+"0000000373f9fefc15dad7e8fee5ae995bad1674633d1c3b46a27210c21822db": [
+"imdb i-tag"
+],
+"4fb8887d28bb9795953f1a1d18176d0b0ef3167bfb9902265bfac469d7f7a8b8": [
+"tmdb i-tag"
+],
+"97a3e1c0cf27516980debd941d8b99115aba885283affe6e5707e02ff923dd35": [
+"anilist i-tag"
+],
+"00000000056d4dbf2a8633603f9b88d4f06131ff4cdb6c7b8b43c3f557957b24": [
+"tpb i-tag bridge",
+"publisher sample"
+],
+"00000000164fc2feee2f1184636bb4fe9c70d04b0d6543fbe31221b24344e77c": [
+"tpb i-tag bridge",
+"publisher sample"
+],
+"b24b8290df7c835e74592ca42087fab1b47e445319501ce0044745585c689412": [
+"machine-translated broken tracker URLs"
+],
+"10d08d300a715e37ab167939ad2a0b5d0a5fbed8e5cd1338bcc59354efa2a809": [
+"empty or wss tracker"
+],
+"0b3d3afb10637fd4d4f49a9a5fad19858f1a3c65ba756c57746a6f81929b8400": [
+"non-media (bitcoin assumeutxo snapshot)"
+],
+"30ccfe1742861ee28d848e2582f6f65a37959afe5e0174f57ea5ee702b0680b9": [
+"client tag"
+],
+"6ae5ed80e301e12fb568140c976351caf9df6bd3e27d14fa22b0261e84f69817": [
+"client tag"
+],
+"000000a62bab01cc78c422f578cc995ebccf34311fc91f2327a2c38a67af44c0": [
+"very large event >64KiB"
+],
+"00000003ba700769f1af01efd50f9885480804794f29ee21060487b3e46f99b5": [
+"many files"
+],
+"023ee8fdec08b9245cff54a840a9f1149b33f69cea4f7fb748e2a62953affba5": [
+"plain hand-published (no PoW, no i)"
+],
+"000005bbfa5b103b35333b699c8f0744335bceae376e5519d1b336eaea9f9012": [
+"pre-2024 early event"
+],
+"0000000017e09784fab2dd7cff6410a74cdbcd50318cf4286f37e6713a19fd27": [
+"publisher sample"
+],
+"00000000491697379e31ab10bcbc2fe2afffe684314d8bb77fcb8eb9c46c1096": [
+"publisher sample"
+],
+"00000000847d416760a988f3fe30d9b5204fba9e03838cb0b3a23346678f768c": [
+"publisher sample"
+],
+"000000008fba17f381b680040d29ee863b2908fe3efd44be489109df09534380": [
+"publisher sample"
+],
+"00000000b971199095d506f7bef83af0a3c47ea7944acf1a636858f641c35d5a": [
+"publisher sample"
+],
+"0000000107063ef8d466ee04fc1ff0f1f19649652cfcb7fb08ab667d024b6c75": [
+"publisher sample"
+],
+"000000014cc978d796bf5314cea8a9d80b93047051246b27d09983b72fc35d46": [
+"publisher sample"
+],
+"0000000176f2893007bccaeafc8927daddc2d410dec51cd89683fc46d46da3c8": [
+"publisher sample"
+],
+"00000005170557418b29e3677f7614bca43c0ec875f3520e543c6a3c18a91568": [
+"publisher sample"
+],
+"00000005e65f824b3faaa2071ae8c1ce56d06198ce1797c11cceefb5adde1f0d": [
+"publisher sample"
+],
+"0000000bba096d7d202f02c24e72106181c41f84869f2f9094a1f66992d08634": [
+"publisher sample"
+],
+"0000027c8ebbf5bec1651895f5b3334d3806169407835a213d4e45b86d7f3072": [
+"random sample"
+],
+"b38ddbf586401cdf4bd1802d98d3303ff69198b4fb666abc4f577626357b4513": [
+"random sample"
+],
+"0000065933957746fa76ed3cd2b12785275dd50eb2142e01f649da1a25142276": [
+"random sample"
+],
+"0000071ef561c512a093f93b9bcd168b418607abd0c5c49c3b6db2e26aaef93d": [
+"random sample"
+],
+"00000059ecebbab7417d5614bb6fbc953151ca815b50f4cfe7f05175c65f258f": [
+"random sample"
+],
+"000003bc00f2f7c552c09e68fb2174a32cbf5027a1353f49c95e93e7d065b8fd": [
+"random sample"
+],
+"000002fa5d4e324f7dabd98430b48490adc029afb5ad93a5d1cb12a78c9143bc": [
+"random sample"
+],
+"0000036398d0ac2b85fb52b124c91e58d051972fc03278bbcd6fae99b8646f30": [
+"random sample"
+],
+"00000228a776fc991cd39ab30f17857f01b88f9ce54936042a89d5bed4e03cac": [
+"random sample"
+],
+"000002aac6ce8eb50be969f290d16261d00b9dedb308c0158ccc02a7336a9549": [
+"random sample"
+]
+}

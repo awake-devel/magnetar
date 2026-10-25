@@ -1,0 +1,36 @@
+[package]
+name = "magnetar-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+downloads = ["dep:librqbit"]
+
+[dependencies]
+nostr.workspace = true
+negentropy.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tracing.workspace = true
+hex.workspace = true
+sha2.workspace = true
+sha1_smol.workspace = true
+rand.workspace = true
+url.workspace = true
+percent-encoding.workspace = true
+data-encoding.workspace = true
+librqbit = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

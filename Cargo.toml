@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/server", "crates/ffi", "crates/uniffi-bindgen"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+repository = "https://github.com/awake-devel/magnetar"
+
+[workspace.dependencies]
+magnetar-core = { path = "crates/core", default-features = false }
+nostr = { version = "0.45.5", default-features = false, features = ["std", "rand", "os-rng"] }
+negentropy = "0.5.2"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "macros", "migrate", "json", "chrono"] }
+axum = { version = "0.8.9", features = ["ws", "macros"] }
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tower-http = { version = "0.7.1", features = ["trace", "cors", "timeout", "limit"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
+uniffi = { version = "0.32.2", features = ["tokio"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+async-trait = "0.1"
+futures = "0.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "http2", "query"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1.0.11"
+hex = "0.4.3"
+sha2 = "0.10"
+sha1_smol = "1.0.1"
+rand = "0.9"
+url = "2.5"
+percent-encoding = "2.3.2"
+data-encoding = "2.11"
+librqbit = { version = "9.0.1", default-features = false, features = ["rust-tls"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = "debuginfo"
