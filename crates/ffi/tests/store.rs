@@ -755,11 +755,7 @@ fn cleanup_invariant() {
     }
     // Their FTS rows are gone and the index is consistent.
     let evicted_title = evicted[0].parsed.title.clone();
-    assert!(
-        !titles(&s, &q(&evicted_title))
-            .iter()
-            .any(|t| *t == evicted_title)
-    );
+    assert!(!titles(&s, &q(&evicted_title)).contains(&evicted_title));
     assert_eq!(after.torrents, 400 - r.evicted);
     // Synced comments on evicted torrents are gone; others stay.
     assert!(after.comments >= 100);
@@ -818,7 +814,7 @@ async fn replaceable_semantics() {
     assert!(s.put_replaceable(&tie).await.unwrap());
     assert_eq!(s.follows_of(&root).await.unwrap(), vec![pk(5)]);
     assert_eq!(
-        s.followers_among(&[pk(5), pk(6)], &[root.clone()])
+        s.followers_among(&[pk(5), pk(6)], std::slice::from_ref(&root))
             .await
             .unwrap(),
         vec![(pk(5), vec![root.clone()])]
@@ -833,7 +829,7 @@ async fn replaceable_semantics() {
     );
     s.put_replaceable(&mute).await.unwrap();
     s.put_replaceable(&set).await.unwrap();
-    let mut mutes = s.mutes_by(&[root.clone()]).await.unwrap();
+    let mut mutes = s.mutes_by(std::slice::from_ref(&root)).await.unwrap();
     mutes.sort();
     assert_eq!(mutes, vec![(root.clone(), pk(7)), (root.clone(), pk(8))]);
 
@@ -857,7 +853,7 @@ async fn replaceable_semantics() {
     let rep = raw(KIND_REPORT, &root, 10, vec![vec!["p", &pk(9), "spam"]]);
     assert!(s.put_report(&rep).await.unwrap());
     assert_eq!(
-        s.reports_by(&[root.clone()]).await.unwrap(),
+        s.reports_by(std::slice::from_ref(&root)).await.unwrap(),
         vec![(root.clone(), pk(9), "spam".to_string())]
     );
 }

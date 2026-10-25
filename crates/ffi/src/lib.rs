@@ -732,7 +732,7 @@ pub fn npub_encode(hex: String) -> Result<String, FfiError> {
     let out = npub(&hex);
     if !is_hex32(&hex) || out == hex {
         return Err(FfiError::Invalid {
-            msg: "pubkey must be 64 hex chars on the curve".into(),
+            msg: "pubkey must be 64 hex chars".into(),
         });
     }
     Ok(out)
