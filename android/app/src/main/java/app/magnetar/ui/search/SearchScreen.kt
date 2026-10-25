@@ -145,8 +145,9 @@ fun SearchScreen(onOpen: (String) -> Unit, vm: SearchViewModel = viewModel()) {
             when {
                 state.error != null && state.hits.isEmpty() ->
                     CenteredMessage(state.error!!, "Retry", vm::submit)
-                !state.loading && state.hits.isEmpty() ->
+                state.hits.isEmpty() -> if (!state.loading) {
                     CenteredMessage(if (state.text.isBlank()) "Nothing cached yet. Crawl from the Status tab." else "No results")
+                }
                 else -> ResultList(state, settings.trustThreshold, onOpen, vm::loadMore)
             }
         }
