@@ -13,7 +13,7 @@
 #   MAGNETAR_BUILD=local                       build from source with `pkg install rust`
 #   default                                    download the GitHub release asset
 #     MAGNETAR_VERSION=v0.1.0   pick a tag instead of "latest" (needed for prereleases)
-#     GITHUB_TOKEN=...          required while the repository is private
+#     GITHUB_TOKEN=...          only for a private fork (uses the GitHub API asset endpoint)
 #
 # Other knobs: MAGNETAR_HOME (default ~/magnetar), MAGNETAR_REPO (owner/name),
 # MAGNETAR_SRC (source checkout for MAGNETAR_BUILD=local), MAGNETAR_ROOT_NPUB,

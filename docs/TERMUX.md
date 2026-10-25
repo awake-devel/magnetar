@@ -41,7 +41,7 @@ bash termux-setup.sh --print-token
 | `MAGNETAR_BINARY=/path` | install this file instead of downloading |
 | `MAGNETAR_BUILD=local` | `cargo build --release --locked -p magnetar-server` in `MAGNETAR_SRC` (default `~/magnetar/src`, cloned if missing) |
 | `MAGNETAR_VERSION=v0.1.0-rc1` | release tag (default `latest`, which skips prereleases) |
-| `GITHUB_TOKEN` | needed while the repo is private: the API asset endpoint is used instead of the public URL |
+| `GITHUB_TOKEN` | only for a private fork: the API asset endpoint is used instead of the public URL |
 | `MAGNETAR_REPO` | `owner/name`, default `awake-devel/magnetar` |
 | `MAGNETAR_HOME` | default `~/magnetar` |
 | `MAGNETAR_ROOT_NPUB` | written to the env file on first run |
@@ -144,8 +144,7 @@ Checked green in both runit and nohup mode (2026-10-25, 62 checks):
 (about 450 KB) says nothing about the real server.
 
 These were not testable in docker: `termux-wake-lock` (no Android `am`), Termux:Boot, the
-phantom process killer, the GitHub release download (the repo is private and has no
-release yet), and the real `magnetar-server`. To run the same suite against the real
+phantom process killer, the GitHub release download (no release existed yet), and the real `magnetar-server`. To run the same suite against the real
 binary, use
 `scripts/termux-docker-test.sh --binary dist/magnetar-server-x86_64-linux-android`.
 

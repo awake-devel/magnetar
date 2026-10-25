@@ -12,9 +12,10 @@ It runs in two places, and both of them crawl:
 - **Android app**: keeps a local SQLite cache, so search still works offline. Whatever the
   phone finds is synced up to the server.
 
-> Status: early development. This README follows the contract in
-> [ARCHITECTURE.md](ARCHITECTURE.md). When this file and ARCHITECTURE.md disagree,
-> ARCHITECTURE.md wins. Anything marked **UNVERIFIED** has not been run on a real phone yet.
+> Status: **v0.1.0 pre-release**, the first test build. Everything in the feature table ran
+> in automated tests and on an emulator; it has not yet run on a real phone. Anything marked
+> **UNVERIFIED** is untested. [ARCHITECTURE.md](ARCHITECTURE.md) is the contract; when it and
+> this file disagree, ARCHITECTURE.md wins.
 
 ## Architecture
 
@@ -47,24 +48,26 @@ uniffi API for Android) and `android/` (the app, package `app.magnetar`).
 
 ## Features
 
-Status is as of this branch. "Contract" means the types and behaviour are fixed in
-ARCHITECTURE.md and the code is being built. "Spike" means a research prototype ran.
+Status for v0.1.0 (first pre-release). "Tested" means automated tests plus an end-to-end run
+of the app on an Android 17 (API 37) x86_64 emulator against a live server crawling real relays.
 
 | Feature | Where | Status |
 |---|---|---|
-| Crawl NIP-35 kind 2003 + comments (2004, 1111 `K=2003`) with `until` pagination and per-relay cursors | core, both | Contract |
-| Signature and id verification on every ingest path | core | Contract |
-| Lenient NIP-35 parser (btih alias, `name;size` files, proxy tags, YGG/Nyaa/TPB bridge quirks) | core | Contract, fixtures from real relays |
-| Relay discovery (seed list, NIP-65, kind 3 maps, tag hints) | core | Contract |
-| Full-text search: Postgres `tsvector` + `pg_trgm`, SQLite FTS5 on the phone | server, ffi | Contract (queries verified in research) |
-| Group by infohash, canonical event = highest trust | both | Contract |
-| Web-of-trust score 0-100 with explanation (follows, mutes, reports, PoW bonus) | core | Contract |
-| Swarm liveness: UDP (BEP 15), HTTP scrape (BEP 48), DHT scrape (BEP 33) | core | Contract, spike against real trackers |
-| Phone to server sync: NIP-77 negentropy, batch POST fallback | core, server | Contract, spike |
-| Saved searches with ntfy push and local notifications | server, app | Contract |
-| Downloads with librqbit on the server and on the phone (fallback: open the magnet in another app) | server, ffi | Spike downloaded a real torrent on an x86_64 emulator; arm64 UNVERIFIED |
-| Termux server: one-command setup, runit services, boot start | scripts | **Done**, verified in termux-docker (see [docs/TERMUX.md](docs/TERMUX.md)) |
-| Cross-compiled server binary for Termux (API 24) | scripts | Script done, spike binary needs only bionic libc/libm/libdl |
+| Crawl NIP-35 kind 2003 + comments (2004, 1111 `K=2003`) with `until` pagination and per-relay cursors | core, both | Tested (live: 2,675 torrents in 47 s from 2 relays) |
+| Signature and id verification on every ingest path | core | Tested |
+| Lenient NIP-35 parser (btih alias, `name;size` files, proxy tags, YGG/Nyaa/TPB bridge quirks) | core | Tested on 112 real fixture events |
+| Relay discovery (seed list, NIP-65, kind 3 maps, tag hints) | core | Tested |
+| Full-text search: Postgres `tsvector` + `pg_trgm`, SQLite FTS5 offline on the phone | server, ffi | Tested |
+| Filters (category, size, date, seeders, hide dead, trust) and sorts (relevance, date, size, seeders) | both | Tested (hide dead: no dead torrent was available to observe) |
+| Detail: files, trackers, infohash, npub, open/copy magnet, pin, hide, block publisher | app | Tested |
+| Web-of-trust score 0-100 with explanation (follows, mutes, reports, PoW bonus) | core | Tested |
+| Swarm liveness: UDP (BEP 15), HTTP scrape (BEP 48), DHT scrape (BEP 33), TTL cache | core | Tested against real trackers and the DHT |
+| Phone cache: background crawl (Wi-Fi + charging), sync, LRU/size-cap cleanup that never deletes unsynced rows | app, ffi | Tested |
+| Phone to server sync: NIP-77 negentropy, batch POST fallback | core, server | Tested (also interop with nostr-sdk) |
+| Saved searches with ntfy push (server) and local notifications (phone) | server, app | Tested (local notifications; ntfy against a fake server only) |
+| Downloads with librqbit on the server and on the phone (fallback: open the magnet in another app) | server, ffi | Tested on x86_64; **arm64 phone downloads UNVERIFIED** |
+| Termux server: one-command setup, runit services, boot start | scripts | Tested in termux-docker with the real binary (64/64 checks); not yet on a real phone |
+| Cross-compiled server binary for Termux (API 24, aarch64 + x86_64) | scripts | Built; needs only bionic libc/libm/libdl |
 
 No analytics, no Google services, no accounts. The app talks to relays, trackers, your own
 server and, if you set it up, ntfy.
@@ -80,20 +83,8 @@ machine. It takes about 10 minutes, most of which is package downloads.
 2. **Get the setup script** in Termux:
    ```sh
    pkg install -y curl jq
-   curl -fsSLO https://github.com/awake-devel/magnetar/releases/latest/download/termux-setup.sh
-   bash termux-setup.sh
-   ```
-   **While the repository is private** that URL returns 404. Use a GitHub token (fine-grained,
-   read-only "Contents" on this repo) and the API instead:
-   ```sh
-   pkg install -y curl jq
-   export GITHUB_TOKEN=github_pat_...
-   api=https://api.github.com/repos/awake-devel/magnetar/releases/latest
-   url=$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" "$api" \
-         | jq -r '.assets[] | select(.name == "termux-setup.sh") | .url')
-   curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/octet-stream" \
-        -o termux-setup.sh "$url"
-   bash termux-setup.sh          # GITHUB_TOKEN stays exported: the script fetches the binary the same way
+   curl -fsSLO https://github.com/awake-devel/magnetar/releases/download/v0.1.0/termux-setup.sh
+   MAGNETAR_VERSION=v0.1.0 bash termux-setup.sh
    ```
    The script installs Postgres 18 and creates the database. It downloads the server binary
    that matches `uname -m` and checks it against `SHA256SUMS`. It then runs the migrations,
