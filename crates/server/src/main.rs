@@ -29,9 +29,14 @@ async fn main() -> anyhow::Result<()> {
             let store = server::open_store(&cli.config).await?;
             daemons::apply_env(&store, &cli.config).await?;
             let status = Default::default();
-            let report =
-                daemons::crawl_pass(&store, &cli.config, &status, Duration::from_secs(seconds))
-                    .await?;
+            let report = daemons::crawl_pass(
+                &store,
+                &cli.config,
+                &status,
+                Duration::from_secs(seconds),
+                true,
+            )
+            .await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             daemons::notify_saved_searches(&store, &cli.config).await;
             Ok(())

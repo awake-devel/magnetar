@@ -131,7 +131,9 @@ See [docs/CONFIG.md](docs/CONFIG.md) for all the details.
 | `MAGNETAR_NTFY_URL` | `https://ntfy.sh` in the generated env | ntfy server for saved-search notifications |
 | `MAGNETAR_NTFY_TOPIC` | random `magnetar-…` | ntfy topic. Treat it as a secret |
 | `MAGNETAR_DOWNLOAD_DIR` | `~/storage/downloads/magnetar` (or `~/magnetar/downloads`) | Server-side download output |
-| `MAGNETAR_CRAWL_INTERVAL_SECS` | `900` | Time between crawler runs |
+| `MAGNETAR_CRAWL_INTERVAL_SECS` | `900` | Pause between crawler passes. `0` crawls continuously (30 s between passes), for an always-on Linux server |
+| `MAGNETAR_CRAWL_MAX_RELAYS` | `30` | Relays crawled per pass |
+| `MAGNETAR_CRAWL_EXPLORE_RELAYS` | `10` | Of those, slots for newly discovered relays that have not yielded events yet |
 | `MAGNETAR_SEED_RELAYS` | built-in list (ARCHITECTURE.md §9) | Comma-separated relay URLs |
 | `RUST_LOG` | `info` | tracing filter |
 

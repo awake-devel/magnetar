@@ -332,6 +332,11 @@ impl PgStore {
         self.live.subscribe()
     }
 
+    /// Open live receivers (one per `/relay` connection with an open REQ).
+    pub fn live_receivers(&self) -> usize {
+        self.live.receiver_count()
+    }
+
     fn publish(&self, raw: &RawEvent) {
         // No receivers is fine.
         let _ = self.live.send(raw.clone());

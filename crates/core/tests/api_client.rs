@@ -178,6 +178,7 @@ async fn server() -> api_support::FakeHttp {
                     running: true,
                     last_run: Some(9),
                     last_report: None,
+                    ..Default::default()
                 },
             }),
             ("GET", "/api/v1/relays") => j(&vec![relay_info()]),

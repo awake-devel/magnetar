@@ -44,6 +44,8 @@ fix one of them in the same change.
 | D28 | librqbit 9.0.1 `rust-tls` still pulls **aws-lc-rs** (its `sha1-ring` feature maps to aws-lc, and its reqwest uses default rustls + platform-verifier). Accepted for the `downloads` feature only; it cross-compiles with cargo-ndk (android.md §4). Because rustls then has two providers, our code must always use `builder_with_provider(ring)` and call `http::install_crypto_provider()` at startup. librqbit's own HTTPS tracker requests may fail on Android (platform verifier without JNI init): UDP trackers + DHT still work | verified via `cargo tree -i aws-lc-rs` |
 | D29 | `crates/core/src/store.rs` is the authoritative Store trait (§4 is a summary) | |
 | D27 | Downloads: librqbit on server; on phone see §8 (spike result recorded there) with fallback = `ACTION_VIEW magnet:` intent | android.md |
+| D30 | Continuous crawling: `MAGNETAR_CRAWL_INTERVAL_SECS=0` runs passes back to back with a fixed 30 s pause (120 s after a failed pass or one with no relay to try, so an instant pass never hot-spins); 1–59 is raised to 60, default stays 900 for phone servers. Each pass keeps the 600 s budget, relay backoff is unchanged (`next_try_at` is absolute time, 300 s doubling to 24 h, so a failing relay is skipped by `select_relays` however often passes run). Indexer metadata and the saved-search notifier run at most every 15 min in every mode (the notifier is watermarked, so skipped polls only batch hits; ntfy.sh allows 250 messages/day). 30 s rather than less: a steady-state pass already reconnects to up to 30 public relays and re-reads the 1 h forward overlap, so a shorter pause mostly adds connection churn against relay rate limits while kind 2003 arrives slowly | measured: first pass on the laptop took 457 s (45 942 inserted, 10 relays ok) |
+| D31 | `/relay` connections take a live broadcast receiver only while they have an open REQ, and drop it at the last CLOSE. Before, every connection subscribed at connect, so an upload-only phone sync (NEG + ~4.4k EVENTs, no REQ) sat behind the 1024-slot channel while its own and the crawler's ingests filled it and logged dozens of "subscriber lagged" warnings. Nothing was lost: lag only skips live pushes to open REQs, every event is already stored. Real lag now warns once per connection and the total is in the close line (`live_dropped`) | server.log 2026-10-25: 579 lag warnings during one upload connection (`accepted=2267 duplicates=2141`); `crates/core/src/sync.rs` sends no REQ |
 
 ---
 
@@ -363,7 +365,7 @@ Auth: `Authorization: Bearer <MAGNETAR_API_TOKEN>` on everything except `GET /he
 | `GET /api/v1/torrents/{infohash}` | | `TorrentDetail` / 404 |
 | `POST /api/v1/torrents/{infohash}/liveness` | | `Liveness` (forces a check now) |
 | `POST /api/v1/events/batch` | `{"events":[RawEvent...]}` (≤ 500) | `{"results":[{"id":..,"accepted":bool,"duplicate":bool,"message":".."}]}` |
-| `GET /api/v1/stats` | | `StoreStats` + `{"crawler":{"running":bool,"last_run":i64}}` |
+| `GET /api/v1/stats` | | `StoreStats` + `{"crawler":{"running":bool,"last_run":i64,"last_report":CrawlReport,"passes":u64,"last_error":str,"next_run":i64}}` |
 | `GET /api/v1/relays` / `PUT /api/v1/relays` | `{"url","enabled"}` | `[RelayInfo]` |
 | `GET /api/v1/trust/{pubkey}` | | `TrustScore` |
 | `GET/PUT /api/v1/settings/trust` | `{"root": npub-or-hex or null, "threshold": u8}` | same |
@@ -488,9 +490,10 @@ core feature `downloads` so core stays light when it is off.
 CLI: `magnetar-server serve | migrate | crawl-once [--seconds N] | selftest | --version`.
 Env/config: `DATABASE_URL`, `MAGNETAR_BIND` (default `127.0.0.1:8787`), `MAGNETAR_API_TOKEN` (required for
 serve), `MAGNETAR_ROOT_NPUB`, `MAGNETAR_NTFY_URL`, `MAGNETAR_NTFY_TOPIC`, `MAGNETAR_DOWNLOAD_DIR`,
-`MAGNETAR_CRAWL_INTERVAL_SECS` (default 900), `MAGNETAR_SEED_RELAYS` (comma), `RUST_LOG`.
+`MAGNETAR_CRAWL_INTERVAL_SECS` (default 900, 0 = continuous, D30), `MAGNETAR_CRAWL_MAX_RELAYS` (30),
+`MAGNETAR_CRAWL_EXPLORE_RELAYS` (10), `MAGNETAR_SEED_RELAYS` (comma), `RUST_LOG`.
 `serve` runs: API + relay endpoint, crawler loop, liveness loop (batch of due infohashes every 5 min),
-trust recompute (on graph_version change, else every 6 h), saved-search notifier (every crawl).
+trust recompute (on graph_version change, else every 6 h), saved-search notifier (after a crawl, at most every 15 min).
 sqlx pool ≤ 5 (Termux phantom-process budget). `selftest` checks DB, DNS, TLS (fetch NIP-11 of a seed relay), UDP.
 
 Seed relays (nostr-nips.md §4.5): `wss://nostr.oxtr.dev, wss://relay.nostr.net, wss://nos.lol,
