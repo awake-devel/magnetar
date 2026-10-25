@@ -467,7 +467,12 @@ impl Tmdb {
         loop {
             attempt += 1;
             self.bucket.take().await;
-            self.requests.fetch_add(1, Ordering::Relaxed);
+            let n = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
+            // Path only: never the query (a v3 key would travel there).
+            tracing::debug!(
+                "tmdb request #{n}: GET {}",
+                url.split('?').next().unwrap_or("")
+            );
             let mut rb = self.http.get(url).query(query);
             if api {
                 rb = self.authorize(rb);

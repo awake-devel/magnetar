@@ -32,6 +32,11 @@ magnetar-server --version
 | `MAGNETAR_NIP66_MONITORS` | `wss://relaypag.es, wss://monitorlizard.nostr1.com, wss://relay.nostr.watch, wss://nos.lol, wss://relay.damus.io` | comma-separated relays queried for kind 10166/30166 monitor events |
 | `MAGNETAR_NIP66_TRUSTED` | built-in list of 12 monitor pubkeys (`nip66::DEFAULT_TRUSTED_MONITORS`) | comma-separated hex pubkeys of trusted NIP-66 monitors. They get their own request and page budget, and only relays they report escape the cap of 100 new relays per run from other announced monitors (ARCHITECTURE.md D36) |
 | `RUST_LOG` | `info` (Termux env) | tracing `EnvFilter` syntax, e.g. `info,magnetar_core=debug` |
+| `MAGNETAR_TMDB_TOKEN` | unset = TMDB off | Your own TMDB API Read Access Token (v4, sent as `Authorization: Bearer`) or v3 API key (32 hex, sent as `api_key`). Only the server uses it; never put it in the app. Posters/overviews/episode names for matched media, fetched lazily by ID and cached ≤ 6 months (docs/ENRICHMENT-TMDB.md, D42) |
+| `MAGNETAR_TMDB_LANGS` | `en-US,fr-FR` | TMDB languages, preferred first; the overview shown is the first language that has one. One details request covers all of them (`append_to_response=translations`); episode names cost one request per language |
+| `MAGNETAR_IMAGE_CACHE_DIR` | `$XDG_CACHE_HOME/magnetar/images`, else `~/.cache/magnetar/images` | Content-addressed poster files (`w342`, `<sha256[0..2]>/<sha256>.<ext>`), served by `GET /api/v1/media/{id}/poster`. Files no row references are removed with the 6-month purge |
+| `MAGNETAR_TMDB_RPS` | `20` | Token bucket for all TMDB requests (API + images), bursts of up to 5. TMDB's documented ceiling is around 40/s; 429/5xx are retried 3 times honouring `Retry-After` |
+| `MAGNETAR_TMDB_PREFETCH_PER_HOUR` | `60` | Background prefetch of media matched in the last 7 days without fresh TMDB data, most releases first (checked every 10 min). `0` = only when a detail is opened |
 
 `GET /api/v1/stats` reports the crawler under `crawler`: `running`, `last_run` (unix end time of
 the last pass), `last_report`, `passes` since start, `last_error` and `next_run` (while pausing).

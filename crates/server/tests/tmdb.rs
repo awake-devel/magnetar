@@ -347,6 +347,12 @@ async fn detail_is_decorated_lazily_and_poster_is_served() {
     assert_eq!(m.tmdb, Some((MediaKind::Series, 1399)));
     let poster = m.poster.unwrap();
     assert_eq!(poster, format!("/api/v1/media/{show}/poster"));
+    // The poster field appears with the details; the worker downloads the image right after.
+    while fake.calls("image/") == 0 {
+        assert!(Instant::now() < deadline, "poster never downloaded");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
     let calls = fake.log.lock().unwrap().len();
 
     // Poster: auth required, bytes + cache headers, 304 on the ETag.

@@ -331,3 +331,45 @@ fn i_tag_imdb_search_without_cached_media() {
         0
     );
 }
+
+/// Against a running server with TMDB on: MAGNETAR_TEST_SERVER_URL, MAGNETAR_TEST_SERVER_TOKEN,
+/// MAGNETAR_TEST_MEDIA_INFOHASH (a matched torrent already decorated).
+#[test]
+#[ignore = "network"]
+fn media_against_server() {
+    let (Ok(url), Ok(ih)) = (
+        std::env::var("MAGNETAR_TEST_SERVER_URL"),
+        std::env::var("MAGNETAR_TEST_MEDIA_INFOHASH"),
+    ) else {
+        eprintln!("SKIPPED (no MAGNETAR_TEST_SERVER_URL / MAGNETAR_TEST_MEDIA_INFOHASH)");
+        return;
+    };
+    let dir = TempDir::new("live-media");
+    let mut cfg = config(Some(url));
+    cfg.api_token = std::env::var("MAGNETAR_TEST_SERVER_TOKEN").ok();
+    let m = Magnetar::open(dir.0.join("m.db").display().to_string(), cfg).unwrap();
+    let d = block_on(m.detail(ih.clone(), true)).unwrap().unwrap();
+    let media = d.media.expect("server media");
+    eprintln!(
+        "{} ({:?}) {:?} {:?}",
+        media.title, media.year, media.episode_title, media.imdb_url
+    );
+    assert!(media.overview.is_some());
+    let path = block_on(m.media_poster(media.media_id, media.poster.unwrap()))
+        .unwrap()
+        .unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(
+        bytes.starts_with(&[0xff, 0xd8]) || bytes.starts_with(b"\x89PNG"),
+        "{path}"
+    );
+    eprintln!("poster {} bytes at {path}", bytes.len());
+    let page = block_on(m.media_torrents(media.media_id)).unwrap();
+    assert_eq!(page.source, "server");
+    assert!(page.hits.iter().any(|h| h.infohash == ih));
+    // Offline afterwards: media from the phone cache.
+    m.set_config(config(None)).unwrap();
+    torrent(&ih, &d.summary.title, &pk(1), 1).put(m.store());
+    let local = block_on(m.detail(ih, false)).unwrap().unwrap();
+    assert_eq!(local.media.unwrap().title, media.title);
+}
