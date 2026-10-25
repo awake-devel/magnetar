@@ -24,7 +24,7 @@ fix one of them in the same change.
 | D7 | Kind 2004 accepted only if it references (e/E tag) a known 2003; kind 1111 with `K=2003` ingested as comment too | nostr-nips.md §2.5 |
 | D8 | Pagination: `until = min(created_at)` (inclusive, dedup), strictly decreasing, stop on a page with 0 new events; never trust "page < limit" | nostr-nips.md §1.7 |
 | D9 | Cursors per (relay, kind): `newest_seen` (forward, overlap 1 h) + `backfill_until` (history not finished) | nostr-nips.md §1.7 |
-| D10 | Relay discovery: seed list ∪ NIP-65 lists of publishers ∪ kind-3 legacy maps ∪ tag hints ∪ NIP-66 monitors (D30); own normalizer; oversized lists (>50 r) penalised and not used | wot-relays.md §3, §5 |
+| D10 | Relay discovery: seed list ∪ NIP-65 lists of publishers ∪ kind-3 legacy maps ∪ tag hints ∪ NIP-66 monitors (D35); own normalizer; oversized lists (>50 r) penalised and not used | wot-relays.md §3, §5 |
 | D11 | Postgres search: generated `tsvector` (`simple` on title/files with separator regexp, `english` on description) + `pg_trgm` `<%` word_similarity fallback | rust-crates.md §9 |
 | D12 | SQLite search: FTS5 external content, `unicode61 remove_diacritics 2 separators '._-[]()'`, sanitized query tokens | rust-crates.md §5 |
 | D13 | NIP-77: own relay side (axum WS + `negentropy` 0.5.2), own initiator on phone; frame limit 60 000; max 500 000 items per NEG-OPEN | negentropy.md §1, §5 |
@@ -44,8 +44,8 @@ fix one of them in the same change.
 | D28 | librqbit 9.0.1 `rust-tls` still pulls **aws-lc-rs** (its `sha1-ring` feature maps to aws-lc, and its reqwest uses default rustls + platform-verifier). Accepted for the `downloads` feature only; it cross-compiles with cargo-ndk (android.md §4). Because rustls then has two providers, our code must always use `builder_with_provider(ring)` and call `http::install_crypto_provider()` at startup. librqbit's own HTTPS tracker requests may fail on Android (platform verifier without JNI init): UDP trackers + DHT still work | verified via `cargo tree -i aws-lc-rs` |
 | D29 | `crates/core/src/store.rs` is the authoritative Store trait (§4 is a summary) | |
 | D27 | Downloads: librqbit on server; on phone see §8 (spike result recorded there) with fallback = `ACTION_VIEW magnet:` intent | android.md |
-| D30 | NIP-66 relay discovery (server only, every 6 h): kind 10166 from monitor relays → announced monitor set; kind 30166 **by those authors only**, last 7 days, pages of 500 (D8); verify each; `d` normalized with `normalize_relay(url,false)`; drop non-clearnet (`n` ≠ clearnet, .onion/.i2p/.loki), hex-pubkey `d`, and any relay that **any** monitor tags `R auth` / `R payment`; insert ≤ 2000 new per run as source `nip66`, most monitors first. `N` tags ignored (crawler needs neither NIP-50 nor 77). Defaults relaypag.es, monitorlizard.nostr1.com, relay.nostr.watch, nos.lol, relay.damus.io | nip66.md |
-| D31 | NIP-66 trust (amends D30): anyone can publish a 10166, so announcements alone are not trusted. (a) A built-in **trusted monitor** list (`DEFAULT_TRUSTED_MONITORS`: every announced monitor with > 100 30166 in 7 days on 2026-10-25; env `MAGNETAR_NIP66_TRUSTED`) is always queried in its **own** `authors` filter, before and with a page budget separate from the other announced ("open") monitors, so fresh sybil 10166s cannot evict it (ordering by 10166 recency would: the real fleet's are 80–130 days old). (b) Open monitors: ≤ 250 per filter, ranked by monitor relays carrying the announcement then recency, ≤ 10 pages per relay. (c) An open monitor's `R auth`/`payment` only counts for relays no trusted monitor reports. (d) Relays reported by open monitors only rank after trusted-reported ones and are capped at 100 inserts per run. (e) Each 30166 is verified once across relays and reduced to (monitor, created_at, verdict) right after its page: no event bodies are held during a run | nip66.md §6 |
+| D35 | NIP-66 relay discovery (server only, every 6 h): kind 10166 from monitor relays → announced monitor set; kind 30166 **by those authors only**, last 7 days, pages of 500 (D8); verify each; `d` normalized with `normalize_relay(url,false)`; drop non-clearnet (`n` ≠ clearnet, .onion/.i2p/.loki), hex-pubkey `d`, and any relay that **any** monitor tags `R auth` / `R payment`; insert ≤ 2000 new per run as source `nip66`, most monitors first. `N` tags ignored (crawler needs neither NIP-50 nor 77). Defaults relaypag.es, monitorlizard.nostr1.com, relay.nostr.watch, nos.lol, relay.damus.io | nip66.md |
+| D36 | NIP-66 trust (amends D35): anyone can publish a 10166, so announcements alone are not trusted. (a) A built-in **trusted monitor** list (`DEFAULT_TRUSTED_MONITORS`: every announced monitor with > 100 30166 in 7 days on 2026-10-25; env `MAGNETAR_NIP66_TRUSTED`) is always queried in its **own** `authors` filter, before and with a page budget separate from the other announced ("open") monitors, so fresh sybil 10166s cannot evict it (ordering by 10166 recency would: the real fleet's are 80–130 days old). (b) Open monitors: ≤ 250 per filter, ranked by monitor relays carrying the announcement then recency, ≤ 10 pages per relay. (c) An open monitor's `R auth`/`payment` only counts for relays no trusted monitor reports. (d) Relays reported by open monitors only rank after trusted-reported ones and are capped at 100 inserts per run. (e) Each 30166 is verified once across relays and reduced to (monitor, created_at, verdict) right after its page: no event bodies are held during a run | nip66.md §6 |
 
 ---
 
@@ -90,7 +90,7 @@ core/src/
   relayurl.rs       relay URL normalizer                                       [nostr]
   relay.rs          RelayConn: WS client (REQ/EOSE/CLOSED/NOTICE/AUTH/OK, NEG-*) [nostr]
   crawler.rs        Crawler<S: Store>: discovery, pagination, cursors          [nostr]
-  nip66.rs          NIP-66 relay discovery from monitor events (D30)            [nostr]
+  nip66.rs          NIP-66 relay discovery from monitor events (D35)            [nostr]
   wot.rs            follow/mute/report extraction from kinds 3/10000/30007/1984/10002 [trust-sync]
   trust.rs          score computation (pure) + TrustEngine<S>                  [trust-sync]
   sync.rs           negentropy initiator (Up) + batch fallback, SyncSource trait [trust-sync]
@@ -495,7 +495,7 @@ serve), `MAGNETAR_ROOT_NPUB`, `MAGNETAR_NTFY_URL`, `MAGNETAR_NTFY_TOPIC`, `MAGNE
 `MAGNETAR_NIP66_MONITORS` (comma), `RUST_LOG`.
 `serve` runs: API + relay endpoint, crawler loop, liveness loop (batch of due infohashes every 5 min),
 trust recompute (on graph_version change, else every 6 h), saved-search notifier (every crawl), NIP-66
-relay discovery (startup, then every 6 h; D30).
+relay discovery (startup, then every 6 h; D35).
 sqlx pool ≤ 5 (Termux phantom-process budget). `selftest` checks DB, DNS, TLS (fetch NIP-11 of a seed relay), UDP.
 
 Seed relays (nostr-nips.md §4.5): `wss://nostr.oxtr.dev, wss://relay.nostr.net, wss://nos.lol,

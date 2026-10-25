@@ -1,4 +1,4 @@
-//! NIP-66 relay discovery (D30, D31, docs/research/nip66.md). Owner: nostr agent.
+//! NIP-66 relay discovery (D35, D36, docs/research/nip66.md). Owner: nostr agent.
 //!
 //! Relay monitors publish one kind-30166 event per (monitor, relay) with the relay URL in `d`,
 //! refreshed every check, and announce themselves with kind 10166. One run:
@@ -11,7 +11,7 @@
 //!
 //! Only trusted or announced monitors count: anyone can publish a 30166, and the crawler connects
 //! to what it is given. Anyone can publish a 10166 too, so announced monitors can neither push the
-//! trusted ones out of the request nor veto a relay a trusted monitor reports (D31). The `N`
+//! trusted ones out of the request nor veto a relay a trusted monitor reports (D36). The `N`
 //! (supported NIPs) tags are not used: the crawler needs neither NIP-50 nor NIP-77 from public
 //! relays.
 
@@ -76,7 +76,7 @@ const GRACE: Duration = Duration::from_secs(3);
 #[derive(Clone, Debug)]
 pub struct Nip66Config {
     pub monitor_relays: Vec<String>,
-    /// Hex pubkeys queried in their own filter whether or not they announce (D31).
+    /// Hex pubkeys queried in their own filter whether or not they announce (D36).
     pub trusted_monitors: Vec<String>,
     /// Only 30166 events newer than this count (monitors refresh every 10 min to 24 h).
     pub max_age: Duration,

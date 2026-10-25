@@ -74,7 +74,7 @@ pub struct Config {
     /// Comma-separated relays holding NIP-66 monitor events (default: built-in list).
     #[arg(long, env = "MAGNETAR_NIP66_MONITORS", value_delimiter = ',')]
     pub nip66_monitors: Vec<String>,
-    /// Comma-separated hex pubkeys of trusted NIP-66 monitors (default: built-in list, D31).
+    /// Comma-separated hex pubkeys of trusted NIP-66 monitors (default: built-in list, D36).
     #[arg(long, env = "MAGNETAR_NIP66_TRUSTED", value_delimiter = ',')]
     pub nip66_trusted: Vec<String>,
 }

@@ -1,4 +1,4 @@
-//! Relay discovery loop run by `serve` (D30): NIP-66 monitor events at startup, then every
+//! Relay discovery loop run by `serve` (D35): NIP-66 monitor events at startup, then every
 //! 6 h. New relays land in the relay table with source "nip66"; the crawler's exploration slots
 //! pick them up from there.
 

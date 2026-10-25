@@ -1,6 +1,6 @@
 # NIP-66 relay discovery: spec and live data (2026-10-25)
 
-Backs D30. The spec is https://github.com/nostr-protocol/nips/blob/master/66.md (status
+Backs D35. The spec is https://github.com/nostr-protocol/nips/blob/master/66.md (status
 `draft optional relay`), fetched the same day. The measurements come from throwaway
 Node/Python WebSocket probes run against public relays on 2026-10-25 around 09:00 UTC. They
 are not in the repo. The samples are in `fixtures/kind30166_sample.jsonl` (39 events) and
@@ -44,7 +44,7 @@ Probe: `REQ {"kinds":[10166],"limit":200}` and `{"kinds":[30166],"since":now-7d,
 | wss://relay.nostr.band | – | – | connect timeout, down |
 
 relay.nostr.watch, monitorlizard and relaypag.es hold nearly the same set: the union of all
-six sources is 13,804 distinct events. The defaults (D30) are relaypag.es and monitorlizard
+six sources is 13,804 distinct events. The defaults (D35) are relaypag.es and monitorlizard
 (fast), relay.nostr.watch (canonical, slow), and nos.lol and relay.damus.io (for the
 `19f3383d…` monitor).
 
@@ -83,7 +83,7 @@ restricted) by the age of their newest event:
 | 48 h | 1,336 | 1,244 |
 | 7 d | 1,386 | 1,288 |
 
-D30 uses 7 days. It costs about 90 extra relays compared with 24 h, some of them dead (the
+D35 uses 7 days. It costs about 90 extra relays compared with 24 h, some of them dead (the
 crawler's backoff handles those), and it keeps relays watched only by the daily monitors. The
 live run of `discover` (ignored test `live_monitors`) found 40 monitors, 13,426 events,
 1,288 candidates, 98 restricted and 176 skipped in 224 s. relay.nostr.watch timed out on one
@@ -105,10 +105,10 @@ Tag counts are from 5,000 events (monitorlizard):
   all from the b2c949c0 monitor, which publishes only `d` and rtt tags.
 - `R`: `!pow` 4,312, `!auth` 4,147, `!payment` 4,061, `payment` 261, `auth` 175, `pow` 9,
   `writes` 2. In the union, 82 relays get a restriction from one monitor and no `R` at all from
-  another. That is missing data, not disagreement, so D30 drops a relay as soon as any monitor
+  another. That is missing data, not disagreement, so D35 drops a relay as soon as any monitor
   says `auth` or `payment` (98 relays).
 - `N`: about 9 per event. Of 13k events, 702 list NIP-50 only, 3,577 list NIP-77 only, and 520
-  list both. D30 does not use `N`: the crawler sends plain REQs to public relays, and NIP-77
+  list both. D35 does not use `N`: the crawler sends plain REQs to public relays, and NIP-77
   is used only against our own server.
 - `T`: rare (28 of 5,000 events: PublicOutbox, Community, Directory…). Not used.
 - Also seen: `g` (about 11 per event), `l`/`L` (language and country labels), `rtt-*`,
@@ -117,7 +117,7 @@ Tag counts are from 5,000 events (monitorlizard):
 
 ## 6. Abuse considerations
 
-- Anyone can publish a 30166 that names any URL. D30 counts only authors with a 10166. A
+- Anyone can publish a 30166 that names any URL. D35 counts only authors with a 10166. A
   spammer can publish a 10166 too, so this filters drive-by junk, not a determined attacker.
   The other limits:
   - the normalizer refuses private, loopback and CGNAT addresses and non-ws schemes
@@ -127,7 +127,7 @@ Tag counts are from 5,000 events (monitorlizard):
 - A 10166 does more than let junk in: sorting announced monitors by announcement recency and
   cutting at 250 lets 250 fresh sybil 10166s push the real fleet (announcements 80–130 days old,
   re-measured 2026-10-25 on relaypag.es) out of the `authors` filter, and one sybil `R auth`
-  would hide any relay. D31 answers with a hand-checked trusted list (§3, the 12 monitors with
+  would hide any relay. D36 answers with a hand-checked trusted list (§3, the 12 monitors with
   more than 100 events in 7 days) that is requested on its own, cannot be vetoed by open
   monitors, and is not subject to the 100-per-run cap on open-only relays.
 - Relays are ranked by the number of distinct monitors that report them (1,146 of 1,386 have
