@@ -6,6 +6,7 @@ pub mod crawler;
 #[cfg(feature = "downloads")]
 pub mod downloads;
 pub mod enrich;
+pub mod enrich_anime;
 pub mod error;
 pub mod http;
 pub mod ingest;

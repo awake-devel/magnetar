@@ -45,6 +45,12 @@ pub enum Command {
         #[arg(long)]
         rematch: bool,
     },
+    /// Import the anime datasets when due (or `--force`), match anime torrents, print a report.
+    EnrichAnime {
+        /// Re-download and re-import even if the datasets were checked recently.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Args, Debug, Clone)]
@@ -110,6 +116,16 @@ pub struct Config {
     /// Conditional re-download + re-import of the IMDb datasets every N hours.
     #[arg(long, env = "MAGNETAR_IMDB_REFRESH_HOURS", default_value_t = 168)]
     pub imdb_refresh_hours: u64,
+    /// Offline anime identification from anime-offline-database + Fribb anime-lists (D41).
+    #[arg(long, env = "MAGNETAR_ANIME_DB", default_value_t = true, action = clap::ArgAction::Set)]
+    pub anime_db: bool,
+    /// anime-offline-database JSONL source: URL or local file, `.zst` is decompressed
+    /// (default: the latest cedya77 weekly release; a `…/download/<tag>/…` URL pins one).
+    #[arg(long, env = "MAGNETAR_ANIME_AOD_URL")]
+    pub anime_aod_url: Option<String>,
+    /// Fribb `anime-list-full.json` source: URL or local file (default: master on GitHub).
+    #[arg(long, env = "MAGNETAR_ANIME_FRIBB_URL")]
+    pub anime_fribb_url: Option<String>,
 }
 
 impl Config {

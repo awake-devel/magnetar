@@ -34,6 +34,10 @@ url.workspace = true
 flate2.workspace = true
 httpdate.workspace = true
 reqwest.workspace = true
+sha2.workspace = true
+parse-torrent-title.workspace = true
+anitomy-ng.workspace = true
+ruzstd.workspace = true
 
 [dev-dependencies]
 tokio-tungstenite.workspace = true

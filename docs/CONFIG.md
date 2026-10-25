@@ -39,6 +39,9 @@ magnetar-server --version
 | `MAGNETAR_IMDB_AKAS` | `false` | Also import `title.akas` (+519 MB download, +~300 MB in Postgres, import ~4.5 min instead of ~1.5): localised titles, +2.8 points correct on French YGG releases |
 | `MAGNETAR_DATASET_DIR` | `<state dir>/datasets` (`$XDG_STATE_HOME/magnetar/datasets` or `~/.local/state/magnetar/datasets`) | Where dataset files are kept between refreshes (conditional GET; a `<file>.last-modified` sidecar stores the server's date) |
 | `MAGNETAR_IMDB_REFRESH_HOURS` | `168` | Conditional re-download every N hours; the tables are rebuilt and swapped only when a file changed (or the UNLOGGED tables were emptied by a crash) |
+| `MAGNETAR_ANIME_DB` | `true` | Offline anime identification with `serve` (docs/ENRICHMENT-ANIME.md, D41): imports anime-offline-database + Fribb anime-lists (checked weekly, conditional GET, ~14 MB download, ~40 k rows) and links anime-category torrents to `media`. `false` = no download, no matching. One-shot: `magnetar-server enrich-anime [--force]` prints a JSON report. Needs the `media`/`torrent_media` tables of the IMDb enrichment |
+| `MAGNETAR_ANIME_AOD_URL` | `https://github.com/cedya77/anime-offline-database/releases/latest/download/anime-offline-database.jsonl.zst` | URL or local path of the AOD JSONL (`.zst` or plain). Use `…/releases/download/2026-43/…` to pin a weekly release, or a local file for offline / air-gapped installs |
+| `MAGNETAR_ANIME_FRIBB_URL` | `https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json` | URL or local path of Fribb `anime-list-full.json`; pin with a commit SHA instead of `master`. `none` = AOD only: no season remap and no IMDb/TMDB/TVDB ids (Fribb has no licence file, see docs/ENRICHMENT-ANIME.md) |
 
 `GET /api/v1/stats` reports the crawler under `crawler`: `running`, `last_run` (unix end time of
 the last pass), `last_report`, `passes` since start, `last_error` and `next_run` (while pausing).

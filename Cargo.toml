@@ -44,6 +44,8 @@ parse-torrent-title = "=2.0.2"
 unicode-normalization = "=0.1.26"
 flate2 = "=1.1.10"
 httpdate = "=1.0.3"
+anitomy-ng = { version = "=1.0.10", default-features = false }
+ruzstd = "=0.9.0"
 
 [profile.release]
 opt-level = 3

@@ -43,6 +43,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "anitomy-ng"
+version = "1.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55bc3830b578d5d8c5c119b101f0b6a19210c0904e8a5bb936aad495b0f953e9"
+dependencies = [
+ "regex",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2537,6 +2546,7 @@ dependencies = [
 name = "magnetar-server"
 version = "0.1.0"
 dependencies = [
+ "anitomy-ng",
  "anyhow",
  "async-trait",
  "axum",
@@ -2549,10 +2559,13 @@ dependencies = [
  "nostr",
  "nostr-memory",
  "nostr-sdk",
+ "parse-torrent-title",
  "rand 0.9.5",
  "reqwest",
+ "ruzstd",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "thiserror 2.0.21",
  "tokio",
@@ -3527,6 +3540,15 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "ruzstd"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a252f5e20f038fe7b4ea53e073e65398d652c864cc162fc77c56c2f13717b888"
+dependencies = [
+ "twox-hash",
+]
 
 [[package]]
 name = "ryu"
@@ -4681,6 +4703,12 @@ dependencies = [
  "sha1 0.11.0",
  "thiserror 2.0.21",
 ]
+
+[[package]]
+name = "twox-hash"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "typenum"
