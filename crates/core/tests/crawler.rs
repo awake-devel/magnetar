@@ -20,6 +20,7 @@ fn cfg(seeds: &[&str]) -> CrawlConfig {
         seed_relays: seeds.iter().map(|s| s.to_string()).collect(),
         indexers: Vec::new(),
         max_relays: 5,
+        explore_relays: 0,
         budget: Duration::from_secs(30),
         max_backfill_pages: 2,
         page_limit: 500,

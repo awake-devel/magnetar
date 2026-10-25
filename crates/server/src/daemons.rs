@@ -59,6 +59,8 @@ pub async fn apply_env(store: &PgStore, cfg: &Config) -> anyhow::Result<()> {
 pub async fn crawl_config(store: &PgStore, cfg: &Config, budget: Duration) -> CrawlConfig {
     let mut c = CrawlConfig::server_default();
     c.budget = budget;
+    c.max_relays = cfg.crawl_max_relays.max(1);
+    c.explore_relays = cfg.crawl_explore_relays;
     let env_seeds = cfg.seed_relays();
     if !env_seeds.is_empty() {
         c.seed_relays = env_seeds;

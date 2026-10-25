@@ -59,6 +59,12 @@ pub struct Config {
     pub downloads: bool,
     #[arg(long, env = "MAGNETAR_CRAWL_INTERVAL_SECS", default_value_t = 900)]
     pub crawl_interval_secs: u64,
+    /// Relays crawled per pass.
+    #[arg(long, env = "MAGNETAR_CRAWL_MAX_RELAYS", default_value_t = 30)]
+    pub crawl_max_relays: usize,
+    /// Of those, slots for relays with no events yet (newly discovered first).
+    #[arg(long, env = "MAGNETAR_CRAWL_EXPLORE_RELAYS", default_value_t = 10)]
+    pub crawl_explore_relays: usize,
     /// Comma-separated seed relays (overrides the `crawl.seed_relays` setting).
     #[arg(long, env = "MAGNETAR_SEED_RELAYS", value_delimiter = ',')]
     pub seed_relays: Vec<String>,

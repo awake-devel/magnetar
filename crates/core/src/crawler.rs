@@ -68,6 +68,10 @@ pub struct CrawlConfig {
     pub indexers: Vec<String>,
     /// Max relays touched per run (server 30, phone 8).
     pub max_relays: usize,
+    /// Slots of `max_relays` reserved for relays not yet proven useful (never tried first, then
+    /// least recently ok), so discovered relays get crawled instead of starving behind the top
+    /// yielders. Seeds keep priority over the rest of the slots.
+    pub explore_relays: usize,
     /// Wall-clock budget for one run.
     pub budget: Duration,
     /// Max pages per relay per run for backfill.
@@ -88,6 +92,7 @@ impl CrawlConfig {
             seed_relays: DEFAULT_SEED_RELAYS.iter().map(|s| s.to_string()).collect(),
             indexers: DEFAULT_INDEXERS.iter().map(|s| s.to_string()).collect(),
             max_relays: 30,
+            explore_relays: 10,
             budget: Duration::from_secs(600),
             max_backfill_pages: 200,
             page_limit: 500,
@@ -100,6 +105,7 @@ impl CrawlConfig {
     pub fn phone_default() -> Self {
         Self {
             max_relays: 8,
+            explore_relays: 2,
             budget: Duration::from_secs(120),
             max_backfill_pages: 10,
             concurrency: 3,
@@ -284,12 +290,51 @@ async fn select_relays<S: Store + ?Sized>(
         )
         .collect();
     rest.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
-    for (_, _, url) in rest {
+
+    // Exploration: relays with no events yet. Never-tried ones first (most-listed first), then
+    // the ones whose last success is oldest, so continuous crawling rotates through all of them.
+    let mut explore: Vec<(bool, i64, u32, String)> = rest
+        .iter()
+        .filter(|(found, _, url)| *found == 0 && !out.contains(url))
+        .map(|(_, f, url)| {
+            let last_ok = infos.get(url).and_then(|i| i.last_ok);
+            (last_ok.is_some(), last_ok.unwrap_or(0), *f, url.clone())
+        })
+        .collect();
+    explore.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.cmp(&b.1))
+            .then(b.2.cmp(&a.2))
+            .then(a.3.cmp(&b.3))
+    });
+    let explore_n = cfg.explore_relays.min(cfg.max_relays).min(explore.len());
+
+    out.truncate(cfg.max_relays - explore_n);
+    for (_, _, url) in &rest {
+        if out.len() >= cfg.max_relays - explore_n {
+            break;
+        }
+        if !out.contains(url) {
+            out.push(url.clone());
+        }
+    }
+    for (_, _, _, url) in explore {
+        if out.len() >= cfg.max_relays {
+            break;
+        }
         if !out.contains(&url) {
             out.push(url);
         }
     }
-    out.truncate(cfg.max_relays);
+    // Too few exploration candidates left over: top up with the ranked list.
+    for (_, _, url) in rest {
+        if out.len() >= cfg.max_relays {
+            break;
+        }
+        if !out.contains(&url) {
+            out.push(url);
+        }
+    }
     Ok(out)
 }
 
