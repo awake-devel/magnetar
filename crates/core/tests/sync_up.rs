@@ -112,8 +112,13 @@ struct FakeRelay {
     queries: Arc<Mutex<Vec<String>>>,
 }
 
+/// id -> negentropy item of every event the fake relay holds.
+type RelayStore = HashMap<String, (u64, [u8; 32])>;
+
 /// NIP-77 relay holding `server` events; EVENT for an id in `reject` gets OK false, in `dup_msg`
 /// gets OK true "duplicate:", for an id the relay already holds also "duplicate:".
+// The handshake callback's error type is tungstenite's (large) HTTP response.
+#[allow(clippy::result_large_err)]
 async fn fake_relay(
     mode: Mode,
     server: Vec<RawEvent>,
@@ -128,7 +133,7 @@ async fn fake_relay(
     let received = Arc::new(Mutex::new(Vec::new()));
     let queries = Arc::new(Mutex::new(Vec::new()));
     // id -> negentropy item of every event the relay holds (grows with accepted EVENTs).
-    let store: Arc<Mutex<HashMap<String, (u64, [u8; 32])>>> = Arc::new(Mutex::new(
+    let store: Arc<Mutex<RelayStore>> = Arc::new(Mutex::new(
         server.iter().map(|e| (e.id.clone(), neg_item(e))).collect(),
     ));
     let (rx_log, q_log) = (received.clone(), queries.clone());
