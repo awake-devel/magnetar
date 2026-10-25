@@ -236,7 +236,12 @@ case "$db_mode" in
   docker)
     docker_ok || die "docker is not usable by $(id -un) (daemon running? in the docker group?)"
     if has_key MAGNETAR_DB_CONTAINER; then DB_CONTAINER=$(env_value MAGNETAR_DB_CONTAINER); fi
-    ensure_key MAGNETAR_DB_PASSWORD "$(rand_hex 24)"
+    if ! has_key MAGNETAR_DB_PASSWORD && [ -z "${MAGNETAR_DB_PASSWORD:-}" ] &&
+      docker container inspect "$DB_CONTAINER" >/dev/null 2>&1; then
+      # Its volume keeps the password it was created with: a new random one would not log in.
+      die "container $DB_CONTAINER already exists but $ENV_FILE has no MAGNETAR_DB_PASSWORD: pass its password as MAGNETAR_DB_PASSWORD, or, for a second instance, pick its own MAGNETAR_DB_CONTAINER, MAGNETAR_DB_VOLUME and MAGNETAR_DB_PORT"
+    fi
+    ensure_key MAGNETAR_DB_PASSWORD "${MAGNETAR_DB_PASSWORD:-$(rand_hex 24)}"
     pw=$(env_value MAGNETAR_DB_PASSWORD)
     if docker container inspect "$DB_CONTAINER" >/dev/null 2>&1; then
       say "  container $DB_CONTAINER exists: starting it"

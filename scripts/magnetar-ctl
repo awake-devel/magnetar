@@ -12,12 +12,14 @@
 #             also publish it on the tailnet with `tailscale serve`
 #   down      stop the server (SIGTERM, then SIGKILL after 30 s); the database keeps running
 #   stop-all  down, stop the Postgres container, remove the tailscale serve entry (if enabled)
-#   update    fetch a new binary (MAGNETAR_VERSION, default latest) with install-linux.sh
-#             --update, then restart if the server was running
+#   update    fetch a new binary with install-linux.sh --update, then restart if the server
+#             was running. Version: MAGNETAR_VERSION from the caller's environment (a tag or
+#             latest), else the one saved in server.env, else latest
 #
 # Files (override with the variables in brackets):
 #   config  ${XDG_CONFIG_HOME:-~/.config}/magnetar/server.env  [MAGNETAR_ENV_FILE]
 #   state   ${XDG_STATE_HOME:-~/.local/state}/magnetar/server.{pid,log}  [MAGNETAR_STATE_DIR]
+#           (mode 700: the log and the server's librqbit session live there)
 #   binary  magnetar-server next to this script, else on PATH  [MAGNETAR_SERVER_BIN]
 set -eu
 
@@ -31,6 +33,9 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 case ${1:-} in -h | --help | help) usage ;; esac
+
+# The caller's MAGNETAR_VERSION wins over the one server.env saved at install time (update).
+caller_version=${MAGNETAR_VERSION:-}
 
 [ -f "$ENV_FILE" ] || die "$ENV_FILE not found: run install-linux.sh first (or set MAGNETAR_ENV_FILE)"
 # The env file is the single source of config: exported to the server as is.
@@ -50,13 +55,28 @@ HOST=${BIND%:*}
 case "$HOST" in 0.0.0.0 | "[::]" | "") HOST=127.0.0.1 ;; esac
 HEALTH_URL=http://$HOST:$PORT/health
 
-mkdir -p "$STATE_DIR"
+# Private: server.log can hold request URIs (RUST_LOG=debug logs ?token=), and the server keeps
+# its librqbit session (magnet links) in the same directory by default.
+(umask 077 && mkdir -p "$STATE_DIR" && touch "$LOG")
+chmod 700 "$STATE_DIR"
+chmod 600 "$LOG"
+
+# is_server PID: the process is `<magnetar-server> serve`, not whatever reused a stale pid
+# (the pid file survives a reboot). argv is compared, not /proc/PID/exe, which reads
+# "... (deleted)" once `update` has replaced the binary under the running server.
+is_server() {
+  [ -r "/proc/$1/cmdline" ] || { kill -0 "$1" 2>/dev/null; return; }
+  argv=$(tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null | head -n 2) || return 1
+  [ "$(printf '%s\n' "$argv" | sed -n 1p)" = "$BIN" ] && [ "$(printf '%s\n' "$argv" | sed -n 2p)" = serve ]
+}
 
 server_pid() {
   [ -f "$PIDFILE" ] || return 1
   pid=$(cat "$PIDFILE")
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
-  echo "$pid"
+  case "$pid" in '' | *[!0-9]*) rm -f "$PIDFILE"; return 1 ;; esac
+  if kill -0 "$pid" 2>/dev/null && is_server "$pid"; then echo "$pid"; return 0; fi
+  rm -f "$PIDFILE"
+  return 1
 }
 
 http_get() {
@@ -107,10 +127,30 @@ tailscale_url() {
   [ "$p" = 443 ] && echo "https://$name" || echo "https://$name:$p"
 }
 
+ts_target() { echo "http://127.0.0.1:$PORT"; }
+
+# ts_root_handler: the handler tailscale serves at path / of our HTTPS port, as `"Kind": "value"`
+# (empty if none). Reads the pretty-printed `tailscale serve status --json` without jq.
+ts_root_handler() {
+  tailscale serve status --json 2>/dev/null | awk -v port="$(ts_https_port)" '
+    /^  "Web": \{/ { web = 1; next }
+    web && /^  [}]/ { web = 0 }
+    web && /^    "[^"]*": \{/ { host = $1; gsub(/[":]+$/, "", host); n = split(host, a, ":"); hp = a[n]; gsub(/"/, "", hp); next }
+    web && /^        "[^"]*": \{/ { root = ($1 == "\"/\":"); next }
+    web && root && hp == port && /^          "/ { sub(/^ +/, ""); sub(/,$/, ""); print; exit }
+  '
+}
+
 tailscale_publish() {
   tailscale_on || return 0
   command -v tailscale >/dev/null 2>&1 || { echo "MAGNETAR_TAILSCALE_SERVE=1 but tailscale is not installed" >&2; return 0; }
-  if tailscale serve --bg --https="$(ts_https_port)" "http://127.0.0.1:$PORT" >/dev/null; then
+  current=$(ts_root_handler)
+  if [ -n "$current" ] && [ "$current" != "\"Proxy\": \"$(ts_target)\"" ]; then
+    echo "tailscale serve: https port $(ts_https_port) path / already serves $current; not replacing it" >&2
+    echo "  (pick a free port with MAGNETAR_TAILSCALE_HTTPS_PORT, or remove that entry yourself)" >&2
+    return 0
+  fi
+  if tailscale serve --bg --https="$(ts_https_port)" --set-path=/ "$(ts_target)" >/dev/null; then
     echo "tailnet URL: $(tailscale_url)"
   else
     echo "tailscale serve failed (logged in? operator rights: sudo tailscale set --operator=\$USER)" >&2
@@ -129,10 +169,12 @@ do_up() {
     else
       nohup "$BIN" serve >>"$LOG" 2>&1 </dev/null &
     fi
-    echo $! >"$PIDFILE"
+    started=$!
+    echo "$started" >"$PIDFILE"
     i=0
     until http_get "$HEALTH_URL" >/dev/null 2>&1; do
-      if ! server_pid >/dev/null; then
+      # kill -0, not server_pid: right after the fork the child may not have exec'd the server yet.
+      if ! kill -0 "$started" 2>/dev/null; then
         rm -f "$PIDFILE"; tail -n 20 "$LOG" >&2; die "server exited (log: $LOG)"
       fi
       i=$((i + 1)); [ "$i" -lt 30 ] || { tail -n 20 "$LOG" >&2; die "no answer on $HEALTH_URL after 30 s"; }
@@ -173,7 +215,7 @@ do_update() {
   [ -f "$installer" ] || die "installer not found at $installer (set MAGNETAR_INSTALLER)"
   was_running=0
   server_pid >/dev/null && was_running=1
-  sh "$installer" --update
+  MAGNETAR_VERSION=${caller_version:-${MAGNETAR_VERSION:-latest}} sh "$installer" --update
   if [ "$was_running" = 1 ]; then do_down; do_up; fi
 }
 
@@ -189,7 +231,11 @@ case ${1:-status} in
   update) do_update ;;
   stop-all)
     do_down
-    if tailscale_on && command -v tailscale >/dev/null 2>&1; then tailscale serve --https="$(ts_https_port)" off || true; fi
+    # Only our entry (path / proxied to this server), never the rest of that HTTPS port.
+    if tailscale_on && command -v tailscale >/dev/null 2>&1 &&
+      [ "$(ts_root_handler)" = "\"Proxy\": \"$(ts_target)\"" ]; then
+      tailscale serve --https="$(ts_https_port)" --set-path=/ off >/dev/null && echo "tailscale serve entry removed" || true
+    fi
     if have_docker_db; then docker stop "$MAGNETAR_DB_CONTAINER" >/dev/null && echo "db stopped ($MAGNETAR_DB_CONTAINER)"; fi ;;
   -h | --help | help) usage ;;
   *) usage 2 ;;

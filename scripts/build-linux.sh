@@ -9,9 +9,10 @@
 #
 #   --docker  (default when docker works) build inside rust:<ver>-alpine, where musl is the
 #             native libc. Needs nothing but docker on the host.
-#   --native  build with the host's cargo for <arch>-unknown-linux-musl. Needs rustup (or a
-#             musl Rust toolchain, as on Alpine) and a musl C compiler for ring/aws-lc:
-#             Alpine: apk add musl-dev gcc; Debian/Ubuntu: apt install musl-tools.
+#   --native  build with the host's cargo for <arch>-unknown-linux-musl. Needs a toolchain
+#             that has that target (rustup, which adds it) and a musl C compiler for
+#             ring/aws-lc: Alpine: apk add rustup musl-dev gcc (Alpine's own `rust` package
+#             only has <arch>-alpine-linux-musl); Debian/Ubuntu: apt install musl-tools.
 #
 # Env: RUST_IMAGE (default rust:1.99-alpine), CARGO_BUILD_JOBS.
 # Fails unless the result is statically linked (no ELF interpreter, no NEEDED libraries).
@@ -78,6 +79,11 @@ case "$mode" in
     if command -v rustup >/dev/null 2>&1; then
       rustup target list --installed | grep -qx "$triple" || rustup target add "$triple"
     fi
+    # Without rustup the target must already be there: a distro rustc (Alpine's `rust` is
+    # <arch>-alpine-linux-musl only) would otherwise fail deep in the build on `core`.
+    libdir=$(rustc --print target-libdir --target "$triple" 2>/dev/null) || libdir=
+    ls "$libdir"/libcore-*.rlib >/dev/null 2>&1 ||
+      die "rustc $(rustc -vV 2>/dev/null | sed -n 's/^host: //p') has no standard library for $triple: install rustup (Alpine: apk add rustup && rustup-init), or use --docker"
     # On a glibc host the musl C compiler is musl-gcc (musl-tools); on Alpine plain cc is musl.
     cc_var=CC_${triple//-/_}
     if [ -z "${!cc_var:-}" ] && ! ldd --version 2>&1 | grep -qi musl; then

@@ -49,7 +49,7 @@ Re-running is safe: the token, the database password and anything you edited in
 |---|---|
 | `MAGNETAR_BINARY=/path/to/magnetar-server` | install that file (checked to run here) |
 | default | download `magnetar-server-<arch>-linux` from the latest release, verify against `SHA256SUMS` (a missing entry or mismatch aborts) |
-| `MAGNETAR_VERSION=v0.2.0` | that tag instead of the latest release. Prereleases are never "latest", so they need it. It is saved to `server.env` for `magnetar-ctl update` |
+| `MAGNETAR_VERSION=v0.2.0` | that tag instead of the latest release. Prereleases are never "latest", so they need it. It is saved to `server.env`: `magnetar-ctl update` stays on it until you pass another one (`MAGNETAR_VERSION=v0.3.0 magnetar-ctl update`, or `=latest`) |
 | `MAGNETAR_REPO=owner/name` | a fork |
 
 ### Where the database comes from
@@ -85,13 +85,23 @@ magnetar-ctl token     # the API token for the app
 magnetar-ctl restart   # after editing server.env
 magnetar-ctl down      # stop the server (SIGTERM, SIGKILL after 30 s); DB keeps running
 magnetar-ctl stop-all  # down + stop the DB container + remove the tailscale serve entry
-magnetar-ctl update    # new binary from MAGNETAR_VERSION (default latest), restart if running
+magnetar-ctl update    # new binary, restart if running (see below for the version)
 magnetar-ctl run       # foreground, for a supervisor or a terminal
 ```
 
 The server is a background process started with `setsid nohup`: it survives closing the
 terminal but not a reboot. After a reboot run `magnetar-ctl up` again, or use one of the
-examples below.
+examples below. The pid file is only trusted while that pid is still `magnetar-server serve`,
+so a pid reused after a reboot or a crash is never mistaken for the server (nor signalled).
+
+`update` takes the version from `MAGNETAR_VERSION` in its own environment, else the one saved
+in `server.env` at install time, else the latest release; the installer saves the new value.
+So a pinned install (any prerelease) moves only when asked:
+`MAGNETAR_VERSION=v0.2.0 magnetar-ctl update`; `MAGNETAR_VERSION=latest` unpins it.
+
+`~/.local/state/magnetar` is made mode 700 and `server.log` 600: with `RUST_LOG=debug` the
+log carries full request URIs, and a `?token=` in one is the API token. The server's
+librqbit session (magnet links, DHT table) lives in the same directory by default.
 
 ## Reaching it from the phone
 
@@ -106,10 +116,13 @@ MAGNETAR_TAILSCALE_SERVE='1'
 # MAGNETAR_TAILSCALE_HTTPS_PORT='443'   # if 443 is taken by another `tailscale serve`
 ```
 
-`magnetar-ctl up` then runs `tailscale serve --bg --https=443 http://127.0.0.1:8787` and prints
-the URL, e.g. `https://myhost.tailnet-name.ts.net`. Put that and the token in the app.
-`tailscale serve` without root needs `sudo tailscale set --operator=$USER` once. The serve
-entry is kept by tailscaled across reboots; `stop-all` removes it.
+`magnetar-ctl up` then runs `tailscale serve --bg --https=443 --set-path=/ http://127.0.0.1:8787`
+and prints the URL, e.g. `https://myhost.tailnet-name.ts.net`. Put that and the token in the
+app. `tailscale serve` without root needs `sudo tailscale set --operator=$USER` once. The serve
+entry is kept by tailscaled across reboots. If path `/` of that HTTPS port already serves
+something else, `up` leaves it alone and says so (choose another port). `stop-all` removes
+only path `/` of that port, and only when it still points at this server; other paths and
+ports stay published.
 
 **LAN only.** `MAGNETAR_BIND='0.0.0.0:8787'` and the app's server URL
 `http://<host-ip>:8787`. Every endpoint except `/health` needs the token, but it travels in
@@ -132,7 +145,16 @@ in [CONFIG.md](CONFIG.md). Useful on an always-on machine:
 | `MAGNETAR_NTFY_URL`, `MAGNETAR_NTFY_TOPIC` | saved-search notifications |
 
 `magnetar-ctl` also reads `MAGNETAR_ENV_FILE`, `MAGNETAR_STATE_DIR` and `MAGNETAR_SERVER_BIN`
-from its own environment, so several instances can live side by side.
+from its own environment. These alone do not make a second instance: the server keeps its
+librqbit session and DHT table in `$XDG_STATE_HOME/magnetar/downloads`, whatever
+`MAGNETAR_STATE_DIR` says. A second instance on the same account needs, for the installer
+and for every `magnetar-ctl` call, its own `XDG_CONFIG_HOME` (or `MAGNETAR_ENV_FILE`) and
+`XDG_STATE_HOME`; at install time its own `MAGNETAR_DB_CONTAINER`, `MAGNETAR_DB_VOLUME`,
+`MAGNETAR_DB_PORT` and `MAGNETAR_BIND`; and in its `server.env` its own
+`MAGNETAR_DOWNLOAD_DIR` (and `MAGNETAR_TAILSCALE_HTTPS_PORT` if both publish). The installer
+refuses to reuse an existing DB container with a fresh `server.env`, since its volume keeps
+the old password (pass it as `MAGNETAR_DB_PASSWORD` if that is what you want). A second Unix
+user is simpler.
 
 ## Starting at boot (optional, examples only)
 
@@ -192,8 +214,10 @@ target must be the host's architecture, nothing is emulated.
 - **Default (`--docker`)**: builds inside `rust:1.99-alpine` (`RUST_IMAGE` to change), where
   musl is the native libc, so ring and aws-lc (librqbit, D28) compile with Alpine's gcc and
   link statically. Only docker is needed on the host. Objects go to `target/linux-musl/`.
-- **`--native`**: the host's cargo with `<arch>-unknown-linux-musl`. On Alpine:
-  `apk add rust cargo musl-dev` (or rustup). On Debian/Ubuntu: rustup plus
+- **`--native`**: the host's cargo with `<arch>-unknown-linux-musl`, which needs rustup
+  (it adds the target). On Alpine: `apk add rustup musl-dev gcc && rustup-init`; Alpine's
+  own `rust` package will not do, it only has the `<arch>-alpine-linux-musl` standard
+  library, and the script stops with that message. On Debian/Ubuntu: rustup plus
   `apt install musl-tools`; the script then uses `musl-gcc` as the C compiler.
   **UNVERIFIED:** only the docker mode was run (x86_64, 2026-10-25); the aarch64 binary is
   built by CI and has not been run here.
