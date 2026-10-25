@@ -34,6 +34,9 @@ fn summary() -> TorrentSummary {
         rank: 0.5,
         pinned: false,
         hidden: false,
+        media_title: Some("Big Buck Bunny".into()),
+        media_year: Some(2008),
+        media_kind: Some(MediaKind::Movie),
     }
 }
 
@@ -92,6 +95,28 @@ fn detail() -> TorrentDetail {
             trust: 41,
         }],
         comments: vec![],
+        media: Some(MediaInfo {
+            media_id: 7,
+            kind: MediaKind::Movie,
+            title: "Big Buck Bunny".into(),
+            original_title: None,
+            year: Some(2008),
+            end_year: None,
+            genres: vec!["Animation".into(), "Short".into()],
+            rating: Some(6.4),
+            votes: Some(1234),
+            runtime_min: Some(10),
+            season: None,
+            episode: None,
+            imdb: Some("tt1254207".into()),
+            tmdb: Some((MediaKind::Movie, 10378)),
+            mal: None,
+            anilist: None,
+            method: "itag".into(),
+            confidence: 1.0,
+            overview: None,
+            poster: Some("/api/v1/media/7/poster".into()),
+        }),
     }
 }
 

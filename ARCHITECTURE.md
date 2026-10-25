@@ -51,6 +51,7 @@ fix one of them in the same change.
 | D34 | Soft crawl trouble that still backs off: a final CLOSED (after the one retry) whose prefix is `blocked`, `rate-limited`, `restricted` (NIP-01) or `auth-required` (NIP-42), case-insensitive, records the visit as a failure even if it inserted events, and nothing more is asked of that relay in the run; a page unanswered for the full 20 s `PAGE_TIMEOUT` is a failure when the visit inserted nothing. A timeout cut short by the crawl deadline counts as budget, not timeout. `error:`/`invalid:`/`unsupported:` CLOSEDs stay soft: they reject one filter (strfry: `ERROR: bad req: unrecognised filter item`), not us. Before, every CLOSED or timeout reset `consecutive_failures` and `next_try_at = now`, so continuous mode (D32) revisited a refusing relay every ~30 s. The saved-search notifier sends **one** ntfy message per poll (`notify::format_digest`; a lone matching search keeps the `format_hits` form): per-search messages exceeded ntfy.sh's 250/day with 3 always-matching searches (3 × 96 polls), now at most 96/day. Supersedes D25's "one message per saved search per poll" | NIP-01 (`CLOSED` prefixes) and NIP-42 (`auth-required:` on REQ), nostr-protocol/nips master, read 2026-10-25; nostr-nips.md §1.5; termux.md §4 (250/day) |
 | D35 | NIP-66 relay discovery (server only, every 6 h): kind 10166 from monitor relays → announced monitor set; kind 30166 **by those authors only**, last 7 days, pages of 500 (D8); verify each; `d` normalized with `normalize_relay(url,false)`; drop non-clearnet (`n` ≠ clearnet, .onion/.i2p/.loki), hex-pubkey `d`, and any relay that **any** monitor tags `R auth` / `R payment`; insert ≤ 2000 new per run as source `nip66`, most monitors first. `N` tags ignored (crawler needs neither NIP-50 nor 77). Defaults relaypag.es, monitorlizard.nostr1.com, relay.nostr.watch, nos.lol, relay.damus.io | nip66.md |
 | D36 | NIP-66 trust (amends D35): anyone can publish a 10166, so announcements alone are not trusted. (a) A built-in **trusted monitor** list (`DEFAULT_TRUSTED_MONITORS`: every announced monitor with > 100 30166 in 7 days on 2026-10-25; env `MAGNETAR_NIP66_TRUSTED`) is always queried in its **own** `authors` filter, before and with a page budget separate from the other announced ("open") monitors, so fresh sybil 10166s cannot evict it (ordering by 10166 recency would: the real fleet's are 80–130 days old). (b) Open monitors: ≤ 250 per filter, ranked by monitor relays carrying the announcement then recency, ≤ 10 pages per relay. (c) An open monitor's `R auth`/`payment` only counts for relays no trusted monitor reports. (d) Relays reported by open monitors only rank after trusted-reported ones and are capped at 100 inserts per run. (e) Each 30166 is verified once across relays and reduced to (monitor, created_at, verdict) right after its page: no event bodies are held during a run | nip66.md §6 |
+| D40 | Metadata enrichment, IMDb part (server only, docs/ENRICHMENT.md): shared tables `media` (lazily created, one row per identified title, unique external ids) + `torrent_media` (one link per infohash: method `itag`/`desc_link`/`offline_title`/`api_search`/`manual`, confidence, `matcher_version`). (a) Strong IDs first, every category, confidence 1.0 (0.9 when a description holds conflicting links of one kind; the first link wins): NIP-35 `i` tags and description links to IMDb/TMDB/TVDB/MAL/AniList/AniDB; a TMDB/MAL-only id gets a torrent-titled media row for D41/D42 to fill. (b) Otherwise, `video` only: `parse-torrent-title` =2.0.2 on the name, then the largest video file (DHT input), exact normalised-title lookup in the IMDb non-commercial datasets (basics + ratings + packed episodes, optional akas), ranked type > year (series run counts as exact) > votes; prefix and pg_trgm fallbacks capped below 0.6. Links under 0.5 are stored but never shown (`MIN_DISPLAY_CONFIDENCE`). (c) Anime is left to D41 except strong IDs; `manual` is never overwritten. (d) Datasets: conditional GET, streamed COPY into UNLOGGED staging tables, atomic swap, refresh every `MAGNETAR_IMDB_REFRESH_HOURS`. (e) Nothing enriched is published to Nostr (IMDb non-commercial terms) and the phone never talks to IMDb/TMDB. Search token `imdb:tt…` / `tmdb:movie:N` / `mal:N` / `media:N`; `GET /api/v1/media/{id}/torrents` | metadata-enrichment.md; measured in docs/ENRICHMENT.md §4 |
 
 ---
 
@@ -96,6 +97,9 @@ core/src/
   relay.rs          RelayConn: WS client (REQ/EOSE/CLOSED/NOTICE/AUTH/OK, NEG-*) [nostr]
   crawler.rs        Crawler<S: Store>: discovery, pagination, cursors          [nostr]
   nip66.rs          NIP-66 relay discovery from monitor events (D35)            [nostr]
+  enrich/ids.rs     strong IDs from i tags + description links, search tokens (D40) [imdb]
+  enrich/parse.rs   release-name parsing, parse-torrent-title (feature `enrich`)  [imdb]
+  enrich/imdb_match.rs  IMDb candidate ranking (feature `enrich`)               [imdb]
   wot.rs            follow/mute/report extraction from kinds 3/10000/30007/1984/10002 [trust-sync]
   trust.rs          score computation (pure) + TrustEngine<S>                  [trust-sync]
   sync.rs           negentropy initiator (Up) + batch fallback, SyncSource trait [trust-sync]
@@ -240,6 +244,9 @@ pub struct TorrentSummary {
     pub trust: u8, pub pow_bits: u8, pub publisher_count: u32,
     pub source_url: Option<String>, pub rank: f32,
     pub pinned: bool, pub hidden: bool,                    // phone-local flags (server always false)
+    #[serde(default)] pub media_title: Option<String>,     // D40, only links ≥ MIN_DISPLAY_CONFIDENCE
+    #[serde(default)] pub media_year: Option<i32>,
+    #[serde(default)] pub media_kind: Option<MediaKind>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TorrentDetail {
@@ -249,6 +256,17 @@ pub struct TorrentDetail {
     pub magnet: String, pub liveness: Option<Liveness>, pub trust: TrustScore,
     pub events: Vec<EventRef>,            // every event that published this infohash
     pub comments: Vec<Comment>,
+    #[serde(default)] pub media: Option<MediaInfo>,        // D40
+}
+#[serde(rename_all = "snake_case")] pub enum MediaKind { Movie, Series, Anime }
+pub struct MediaInfo {
+    pub media_id: i64, pub kind: MediaKind, pub title: String, pub original_title: Option<String>,
+    pub year: Option<i32>, pub end_year: Option<i32>, pub genres: Vec<String>, pub rating: Option<f32>,
+    pub votes: Option<u32>, pub runtime_min: Option<i32>,
+    pub season: Option<i32>, pub episode: Option<i32>,     // of this torrent
+    pub imdb: Option<String>, pub tmdb: Option<(MediaKind, u32)>, pub mal: Option<u32>, pub anilist: Option<u32>,
+    pub method: String, pub confidence: f32,
+    pub overview: Option<String>, pub poster: Option<String>,  // D42; poster = "/api/v1/media/{id}/poster"
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct EventRef { pub event_id: Hex32, pub pubkey: Hex32, pub npub: String, pub created_at: i64, pub title: String, pub trust: u8 }
@@ -369,6 +387,7 @@ Auth: `Authorization: Bearer <MAGNETAR_API_TOKEN>` on everything except `GET /he
 | `GET /api/v1/search` | `SearchQuery` as query string: `q, cat` (repeatable/comma), `min_size, max_size, since, until, min_seeders, hide_dead, min_trust, sort, desc, limit, offset` | `SearchPage` |
 | `POST /api/v1/search` | `SearchQuery` JSON | `SearchPage` |
 | `GET /api/v1/torrents/{infohash}` | | `TorrentDetail` / 404 |
+| `GET /api/v1/media/{id}/torrents` | search query string (`sort`, `limit`, `q`, …) | `SearchPage` of the torrents linked to one media row (D40) |
 | `POST /api/v1/torrents/{infohash}/liveness` | | `Liveness` (forces a check now) |
 | `POST /api/v1/events/batch` | `{"events":[RawEvent...]}` (≤ 500) | `{"results":[{"id":..,"accepted":bool,"duplicate":bool,"message":".."}]}` |
 | `GET /api/v1/stats` | | `StoreStats` + `{"crawler":{"running":bool,"last_run":i64,"last_report":CrawlReport,"passes":u64,"last_error":str,"next_run":i64}}` |
@@ -498,10 +517,13 @@ Env/config: `DATABASE_URL`, `MAGNETAR_BIND` (default `127.0.0.1:8787`), `MAGNETA
 serve), `MAGNETAR_ROOT_NPUB`, `MAGNETAR_NTFY_URL`, `MAGNETAR_NTFY_TOPIC`, `MAGNETAR_DOWNLOAD_DIR`,
 `MAGNETAR_CRAWL_INTERVAL_SECS` (default 900, 0 = continuous, D32), `MAGNETAR_CRAWL_MAX_RELAYS` (30),
 `MAGNETAR_CRAWL_EXPLORE_RELAYS` (10), `MAGNETAR_SEED_RELAYS` (comma), `MAGNETAR_NIP66` (default true),
-`MAGNETAR_NIP66_MONITORS` (comma), `MAGNETAR_NIP66_TRUSTED` (comma), `RUST_LOG`.
+`MAGNETAR_NIP66_MONITORS` (comma), `MAGNETAR_NIP66_TRUSTED` (comma), `MAGNETAR_IMDB` (default true),
+`MAGNETAR_IMDB_AKAS` (false), `MAGNETAR_DATASET_DIR` (`<state dir>/datasets`), `MAGNETAR_IMDB_REFRESH_HOURS` (168), `RUST_LOG`.
+`magnetar-server enrich [--reimport] [--rematch]` refreshes the datasets, links everything due and prints a JSON report (D40).
 `serve` runs: API + relay endpoint, crawler loop, liveness loop (batch of due infohashes every 5 min),
 trust recompute (on graph_version change, else every 6 h), saved-search notifier (after a crawl, at most every 15 min), NIP-66
-relay discovery (startup, then every 6 h; D35).
+relay discovery (startup, then every 6 h; D35), enrichment (new torrents within a minute, dataset refresh check
+after the first drain, then every `MAGNETAR_IMDB_REFRESH_HOURS`; D40).
 sqlx pool ≤ 5 (Termux phantom-process budget). `selftest` checks DB, DNS, TLS (fetch NIP-11 of a seed relay), UDP.
 
 Seed relays (nostr-nips.md §4.5): `wss://nostr.oxtr.dev, wss://relay.nostr.net, wss://nos.lol,

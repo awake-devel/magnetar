@@ -8,6 +8,8 @@ license.workspace = true
 [features]
 default = []
 downloads = ["dep:librqbit"]
+# Title parsing + IMDb ranking (server only; keeps the phone library small).
+enrich = ["dep:parse-torrent-title", "dep:unicode-normalization"]
 
 [dependencies]
 nostr.workspace = true
@@ -31,6 +33,8 @@ url.workspace = true
 percent-encoding.workspace = true
 data-encoding.workspace = true
 librqbit = { workspace = true, optional = true }
+parse-torrent-title = { workspace = true, optional = true }
+unicode-normalization = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

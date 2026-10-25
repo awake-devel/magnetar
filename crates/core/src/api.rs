@@ -138,6 +138,22 @@ impl ApiClient {
             Ok(r) => Ok(Some(r.json().await?)),
         }
     }
+    /// Other releases of one identified title (`GET /api/v1/media/{id}/torrents`, D40),
+    /// best seeded first.
+    pub async fn media_torrents(
+        &self,
+        media_id: i64,
+        limit: u32,
+        offset: u32,
+    ) -> crate::Result<SearchPage> {
+        let path = format!("/api/v1/media/{media_id}/torrents");
+        let query = [
+            ("sort", "seeders".to_string()),
+            ("limit", limit.to_string()),
+            ("offset", offset.to_string()),
+        ];
+        self.json(self.req(Method::GET, &path).query(&query)).await
+    }
     pub async fn refresh_liveness(&self, infohash: &str) -> crate::Result<Liveness> {
         let path = format!("/api/v1/torrents/{}/liveness", encode(infohash));
         self.json(self.req(Method::POST, &path)).await

@@ -10,6 +10,7 @@ magnetar-server serve                 # API + /relay endpoint + crawler, livenes
 magnetar-server migrate               # apply sqlx migrations (idempotent)
 magnetar-server crawl-once [--seconds N]
 magnetar-server selftest              # DB, DNS, TLS (NIP-11 of a seed relay), UDP
+magnetar-server enrich [--reimport] [--rematch]   # refresh IMDb datasets, link all pending torrents, JSON report
 magnetar-server --version
 ```
 
@@ -32,6 +33,10 @@ magnetar-server --version
 | `MAGNETAR_NIP66_MONITORS` | `wss://relaypag.es, wss://monitorlizard.nostr1.com, wss://relay.nostr.watch, wss://nos.lol, wss://relay.damus.io` | comma-separated relays queried for kind 10166/30166 monitor events |
 | `MAGNETAR_NIP66_TRUSTED` | built-in list of 12 monitor pubkeys (`nip66::DEFAULT_TRUSTED_MONITORS`) | comma-separated hex pubkeys of trusted NIP-66 monitors. They get their own request and page budget, and only relays they report escape the cap of 100 new relays per run from other announced monitors (ARCHITECTURE.md D36) |
 | `RUST_LOG` | `info` (Termux env) | tracing `EnvFilter` syntax, e.g. `info,magnetar_core=debug` |
+| `MAGNETAR_IMDB` | `true` | Offline IMDb identification (D40, docs/ENRICHMENT.md): downloads the IMDb non-commercial datasets (~293 MB: title.basics, title.ratings, title.episode) and imports them (~585 MB in Postgres). `false` keeps strong-ID linking (i tags, description links) and skips all downloads |
+| `MAGNETAR_IMDB_AKAS` | `false` | Also import `title.akas` (+519 MB download, +~300 MB in Postgres, import ~4.5 min instead of ~1.5): localised titles, +2.8 points correct on French YGG releases |
+| `MAGNETAR_DATASET_DIR` | `<state dir>/datasets` (`$XDG_STATE_HOME/magnetar/datasets` or `~/.local/state/magnetar/datasets`) | Where dataset files are kept between refreshes (conditional GET; a `<file>.last-modified` sidecar stores the server's date) |
+| `MAGNETAR_IMDB_REFRESH_HOURS` | `168` | Conditional re-download every N hours; the tables are rebuilt and swapped only when a file changed (or the UNLOGGED tables were emptied by a crash) |
 
 `GET /api/v1/stats` reports the crawler under `crawler`: `running`, `last_run` (unix end time of
 the last pass), `last_report`, `passes` since start, `last_error` and `next_run` (while pausing).

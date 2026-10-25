@@ -603,6 +603,12 @@ impl Store for PgStore {
         .execute(&mut *tx)
         .await
         .map_err(db)?;
+        // A new event may carry new links: let the enricher look at the infohash again (D40).
+        sqlx::query("DELETE FROM enrich_checked WHERE infohash = $1")
+            .bind(&t.infohash)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
         tx.commit().await.map_err(db)?;
         self.publish(raw);
         Ok(true)
@@ -1084,6 +1090,7 @@ impl Store for PgStore {
         publishers.sort_unstable();
         publishers.dedup();
         let total_size = canon.total_size.and_then(|s| u64::try_from(s).ok());
+        let media = crate::enrich::media_for_infohash(&self.pool, infohash).await?;
         let summary = TorrentSummary {
             infohash: infohash.to_string(),
             event_id: canon.event_id.clone(),
@@ -1104,6 +1111,9 @@ impl Store for PgStore {
             rank: 0.0,
             pinned: false,
             hidden: false,
+            media_title: media.as_ref().map(|m| m.title.clone()),
+            media_year: media.as_ref().and_then(|m| m.year),
+            media_kind: media.as_ref().map(|m| m.kind),
         };
         let events = rows
             .iter()
@@ -1130,6 +1140,7 @@ impl Store for PgStore {
             trust,
             events,
             comments: comments.into_iter().map(Into::into).collect(),
+            media,
         }))
     }
 

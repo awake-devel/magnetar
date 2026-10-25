@@ -5,6 +5,7 @@ pub mod api;
 pub mod crawler;
 #[cfg(feature = "downloads")]
 pub mod downloads;
+pub mod enrich;
 pub mod error;
 pub mod http;
 pub mod ingest;

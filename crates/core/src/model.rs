@@ -343,6 +343,13 @@ pub struct TorrentSummary {
     pub rank: f32,
     pub pinned: bool,
     pub hidden: bool,
+    /// Linked title (D40), only when the link is confident enough to show.
+    #[serde(default)]
+    pub media_title: Option<String>,
+    #[serde(default)]
+    pub media_year: Option<i32>,
+    #[serde(default)]
+    pub media_kind: Option<MediaKind>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -369,6 +376,85 @@ pub struct TorrentDetail {
     pub trust: TrustScore,
     pub events: Vec<EventRef>,
     pub comments: Vec<Comment>,
+    /// Identified film/series/anime (D40); None when unknown or below the display threshold.
+    #[serde(default)]
+    pub media: Option<MediaInfo>,
+}
+
+/// What a `media` row describes (D40).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaKind {
+    Movie,
+    Series,
+    Anime,
+}
+
+impl MediaKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MediaKind::Movie => "movie",
+            MediaKind::Series => "series",
+            MediaKind::Anime => "anime",
+        }
+    }
+}
+
+impl std::str::FromStr for MediaKind {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "movie" => Ok(MediaKind::Movie),
+            "series" => Ok(MediaKind::Series),
+            "anime" => Ok(MediaKind::Anime),
+            _ => Err(Error::Invalid(format!("unknown media kind {s}"))),
+        }
+    }
+}
+
+/// A torrent's identified title, from the server's `media` + `torrent_media` rows (D40).
+/// Enriched data is never republished to Nostr (IMDb/TMDB terms, metadata-enrichment.md §5).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct MediaInfo {
+    pub media_id: i64,
+    pub kind: MediaKind,
+    pub title: String,
+    #[serde(default)]
+    pub original_title: Option<String>,
+    #[serde(default)]
+    pub year: Option<i32>,
+    #[serde(default)]
+    pub end_year: Option<i32>,
+    #[serde(default)]
+    pub genres: Vec<String>,
+    #[serde(default)]
+    pub rating: Option<f32>,
+    #[serde(default)]
+    pub votes: Option<u32>,
+    #[serde(default)]
+    pub runtime_min: Option<i32>,
+    /// Season/episode of this torrent (from its name or link), not of the title.
+    #[serde(default)]
+    pub season: Option<i32>,
+    #[serde(default)]
+    pub episode: Option<i32>,
+    #[serde(default)]
+    pub imdb: Option<String>,
+    /// (Movie, id) = themoviedb.org/movie/id, (Series, id) = themoviedb.org/tv/id.
+    #[serde(default)]
+    pub tmdb: Option<(MediaKind, u32)>,
+    #[serde(default)]
+    pub mal: Option<u32>,
+    #[serde(default)]
+    pub anilist: Option<u32>,
+    /// "itag" | "desc_link" | "offline_title" | "api_search" | "manual"
+    pub method: String,
+    pub confidence: f32,
+    #[serde(default)]
+    pub overview: Option<String>,
+    /// Server-relative URL such as `/api/v1/media/{id}/poster`.
+    #[serde(default)]
+    pub poster: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
