@@ -3,7 +3,7 @@
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::Duration;
 
-use magnetar_core::api::ApiClient;
+use magnetar_core::api::{ApiClient, Fetched};
 use magnetar_core::crawler::{CrawlConfig, DEFAULT_SEED_RELAYS};
 use magnetar_core::model::{SavedSearch, TorrentSummary, parse_pubkey};
 use magnetar_core::query::{SearchPage, SearchQuery, Sort};
@@ -29,6 +29,8 @@ pub struct State {
 pub struct Inner {
     pub store: Arc<SqliteStore>,
     state: RwLock<State>,
+    /// Poster files fetched from the server (next to the database).
+    pub poster_dir: std::path::PathBuf,
     #[cfg(feature = "downloads")]
     engine: tokio::sync::Mutex<Option<Arc<magnetar_core::downloads::Downloader>>>,
 }
@@ -62,8 +64,92 @@ impl Inner {
                 api: None,
                 root: None,
             }),
+            poster_dir: "posters".into(),
             #[cfg(feature = "downloads")]
             engine: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn with_poster_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.poster_dir = dir;
+        self
+    }
+
+    /// See `Magnetar::media_poster`.
+    pub async fn media_poster(&self, media_id: i64, url: &str) -> Result<Option<String>, FfiError> {
+        if !magnetar_core::api::is_api_path(url) {
+            return Err(FfiError::Invalid {
+                msg: format!("not a server poster URL: {url:?}"),
+            });
+        }
+        let now = magnetar_core::now();
+        let cached = self
+            .store
+            .poster(media_id, now)?
+            .filter(|p| std::path::Path::new(&p.file).is_file());
+        let fresh = cached
+            .as_ref()
+            .is_some_and(|p| now - p.fetched_at < crate::media::POSTER_REFRESH_SECS);
+        let Some(api) = self.api().filter(|_| !fresh) else {
+            return Ok(cached.map(|p| p.file));
+        };
+        let etag = cached.as_ref().and_then(|p| p.etag.clone());
+        let fetched = match api.get_bytes(url, etag.as_deref()).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::debug!("poster {media_id}: {e}");
+                return Ok(cached.map(|p| p.file));
+            }
+        };
+        match fetched {
+            Some(Fetched::NotModified) => {
+                self.store.touch_poster(media_id, now)?;
+                Ok(cached.map(|p| p.file))
+            }
+            Some(Fetched::Body {
+                bytes,
+                content_type,
+                etag,
+            }) => {
+                let ext = match content_type.as_deref().unwrap_or("") {
+                    t if t.starts_with("image/png") => "png",
+                    t if t.starts_with("image/webp") => "webp",
+                    t if t.starts_with("image/jpeg") => "jpg",
+                    other => {
+                        return Err(FfiError::Invalid {
+                            msg: format!("poster content-type {other:?}"),
+                        });
+                    }
+                };
+                let io = |e: std::io::Error| FfiError::Other {
+                    msg: format!("poster cache: {e}"),
+                };
+                std::fs::create_dir_all(&self.poster_dir).map_err(io)?;
+                let file = self.poster_dir.join(format!("{media_id}.{ext}"));
+                let tmp = self.poster_dir.join(format!("{media_id}.tmp"));
+                std::fs::write(&tmp, &bytes).map_err(io)?;
+                std::fs::rename(&tmp, &file).map_err(io)?;
+                if let Some(old) = &cached
+                    && std::path::Path::new(&old.file) != file
+                {
+                    let _ = std::fs::remove_file(&old.file);
+                }
+                let file = file.to_string_lossy().into_owned();
+                self.store
+                    .put_poster(media_id, &file, etag.as_deref(), bytes.len() as u64, now)?;
+                for f in self.store.evict_posters(crate::media::POSTER_CACHE_BYTES)? {
+                    let _ = std::fs::remove_file(f);
+                }
+                Ok(Some(file))
+            }
+            None => {
+                // The server no longer has one.
+                if let Some(old) = cached {
+                    let _ = std::fs::remove_file(&old.file);
+                    self.store.forget_poster(media_id)?;
+                }
+                Ok(None)
+            }
         }
     }
 

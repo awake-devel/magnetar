@@ -381,6 +381,31 @@ async fn detail_is_decorated_lazily_and_poster_is_served() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(fake.log.lock().unwrap().len(), calls);
 
+    // Other releases of the same media.
+    let (p2, _) = put(
+        &db.store,
+        torrent(2, 2, NOW, 78, "Game.of.Thrones.S01.Complete"),
+    )
+    .await;
+    link(&db.store, &p2.infohash, show, Some((1, 0))).await;
+    let page: magnetar_core::query::SearchPage = http
+        .get(format!("{base}/api/v1/media/{show}/torrents"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut ihs: Vec<_> = page.hits.iter().map(|h| h.infohash.clone()).collect();
+    ihs.sort();
+    assert_eq!(ihs, vec![p.infohash.clone(), p2.infohash.clone()]);
+    assert!(
+        page.hits
+            .iter()
+            .all(|h| h.media_title.as_deref() == Some("Game of Thrones"))
+    );
+
     let r = http
         .get(format!("{base}/api/v1/media/999999/poster"))
         .bearer_auth(TOKEN)

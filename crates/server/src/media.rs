@@ -6,9 +6,14 @@
 
 use magnetar_core::error::Result;
 use magnetar_core::model::{MediaInfo, MediaKind, TorrentDetail};
+use magnetar_core::query::SearchPage;
+use magnetar_core::store::Store;
 use sqlx::{FromRow, PgPool};
 
-use crate::store::db;
+use crate::store::{PgStore, db};
+
+/// Releases listed by the fallback (one detail lookup each).
+const FALLBACK_RELEASES: i64 = 50;
 
 #[derive(FromRow)]
 struct MediaRow {
@@ -105,4 +110,40 @@ pub async fn fill_if_missing(pool: &PgPool, detail: &mut TorrentDetail) {
         }
         Err(e) => tracing::debug!("media for {}: {e}", detail.summary.infohash),
     }
+}
+
+/// Releases of a media without the `media:N` search token: the linked infohashes' summaries
+/// (blocked publishers already excluded by `torrent_detail`), most peers first.
+pub async fn releases_fallback(store: &PgStore, media_id: i64, now: i64) -> Result<SearchPage> {
+    let ihs: Vec<(String,)> = match sqlx::query_as(
+        "SELECT infohash FROM torrent_media WHERE media_id = $1 ORDER BY matched_at DESC LIMIT $2",
+    )
+    .bind(media_id)
+    .bind(FALLBACK_RELEASES)
+    .fetch_all(store.pool())
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!("releases of media {media_id}: {e}");
+            Vec::new()
+        }
+    };
+    let mut hits = Vec::new();
+    for (ih,) in ihs {
+        if let Some(mut d) = store.torrent_detail(&ih, now).await? {
+            fill_if_missing(store.pool(), &mut d).await;
+            hits.push(d.summary);
+        }
+    }
+    hits.sort_by(|a, b| {
+        b.seeders
+            .cmp(&a.seeders)
+            .then(b.created_at.cmp(&a.created_at))
+    });
+    Ok(SearchPage {
+        total: hits.len() as u64,
+        hits,
+        source: "server".into(),
+    })
 }
