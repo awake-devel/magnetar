@@ -42,6 +42,14 @@ pub enum Command {
 pub struct Config {
     #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
     pub database_url: Option<String>,
+    /// Maximum pooled Postgres connections (sqlx).
+    #[arg(
+        long,
+        env = "MAGNETAR_DB_POOL",
+        default_value_t = crate::store::DEFAULT_MAX_CONNECTIONS,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub db_pool: u32,
     #[arg(long, env = "MAGNETAR_BIND", default_value = "127.0.0.1:8787")]
     pub bind: SocketAddr,
     #[arg(long, env = "MAGNETAR_API_TOKEN", hide_env_values = true)]
@@ -149,6 +157,8 @@ mod tests {
         assert!(matches!(cli.command, Command::CrawlOnce { seconds: 30 }));
         assert_eq!(cli.config.seed_relays(), vec!["wss://a", "wss://b"]);
         assert!(!cli.config.downloads);
+        assert_eq!(cli.config.db_pool, crate::store::DEFAULT_MAX_CONNECTIONS);
+        assert!(Cli::try_parse_from(["magnetar-server", "--db-pool", "0", "serve"]).is_err());
         assert!(Cli::try_parse_from(["magnetar-server", "bogus"]).is_err());
     }
 

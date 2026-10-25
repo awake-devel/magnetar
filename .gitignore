@@ -6,3 +6,4 @@ target/
 /android/app/src/main/jniLibs/
 /dist/
 *.apk
+/.env

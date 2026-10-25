@@ -1,0 +1,4 @@
+# Shell scripts run inside containers and Linux hosts: a CRLF checkout (Git for Windows'
+# core.autocrlf=true) would break their shebang lines, so they are always LF (D37a).
+*.sh text eol=lf
+docker/** text eol=lf

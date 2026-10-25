@@ -1,0 +1,94 @@
+# Magnetar server + Postgres (docs/DOCKER.md, ARCHITECTURE.md D37).
+#
+#   cp .env.example .env      # then set POSTGRES_PASSWORD and MAGNETAR_API_TOKEN
+#   docker compose up -d      # pulls ghcr.io/awake-devel/magnetar (or: up -d --build)
+#   curl http://127.0.0.1:8787/health
+#
+# Optional Tailscale HTTPS front end: docker compose --profile tailscale up -d
+# Only the variables listed under magnetar.environment reach the server container; TS_AUTHKEY
+# and POSTGRES_PASSWORD stay out of it (DATABASE_URL already carries the password).
+
+services:
+  db:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-magnetar}
+      POSTGRES_DB: ${POSTGRES_DB:-magnetar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set. Copy .env.example to .env and set it (openssl rand -hex 24)}
+    volumes:
+      # postgres:18 keeps PGDATA in /var/lib/postgresql/18/docker: mount the parent so a
+      # future major upgrade (pg_upgrade --link) sees both versions on one volume.
+      - db-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    # No published port: only the magnetar service talks to Postgres, over the compose network.
+
+  magnetar:
+    image: ghcr.io/awake-devel/magnetar:${MAGNETAR_VERSION:-latest}
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    # No env_file: .env also holds TS_AUTHKEY, which must not end up in this container.
+    # A bare name passes the value from .env (or the shell) and is unset in the container when
+    # missing there. That also hides an image ENV of the same name, hence RUST_LOG's default.
+    # A server variable not listed here goes in compose.override.yml (docs/DOCKER.md).
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-magnetar}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-magnetar}}
+      MAGNETAR_API_TOKEN: ${MAGNETAR_API_TOKEN:?MAGNETAR_API_TOKEN is not set. Put a long random token in .env (openssl rand -hex 32)}
+      MAGNETAR_DB_POOL: ${MAGNETAR_DB_POOL:-10}
+      MAGNETAR_ROOT_NPUB:
+      MAGNETAR_SEED_RELAYS:
+      MAGNETAR_CRAWL_INTERVAL_SECS:
+      MAGNETAR_CRAWL_MAX_RELAYS:
+      MAGNETAR_CRAWL_EXPLORE_RELAYS:
+      MAGNETAR_NIP66:
+      MAGNETAR_NIP66_MONITORS:
+      MAGNETAR_NIP66_TRUSTED:
+      MAGNETAR_DOWNLOADS:
+      MAGNETAR_NTFY_URL:
+      MAGNETAR_NTFY_TOPIC:
+      RUST_LOG: ${RUST_LOG:-info}
+    # Image default is 10001:10001. Set to your own uid:gid when MAGNETAR_DATA is a host folder.
+    user: ${MAGNETAR_UID:-10001}:${MAGNETAR_GID:-10001}
+    volumes:
+      # A named volume by default; set MAGNETAR_DATA to a host path (e.g. /volume1/magnetar on
+      # Synology) to keep downloads in a share. It holds downloads/ and state/.
+      - ${MAGNETAR_DATA:-magnetar-data}:/data
+    ports:
+      # 127.0.0.1 only by default: the API is token protected but plain HTTP. Use 0.0.0.0:8787
+      # (or a LAN address) only on a trusted network, or put HTTPS (Tailscale, a proxy) in front.
+      - ${MAGNETAR_PUBLISH:-127.0.0.1:8787}:8787
+
+  # Optional: expose the API on your tailnet as https://<TS_HOSTNAME>.<tailnet>.ts.net
+  # (Tailscale terminates TLS with a real certificate). Needs TS_AUTHKEY in .env.
+  # Start with: docker compose --profile tailscale up -d
+  tailscale:
+    image: tailscale/tailscale:v1.102.5
+    profiles: [tailscale]
+    restart: unless-stopped
+    hostname: ${TS_HOSTNAME:-magnetar}
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_HOSTNAME: ${TS_HOSTNAME:-magnetar}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SERVE_CONFIG: /config/serve.json
+      # Userspace networking: no /dev/net/tun, no NET_ADMIN (works on Synology and Docker Desktop).
+      TS_USERSPACE: "true"
+      TS_EXTRA_ARGS: ${TS_EXTRA_ARGS:-}
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - ./docker/tailscale-serve.json:/config/serve.json:ro
+    depends_on:
+      - magnetar
+
+volumes:
+  db-data:
+  magnetar-data:
+  tailscale-state:

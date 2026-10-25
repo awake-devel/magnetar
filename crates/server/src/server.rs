@@ -38,7 +38,7 @@ async fn shutdown_signal() {
 
 /// Connect and migrate (every entry point runs migrations first).
 pub async fn open_store(cfg: &Config) -> anyhow::Result<Arc<PgStore>> {
-    let store = PgStore::connect(cfg.database_url()?)
+    let store = PgStore::connect(cfg.database_url()?, cfg.db_pool)
         .await
         .context("connect to Postgres")?;
     store.migrate().await?;

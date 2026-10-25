@@ -1,0 +1,9 @@
+# The image only needs the Rust workspace (see Dockerfile). Everything else stays out of the
+# build context so docs, the Android project or a local target/ never invalidate the cache.
+**
+!Cargo.toml
+!Cargo.lock
+!crates/
+!docker/
+# Tests and fixtures are not compiled by `cargo build -p magnetar-server --bin magnetar-server`.
+crates/*/tests/
