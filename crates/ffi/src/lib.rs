@@ -7,6 +7,18 @@ uniffi::setup_scaffolding!();
 
 use std::sync::Arc;
 
+use magnetar_core::liveness::{self, LivenessConfig};
+use magnetar_core::model::{OverrideAction, SavedSearch, is_hex32, npub, parse_pubkey};
+use magnetar_core::{crawler, magnet, notify, sync, trust};
+
+mod app;
+mod convert;
+mod schema;
+pub mod store;
+
+use app::{Inner, LAST_CRAWL, LAST_SYNC, TRUST_MAX_AGE_SECS, norm_infohash};
+pub use store::SqliteStore;
+
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum FfiError {
     #[error("database: {msg}")]
@@ -282,109 +294,372 @@ pub struct FfiDownload {
 /// One per process. Thread-safe; all heavy work runs on an internal tokio runtime.
 #[derive(uniffi::Object)]
 pub struct Magnetar {
-    _private: (),
+    inner: Arc<Inner>,
+    handle: tokio::runtime::Handle,
+    /// Taken in Drop and shut down in the background (dropping a Runtime inside an async
+    /// context would panic).
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl Drop for Magnetar {
+    fn drop(&mut self) {
+        if let Some(rt) = self.runtime.take() {
+            rt.shutdown_background();
+        }
+    }
 }
 
 #[uniffi::export(async_runtime = "tokio")]
 impl Magnetar {
     #[uniffi::constructor]
     pub fn open(db_path: String, config: FfiConfig) -> Result<Arc<Self>, FfiError> {
-        let _ = (db_path, config);
-        todo!()
+        magnetar_core::http::install_crypto_provider();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .thread_name("magnetar")
+            .enable_all()
+            .build()
+            .map_err(|e| FfiError::Other {
+                msg: format!("tokio runtime: {e}"),
+            })?;
+        if let Some(dir) = std::path::Path::new(&db_path).parent()
+            && !dir.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(dir).map_err(|e| FfiError::Db {
+                msg: format!("{}: {e}", dir.display()),
+            })?;
+        }
+        let store = Arc::new(SqliteStore::open(&db_path)?);
+        let inner = Arc::new(Inner::new(store, config.clone()));
+        let this = Magnetar {
+            inner,
+            handle: runtime.handle().clone(),
+            runtime: Some(runtime),
+        };
+        this.set_config(config)?;
+        Ok(Arc::new(this))
     }
+
     pub fn set_config(&self, config: FfiConfig) -> Result<(), FfiError> {
-        let _ = config;
-        todo!()
+        // reqwest wants a runtime context while building its connector.
+        let _guard = self.handle.enter();
+        self.inner.apply_config(config)
     }
+
     pub fn config(&self) -> FfiConfig {
-        todo!()
+        self.inner.state().config.clone()
     }
+
     /// Server first when `prefer_server` and configured; local FTS5 fallback.
     pub async fn search(
         &self,
         query: FfiSearchQuery,
         prefer_server: bool,
     ) -> Result<FfiSearchPage, FfiError> {
-        let _ = (query, prefer_server);
-        todo!()
+        let q = self.inner.query(query);
+        self.run(move |inner| async move {
+            let mut server_error = None;
+            if prefer_server && let Some(api) = inner.api() {
+                match api.search(&q).await {
+                    Ok(mut p) => {
+                        p.source = "server".into();
+                        inner.overlay_flags(&mut p, q.include_hidden)?;
+                        return Ok(convert::page(p, None));
+                    }
+                    Err(e) => server_error = Some(e.to_string()),
+                }
+            }
+            let p = inner.store.search_sync(&q, magnetar_core::now())?;
+            Ok(convert::page(p, server_error))
+        })
+        .await
     }
+
     pub async fn detail(
         &self,
         infohash: String,
         prefer_server: bool,
     ) -> Result<Option<FfiTorrentDetail>, FfiError> {
-        let _ = (infohash, prefer_server);
-        todo!()
+        let ih = norm_infohash(&infohash)?;
+        self.run(move |inner| async move {
+            let now = magnetar_core::now();
+            if prefer_server && let Some(api) = inner.api() {
+                match api.torrent(&ih).await {
+                    Ok(Some(mut d)) => {
+                        // Not cached as events; only the local flags and LRU are applied.
+                        let flags = inner.store.flags(std::slice::from_ref(&ih))?;
+                        let (pinned, hidden) = flags.get(&ih).copied().unwrap_or_default();
+                        d.summary.pinned = pinned;
+                        d.summary.hidden = hidden;
+                        inner.store.touch(&ih, now)?;
+                        return Ok(Some(convert::detail(d, "server")));
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!("server detail {ih}: {e}; using local cache"),
+                }
+            }
+            Ok(inner
+                .store
+                .torrent_detail_sync(&ih, now)?
+                .map(|d| convert::detail(d, "local")))
+        })
+        .await
     }
+
     pub async fn crawl_once(&self, max_seconds: u32) -> Result<FfiCrawlReport, FfiError> {
-        let _ = max_seconds;
-        todo!()
+        let cfg = self.inner.crawl_config(max_seconds);
+        self.run(move |inner| async move {
+            let mut report = crawler::crawl_once(&*inner.store, &cfg).await?;
+            let now = magnetar_core::now();
+            if let Err(e) = trust::recompute(&*inner.store, now, TRUST_MAX_AGE_SECS).await {
+                report.errors.push(format!("trust: {e}"));
+            }
+            inner.store.set_setting_sync(LAST_CRAWL, &now.to_string())?;
+            Ok(report.into())
+        })
+        .await
     }
+
     pub async fn sync_now(&self) -> Result<FfiSyncReport, FfiError> {
-        todo!()
+        let Some(api) = self.inner.api() else {
+            return Ok(FfiSyncReport {
+                method: "none".into(),
+                have: 0,
+                uploaded: 0,
+                duplicates: 0,
+                failed: 0,
+                error: None,
+            });
+        };
+        self.run(move |inner| async move {
+            let report = sync::sync_up(&*inner.store, &api.relay_ws_url(), &api).await?;
+            if report.error.is_none() {
+                inner
+                    .store
+                    .set_setting_sync(LAST_SYNC, &magnetar_core::now().to_string())?;
+            }
+            Ok(report.into())
+        })
+        .await
     }
+
     pub fn cleanup(&self) -> Result<FfiCleanupReport, FfiError> {
-        todo!()
+        let cap_mb = self.inner.state().config.cache_cap_mb as u64;
+        Ok(self.inner.store.cleanup(cap_mb * 1024 * 1024)?.into())
     }
+
     /// Local liveness check (trackers + DHT); also stored in the cache.
     pub async fn check_liveness(&self, infohash: String) -> Result<Option<FfiLiveness>, FfiError> {
-        let _ = infohash;
-        todo!()
+        let ih = norm_infohash(&infohash)?;
+        self.run(move |inner| async move {
+            let mut trackers = inner.store.trackers_of(&ih)?;
+            if trackers.is_empty() {
+                trackers = magnet::DEFAULT_TRACKERS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+            }
+            let now = magnetar_core::now();
+            let results =
+                liveness::check_batch(&[(ih.clone(), trackers)], &LivenessConfig::default(), now)
+                    .await;
+            let Some(l) = results.into_iter().find(|l| l.infohash == ih) else {
+                return Ok(None);
+            };
+            inner.store.put_liveness_sync(&l)?;
+            Ok(Some(l.into()))
+        })
+        .await
     }
+
     pub fn set_pinned(&self, infohash: String, pinned: bool) -> Result<(), FfiError> {
-        let _ = (infohash, pinned);
-        todo!()
+        Ok(self
+            .inner
+            .store
+            .set_pinned(&norm_infohash(&infohash)?, pinned)?)
     }
+
     pub fn set_hidden(&self, infohash: String, hidden: bool) -> Result<(), FfiError> {
-        let _ = (infohash, hidden);
-        todo!()
+        Ok(self
+            .inner
+            .store
+            .set_hidden(&norm_infohash(&infohash)?, hidden)?)
     }
+
     /// Local override + server override when reachable.
     pub async fn block_publisher(&self, pubkey: String, blocked: bool) -> Result<(), FfiError> {
-        let _ = (pubkey, blocked);
-        todo!()
+        let hex = parse_pubkey(&pubkey)?;
+        let action = blocked.then_some(OverrideAction::Block);
+        self.inner.store.set_override_sync(&hex, action)?;
+        // Best effort from here on: rescore (refreshes denormalised trust), then tell the server.
+        let store = self.inner.store.clone();
+        let pk = hex.clone();
+        let rescore = self
+            .handle
+            .spawn(async move { trust::score_publisher(&*store, &pk, magnetar_core::now()).await });
+        match rescore.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!("rescore {hex}: {e}"),
+            Err(e) => tracing::warn!("rescore {hex}: {e}"),
+        }
+        if let Some(api) = self.inner.api() {
+            let pk = hex.clone();
+            let remote = self
+                .handle
+                .spawn(async move { api.set_override(&pk, action).await });
+            match remote.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!("server override {hex}: {e}"),
+                Err(e) => tracing::warn!("server override {hex}: {e}"),
+            }
+        }
+        Ok(())
     }
+
     pub fn saved_searches(&self) -> Result<Vec<FfiSavedSearch>, FfiError> {
-        todo!()
+        Ok(self
+            .inner
+            .store
+            .list_saved_searches_sync()?
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
+
     pub fn save_search(&self, search: FfiSavedSearch) -> Result<i64, FfiError> {
-        let _ = search;
-        todo!()
+        let existing = match search.id {
+            0 => None,
+            id => self.inner.store.get_saved_search(id)?,
+        };
+        let s = SavedSearch {
+            id: search.id,
+            name: search.name,
+            query: search.query.into(),
+            notify: search.notify,
+            last_checked: search.last_checked,
+            last_seen_created_at: existing.and_then(|e| e.last_seen_created_at),
+        };
+        Ok(self.inner.store.put_saved_search_sync(&s)?)
     }
+
     pub fn delete_saved_search(&self, id: i64) -> Result<(), FfiError> {
-        let _ = id;
-        todo!()
+        Ok(self.inner.store.delete_saved_search_sync(id)?)
     }
+
     /// New hits since the last poll for notify=true searches (server if reachable, else local).
     pub async fn poll_saved_searches(&self) -> Result<Vec<FfiSavedSearchHit>, FfiError> {
-        todo!()
+        self.run(move |inner| async move {
+            let now = magnetar_core::now();
+            let api = match inner.api() {
+                Some(api) if api.health().await.is_ok() => Some(api),
+                _ => None,
+            };
+            let results = match api {
+                Some(api) => inner.poll_via_server(&api, now).await?,
+                None => notify::poll_saved_searches(&*inner.store, now).await?,
+            };
+            Ok(results
+                .into_iter()
+                .filter(|(_, hits)| !hits.is_empty())
+                .map(|(s, hits)| FfiSavedSearchHit {
+                    search: s.into(),
+                    new_hits: hits.into_iter().map(Into::into).collect(),
+                })
+                .collect())
+        })
+        .await
     }
+
     pub fn stats(&self) -> Result<FfiStats, FfiError> {
-        todo!()
+        let store = &self.inner.store;
+        let s = store.stats_sync()?;
+        let ts = |key: &str| -> Result<Option<i64>, FfiError> {
+            Ok(store
+                .get_setting_sync(key)?
+                .and_then(|v| v.trim().parse().ok()))
+        };
+        Ok(FfiStats {
+            torrents: s.torrents,
+            events: s.events,
+            publishers: s.publishers,
+            comments: s.comments,
+            relays: s.relays,
+            unsynced: s.unsynced,
+            db_bytes: s.db_bytes,
+            last_crawl: ts(LAST_CRAWL)?,
+            last_sync: ts(LAST_SYNC)?,
+        })
     }
+
     pub fn relays(&self) -> Result<Vec<FfiRelay>, FfiError> {
-        todo!()
+        Ok(self
+            .inner
+            .store
+            .list_relays_sync()?
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
+
     pub fn set_relay_enabled(&self, url: String, enabled: bool) -> Result<(), FfiError> {
-        let _ = (url, enabled);
-        todo!()
+        let url = url.trim();
+        if url.is_empty() {
+            return Err(FfiError::Invalid {
+                msg: "empty relay url".into(),
+            });
+        }
+        Ok(self.inner.store.set_relay_enabled_sync(url, enabled)?)
     }
+
     pub async fn server_health(&self) -> Result<bool, FfiError> {
-        todo!()
+        let Some(api) = self.inner.api() else {
+            return Ok(false);
+        };
+        self.run(move |_| async move {
+            Ok(api
+                .health()
+                .await
+                .map(|h| h.status == "ok")
+                .unwrap_or(false))
+        })
+        .await
     }
+
     /// Phone engine (on_server=false) or server engine. Phone errors with Invalid if librqbit is unavailable.
     pub async fn download_start(
         &self,
         magnet: String,
         on_server: bool,
     ) -> Result<FfiDownload, FfiError> {
-        let _ = (magnet, on_server);
-        todo!()
+        if on_server {
+            let api = self.inner.require_api()?;
+            return self
+                .run(move |_| async move { Ok(api.add_download(&magnet).await?.into()) })
+                .await;
+        }
+        self.run(move |inner| async move {
+            let engine = inner.downloader().await?;
+            Ok(engine.add_magnet(&magnet).await?.into())
+        })
+        .await
     }
+
     pub async fn downloads(&self, on_server: bool) -> Result<Vec<FfiDownload>, FfiError> {
-        let _ = on_server;
-        todo!()
+        if on_server {
+            let api = self.inner.require_api()?;
+            return self
+                .run(move |_| async move {
+                    Ok(api.downloads().await?.into_iter().map(Into::into).collect())
+                })
+                .await;
+        }
+        self.run(move |inner| async move {
+            let engine = inner.downloader().await?;
+            Ok(engine.list().into_iter().map(Into::into).collect())
+        })
+        .await
     }
+
     /// action: "pause" | "resume" | "delete"
     pub async fn download_action(
         &self,
@@ -392,32 +667,86 @@ impl Magnetar {
         action: String,
         on_server: bool,
     ) -> Result<(), FfiError> {
-        let _ = (id, action, on_server);
-        todo!()
+        if !matches!(action.as_str(), "pause" | "resume" | "delete") {
+            return Err(FfiError::Invalid {
+                msg: format!("unknown download action {action:?}"),
+            });
+        }
+        if on_server {
+            let api = self.inner.require_api()?;
+            return self
+                .run(move |_| async move { Ok(api.download_action(id, &action).await?) })
+                .await;
+        }
+        self.run(move |inner| async move {
+            let engine = inner.downloader().await?;
+            match action.as_str() {
+                "pause" => engine.pause(id).await?,
+                "resume" => engine.resume(id).await?,
+                // Keep the files: deleting user data needs its own explicit action.
+                _ => engine.remove(id, false).await?,
+            }
+            Ok(())
+        })
+        .await
     }
+
     /// Pause every phone download and persist (foreground-service onTimeout).
     pub async fn pause_all_downloads(&self) {
-        todo!()
+        let _ = self
+            .run(move |inner| async move {
+                inner.pause_all().await;
+                Ok(())
+            })
+            .await;
+    }
+}
+
+impl Magnetar {
+    /// Run `f` on our multi-thread runtime. uniffi's tokio support only wraps the future in
+    /// async-compat (a single-threaded fallback runtime polled from the foreign thread), so all
+    /// real work is spawned here and the JoinHandle is awaited. Panics become `FfiError::Other`.
+    async fn run<T, F, Fut>(&self, f: F) -> Result<T, FfiError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<Inner>) -> Fut,
+        Fut: Future<Output = Result<T, FfiError>> + Send + 'static,
+    {
+        match self.handle.spawn(f(self.inner.clone())).await {
+            Ok(r) => r,
+            Err(e) => Err(FfiError::Other {
+                msg: format!("task failed: {e}"),
+            }),
+        }
+    }
+
+    /// The store behind this instance (tests, diagnostics).
+    pub fn store(&self) -> &Arc<SqliteStore> {
+        &self.inner.store
     }
 }
 
 #[uniffi::export]
 pub fn npub_encode(hex: String) -> Result<String, FfiError> {
-    let _ = hex;
-    todo!()
+    let hex = hex.trim().to_ascii_lowercase();
+    let out = npub(&hex);
+    if !is_hex32(&hex) || out == hex {
+        return Err(FfiError::Invalid {
+            msg: "pubkey must be 64 hex chars on the curve".into(),
+        });
+    }
+    Ok(out)
 }
 
 /// npub / hex / nprofile / nostr: URI -> hex.
 #[uniffi::export]
 pub fn pubkey_decode(input: String) -> Result<String, FfiError> {
-    let _ = input;
-    todo!()
+    Ok(parse_pubkey(&input)?)
 }
 
 #[uniffi::export]
 pub fn build_magnet(infohash: String, name: Option<String>, trackers: Vec<String>) -> String {
-    let _ = (infohash, name, trackers);
-    todo!()
+    magnet::build_magnet(infohash.trim(), name.as_deref(), &trackers, None)
 }
 
 #[uniffi::export]
