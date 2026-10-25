@@ -452,6 +452,17 @@ impl Magnetar {
     pub async fn check_liveness(&self, infohash: String) -> Result<Option<FfiLiveness>, FfiError> {
         let ih = norm_infohash(&infohash)?;
         self.run(move |inner| async move {
+            // The server knows the torrent's own trackers even when the phone cache does not
+            // (and keeps the result for everyone); scrape locally only without one.
+            if let Some(api) = inner.api() {
+                match api.refresh_liveness(&ih).await {
+                    Ok(l) => {
+                        inner.store.put_liveness_sync(&l)?;
+                        return Ok(Some(l.into()));
+                    }
+                    Err(e) => tracing::warn!("server liveness {ih}: {e}; scraping from the phone"),
+                }
+            }
             let mut trackers = inner.store.trackers_of(&ih)?;
             if trackers.is_empty() {
                 trackers = magnet::DEFAULT_TRACKERS
