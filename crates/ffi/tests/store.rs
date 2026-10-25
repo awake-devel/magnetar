@@ -164,20 +164,36 @@ fn denormalised_trust_matches_event_trust() {
     }
     // Unscored: PoW bonus only.
     for (h, bits) in &ids {
-        assert_eq!(trust_of(&s, h), event_trust(None, *bits));
+        assert_eq!(trust_of(&s, h), event_trust(None, false, *bits));
     }
     for score in [0u8, 1, 20, 90, 99, 100] {
         s.put_trust_sync(&score_of(&pk(1), score)).unwrap();
         for (h, bits) in &ids {
-            let want = event_trust(Some(score), *bits);
+            let want = event_trust(Some(score), false, *bits);
             assert_eq!(trust_of(&s, h), want, "score {score} bits {bits}");
-            if score == 0 || score == 100 {
-                assert_eq!(want, score, "0/100 ignore PoW");
-            }
+            // Same rule as core (and PgStore): only overrides ignore PoW, not a plain 0.
+            let core = magnetar_core::trust::event_trust(&score_of(&pk(1), score), *bits);
+            assert_eq!(want, core, "score {score} bits {bits}");
         }
     }
-    assert_eq!(event_trust(Some(90), 24), 100);
-    assert_eq!(event_trust(Some(20), 16), 32);
+    assert_eq!(event_trust(Some(0), false, 24), 25);
+    assert_eq!(event_trust(Some(90), false, 24), 100);
+    assert_eq!(event_trust(Some(20), false, 16), 32);
+    // An override short-circuits: PoW is ignored.
+    let trusted = TrustScore {
+        factors: vec![TrustFactor {
+            code: "TRUSTED".into(),
+            delta: 100,
+            detail: "trusted by you".into(),
+            evidence: vec![],
+        }],
+        ..score_of(&pk(1), 100)
+    };
+    s.put_trust_sync(&trusted).unwrap();
+    for (h, _) in &ids {
+        assert_eq!(trust_of(&s, h), 100);
+    }
+    assert_eq!(event_trust(Some(0), true, 24), 0);
     // A torrent inserted after the score uses it straight away.
     s.put_trust_sync(&score_of(&pk(1), 40)).unwrap();
     torrent(&ih(999), "late", &pk(1), 100)
@@ -922,4 +938,54 @@ async fn fixture_ingest_parity() {
             "search and detail agree on canonical"
         );
     }
+}
+
+/// Schema V2 repairs `torrents.trust` written by V1's rule (score 0 dropped the PoW bonus) and
+/// leaves override scores alone.
+#[test]
+fn v2_migration_recomputes_zero_score_trust() {
+    let dir = TempDir::new("v2trust");
+    let path = dir.0.join("cache.db");
+    {
+        let s = SqliteStore::open(&path).unwrap();
+        torrent(&ih(1), "plain", &pk(1), 100)
+            .with(|t| t.pow_bits = 24)
+            .put(&s);
+        torrent(&ih(2), "blocked", &pk(2), 100)
+            .with(|t| t.pow_bits = 24)
+            .put(&s);
+        s.put_trust_sync(&score_of(&pk(1), 0)).unwrap();
+        let blocked = TrustScore {
+            factors: vec![TrustFactor {
+                code: "BLOCKED".into(),
+                delta: -100,
+                detail: "blocked by you".into(),
+                evidence: vec![],
+            }],
+            ..score_of(&pk(2), 0)
+        };
+        s.put_trust_sync(&blocked).unwrap();
+    }
+    {
+        // Simulate a V1 database: wrong trust for the plain publisher, version 1.
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute("UPDATE torrents SET trust = 0", []).unwrap();
+        c.pragma_update(None, "user_version", 1).unwrap();
+    }
+    let s = SqliteStore::open(&path).unwrap();
+    let mut query = q("");
+    query.min_trust = Some(0);
+    let page = s.search_sync(&query, 0).unwrap();
+    let trust = |h: &str| page.hits.iter().find(|x| x.infohash == h).map(|x| x.trust);
+    assert_eq!(trust(&ih(1)), Some(25));
+    // Blocked publishers are filtered from search; check the row directly.
+    let c = rusqlite::Connection::open(&path).unwrap();
+    let blocked: i64 = c
+        .query_row(
+            "SELECT trust FROM torrents WHERE infohash = ?1",
+            [ih(2)],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(blocked, 0);
 }

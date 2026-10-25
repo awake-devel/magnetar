@@ -3,7 +3,7 @@
 use rusqlite::Connection;
 
 /// Migration N (1-based) brings `user_version` from N-1 to N. Append only.
-const MIGRATIONS: &[&str] = &[V1];
+const MIGRATIONS: &[&str] = &[V1, V2];
 
 const V1: &str = r#"
 CREATE TABLE events(
@@ -170,6 +170,19 @@ CREATE TABLE sync_ids(
     failure TEXT
 );
 CREATE INDEX sync_ids_unsynced ON sync_ids(synced, created_at);
+"#;
+
+/// Recompute denormalised `torrents.trust`: V1 builds treated any publisher score of 0 as an
+/// override and dropped the PoW bonus (`store::event_trust` has the corrected rule).
+const V2: &str = r#"
+UPDATE torrents SET trust = MIN(100,
+        COALESCE((SELECT c.score FROM trust_cache c WHERE c.pubkey = torrents.pubkey), 0)
+        + (25 * MAX(0, MIN(16, pow_bits - 8))) / 16)
+WHERE NOT EXISTS (
+    SELECT 1 FROM trust_cache c
+    WHERE c.pubkey = torrents.pubkey
+      AND json_array_length(c.factors) = 1
+      AND json_extract(c.factors, '$[0].code') IN ('BLOCKED', 'TRUSTED', 'ROOT_MUTED'));
 "#;
 
 /// Bring the database to the latest schema. A brand-new file gets incremental auto-vacuum so

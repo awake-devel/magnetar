@@ -35,18 +35,20 @@ pub fn backoff_secs(failures: u32) -> i64 {
     (BACKOFF_BASE_SECS << exp).min(MAX_BACKOFF_SECS)
 }
 
-/// Same rule as `core::trust::event_trust`: publisher score + PoW bonus, with 0/100 (overrides,
-/// root mute) ignoring PoW. Unscored publishers count as 0 + PoW bonus.
-pub fn event_trust(score: Option<u8>, pow_bits: u8) -> u8 {
+/// Same rule as `core::trust::event_trust`: publisher score + PoW bonus, except that an
+/// override / root-mute score (`short_circuit`, see `trust::is_short_circuit`) ignores PoW.
+/// A plain score of 0 (e.g. a new publisher) still gets the PoW bonus. Unscored publishers count
+/// as 0 + PoW bonus.
+pub fn event_trust(score: Option<u8>, short_circuit: bool, pow_bits: u8) -> u8 {
     match score {
-        Some(s @ (0 | 100)) => s,
+        Some(s) if short_circuit => s,
         Some(s) => s.saturating_add(trust::pow_bonus(pow_bits)).min(100),
         None => trust::pow_bonus(pow_bits).min(100),
     }
 }
 
-/// SQL twin of `event_trust` for a known score bound as ?1.
-const EVENT_TRUST_SQL: &str = "CASE WHEN ?1 IN (0, 100) THEN ?1 \
+/// SQL twin of `event_trust` for a known score bound as ?1 and the short-circuit flag as ?3.
+const EVENT_TRUST_SQL: &str = "CASE WHEN ?3 THEN ?1 \
      ELSE MIN(100, ?1 + (25 * MAX(0, MIN(16, pow_bits - 8))) / 16) END";
 
 const BEST_PEERS_SQL: &str = "CASE WHEN l.seeders IS NULL AND l.dht_peers_est IS NULL THEN NULL \
@@ -226,15 +228,20 @@ impl SqliteStore {
         if known_id(&tx, &raw.id)? {
             return Ok(false);
         }
-        let score: Option<i64> = tx
+        let cached: Option<TrustScore> = tx
             .query_row(
-                "SELECT score FROM trust_cache WHERE pubkey = ?1",
+                "SELECT score, factors, root, computed_at, graph_version FROM trust_cache
+                 WHERE pubkey = ?1",
                 [&t.pubkey],
-                |r| r.get(0),
+                |r| trust_from_row(&t.pubkey, r),
             )
             .optional()
             .db()?;
-        let trust = event_trust(score.map(|s| s.clamp(0, 100) as u8), t.pow_bits);
+        let trust = event_trust(
+            cached.as_ref().map(|c| c.score.min(100)),
+            cached.as_ref().is_some_and(trust::is_short_circuit),
+            t.pow_bits,
+        );
         insert_event(&tx, raw)?;
         tx.execute(
             "INSERT INTO torrents(event_id, infohash, pubkey, created_at, infohash_v2, title,
@@ -1226,7 +1233,7 @@ impl SqliteStore {
         .db()?;
         tx.execute(
             &format!("UPDATE torrents SET trust = {EVENT_TRUST_SQL} WHERE pubkey = ?2"),
-            params![s.score.min(100), s.pubkey],
+            params![s.score.min(100), s.pubkey, trust::is_short_circuit(s)],
         )
         .db()?;
         tx.commit().db()
