@@ -5,8 +5,8 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
+import androidx.core.net.toUri
 import app.magnetar.MainActivity
 
 /**
@@ -14,7 +14,7 @@ import app.magnetar.MainActivity
  * Returns false (after copying the magnet) when no other app can take it.
  */
 fun openMagnetExternally(context: Context, magnet: String): Boolean {
-    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(magnet)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    val intent = Intent(Intent.ACTION_VIEW, magnet.toUri()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     val others = queryViewers(context, intent).filter { it.packageName != context.packageName }
     return try {
         when (others.size) {

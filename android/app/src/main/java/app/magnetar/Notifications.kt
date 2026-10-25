@@ -7,11 +7,11 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import androidx.core.net.toUri
 import app.magnetar.ffi.FfiSavedSearchHit
 
 object Notifications {
@@ -39,7 +39,7 @@ object Notifications {
             NotificationManagerCompat.from(context).areNotificationsEnabled()
 
     fun torrentIntent(context: Context, infohash: String): PendingIntent {
-        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("magnetar://torrent/$infohash"))
+        val intent = Intent(Intent.ACTION_VIEW, "magnetar://torrent/$infohash".toUri())
             .setPackage(context.packageName)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         return PendingIntent.getActivity(

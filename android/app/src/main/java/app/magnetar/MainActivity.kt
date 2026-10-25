@@ -3,7 +3,6 @@ package app.magnetar
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
@@ -47,7 +46,7 @@ class MainActivity : ComponentActivity() {
     private fun handleIntent(intent: Intent?) {
         if (intent?.action != Intent.ACTION_VIEW) return
         val uri = intent.data ?: return
-        val request = parseOpenUri(uri)
+        val request = parseOpenUri(uri.toString())
         if (request == null) {
             Toast.makeText(this, "Not a BitTorrent v1 magnet link", Toast.LENGTH_LONG).show()
             return
@@ -67,17 +66,5 @@ class MainActivity : ComponentActivity() {
         if (prefs.getBoolean("asked_notifications", false)) return
         prefs.edit { putBoolean("asked_notifications", true) }
         notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
-    }
-
-    companion object {
-        fun parseOpenUri(uri: Uri): OpenRequest? = parseOpenUri(uri.toString())
-
-        fun parseOpenUri(s: String): OpenRequest? = when {
-            s.startsWith("magnet:", ignoreCase = true) -> magnetInfohash(s)?.let { OpenRequest(it, s) }
-            s.startsWith("magnetar://torrent/", ignoreCase = true) ->
-                normalizeInfohash(s.substring("magnetar://torrent/".length).substringBefore('?').trimEnd('/'))
-                    ?.let { OpenRequest(it, null) }
-            else -> null
-        }
     }
 }

@@ -76,4 +76,6 @@ dependencies {
     implementation("androidx.work:work-runtime-ktx:2.12.0")
     implementation("net.java.dev.jna:jna:5.19.1@aar")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
+
+    testImplementation("junit:junit:4.13.2")
 }

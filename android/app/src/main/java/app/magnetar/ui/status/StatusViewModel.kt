@@ -45,8 +45,8 @@ class StatusViewModel(application: Application) : BaseViewModel(application) {
                 _state.update {
                     it.copy(
                         workRunning = running,
-                        lastRun = info.outputData.getStringArray(CrawlSyncWorker.KEY_SUMMARY)?.toList() ?: it.lastRun,
-                        lastRunErrors = info.outputData.getStringArray(CrawlSyncWorker.KEY_ERRORS)?.toList()
+                        lastRun = info.outputData.getNullableStringArray(CrawlSyncWorker.KEY_SUMMARY)?.filterNotNull() ?: it.lastRun,
+                        lastRunErrors = info.outputData.getNullableStringArray(CrawlSyncWorker.KEY_ERRORS)?.filterNotNull()
                             ?: it.lastRunErrors,
                     )
                 }

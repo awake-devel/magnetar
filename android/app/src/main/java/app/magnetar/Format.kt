@@ -92,3 +92,12 @@ private fun base32ToHex(s: String): String? {
     }
     return out.toString().takeIf { it.length == 40 }
 }
+
+/** A magnet: link or a magnetar://torrent/<infohash> deep link, else null. */
+fun parseOpenUri(s: String): OpenRequest? = when {
+    s.startsWith("magnet:", ignoreCase = true) -> magnetInfohash(s)?.let { OpenRequest(it, s) }
+    s.startsWith("magnetar://torrent/", ignoreCase = true) ->
+        normalizeInfohash(s.substring("magnetar://torrent/".length).substringBefore('?').trimEnd('/'))
+            ?.let { OpenRequest(it, null) }
+    else -> null
+}

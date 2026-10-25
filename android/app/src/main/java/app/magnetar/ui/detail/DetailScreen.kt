@@ -19,8 +19,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.KeyboardArrowDown
-import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
@@ -409,7 +409,7 @@ private fun TrustCard(trust: FfiTrust, threshold: Int, open: Boolean, onToggle: 
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Trust", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
                 TrustBadge(trust.score.toInt(), threshold)
-                Icon(if (open) Icons.Filled.KeyboardArrowDown else Icons.Filled.KeyboardArrowRight, null)
+                Icon(if (open) Icons.Filled.KeyboardArrowDown else Icons.AutoMirrored.Filled.KeyboardArrowRight, null)
             }
             if (open) {
                 trust.root?.let { Text("Relative to root ${shortKey(it)}", style = MaterialTheme.typography.bodySmall) }
