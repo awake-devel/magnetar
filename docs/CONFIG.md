@@ -6,7 +6,7 @@ The authoritative definition is ARCHITECTURE.md §4 (setting keys), §8.1 (`FfiC
 ## Server: `magnetar-server`
 
 ```
-magnetar-server serve                 # API + /relay endpoint + crawler, liveness, trust, notifier loops
+magnetar-server serve                 # API + /relay endpoint + crawler, liveness, trust, notifier, NIP-66 loops
 magnetar-server migrate               # apply sqlx migrations (idempotent)
 magnetar-server crawl-once [--seconds N]
 magnetar-server selftest              # DB, DNS, TLS (NIP-11 of a seed relay), UDP
@@ -26,6 +26,8 @@ magnetar-server --version
 | `MAGNETAR_DOWNLOAD_DIR` | Termux env: `~/storage/downloads/magnetar` if `termux-setup-storage` was run, else `~/magnetar/downloads` | librqbit output for server downloads |
 | `MAGNETAR_CRAWL_INTERVAL_SECS` | `900` | |
 | `MAGNETAR_SEED_RELAYS` | built-in list | comma-separated `wss://` URLs |
+| `MAGNETAR_NIP66` | `true` | NIP-66 relay discovery with `serve`: at startup, then every 6 h, new relays from monitor events are added with source `nip66` (ARCHITECTURE.md D30) |
+| `MAGNETAR_NIP66_MONITORS` | `wss://relaypag.es, wss://monitorlizard.nostr1.com, wss://relay.nostr.watch, wss://nos.lol, wss://relay.damus.io` | comma-separated relays queried for kind 10166/30166 monitor events |
 | `RUST_LOG` | `info` (Termux env) | tracing `EnvFilter` syntax, e.g. `info,magnetar_core=debug` |
 
 The Termux setup also writes these:

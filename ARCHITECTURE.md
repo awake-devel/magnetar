@@ -24,7 +24,7 @@ fix one of them in the same change.
 | D7 | Kind 2004 accepted only if it references (e/E tag) a known 2003; kind 1111 with `K=2003` ingested as comment too | nostr-nips.md §2.5 |
 | D8 | Pagination: `until = min(created_at)` (inclusive, dedup), strictly decreasing, stop on a page with 0 new events; never trust "page < limit" | nostr-nips.md §1.7 |
 | D9 | Cursors per (relay, kind): `newest_seen` (forward, overlap 1 h) + `backfill_until` (history not finished) | nostr-nips.md §1.7 |
-| D10 | Relay discovery: seed list ∪ NIP-65 lists of publishers ∪ kind-3 legacy maps ∪ tag hints; own normalizer; oversized lists (>50 r) penalised and not used | wot-relays.md §3, §5 |
+| D10 | Relay discovery: seed list ∪ NIP-65 lists of publishers ∪ kind-3 legacy maps ∪ tag hints ∪ NIP-66 monitors (D30); own normalizer; oversized lists (>50 r) penalised and not used | wot-relays.md §3, §5 |
 | D11 | Postgres search: generated `tsvector` (`simple` on title/files with separator regexp, `english` on description) + `pg_trgm` `<%` word_similarity fallback | rust-crates.md §9 |
 | D12 | SQLite search: FTS5 external content, `unicode61 remove_diacritics 2 separators '._-[]()'`, sanitized query tokens | rust-crates.md §5 |
 | D13 | NIP-77: own relay side (axum WS + `negentropy` 0.5.2), own initiator on phone; frame limit 60 000; max 500 000 items per NEG-OPEN | negentropy.md §1, §5 |
@@ -44,6 +44,7 @@ fix one of them in the same change.
 | D28 | librqbit 9.0.1 `rust-tls` still pulls **aws-lc-rs** (its `sha1-ring` feature maps to aws-lc, and its reqwest uses default rustls + platform-verifier). Accepted for the `downloads` feature only; it cross-compiles with cargo-ndk (android.md §4). Because rustls then has two providers, our code must always use `builder_with_provider(ring)` and call `http::install_crypto_provider()` at startup. librqbit's own HTTPS tracker requests may fail on Android (platform verifier without JNI init): UDP trackers + DHT still work | verified via `cargo tree -i aws-lc-rs` |
 | D29 | `crates/core/src/store.rs` is the authoritative Store trait (§4 is a summary) | |
 | D27 | Downloads: librqbit on server; on phone see §8 (spike result recorded there) with fallback = `ACTION_VIEW magnet:` intent | android.md |
+| D30 | NIP-66 relay discovery (server only, every 6 h): kind 10166 from monitor relays → announced monitor set; kind 30166 **by those authors only**, last 7 days, pages of 500 (D8); verify each; `d` normalized with `normalize_relay(url,false)`; drop non-clearnet (`n` ≠ clearnet, .onion/.i2p/.loki), hex-pubkey `d`, and any relay that **any** monitor tags `R auth` / `R payment`; insert ≤ 2000 new per run as source `nip66`, most monitors first. `N` tags ignored (crawler needs neither NIP-50 nor 77). Defaults relaypag.es, monitorlizard.nostr1.com, relay.nostr.watch, nos.lol, relay.damus.io | nip66.md |
 
 ---
 
@@ -88,6 +89,7 @@ core/src/
   relayurl.rs       relay URL normalizer                                       [nostr]
   relay.rs          RelayConn: WS client (REQ/EOSE/CLOSED/NOTICE/AUTH/OK, NEG-*) [nostr]
   crawler.rs        Crawler<S: Store>: discovery, pagination, cursors          [nostr]
+  nip66.rs          NIP-66 relay discovery from monitor events (D30)            [nostr]
   wot.rs            follow/mute/report extraction from kinds 3/10000/30007/1984/10002 [trust-sync]
   trust.rs          score computation (pure) + TrustEngine<S>                  [trust-sync]
   sync.rs           negentropy initiator (Up) + batch fallback, SyncSource trait [trust-sync]
@@ -196,7 +198,7 @@ pub struct TrustScore {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RelayInfo {
-    pub url: String, pub source: String,          // "seed" | "nip65" | "kind3" | "hint" | "manual"
+    pub url: String, pub source: String,          // "seed" | "nip65" | "kind3" | "hint" | "nip66" | "manual"
     pub enabled: bool, pub last_ok: Option<i64>, pub last_err: Option<String>,
     pub consecutive_failures: u32, pub next_try_at: i64,
     pub events_found: u64, pub supports_neg: Option<bool>,
@@ -488,9 +490,11 @@ core feature `downloads` so core stays light when it is off.
 CLI: `magnetar-server serve | migrate | crawl-once [--seconds N] | selftest | --version`.
 Env/config: `DATABASE_URL`, `MAGNETAR_BIND` (default `127.0.0.1:8787`), `MAGNETAR_API_TOKEN` (required for
 serve), `MAGNETAR_ROOT_NPUB`, `MAGNETAR_NTFY_URL`, `MAGNETAR_NTFY_TOPIC`, `MAGNETAR_DOWNLOAD_DIR`,
-`MAGNETAR_CRAWL_INTERVAL_SECS` (default 900), `MAGNETAR_SEED_RELAYS` (comma), `RUST_LOG`.
+`MAGNETAR_CRAWL_INTERVAL_SECS` (default 900), `MAGNETAR_SEED_RELAYS` (comma), `MAGNETAR_NIP66` (default true),
+`MAGNETAR_NIP66_MONITORS` (comma), `RUST_LOG`.
 `serve` runs: API + relay endpoint, crawler loop, liveness loop (batch of due infohashes every 5 min),
-trust recompute (on graph_version change, else every 6 h), saved-search notifier (every crawl).
+trust recompute (on graph_version change, else every 6 h), saved-search notifier (every crawl), NIP-66
+relay discovery (startup, then every 6 h; D30).
 sqlx pool ≤ 5 (Termux phantom-process budget). `selftest` checks DB, DNS, TLS (fetch NIP-11 of a seed relay), UDP.
 
 Seed relays (nostr-nips.md §4.5): `wss://nostr.oxtr.dev, wss://relay.nostr.net, wss://nos.lol,

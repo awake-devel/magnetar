@@ -285,7 +285,7 @@ pub struct TrustScore {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RelayInfo {
     pub url: String,
-    /// "seed" | "nip65" | "kind3" | "hint" | "manual"
+    /// "seed" | "nip65" | "kind3" | "hint" | "nip66" | "manual"
     pub source: String,
     pub enabled: bool,
     pub last_ok: Option<i64>,
