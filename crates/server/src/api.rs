@@ -184,7 +184,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/search", get(search_get).post(search_post))
         .route("/api/v1/torrents/{infohash}", get(torrent))
         .route("/api/v1/media/{id}/poster", get(media_poster))
-        .route("/api/v1/media/{id}/torrents", get(media_torrents))
         .route(
             "/api/v1/torrents/{infohash}/liveness",
             post(refresh_liveness),
@@ -334,30 +333,6 @@ async fn torrent(
         t.decorate(m, now).await;
     }
     Ok(Json(d))
-}
-
-/// `GET /api/v1/media/{id}/torrents`: every release linked to one media (D40), best seeded
-/// first, same eligibility as search (trust threshold, blocked publishers). Uses the `media:N`
-/// search token; `media::releases_fallback` covers a store whose search lacks it.
-async fn media_torrents(
-    State(st): State<AppState>,
-    Path(id): Path<i64>,
-) -> ApiResult<Json<SearchPage>> {
-    let now = magnetar_core::now();
-    let q = SearchQuery {
-        text: format!("media:{id}"),
-        sort: Sort::Seeders,
-        descending: true,
-        limit: 100,
-        ..Default::default()
-    };
-    let page = st.store.search(&q, now).await?;
-    if page.total > 0 {
-        return Ok(Json(page));
-    }
-    Ok(Json(
-        crate::media::releases_fallback(&st.store, id, now).await?,
-    ))
 }
 
 /// `GET /api/v1/media/{id}/poster`: the cached TMDB poster (w342), never a redirect to TMDB.

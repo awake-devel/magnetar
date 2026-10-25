@@ -49,20 +49,24 @@ is the first configured language that has one; TMDB leaves untranslated overview
 `fr-FR` often falls back to `en-US` and vice versa.
 
 Triggers:
-- **Detail view** (`GET /api/v1/torrents/{infohash}`): `MediaInfo.overview`, `.poster`,
+- **Detail view** (`GET /api/v1/torrents/{infohash}`), only for a displayed link (confidence
+  ≥ `MIN_DISPLAY_CONFIDENCE` = 0.5, the D40 rule; a hidden match is never shown, decorated or
+  prefetched): `MediaInfo.overview`, `.poster`,
   `.episode_title` and `.tmdb` are filled from `media_extra` (one indexed query). If something
   is missing or stale, the media is queued for the background workers and the response is
   returned at once: TMDB never sits in the request path. A job is not queued again within
   15 min (also after a failure).
-- **Prefetch**: every 10 min, up to `MAGNETAR_TMDB_PREFETCH_PER_HOUR / 6` media matched in the
-  last 7 days without fresh data, most linked releases first, then IMDb votes.
+- **Prefetch**: every 10 min, up to `MAGNETAR_TMDB_PREFETCH_PER_HOUR / 6` media with a
+  displayed link matched in the last 7 days without fresh data, most linked releases first, then IMDb votes.
 - **Poster request** for a media whose poster path is known but whose file is missing: fetched
   then (≤ 15 s), so the first view after a cache wipe still shows the poster.
 
 Rate limit: one token bucket for API and image requests, `MAGNETAR_TMDB_RPS` per second, bursts
 of up to 5 (TMDB documents "somewhere in the 40 requests per second range"). 429 and 5xx are
 retried up to 3 times, waiting `Retry-After` seconds when present (else 2, 4, 8 s; at most 60 s).
-404 is a normal answer (cached as "nothing"), 401 is an error in the log.
+404 is a normal answer (cached as "nothing"), 401 is an error in the log. A v3 API key
+(32 hex) is sent as `api_key=` in the query, so every kept `reqwest` error is stripped of its
+URL (`without_url`) and only request paths are logged: the key never reaches the log.
 
 ## Serving posters
 
@@ -71,8 +75,8 @@ retried up to 3 times, waiting `Retry-After` seconds when present (else 2, 4, 8 
 gives 304. 404 when TMDB is off or the media has no poster. The server never redirects to or
 embeds `image.tmdb.org` URLs: clients only see `/api/v1/…` paths (`MediaInfo.poster`).
 
-`GET /api/v1/media/{id}/torrents` lists the other releases of the media (the `media:N` search
-token of D40, best seeded first).
+`GET /api/v1/media/{id}/torrents` (other releases, the `media:N` search token, trust threshold
+and blocked publishers applied) is enrich/imdb's route (D40); this branch does not define it.
 
 ## Terms we follow (TMDB API Terms of Use, read 2026-10-25)
 
@@ -96,11 +100,18 @@ token of D40, best seeded first).
   schema V3), so the media card works offline and `imdb:tt…`, `tmdb:movie:N`, `tmdb:tv:N`,
   `mal:N` work in local search too (also matching a torrent's own `i` tag). Rows of evicted
   torrents are dropped by `cleanup()`.
+- TMDB content is kept on the phone at most 90 days after the server last sent or revalidated
+  it (`TMDB_MAX_AGE_SECS`): the server's own copy is at most ~90 days old when served (refresh
+  at 90, purge at 180), so the whole chain stays within the six months of §1.C. Past that,
+  reads leave out `overview`, `episode_title` and `poster`; `cleanup()` blanks them in
+  `media_cache` and deletes older `poster_cache` rows and files; an expired poster is not
+  served offline. IMDb fields (title, year, rating, ids) are not TMDB content and stay.
 - `Magnetar.media_poster(media_id, poster_url)` downloads the poster from the server with the
   bearer token into `<db dir>/posters/` (`poster_cache`, 30 MB LRU, ETag revalidation after
   30 days) and returns the file path; offline it returns the cached file. Only `/api/v1/` paths
   are accepted.
-- `Magnetar.media_torrents(media_id)`: server list, else the cached torrents linked to it.
+- `Magnetar.media_torrents(media_id)`: server list, else the cached torrents linked to it
+  above the configured trust threshold (as any local search).
 - Detail screen: poster, title (year), kind, ★ rating (votes), genres, `S01E02 · name`,
   overview, an IMDb button (`https://www.imdb.com/title/tt…/`), and "Other releases". The
   screen re-reads the detail once after 4 s when the server had not decorated it yet.
@@ -145,5 +156,33 @@ prefetch off, so every request came from the lazy detail path.
   migration that creates `media` is present.
 - Tests: `crates/server/tests/tmdb.rs` (fake TMDB in-process: find/details/season/poster, 429 +
   `Retry-After`, negative cache, purge, lazy detail decoration, poster ETag/304, other
-  releases, prefetch selection), `crates/ffi/tests/media.rs` (offline cache, posters, local
-  `imdb:` search; `media_against_server` is `#[ignore]` and needs a live server).
+  prefetch selection, hidden low-confidence links, v3 key absent from errors, migration guard),
+  `crates/ffi/tests/media.rs` (offline cache, posters, local `imdb:` search, TMDB expiry,
+  offline releases under the trust threshold; `media_against_server` is `#[ignore]` and needs a
+  live server).
+
+## Merging (enrich/imdb first)
+
+enrich/tmdb builds on the D40 tables but was developed without enrich/imdb. Merge order and
+the exact resolutions:
+
+1. **Merge enrich/imdb first.** `20261027200000_tmdb_media_extra.sql` references `media`
+   (created by `20261026000000_enrich_imdb.sql`) and refuses to run without it, with an
+   explicit message (`merge enrich/imdb before enrich/tmdb`), so deploying this branch alone
+   fails at `migrate` instead of half-applying. The TEST-ONLY mirror
+   `crates/server/tests/common/contract_media.sql` is skipped automatically once imdb's
+   migration is in the build.
+2. `crates/server/src/media.rs` is a stand-in for imdb's `enrich::media_for_infohash` (same
+   `MIN_DISPLAY_CONFIDENCE` rule). Delete the module, its `pub mod media;` and the
+   `crate::media::fill_if_missing` call in `api::torrent` (imdb's `PgStore::torrent_detail`
+   already fills `media`); keep the `decorate` call, which runs only when `d.media` is `Some`.
+   Replace `crate::media::MIN_DISPLAY_CONFIDENCE` in `tmdb::prefetch_candidates` with
+   `magnetar_core::enrich::MIN_DISPLAY_CONFIDENCE`.
+3. `GET /api/v1/media/{id}/torrents`: imdb's handler and route only (this branch has none).
+   `ApiClient::media_torrents(media_id, limit, offset)` has imdb's exact signature: keep one
+   copy.
+4. `MediaInfo.episode_title` (additive, `#[serde(default)]`) is the one field this branch adds
+   to imdb's `core::model::MediaInfo`. Add it after `poster` in imdb's struct and
+   `episode_title: None` to imdb's two literals (`crates/server/src/enrich/mod.rs`, `From<MediaRow>`;
+   `crates/core/tests/api_client.rs`). Old clients and servers ignore/default it.
+5. Decision numbers: D42 here; `docs/CONFIG.md` rows were appended at the end of the table.

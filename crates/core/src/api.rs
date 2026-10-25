@@ -158,10 +158,21 @@ impl ApiClient {
             Ok(r) => Ok(Some(r.json().await?)),
         }
     }
-    /// Other releases of one identified media (`GET /api/v1/media/{id}/torrents`, D40).
-    pub async fn media_torrents(&self, media_id: i64) -> crate::Result<SearchPage> {
+    /// Other releases of one identified title (`GET /api/v1/media/{id}/torrents`, D40),
+    /// best seeded first.
+    pub async fn media_torrents(
+        &self,
+        media_id: i64,
+        limit: u32,
+        offset: u32,
+    ) -> crate::Result<SearchPage> {
         let path = format!("/api/v1/media/{media_id}/torrents");
-        self.json(self.req(Method::GET, &path)).await
+        let query = [
+            ("sort", "seeders".to_string()),
+            ("limit", limit.to_string()),
+            ("offset", offset.to_string()),
+        ];
+        self.json(self.req(Method::GET, &path).query(&query)).await
     }
     /// GET a server-relative binary resource (e.g. `MediaInfo.poster`) with the bearer token.
     /// Only `/api/v1/` paths are accepted, so a URL from the server cannot point elsewhere.

@@ -921,7 +921,7 @@ impl SqliteStore {
             params![infohash, now],
         )
         .db()?;
-        let media = crate::media::cached_media(&conn, infohash)?;
+        let media = crate::media::cached_media(&conn, infohash, now)?;
         drop(conn);
 
         let publishers: HashSet<&str> = rows

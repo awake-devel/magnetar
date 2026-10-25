@@ -153,16 +153,27 @@ async fn add_media(store: &PgStore, kind: &str, imdb: &str, title: &str) -> i64 
 }
 
 async fn link(store: &PgStore, infohash: &str, media_id: i64, se: Option<(i32, i32)>) {
+    link_at(store, infohash, media_id, se, 1.0).await;
+}
+
+async fn link_at(
+    store: &PgStore,
+    infohash: &str,
+    media_id: i64,
+    se: Option<(i32, i32)>,
+    confidence: f32,
+) {
     sqlx::query(
         "INSERT INTO torrent_media (infohash, media_id, season, episode, method, confidence,
                                     matcher_version, matched_at)
-         VALUES ($1, $2, $3, $4, 'itag', 1.0, 1, $5)",
+         VALUES ($1, $2, $3, $4, 'itag', $6, 1, $5)",
     )
     .bind(infohash)
     .bind(media_id)
     .bind(se.map(|s| s.0))
     .bind(se.map(|s| s.1))
     .bind(magnetar_core::now())
+    .bind(confidence)
     .execute(store.pool())
     .await
     .unwrap();
@@ -323,11 +334,15 @@ async fn detail_is_decorated_lazily_and_poster_is_served() {
             .unwrap()
     };
 
-    // First view: matcher data only, TMDB fetch queued in the background.
-    let started = Instant::now();
+    // First view: matcher data only, TMDB fetch queued in the background. The answer never
+    // waits for TMDB, so it cannot carry TMDB fields yet (deterministic, unlike a time bound,
+    // which flaked when the test database was busy with parallel migrations).
     let d = detail().await;
-    assert!(started.elapsed() < Duration::from_secs(2));
     let m = d.media.expect("media");
+    assert_eq!(
+        (&m.overview, &m.poster, &m.episode_title),
+        (&None, &None, &None)
+    );
     assert_eq!(
         (m.title.as_str(), m.season, m.episode),
         ("Game of Thrones", Some(1), Some(2))
@@ -387,31 +402,6 @@ async fn detail_is_decorated_lazily_and_poster_is_served() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(fake.log.lock().unwrap().len(), calls);
 
-    // Other releases of the same media.
-    let (p2, _) = put(
-        &db.store,
-        torrent(2, 2, NOW, 78, "Game.of.Thrones.S01.Complete"),
-    )
-    .await;
-    link(&db.store, &p2.infohash, show, Some((1, 0))).await;
-    let page: magnetar_core::query::SearchPage = http
-        .get(format!("{base}/api/v1/media/{show}/torrents"))
-        .bearer_auth(TOKEN)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let mut ihs: Vec<_> = page.hits.iter().map(|h| h.infohash.clone()).collect();
-    ihs.sort();
-    assert_eq!(ihs, vec![p.infohash.clone(), p2.infohash.clone()]);
-    assert!(
-        page.hits
-            .iter()
-            .all(|h| h.media_title.as_deref() == Some("Game of Thrones"))
-    );
-
     let r = http
         .get(format!("{base}/api/v1/media/999999/poster"))
         .bearer_auth(TOKEN)
@@ -449,4 +439,165 @@ async fn prefetch_picks_recent_undecorated_media() {
     .unwrap();
     assert_eq!(t.prefetch_candidates(now, 10).await.unwrap(), vec![b]);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn low_confidence_link_is_neither_shown_nor_decorated() {
+    let Some(db) = test_db().await else { return };
+    let (fake_base, fake) = spawn_fake().await;
+    let dir = temp_dir("lowconf");
+    let t = Tmdb::new(config(&fake_base, &dir), db.store.pool().clone()).unwrap();
+    let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    t.spawn_workers(stop_rx);
+
+    let (p, _) = put(&db.store, torrent(1, 1, NOW, 77, "family.holiday.2019.mp4")).await;
+    let film = add_media(&db.store, "movie", "tt1375666", "Inception").await;
+    // Below MIN_DISPLAY_CONFIDENCE (0.5): kept for review, hidden everywhere.
+    link_at(&db.store, &p.infohash, film, None, 0.3).await;
+    assert!(
+        magnetar_server::media::media_for(db.store.pool(), &p.infohash)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        t.prefetch_candidates(magnetar_core::now(), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let state = AppState::new(Arc::new(db.store.clone()), TOKEN).with_tmdb(Some(t.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, magnetar_server::router(state))
+            .await
+            .unwrap()
+    });
+    let http = magnetar_core::http::client(Duration::from_secs(20)).unwrap();
+    let d: TorrentDetail = http
+        .get(format!("{base}/api/v1/torrents/{}", p.infohash))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(d.media.is_none(), "{:?}", d.media);
+    assert_eq!(
+        (
+            d.summary.media_title,
+            d.summary.media_year,
+            d.summary.media_kind
+        ),
+        (None, None, None)
+    );
+    // Nothing queued: TMDB never contacted for a hidden match.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(fake.log.lock().unwrap().is_empty());
+
+    // The same link at a displayable confidence is shown.
+    sqlx::query("UPDATE torrent_media SET confidence = 0.5 WHERE infohash = $1")
+        .bind(&p.infohash)
+        .execute(db.store.pool())
+        .await
+        .unwrap();
+    let m = magnetar_server::media::media_for(db.store.pool(), &p.infohash)
+        .await
+        .unwrap()
+        .expect("shown at 0.5");
+    assert_eq!(m.title, "Inception");
+    assert_eq!(
+        t.prefetch_candidates(magnetar_core::now(), 10)
+            .await
+            .unwrap(),
+        vec![film]
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A v3 key travels in the query string; reqwest's error Display appends the URL. Neither a
+/// decode error nor the logged message may carry it.
+#[tokio::test]
+async fn v3_key_never_in_errors() {
+    let Some(db) = test_db().await else { return };
+    const V3: &str = "0123456789abcdef0123456789abcdef";
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let s2 = seen.clone();
+    let app = axum::Router::new().route(
+        "/3/find/{id}",
+        get(move |q: axum::extract::RawQuery| {
+            let s2 = s2.clone();
+            async move {
+                s2.lock().unwrap().push(q.0.unwrap_or_default());
+                // A CDN error page with a 200.
+                (
+                    [(header::CONTENT_TYPE, "text/html")],
+                    "<html>upstream error</html>",
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let dir = temp_dir("v3");
+    let mut cfg = config(&base, &dir);
+    cfg.token = V3.into();
+    let t = Tmdb::new(cfg, db.store.pool().clone()).unwrap();
+    let movie = add_media(&db.store, "movie", "tt1375666", "Inception").await;
+    let e = t
+        .refresh(
+            Job {
+                media_id: movie,
+                season: None,
+            },
+            magnetar_core::now(),
+        )
+        .await
+        .expect_err("not JSON");
+    // The key was really sent in the query, and is absent from the error.
+    assert!(seen.lock().unwrap().iter().any(|q| q.contains(V3)));
+    let msg = format!("{e} {e:?}");
+    assert!(!msg.contains(V3), "{msg}");
+    assert!(!msg.contains("api_key"), "{msg}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn migration_refuses_without_enrich_imdb() {
+    let owned = magnetar_server::store::MIGRATOR
+        .iter()
+        .any(|m| m.sql.as_str().contains("CREATE TABLE media "));
+    if owned {
+        // Merged with enrich/imdb: the ordering is satisfied by construction.
+        return;
+    }
+    let Some(db) = bare_db().await else { return };
+    // Run only this branch's migration, with `public` off the search path: the test database
+    // may hold a real `media` table there (end-to-end runs), which would satisfy the guard.
+    let m = magnetar_server::store::MIGRATOR
+        .iter()
+        .find(|m| m.description.contains("tmdb media extra"))
+        .expect("tmdb migration");
+    let mut conn = db.store.pool().acquire().await.unwrap();
+    let schema: String = sqlx::query_scalar("SELECT current_schema()")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET search_path TO {schema}, pg_catalog"
+    )))
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    let e = sqlx::raw_sql(sqlx::AssertSqlSafe(m.sql.as_str().to_string()))
+        .execute(&mut *conn)
+        .await
+        .expect_err("no media table");
+    assert!(e.to_string().contains("merge enrich/imdb"), "{e}");
+    // The pooled connection keeps its narrowed path: drop it rather than reuse it.
+    conn.detach();
 }

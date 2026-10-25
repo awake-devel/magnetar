@@ -470,13 +470,14 @@ impl Magnetar {
             .await
     }
 
-    /// Other releases of the same media: the server's list (`GET /api/v1/media/{id}/torrents`),
-    /// else the cached torrents linked to it.
+    /// Other releases of the same media: the server's list (`GET /api/v1/media/{id}/torrents`,
+    /// enrich/imdb), else the cached torrents linked to it, under the configured trust threshold
+    /// like any other local search.
     pub async fn media_torrents(&self, media_id: i64) -> Result<FfiSearchPage, FfiError> {
         self.run(move |inner| async move {
             let mut server_error = None;
             if let Some(api) = inner.api() {
-                match api.media_torrents(media_id).await {
+                match api.media_torrents(media_id, media::MEDIA_RELEASES, 0).await {
                     Ok(mut p) => {
                         p.source = "server".into();
                         inner.overlay_flags(&mut p, false)?;
@@ -487,9 +488,10 @@ impl Magnetar {
             }
             let q = magnetar_core::query::SearchQuery {
                 text: format!("media:{media_id}"),
-                min_trust: Some(0),
+                min_trust: Some(inner.state().config.trust_threshold),
+                sort: magnetar_core::query::Sort::Seeders,
                 descending: true,
-                limit: 100,
+                limit: media::MEDIA_RELEASES,
                 ..Default::default()
             };
             let p = inner.store.search_sync(&q, magnetar_core::now())?;
@@ -537,7 +539,13 @@ impl Magnetar {
 
     pub fn cleanup(&self) -> Result<FfiCleanupReport, FfiError> {
         let cap_mb = self.inner.state().config.cache_cap_mb as u64;
-        Ok(self.inner.store.cleanup(cap_mb * 1024 * 1024)?.into())
+        let report = self.inner.store.cleanup(cap_mb * 1024 * 1024)?;
+        // TMDB content kept at most media::TMDB_MAX_AGE_SECS (D42).
+        let (_, files) = self.inner.store.expire_tmdb(magnetar_core::now())?;
+        for f in files {
+            let _ = std::fs::remove_file(f);
+        }
+        Ok(report.into())
     }
 
     /// Local liveness check (trackers + DHT); also stored in the cache.

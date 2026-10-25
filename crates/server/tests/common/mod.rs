@@ -18,6 +18,14 @@ pub struct TestDb {
 
 /// None (and a SKIPPED line) when no test database is configured.
 pub async fn test_db() -> Option<TestDb> {
+    let db = bare_db().await?;
+    contract_media_tables(&db.store).await;
+    db.store.migrate().await.expect("migrate");
+    Some(db)
+}
+
+/// A fresh, empty schema: nothing created, nothing migrated.
+pub async fn bare_db() -> Option<TestDb> {
     let Ok(url) = std::env::var("MAGNETAR_TEST_DATABASE_URL") else {
         eprintln!("SKIPPED (no MAGNETAR_TEST_DATABASE_URL)");
         return None;
@@ -61,8 +69,6 @@ pub async fn test_db() -> Option<TestDb> {
         .await
         .unwrap();
     let store = PgStore::from_pool(pool);
-    contract_media_tables(&store).await;
-    store.migrate().await.expect("migrate");
     Some(TestDb { store, url, schema })
 }
 

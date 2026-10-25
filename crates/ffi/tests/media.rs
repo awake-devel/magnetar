@@ -373,3 +373,112 @@ fn media_against_server() {
     let local = block_on(m.detail(ih, false)).unwrap().unwrap();
     assert_eq!(local.media.unwrap().title, media.title);
 }
+
+fn score(pubkey: &str, score: u8) -> magnetar_core::model::TrustScore {
+    magnetar_core::model::TrustScore {
+        pubkey: pubkey.into(),
+        score,
+        factors: vec![magnetar_core::model::TrustFactor {
+            code: "FOLLOW_D1".into(),
+            delta: score as i32,
+            detail: "followed".into(),
+            evidence: vec![],
+        }],
+        root: None,
+        computed_at: 1,
+        graph_version: 0,
+    }
+}
+
+/// Offline "other releases" use the configured trust threshold, like every local search.
+#[test]
+fn offline_releases_respect_trust_threshold() {
+    let dir = TempDir::new("reltrust");
+    let mut cfg = config(None);
+    cfg.trust_threshold = 30;
+    let m = Magnetar::open(dir.0.join("m.db").display().to_string(), cfg).unwrap();
+    torrent(&ih(1), "Game.of.Thrones.S01E02.1080p", &pk(1), 100).put(m.store());
+    torrent(&ih(2), "Game.of.Thrones.S01E02.SPAM", &pk(2), 100).put(m.store());
+    m.store().put_trust_sync(&score(&pk(1), 80)).unwrap();
+    m.store().put_trust_sync(&score(&pk(2), 5)).unwrap();
+    let now = magnetar_core::now();
+    m.store().put_media(&ih(1), Some(&media()), now).unwrap();
+    m.store().put_media(&ih(2), Some(&media()), now).unwrap();
+    let page = block_on(m.media_torrents(7)).unwrap();
+    let ihs: Vec<_> = page.hits.iter().map(|h| h.infohash.clone()).collect();
+    assert_eq!((page.source.as_str(), ihs), ("local", vec![ih(1)]));
+}
+
+/// TMDB content is not kept on the phone past `TMDB_MAX_AGE_SECS`; IMDb fields stay.
+#[test]
+fn tmdb_content_expires_on_the_phone() {
+    use magnetar_ffi::media::TMDB_MAX_AGE_SECS;
+    let dir = TempDir::new("expire");
+    let m = Magnetar::open(dir.0.join("m.db").display().to_string(), config(None)).unwrap();
+    torrent(&ih(1), "Game.of.Thrones.S01E02.1080p", &pk(1), 100).put(m.store());
+    torrent(&ih(2), "Inception.2010.1080p", &pk(1), 100).put(m.store());
+    let now = magnetar_core::now();
+    let old = now - TMDB_MAX_AGE_SECS - 1;
+    m.store().put_media(&ih(1), Some(&media()), old).unwrap();
+    let recent = MediaInfo {
+        media_id: 8,
+        ..media()
+    };
+    m.store().put_media(&ih(2), Some(&recent), now).unwrap();
+
+    // Read path: stale TMDB fields are left out at once.
+    let s = m.store().media_of(&ih(1), now).unwrap().unwrap();
+    assert_eq!((s.title.as_str(), s.year), ("Game of Thrones", Some(2011)));
+    assert_eq!(s.imdb.as_deref(), Some("tt0944947"));
+    assert_eq!((s.overview, s.episode_title, s.poster), (None, None, None));
+    let d = block_on(m.detail(ih(1), false))
+        .unwrap()
+        .unwrap()
+        .media
+        .unwrap();
+    assert_eq!((d.overview, d.poster), (None, None));
+    let r = m.store().media_of(&ih(2), now).unwrap().unwrap();
+    assert_eq!(r.overview.as_deref(), Some("Seven noble families."));
+
+    // At rest: cleanup blanks the stale row and deletes stale poster files.
+    let posters = dir.0.join("posters");
+    std::fs::create_dir_all(&posters).unwrap();
+    let (stale, fresh) = (posters.join("7.png"), posters.join("8.png"));
+    std::fs::write(&stale, PNG).unwrap();
+    std::fs::write(&fresh, PNG).unwrap();
+    let path = |p: &std::path::Path| p.display().to_string();
+    m.store()
+        .put_poster(7, &path(&stale), None, PNG.len() as u64, old)
+        .unwrap();
+    m.store()
+        .put_poster(8, &path(&fresh), None, PNG.len() as u64, now)
+        .unwrap();
+    m.cleanup().unwrap();
+    assert!(!stale.exists() && fresh.exists());
+    assert!(m.store().poster(7, now).unwrap().is_none());
+    assert!(m.store().poster(8, now).unwrap().is_some());
+    // Even read without the age check, the stored JSON no longer holds TMDB text.
+    let raw = m.store().media_of(&ih(1), old).unwrap().unwrap();
+    assert_eq!((raw.overview, raw.episode_title), (None, None));
+    assert_eq!(raw.title, "Game of Thrones");
+    assert!(
+        m.store()
+            .media_of(&ih(2), now)
+            .unwrap()
+            .unwrap()
+            .overview
+            .is_some()
+    );
+
+    // Offline, an expired poster copy is not served (and is removed).
+    let p9 = posters.join("9.png");
+    std::fs::write(&p9, PNG).unwrap();
+    m.store()
+        .put_poster(9, &path(&p9), None, PNG.len() as u64, old)
+        .unwrap();
+    assert_eq!(
+        block_on(m.media_poster(9, "/api/v1/media/9/poster".into())).unwrap(),
+        None
+    );
+    assert!(!p9.exists());
+}

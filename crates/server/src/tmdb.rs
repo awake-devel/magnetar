@@ -477,7 +477,9 @@ impl Tmdb {
             if api {
                 rb = self.authorize(rb);
             }
-            let wait = match rb.send().await {
+            // `without_url` everywhere a reqwest error is kept: its Display appends the request
+            // URL, query included, and a v3 key travels in the query.
+            let wait = match rb.send().await.map_err(reqwest::Error::without_url) {
                 Ok(r) if r.status().is_success() => return Ok(Some(r)),
                 Ok(r) if r.status() == StatusCode::NOT_FOUND => return Ok(None),
                 Ok(r)
@@ -521,7 +523,7 @@ impl Tmdb {
     async fn get_json(&self, path: &str, query: &[(&str, &str)]) -> Result<Option<Value>> {
         let url = format!("{}{path}", self.cfg.api_base);
         match self.get(&url, query, true).await? {
-            Some(r) => Ok(Some(r.json().await?)),
+            Some(r) => Ok(Some(r.json().await.map_err(reqwest::Error::without_url)?)),
             None => Ok(None),
         }
     }
@@ -778,7 +780,7 @@ impl Tmdb {
                 "poster content-type {content_type:?}"
             )));
         }
-        let bytes = resp.bytes().await?;
+        let bytes = resp.bytes().await.map_err(reqwest::Error::without_url)?;
         if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
             return Err(Error::Invalid(format!("poster of {} bytes", bytes.len())));
         }
@@ -821,7 +823,7 @@ impl Tmdb {
     pub async fn prefetch_candidates(&self, now: i64, limit: i64) -> Result<Vec<i64>> {
         let ids: Vec<(i64,)> = sqlx::query_as(
             "SELECT tm.media_id FROM torrent_media tm JOIN media m ON m.id = tm.media_id
-             WHERE tm.matched_at > $1
+             WHERE tm.matched_at > $1 AND tm.confidence >= $5
                AND (m.imdb IS NOT NULL OR m.tmdb_movie IS NOT NULL OR m.tmdb_tv IS NOT NULL)
                AND NOT EXISTS (SELECT 1 FROM media_extra e WHERE e.media_id = tm.media_id
                    AND ((e.source = 'tmdb' AND e.fetched_at > $2)
@@ -834,6 +836,7 @@ impl Tmdb {
         .bind(now - REFRESH_SECS)
         .bind(now - NEGATIVE_SECS)
         .bind(limit)
+        .bind(crate::media::MIN_DISPLAY_CONFIDENCE)
         .fetch_all(&self.pool)
         .await
         .map_err(db)?;

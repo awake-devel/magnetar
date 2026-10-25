@@ -1,19 +1,21 @@
 //! Reading the shared enrichment tables (`media`, `torrent_media`, contract D40).
 //!
-//! enrich/imdb owns these tables and fills `TorrentDetail.media` in `PgStore::torrent_detail`.
-//! This module only provides the read used by the TMDB decoration path on a branch where that
-//! fill is missing; `fill_if_missing` is a no-op as soon as the store already set `media`.
+//! enrich/imdb owns these tables and fills `TorrentDetail.media` in `PgStore::torrent_detail`
+//! (`crate::enrich::media_for_infohash`). This module is a stand-in for that read on a branch
+//! without it, with the same rule: a link below [`MIN_DISPLAY_CONFIDENCE`] is never shown, so
+//! never decorated either. `fill_if_missing` is a no-op as soon as the store already set
+//! `media`. When merging with enrich/imdb, delete this module and its call in `api::torrent`
+//! (see docs/ENRICHMENT-TMDB.md, "Merging").
 
 use magnetar_core::error::Result;
 use magnetar_core::model::{MediaInfo, MediaKind, TorrentDetail};
-use magnetar_core::query::SearchPage;
-use magnetar_core::store::Store;
 use sqlx::{FromRow, PgPool};
 
-use crate::store::{PgStore, db};
+use crate::store::db;
 
-/// Releases listed by the fallback (one detail lookup each).
-const FALLBACK_RELEASES: i64 = 50;
+/// Links below this are kept for review but never displayed or decorated. Mirror of
+/// `magnetar_core::enrich::MIN_DISPLAY_CONFIDENCE` (enrich/imdb); use that one after the merge.
+pub const MIN_DISPLAY_CONFIDENCE: f32 = 0.5;
 
 #[derive(FromRow)]
 struct MediaRow {
@@ -77,16 +79,17 @@ impl From<MediaRow> for MediaInfo {
     }
 }
 
-/// The media linked to one infohash, if any.
+/// The displayed media of one infohash (None when unlinked or below [`MIN_DISPLAY_CONFIDENCE`]).
 pub async fn media_for(pool: &PgPool, infohash: &str) -> Result<Option<MediaInfo>> {
     let row: Option<MediaRow> = sqlx::query_as(
         "SELECT m.id, m.kind, m.imdb, m.tmdb_movie, m.tmdb_tv, m.mal, m.anilist, m.title,
                 m.original_title, m.year, m.end_year, m.genres, m.rating, m.votes, m.runtime_min,
                 tm.season, tm.episode, tm.method, tm.confidence
          FROM torrent_media tm JOIN media m ON m.id = tm.media_id
-         WHERE tm.infohash = $1",
+         WHERE tm.infohash = $1 AND tm.confidence >= $2",
     )
     .bind(infohash)
+    .bind(MIN_DISPLAY_CONFIDENCE)
     .fetch_optional(pool)
     .await
     .map_err(db)?;
@@ -110,40 +113,4 @@ pub async fn fill_if_missing(pool: &PgPool, detail: &mut TorrentDetail) {
         }
         Err(e) => tracing::debug!("media for {}: {e}", detail.summary.infohash),
     }
-}
-
-/// Releases of a media without the `media:N` search token: the linked infohashes' summaries
-/// (blocked publishers already excluded by `torrent_detail`), most peers first.
-pub async fn releases_fallback(store: &PgStore, media_id: i64, now: i64) -> Result<SearchPage> {
-    let ihs: Vec<(String,)> = match sqlx::query_as(
-        "SELECT infohash FROM torrent_media WHERE media_id = $1 ORDER BY matched_at DESC LIMIT $2",
-    )
-    .bind(media_id)
-    .bind(FALLBACK_RELEASES)
-    .fetch_all(store.pool())
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::debug!("releases of media {media_id}: {e}");
-            Vec::new()
-        }
-    };
-    let mut hits = Vec::new();
-    for (ih,) in ihs {
-        if let Some(mut d) = store.torrent_detail(&ih, now).await? {
-            fill_if_missing(store.pool(), &mut d).await;
-            hits.push(d.summary);
-        }
-    }
-    hits.sort_by(|a, b| {
-        b.seeders
-            .cmp(&a.seeders)
-            .then(b.created_at.cmp(&a.created_at))
-    });
-    Ok(SearchPage {
-        total: hits.len() as u64,
-        hits,
-        source: "server".into(),
-    })
 }

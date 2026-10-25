@@ -90,15 +90,26 @@ impl Inner {
         let fresh = cached
             .as_ref()
             .is_some_and(|p| now - p.fetched_at < crate::media::POSTER_REFRESH_SECS);
+        // Past the TMDB keep limit a copy is only usable once the server revalidates it.
+        let usable = |c: Option<crate::media::CachedPoster>| -> Result<Option<String>, FfiError> {
+            match c {
+                Some(p) if now - p.fetched_at >= crate::media::TMDB_MAX_AGE_SECS => {
+                    let _ = std::fs::remove_file(&p.file);
+                    self.store.forget_poster(media_id)?;
+                    Ok(None)
+                }
+                c => Ok(c.map(|p| p.file)),
+            }
+        };
         let Some(api) = self.api().filter(|_| !fresh) else {
-            return Ok(cached.map(|p| p.file));
+            return usable(cached);
         };
         let etag = cached.as_ref().and_then(|p| p.etag.clone());
         let fetched = match api.get_bytes(url, etag.as_deref()).await {
             Ok(f) => f,
             Err(e) => {
                 tracing::debug!("poster {media_id}: {e}");
-                return Ok(cached.map(|p| p.file));
+                return usable(cached);
             }
         };
         match fetched {

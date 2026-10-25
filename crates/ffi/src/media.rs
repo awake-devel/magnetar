@@ -12,6 +12,14 @@ use crate::store::{DbExt, SqliteStore};
 pub const POSTER_CACHE_BYTES: u64 = 30 << 20;
 /// A cached poster is revalidated (ETag) after this.
 pub const POSTER_REFRESH_SECS: i64 = 30 * 86400;
+/// TMDB-derived content (overview, episode name, poster) is kept on the phone at most this
+/// long after the server last sent or revalidated it. The server refreshes its own copy after
+/// 90 days and purges it after 180 (TMDB API terms §1.C, D42), so what it serves is at most
+/// ~90 days old: 90 more on the phone keeps the whole chain within six months. IMDb fields
+/// (title, year, rating, ids) are not TMDB content and stay.
+pub const TMDB_MAX_AGE_SECS: i64 = 90 * 86400;
+/// Most "other releases" listed.
+pub const MEDIA_RELEASES: u32 = 100;
 
 /// A media filter typed into the search box (`imdb:tt0944947`, `tmdb:movie:27205`, `tmdb:tv:1399`,
 /// `mal:5114`), same tokens as the server search (D40).
@@ -89,23 +97,36 @@ pub fn token_condition(t: &MediaToken) -> (String, rusqlite::types::Value) {
     }
 }
 
-/// Cached media of one infohash.
-pub fn cached_media(conn: &Connection, infohash: &str) -> Result<Option<MediaInfo>> {
-    let json: Option<String> = conn
+/// Drop the TMDB-derived fields of a media.
+pub fn strip_tmdb(m: &mut MediaInfo) {
+    m.overview = None;
+    m.episode_title = None;
+    m.poster = None;
+}
+
+/// Cached media of one infohash; TMDB fields older than [`TMDB_MAX_AGE_SECS`] are left out.
+pub fn cached_media(conn: &Connection, infohash: &str, now: i64) -> Result<Option<MediaInfo>> {
+    let row: Option<(String, i64)> = conn
         .query_row(
-            "SELECT json FROM media_cache WHERE infohash = ?1",
+            "SELECT json, fetched_at FROM media_cache WHERE infohash = ?1",
             [infohash],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()
         .db()?;
-    Ok(json.and_then(|j| serde_json::from_str(&j).ok()))
+    Ok(row.and_then(|(j, at)| {
+        let mut m: MediaInfo = serde_json::from_str(&j).ok()?;
+        if now - at >= TMDB_MAX_AGE_SECS {
+            strip_tmdb(&mut m);
+        }
+        Some(m)
+    }))
 }
 
 /// Media of a detail from the cache (offline path).
-pub fn attach_cached(conn: &Connection, d: &mut TorrentDetail) -> Result<()> {
+pub fn attach_cached(conn: &Connection, d: &mut TorrentDetail, now: i64) -> Result<()> {
     if d.media.is_none() {
-        d.media = cached_media(conn, &d.summary.infohash)?;
+        d.media = cached_media(conn, &d.summary.infohash, now)?;
     }
     if let Some(m) = &d.media {
         d.summary.media_title = Some(m.title.clone());
@@ -158,8 +179,35 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub fn media_of(&self, infohash: &str) -> Result<Option<MediaInfo>> {
-        cached_media(&self.conn(), infohash)
+    pub fn media_of(&self, infohash: &str, now: i64) -> Result<Option<MediaInfo>> {
+        cached_media(&self.conn(), infohash, now)
+    }
+
+    /// Enforce [`TMDB_MAX_AGE_SECS`] at rest: blank the TMDB fields of stale `media_cache` rows
+    /// and drop stale poster rows. Returns the poster files to delete (the caller owns them).
+    pub fn expire_tmdb(&self, now: i64) -> Result<(u64, Vec<String>)> {
+        let conn = self.conn();
+        let cutoff = now - TMDB_MAX_AGE_SECS;
+        let blanked = conn
+            .execute(
+                "UPDATE media_cache
+                 SET json = json_remove(json, '$.overview', '$.episode_title', '$.poster')
+                 WHERE fetched_at <= ?1
+                   AND (json_extract(json, '$.overview') IS NOT NULL
+                     OR json_extract(json, '$.episode_title') IS NOT NULL
+                     OR json_extract(json, '$.poster') IS NOT NULL)",
+                [cutoff],
+            )
+            .db()? as u64;
+        let mut st = conn
+            .prepare("DELETE FROM poster_cache WHERE fetched_at <= ?1 RETURNING file")
+            .db()?;
+        let files = st
+            .query_map([cutoff], |r| r.get(0))
+            .db()?
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .db()?;
+        Ok((blanked, files))
     }
 
     pub fn poster(&self, media_id: i64, now: i64) -> Result<Option<CachedPoster>> {
