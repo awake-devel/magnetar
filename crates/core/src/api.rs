@@ -1,5 +1,6 @@
 //! HTTP API DTOs + client (ARCHITECTURE.md §6). Owner: trust-sync agent (DTOs are contracts).
 
+use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
 use crate::model::*;
@@ -92,77 +93,173 @@ impl ApiClient {
     }
     /// ws(s)://…/relay?token=… derived from base_url.
     pub fn relay_ws_url(&self) -> String {
-        todo!()
+        let base = &self.base_url;
+        let ws = if let Some(rest) = base.strip_prefix("https://") {
+            format!("wss://{rest}")
+        } else if let Some(rest) = base.strip_prefix("http://") {
+            format!("ws://{rest}")
+        } else if base.starts_with("ws://") || base.starts_with("wss://") {
+            base.clone()
+        } else {
+            format!("ws://{base}")
+        };
+        match self.token.as_deref().filter(|t| !t.is_empty()) {
+            Some(t) => format!("{ws}/relay?token={}", encode(t)),
+            None => format!("{ws}/relay"),
+        }
     }
     pub async fn health(&self) -> crate::Result<Health> {
-        todo!()
+        self.json(self.req(Method::GET, "/health")).await
     }
     pub async fn search(&self, q: &SearchQuery) -> crate::Result<SearchPage> {
-        let _ = (q, &self.token, &self.http);
-        todo!()
+        self.json(self.req(Method::POST, "/api/v1/search").json(q))
+            .await
     }
     pub async fn torrent(&self, infohash: &str) -> crate::Result<Option<TorrentDetail>> {
-        let _ = infohash;
-        todo!()
+        let resp = self
+            .send(self.req(
+                Method::GET,
+                &format!("/api/v1/torrents/{}", encode(infohash)),
+            ))
+            .await;
+        match resp {
+            Err(crate::Error::Server { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+            Ok(r) => Ok(Some(r.json().await?)),
+        }
     }
     pub async fn refresh_liveness(&self, infohash: &str) -> crate::Result<Liveness> {
-        let _ = infohash;
-        todo!()
+        let path = format!("/api/v1/torrents/{}/liveness", encode(infohash));
+        self.json(self.req(Method::POST, &path)).await
     }
+    /// Posts in chunks of `MAX_BATCH` and concatenates the results.
     pub async fn post_batch(&self, events: &[RawEvent]) -> crate::Result<BatchResponse> {
-        let _ = events;
-        todo!()
+        let mut out = BatchResponse::default();
+        for chunk in events.chunks(MAX_BATCH) {
+            let body = BatchRequest {
+                events: chunk.to_vec(),
+            };
+            let r: BatchResponse = self
+                .json(self.req(Method::POST, "/api/v1/events/batch").json(&body))
+                .await?;
+            out.results.extend(r.results);
+        }
+        Ok(out)
     }
     pub async fn stats(&self) -> crate::Result<StatsResponse> {
-        todo!()
+        self.json(self.req(Method::GET, "/api/v1/stats")).await
     }
     pub async fn relays(&self) -> crate::Result<Vec<RelayInfo>> {
-        todo!()
+        self.json(self.req(Method::GET, "/api/v1/relays")).await
     }
     pub async fn set_relay(&self, u: &RelayUpdate) -> crate::Result<Vec<RelayInfo>> {
-        let _ = u;
-        todo!()
+        self.json(self.req(Method::PUT, "/api/v1/relays").json(u))
+            .await
     }
     pub async fn trust(&self, pubkey: &str) -> crate::Result<TrustScore> {
-        let _ = pubkey;
-        todo!()
+        let path = format!("/api/v1/trust/{}", encode(pubkey));
+        self.json(self.req(Method::GET, &path)).await
     }
     pub async fn trust_settings(&self) -> crate::Result<TrustSettings> {
-        todo!()
+        self.json(self.req(Method::GET, "/api/v1/settings/trust"))
+            .await
     }
     pub async fn set_trust_settings(&self, s: &TrustSettings) -> crate::Result<TrustSettings> {
-        let _ = s;
-        todo!()
+        self.json(self.req(Method::PUT, "/api/v1/settings/trust").json(s))
+            .await
     }
     pub async fn set_override(
         &self,
         pubkey: &str,
         action: Option<OverrideAction>,
     ) -> crate::Result<()> {
-        let _ = (pubkey, action);
-        todo!()
+        let path = format!("/api/v1/overrides/{}", encode(pubkey));
+        self.send(
+            self.req(Method::PUT, &path)
+                .json(&OverrideRequest { action }),
+        )
+        .await
+        .map(drop)
     }
     pub async fn saved_searches(&self) -> crate::Result<Vec<SavedSearch>> {
-        todo!()
+        self.json(self.req(Method::GET, "/api/v1/saved-searches"))
+            .await
     }
     pub async fn put_saved_search(&self, s: &SavedSearch) -> crate::Result<SavedSearch> {
-        let _ = s;
-        todo!()
+        self.json(self.req(Method::POST, "/api/v1/saved-searches").json(s))
+            .await
     }
     pub async fn delete_saved_search(&self, id: i64) -> crate::Result<()> {
-        let _ = id;
-        todo!()
+        let path = format!("/api/v1/saved-searches/{id}");
+        self.send(self.req(Method::DELETE, &path)).await.map(drop)
     }
     pub async fn downloads(&self) -> crate::Result<Vec<DownloadInfo>> {
-        todo!()
+        self.json(self.req(Method::GET, "/api/v1/downloads")).await
     }
     pub async fn add_download(&self, magnet: &str) -> crate::Result<DownloadInfo> {
-        let _ = magnet;
-        todo!()
+        let body = DownloadRequest {
+            magnet: magnet.to_string(),
+        };
+        self.json(self.req(Method::POST, "/api/v1/downloads").json(&body))
+            .await
     }
     /// action: "pause" | "resume" | "delete"
     pub async fn download_action(&self, id: u64, action: &str) -> crate::Result<()> {
-        let _ = (id, action);
-        todo!()
+        let req = match action {
+            "pause" | "resume" => {
+                self.req(Method::POST, &format!("/api/v1/downloads/{id}/{action}"))
+            }
+            "delete" => self.req(Method::DELETE, &format!("/api/v1/downloads/{id}")),
+            other => {
+                return Err(crate::Error::Invalid(format!(
+                    "unknown download action {other:?}"
+                )));
+            }
+        };
+        self.send(req).await.map(drop)
     }
+
+    fn req(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
+        let rb = self
+            .http
+            .request(method, format!("{}{path}", self.base_url));
+        match &self.token {
+            Some(t) => rb.bearer_auth(t),
+            None => rb,
+        }
+    }
+
+    /// Send; any non-2xx becomes `Error::Server` with the message from the error body.
+    async fn send(&self, rb: reqwest::RequestBuilder) -> crate::Result<reqwest::Response> {
+        let resp = rb.send().await?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp);
+        }
+        let body = resp.text().await.unwrap_or_default();
+        let msg = match serde_json::from_str::<ApiErrorBody>(&body) {
+            Ok(e) if !e.message.is_empty() => e.message,
+            Ok(e) => e.error,
+            Err(_) if body.trim().is_empty() => {
+                status.canonical_reason().unwrap_or("error").to_string()
+            }
+            Err(_) => body.chars().take(500).collect(),
+        };
+        Err(crate::Error::Server {
+            status: status.as_u16(),
+            msg,
+        })
+    }
+
+    async fn json<T: serde::de::DeserializeOwned>(
+        &self,
+        rb: reqwest::RequestBuilder,
+    ) -> crate::Result<T> {
+        Ok(self.send(rb).await?.json().await?)
+    }
+}
+
+/// Percent-encode one path segment / query value.
+fn encode(s: &str) -> String {
+    percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
