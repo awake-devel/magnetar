@@ -49,6 +49,10 @@ RUN groupadd --system --gid "$GID" magnetar \
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /out/magnetar-server /usr/local/bin/magnetar-server
 COPY docker/healthcheck.sh /usr/local/bin/magnetar-healthcheck
+# .gitattributes keeps it LF, but a checkout copied from Windows can still carry CRLF, and
+# `#!/bin/bash\r` would leave the container "unhealthy" forever: strip CRs either way.
+RUN sed -i 's/\r$//' /usr/local/bin/magnetar-healthcheck \
+    && chmod 0755 /usr/local/bin/magnetar-healthcheck
 
 # Inside a container the server must listen on all interfaces; what the host exposes is
 # decided by the published port (compose: 127.0.0.1:8787 by default).

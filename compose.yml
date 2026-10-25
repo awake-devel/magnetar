@@ -5,7 +5,8 @@
 #   curl http://127.0.0.1:8787/health
 #
 # Optional Tailscale HTTPS front end: docker compose --profile tailscale up -d
-# Every variable in .env is also passed to the magnetar container (MAGNETAR_*, RUST_LOG).
+# Only the variables listed under magnetar.environment reach the server container; TS_AUTHKEY
+# and POSTGRES_PASSWORD stay out of it (DATABASE_URL already carries the password).
 
 services:
   db:
@@ -34,11 +35,26 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    env_file: .env
+    # No env_file: .env also holds TS_AUTHKEY, which must not end up in this container.
+    # A bare name passes the value from .env (or the shell) and is unset in the container when
+    # missing there. That also hides an image ENV of the same name, hence RUST_LOG's default.
+    # A server variable not listed here goes in compose.override.yml (docs/DOCKER.md).
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-magnetar}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-magnetar}}
       MAGNETAR_API_TOKEN: ${MAGNETAR_API_TOKEN:?MAGNETAR_API_TOKEN is not set. Put a long random token in .env (openssl rand -hex 32)}
       MAGNETAR_DB_POOL: ${MAGNETAR_DB_POOL:-10}
+      MAGNETAR_ROOT_NPUB:
+      MAGNETAR_SEED_RELAYS:
+      MAGNETAR_CRAWL_INTERVAL_SECS:
+      MAGNETAR_CRAWL_MAX_RELAYS:
+      MAGNETAR_CRAWL_EXPLORE_RELAYS:
+      MAGNETAR_NIP66:
+      MAGNETAR_NIP66_MONITORS:
+      MAGNETAR_NIP66_TRUSTED:
+      MAGNETAR_DOWNLOADS:
+      MAGNETAR_NTFY_URL:
+      MAGNETAR_NTFY_TOPIC:
+      RUST_LOG: ${RUST_LOG:-info}
     # Image default is 10001:10001. Set to your own uid:gid when MAGNETAR_DATA is a host folder.
     user: ${MAGNETAR_UID:-10001}:${MAGNETAR_GID:-10001}
     volumes:

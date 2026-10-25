@@ -17,7 +17,7 @@ magnetar-server --version
 
 | Variable | Default | Notes |
 |---|---|---|
-| `DATABASE_URL` | none (required) | Termux socket form: `postgres:///magnetar?host=/data/data/com.termux/files/usr/tmp&user=magnetar`. Also accepted: `postgres://magnetar@localhost/magnetar?host=<dir>`, or TCP `postgres://magnetar:<pw>@127.0.0.1:5432/magnetar`. sqlx pool of 5 or fewer |
+| `DATABASE_URL` | none (required) | Termux socket form: `postgres:///magnetar?host=/data/data/com.termux/files/usr/tmp&user=magnetar`. Also accepted: `postgres://magnetar@localhost/magnetar?host=<dir>`, or TCP `postgres://magnetar:<pw>@127.0.0.1:5432/magnetar`. Pool size: `MAGNETAR_DB_POOL` |
 | `MAGNETAR_DB_POOL` | `10` | sqlx pool size (maximum open Postgres connections), at least 1. Postgres allows 100 connections by default (ARCHITECTURE.md D37) |
 | `MAGNETAR_BIND` | `127.0.0.1:8787` | Never `0.0.0.0` on a phone: every app can reach loopback, and on Wi-Fi other hosts could reach the port too |
 | `MAGNETAR_API_TOKEN` | none (required for `serve`) | `Authorization: Bearer <token>` on everything except `GET /health`. The `/relay` WebSocket also accepts `?token=` |

@@ -3,7 +3,9 @@
 `compose.yml` at the repo root runs two containers: `db` (`postgres:18`) and `magnetar`
 (`ghcr.io/awake-devel/magnetar`, built from the root `Dockerfile`). This works the same on a
 Linux PC or VPS, a Synology NAS (x86_64), a Raspberry Pi with a 64-bit OS and Docker
-Desktop on macOS or Windows. The image is published for `linux/amd64` and `linux/arm64`.
+Desktop on macOS or Windows. The image is meant to be published for `linux/amd64` and
+`linux/arm64` by CI (`.github/workflows/docker.yml`, D39), but **nothing is published yet**:
+until the first release, build it from a full checkout (below).
 Design notes are in ARCHITECTURE.md D37, and every variable is in docs/CONFIG.md.
 
 Nothing is installed on the host apart from Docker: no systemd unit, timer or udev rule.
@@ -14,23 +16,27 @@ packages, Synology and Docker Desktop with "Start when you sign in").
 ## Quick start
 
 ```sh
-git clone https://github.com/awake-devel/magnetar && cd magnetar   # or copy compose.yml,
-cp .env.example .env                                               # .env.example and docker/
+git clone https://github.com/awake-devel/magnetar && cd magnetar
+cp .env.example .env && chmod 600 .env   # holds the DB password and the API token
 # edit .env: POSTGRES_PASSWORD=$(openssl rand -hex 24), MAGNETAR_API_TOKEN=$(openssl rand -hex 32)
+docker compose build                   # until an image is published (see below)
 docker compose up -d
 docker compose ps                      # both "healthy" after ~30 s
 curl http://127.0.0.1:8787/health      # {"status":"ok","version":"0.1.0","db":true}
 ```
 
-`docker compose up -d` pulls the published image; if that tag cannot be pulled (offline, or
-not published yet) compose builds it from the checkout instead. To build it yourself (no
-registry needed; on this 12-thread laptop the first build took about 15 minutes and a rebuild
-after a source change about 4.5, since cargo-chef keeps the dependency layer; expect far
-longer on a Pi):
+**Building** needs the whole checkout (`Dockerfile` and `crates/`), not just `compose.yml`.
+On this 12-thread laptop the first build took about 15 minutes and a rebuild after a source
+change about 4.5, since cargo-chef keeps the dependency layer; expect far longer on a Pi
+(not measured).
 
-```sh
-docker compose build && docker compose up -d
-```
+**Pulling** (planned): once CI publishes `ghcr.io/awake-devel/magnetar`, `docker compose up -d`
+pulls it (checked: compose pulls a tag that exists and builds only when the pull fails) and
+the build step is unnecessary; then `compose.yml`, `.env` and `docker/` are all a
+host needs. CI tags `X.Y.Z` and `latest` from a release tag `vX.Y.Z` (a prerelease such as
+`v0.1.0-rc1` gets only its own tag and never moves `latest`) and `edge` from `main`. Until
+then a plain `up -d` fails to pull and falls back to building, which only works in a full
+checkout. Check with `docker manifest inspect ghcr.io/awake-devel/magnetar:latest`.
 
 Without `POSTGRES_PASSWORD` or `MAGNETAR_API_TOKEN` in `.env`, compose stops before
 creating anything and prints which one is missing.
@@ -53,6 +59,21 @@ reach it. Choose one of:
 
 Inside the container the server listens on `0.0.0.0:8787` (`MAGNETAR_BIND` is set in the
 image). Do not change that: the published port decides what the host exposes.
+
+### Environment
+
+`.env` is read by compose itself, but the magnetar container only receives the server
+variables that `compose.yml` lists by name under `magnetar.environment` (each one is left out
+when unset in `.env`). So `TS_AUTHKEY` and `POSTGRES_PASSWORD` never reach the server process
+(`DATABASE_URL` carries the password). To pass a variable that is not listed, add it in
+`compose.override.yml`:
+
+```yaml
+services:
+  magnetar:
+    environment:
+      MAGNETAR_SOMETHING: ${MAGNETAR_SOMETHING:-}
+```
 
 ## What lives where
 
@@ -90,7 +111,7 @@ is fine on an always-on box.
 ## Updates
 
 ```sh
-docker compose pull          # new ghcr.io/awake-devel/magnetar:${MAGNETAR_VERSION:-latest}
+docker compose pull          # once published: ghcr.io/awake-devel/magnetar:${MAGNETAR_VERSION:-latest}
 docker compose up -d         # recreates only what changed; migrations run at start
 docker image prune           # optional: drop the old image
 ```
@@ -179,6 +200,9 @@ capabilities, so it also runs on Synology and Docker Desktop) and serves
 configured by `docker/tailscale-serve.json`. HTTPS certificates must be enabled for the
 tailnet (admin console → DNS → HTTPS Certificates). Funnel (public internet) is off. The node
 state lives in the `tailscale-state` volume, so the auth key is only used on the first start.
+Only the sidecar receives `TS_AUTHKEY` (the magnetar container gets just the server variables
+listed in `compose.yml`). Use a one-off (non-reusable) key and delete it from `.env` once the
+node has joined.
 With the sidecar you can leave `MAGNETAR_PUBLISH` at `127.0.0.1:8787`.
 
 If the host already runs Tailscale, skip the sidecar and use the host's
@@ -191,27 +215,32 @@ it has not been run against a real tailnet.
 
 ### Synology NAS (DSM 7.2+, x86_64 models)
 
-Container Manager runs compose projects: **Container Manager → Project → Create**, pick a
-folder such as `/volume1/docker/magnetar`, and upload `compose.yml` and a filled-in `.env`
-(and `docker/tailscale-serve.json` if you use the profile). Or over SSH in that folder:
-`sudo docker compose up -d`. To put downloads in a shared folder, set
-`MAGNETAR_DATA=/volume1/downloads/magnetar` and `MAGNETAR_UID`/`MAGNETAR_GID` to the user
-that owns it (`id <user>` over SSH). ARM-based Synology models (`aarch64`) use the arm64
-image; 32-bit ARM models are not supported. **UNVERIFIED** on a real DSM.
+Until an image is published, the NAS has to build it: copy the **whole checkout** (or `git
+clone` over SSH) to a folder such as `/volume1/docker/magnetar`, then over SSH in that folder
+`sudo docker compose build && sudo docker compose up -d`, or in **Container Manager → Project
+→ Create** pick that folder (it should find `compose.yml` and build). Once the image is
+published (planned, D39), `compose.yml`, a filled-in `.env` (`chmod 600`) and `docker/` are
+enough. To put downloads in a shared folder, set `MAGNETAR_DATA=/volume1/downloads/magnetar`
+and `MAGNETAR_UID`/`MAGNETAR_GID` to the user that owns it (`id <user>` over SSH).
+ARM-based Synology models (`aarch64`) build or pull for arm64 like a Pi; 32-bit ARM models
+are not supported. **UNVERIFIED** on a real DSM.
 
 ### Raspberry Pi (64-bit Raspberry Pi OS / Debian / Ubuntu, Pi 4 or 5)
 
-Install Docker Engine (`curl -fsSL https://get.docker.com | sh`), then the quick start. The
-arm64 image is pulled automatically; a 32-bit OS (`armv7l` in `uname -m`) is not supported.
-Prefer an SSD over the SD card for the Postgres volume (it writes constantly while crawling).
-Building on a Pi works but takes long; pulling is the normal path. **UNVERIFIED** on a Pi:
-the arm64 image is built on GitHub's native arm64 runners, not on this laptop.
+Install Docker Engine (`curl -fsSL https://get.docker.com | sh`), then the quick start. A
+32-bit OS (`armv7l` in `uname -m`) is not supported. Prefer an SSD over the SD card for the
+Postgres volume (it writes constantly while crawling). Until an arm64 image is published
+(planned: CI builds it on GitHub's native arm64 runners, D39), the quick start builds on the
+Pi itself, which takes long; afterwards `up -d` pulls the arm64 variant automatically.
+**UNVERIFIED** on arm64: this laptop is x86_64 without emulation, so neither the arm64 build
+nor the image has been run here.
 
 ### Docker Desktop (macOS, Windows)
 
-Same commands in a terminal (PowerShell works). The linux/arm64 image runs natively on Apple
-silicon, linux/amd64 on Intel Macs and Windows. Docker Desktop's VM sleeps with the laptop,
-so crawling pauses too. To reach the server from a phone on the same Wi-Fi, set
+Same commands in a terminal (PowerShell works). `docker compose build` builds for the
+machine's own architecture (linux/arm64 on Apple silicon, linux/amd64 on Intel Macs and
+Windows); a published image would be picked the same way. Docker Desktop's VM sleeps with
+the laptop, so crawling pauses too. To reach the server from a phone on the same Wi-Fi, set
 `MAGNETAR_PUBLISH=0.0.0.0:8787` and allow the port in the OS firewall, or use Tailscale on
 the host. **UNVERIFIED** on macOS and Windows.
 
