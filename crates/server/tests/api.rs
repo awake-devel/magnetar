@@ -521,7 +521,6 @@ async fn relay_rejects_missing_token() {
 // ---- post-merge: need core::ingest / nip35 / sync::NegResponder ----
 
 #[tokio::test]
-#[ignore = "post-merge"]
 async fn batch_ingest_fixtures() {
     let Some(db) = test_db().await else { return };
     let base = spawn_server(&db.store).await;
@@ -544,18 +543,21 @@ async fn batch_ingest_fixtures() {
     };
     let first = send().await;
     assert_eq!(first.results.len(), n);
-    assert!(
-        first.results.iter().all(|r| r.accepted),
-        "{:?}",
-        first.results
-    );
+    // Only the fixture with a 64-hex (v2-only) `x` tag is refused.
+    let refused: Vec<_> = first.results.iter().filter(|r| !r.accepted).collect();
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0].message, "invalid: no valid infohash");
     let second = send().await;
-    assert!(
-        second
-            .results
-            .iter()
-            .all(|r| r.accepted && r.duplicate && r.message.starts_with("duplicate:"))
-    );
+    for (a, b) in first.results.iter().zip(&second.results) {
+        if a.accepted {
+            assert!(
+                b.accepted && b.duplicate && b.message.starts_with("duplicate:"),
+                "{b:?}"
+            );
+        } else {
+            assert_eq!(a, b);
+        }
+    }
     // Tampered event is refused.
     let mut bad = events[0].clone();
     bad.content.push('!');
@@ -573,7 +575,6 @@ async fn batch_ingest_fixtures() {
 }
 
 #[tokio::test]
-#[ignore = "post-merge"]
 async fn relay_event_ok_prefixes() {
     let Some(db) = test_db().await else { return };
     let base = spawn_server(&db.store).await;
@@ -617,7 +618,6 @@ async fn relay_event_ok_prefixes() {
 
 /// NIP-77 interop with nostr-sdk as the oracle: Down (server → client) then Up (client → server).
 #[tokio::test]
-#[ignore = "post-merge"]
 async fn negentropy_interop_nostr_sdk() {
     use nostr_sdk::prelude::*;
     let Some(db) = test_db().await else { return };
@@ -679,7 +679,12 @@ async fn negentropy_interop_nostr_sdk() {
         .unwrap();
     assert!(up.failed.is_empty(), "{:?}", up.failed);
     assert_eq!(up.value.sent.len(), 25);
-    assert!(up.value.send_failures.is_empty());
+    // nostr-sdk keys the map by relay even when that relay had no failures.
+    assert!(
+        up.value.send_failures.values().all(|f| f.is_empty()),
+        "{:?}",
+        up.value.send_failures
+    );
     assert_eq!(s.stats().await.unwrap().events, 65);
 
     // Both sides converged: a second Both sync is a no-op.

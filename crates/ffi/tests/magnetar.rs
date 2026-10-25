@@ -267,7 +267,6 @@ fn block_publisher_is_local_first() {
 // ---- post-merge / network
 
 #[test]
-#[ignore = "post-merge"]
 fn server_failure_falls_back_to_local() {
     let dir = TempDir::new("fallback");
     let mut cfg = config();
@@ -300,7 +299,7 @@ fn server_failure_falls_back_to_local() {
 
 /// Real relays, phone budget: run with `cargo test -p magnetar-ffi -- --ignored crawl_once_live`.
 #[test]
-#[ignore = "post-merge"]
+#[ignore = "network"]
 fn crawl_once_live() {
     let dir = TempDir::new("crawl");
     let m = open(&dir, config());
@@ -318,7 +317,6 @@ fn crawl_once_live() {
 
 /// Needs a running magnetar-server: MAGNETAR_TEST_SERVER_URL (+ MAGNETAR_TEST_SERVER_TOKEN).
 #[test]
-#[ignore = "post-merge"]
 fn sync_now_against_server() {
     let Ok(url) = std::env::var("MAGNETAR_TEST_SERVER_URL") else {
         eprintln!("SKIPPED (no MAGNETAR_TEST_SERVER_URL)");

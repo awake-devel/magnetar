@@ -127,7 +127,7 @@ async fn migrate_serve_and_graceful_shutdown() {
 
 /// Real relays. Run with `--ignored` after merge (needs core::crawler + nip35 + ingest).
 #[tokio::test]
-#[ignore = "post-merge"]
+#[ignore = "network"]
 async fn crawl_once_end_to_end() {
     let Some(db) = test_db().await else { return };
     let out = Command::new(BIN)

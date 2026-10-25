@@ -205,7 +205,6 @@ fn not_a_relay_list() {
 }
 
 #[test]
-#[ignore = "post-merge"]
 fn relay_list_markers_and_dupes() {
     let e = ev(
         10002,
@@ -238,7 +237,6 @@ fn relay_list_markers_and_dupes() {
 }
 
 #[test]
-#[ignore = "post-merge"]
 fn relay_list_real_fixtures() {
     let evs = fixture("kind10002_sample.jsonl");
     // 90cbca96…: wss://relay.0xchat.com/ listed as read and as write → one read+write entry.
@@ -265,7 +263,6 @@ fn relay_list_real_fixtures() {
 }
 
 #[test]
-#[ignore = "post-merge"]
 fn kind3_legacy_relay_map_fallback() {
     let evs = fixture("kind3_sample.jsonl");
     // d7607464… (publisher): 14-entry legacy content map, all read+write.
@@ -298,7 +295,6 @@ fn kind3_legacy_relay_map_fallback() {
 }
 
 #[test]
-#[ignore = "post-merge"]
 fn oversized_threshold_is_over_50() {
     let urls: Vec<String> = (0..51).map(|i| format!("wss://r{i}.example.com")).collect();
     let tags = |n: usize| urls[..n].iter().map(|u| vec!["r", u.as_str()]).collect();

@@ -753,7 +753,6 @@ fn replaceable(id: u64, pubkey: u64, kind: u16, created_at: i64, tags: Vec<Vec<&
 }
 
 #[tokio::test]
-#[ignore = "post-merge"]
 async fn replaceable_newer_wins_tie_lowest_id() {
     let Some(db) = test_db().await else { return };
     let s = &db.store;
@@ -830,7 +829,6 @@ async fn replaceable_newer_wins_tie_lowest_id() {
 }
 
 #[tokio::test]
-#[ignore = "post-merge"]
 async fn reports_are_extracted() {
     let Some(db) = test_db().await else { return };
     let s = &db.store;
@@ -845,7 +843,6 @@ async fn reports_are_extracted() {
 }
 
 #[tokio::test]
-#[ignore = "post-merge"]
 async fn torrent_detail_groups_events() {
     let Some(db) = test_db().await else { return };
     let s = &db.store;
@@ -875,7 +872,6 @@ async fn torrent_detail_groups_events() {
 }
 
 #[tokio::test]
-#[ignore = "post-merge"]
 async fn ingest_fixtures() {
     let Some(db) = test_db().await else { return };
     let s = &db.store;
@@ -898,9 +894,10 @@ async fn ingest_fixtures() {
         }
     }
     let st = s.stats().await.unwrap();
-    assert!(
-        inserted >= 52,
-        "every kind 2003 fixture verifies and parses ({inserted})"
+    // 52 kind-2003 fixtures; the one with only a 64-hex (v2) `x` is rejected as NoInfohash.
+    assert_eq!(
+        inserted, 51,
+        "every kind 2003 fixture with a v1 hash is ingested"
     );
     assert!(st.torrents > 0);
     let page = s

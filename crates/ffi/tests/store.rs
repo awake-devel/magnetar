@@ -786,7 +786,6 @@ fn reopen_keeps_data_and_schema() {
 // ---- post-merge: need nostr agent's nip35/ingest/magnet and trust-sync agent's wot.
 
 #[tokio::test]
-#[ignore = "post-merge"]
 async fn replaceable_semantics() {
     let s = store();
     let root = pk(1);
@@ -860,7 +859,6 @@ async fn replaceable_semantics() {
 }
 
 #[tokio::test]
-#[ignore = "post-merge"]
 async fn detail_groups_events_and_comments() {
     let s = store();
     let a = torrent(&ih(5), "Big.Buck.Bunny", &pk(1), 100);
@@ -892,7 +890,6 @@ async fn detail_groups_events_and_comments() {
 /// Fixture ingest parity with PgStore (ARCHITECTURE.md §10): every fixture line ingests, and the
 /// same queries give the same grouped results as the server store's test.
 #[tokio::test]
-#[ignore = "post-merge"]
 async fn fixture_ingest_parity() {
     use magnetar_core::ingest::{IngestOutcome, ingest_into};
     let s = store();
@@ -909,9 +906,10 @@ async fn fixture_ingest_parity() {
             }
         }
     }
-    assert!(
-        inserted >= 52,
-        "every 2003 fixture is ingested ({inserted})"
+    // 52 kind-2003 fixtures; the one with only a 64-hex (v2) `x` is rejected as NoInfohash.
+    assert_eq!(
+        inserted, 51,
+        "every 2003 fixture with a v1 hash is ingested"
     );
     let stats = s.stats().await.unwrap();
     assert!(stats.torrents > 0 && stats.torrents <= 52);
