@@ -6,7 +6,7 @@ mod support;
 use std::time::Duration;
 
 use magnetar_core::model::RawEvent;
-use magnetar_core::nip66::{self, Nip66Config, Nip66Report, Skip, Verdict, classify};
+use magnetar_core::nip66::{self, Nip66Config, Nip66Report, Observation, Skip, Verdict, classify};
 use magnetar_core::store::Store;
 use nostr::prelude::Keys;
 use serde_json::Value;
@@ -76,7 +76,19 @@ fn real_fixtures_verify_and_classify() {
     }
 
     let mut report = Nip66Report::default();
-    let urls = nip66::candidates(&events, &mut report);
+    let obs: Vec<Observation> = events
+        .iter()
+        .map(|e| {
+            Observation::of(
+                e,
+                nip66::DEFAULT_TRUSTED_MONITORS.contains(&e.pubkey.as_str()),
+            )
+        })
+        .collect();
+    let urls: Vec<String> = nip66::candidates(&obs, &mut report)
+        .into_iter()
+        .map(|c| c.url)
+        .collect();
     // podsystems is reported restricted by two monitors and must not come back.
     assert!(!urls.contains(&"wss://podsystems.nostr1.com".to_string()));
     assert!(urls.contains(&"wss://relay.21mil.me".to_string()));
@@ -102,6 +114,8 @@ fn cfg(relays: &[&FakeRelay]) -> Nip66Config {
         monitor_relays: relays.iter().map(|r| r.url.clone()).collect(),
         page_timeout: Duration::from_secs(5),
         budget: Duration::from_secs(20),
+        trusted_monitors: Vec::new(),
+        max_new_open: 10_000,
         ..Nip66Config::default()
     }
 }
@@ -293,6 +307,103 @@ async fn caps_insertions_and_survives_dead_relays() {
     }
 }
 
+/// The eviction attack: hundreds of fresh 10166s from throwaway keys next to a trusted monitor
+/// whose own announcement is months old (as the nostr.watch fleet's is).
+#[tokio::test]
+async fn sybil_monitors_cannot_evict_or_veto_trusted_ones() {
+    let t0 = now();
+    let real = Keys::generate();
+    let real_hex = real.public_key().to_hex();
+    let mut events = vec![sign(
+        &real,
+        nip66::KIND_MONITOR_ANNOUNCEMENT,
+        t0 - 120 * 86_400,
+        &[&["frequency", "14400"]],
+        "",
+    )];
+    events.extend((0..30).map(|i| {
+        discovery(
+            &real,
+            t0 - 200 - i,
+            &format!("wss://real{i}.example.com"),
+            &[],
+        )
+    }));
+    for i in 0..300 {
+        let k = Keys::generate();
+        events.push(sign(
+            &k,
+            nip66::KIND_MONITOR_ANNOUNCEMENT,
+            t0 - 5,
+            &[&["frequency", "60"]],
+            "",
+        ));
+        events.push(discovery(
+            &k,
+            t0 - 10,
+            &format!("wss://junk{i}.example.com"),
+            &[],
+        ));
+        // Newer than every trusted event, and trying to hide one of them.
+        events.push(discovery(
+            &k,
+            t0 - 10,
+            &format!("wss://real{}.example.com", i % 30),
+            &[&["R", "auth"]],
+        ));
+    }
+    let relay = FakeRelay::start(
+        events,
+        Behaviour {
+            page_clamp: 500,
+            ..Behaviour::default()
+        },
+    )
+    .await;
+    let store = MemStore::default();
+    let mut c = cfg(&[&relay]);
+    c.trusted_monitors = vec![real_hex.clone()];
+    c.max_new_open = 7;
+    let report = nip66::discover(&store, &c).await.unwrap();
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.monitors, 251, "the trusted one plus 250 open");
+    assert_eq!(report.trusted, 1);
+    assert_eq!(report.inserted, 37);
+    let urls: Vec<String> = store
+        .list_relays()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.url)
+        .collect();
+    for i in 0..30 {
+        assert!(
+            urls.contains(&format!("wss://real{i}.example.com")),
+            "real{i}"
+        );
+    }
+    assert_eq!(urls.iter().filter(|u| u.contains("junk")).count(), 7);
+
+    // The trusted monitor has its own filter, sent before any open one.
+    let pages: Vec<Value> = relay
+        .reqs()
+        .into_iter()
+        .filter(|f| f["kinds"][0] == 30166)
+        .collect();
+    assert_eq!(pages[0]["authors"], serde_json::json!([real_hex]));
+    let open = pages
+        .iter()
+        .find(|f| f["authors"].as_array().unwrap().len() > 1)
+        .unwrap();
+    assert_eq!(open["authors"].as_array().unwrap().len(), 250);
+    assert!(
+        !open["authors"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::from(real_hex))
+    );
+}
+
 #[tokio::test]
 #[ignore = "network"]
 async fn live_monitors() {
@@ -302,5 +413,7 @@ async fn live_monitors() {
         .unwrap();
     eprintln!("{report:#?}");
     assert!(report.monitors > 0);
+    // 12 of 12 answered on 2026-10-25; fewer means DEFAULT_TRUSTED_MONITORS needs a look.
+    assert!(report.trusted >= 6, "{}", report.trusted);
     assert!(report.candidates > 100);
 }

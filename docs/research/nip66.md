@@ -124,5 +124,11 @@ Tag counts are from 5,000 events (monitorlizard):
   - at most 2,000 new rows per run
   - new relays only get exploration slots, and failures back off (up to 24 h)
   - existing rows are never changed (`upsert_relay`)
+- A 10166 does more than let junk in: sorting announced monitors by announcement recency and
+  cutting at 250 lets 250 fresh sybil 10166s push the real fleet (announcements 80–130 days old,
+  re-measured 2026-10-25 on relaypag.es) out of the `authors` filter, and one sybil `R auth`
+  would hide any relay. D31 answers with a hand-checked trusted list (§3, the 12 monitors with
+  more than 100 events in 7 days) that is requested on its own, cannot be vetoed by open
+  monitors, and is not subject to the 100-per-run cap on open-only relays.
 - Relays are ranked by the number of distinct monitors that report them (1,146 of 1,386 have
   5 or more), so if the cap applies, the best-corroborated relays go in first.

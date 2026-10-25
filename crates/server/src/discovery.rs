@@ -15,17 +15,22 @@ use crate::store::PgStore;
 /// Monitors refresh every 10 min to 24 h, but the relay population moves slowly.
 pub const NIP66_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 
-/// Monitor relays from env, else the built-in list.
+/// Monitor relays and trusted monitors from env, else the built-in lists.
 pub fn nip66_config(cfg: &Config) -> Nip66Config {
     let mut c = Nip66Config::default();
-    let monitors: Vec<String> = cfg
-        .nip66_monitors
-        .iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let list = |v: &[String]| -> Vec<String> {
+        v.iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let monitors = list(&cfg.nip66_monitors);
     if !monitors.is_empty() {
         c.monitor_relays = monitors;
+    }
+    let trusted = list(&cfg.nip66_trusted);
+    if !trusted.is_empty() {
+        c.trusted_monitors = trusted;
     }
     c
 }
@@ -45,12 +50,16 @@ pub async fn discovery_loop(
                 Ok(r) => {
                     tracing::info!(
                         monitors = r.monitors,
+                        trusted = r.trusted,
                         events = r.events,
                         candidates = r.candidates,
                         inserted = r.inserted,
                         "nip66 discovery done in {} ms",
                         r.duration_ms
                     );
+                    if r.trusted == 0 {
+                        tracing::warn!("nip66: no trusted monitor answered; check MAGNETAR_NIP66_TRUSTED");
+                    }
                     for e in &r.errors {
                         tracing::debug!("nip66: {e}");
                     }
@@ -81,12 +90,18 @@ mod tests {
             nip66_config(&cli.config).monitor_relays,
             nip66::DEFAULT_MONITOR_RELAYS
         );
+        assert_eq!(
+            nip66_config(&cli.config).trusted_monitors,
+            nip66::DEFAULT_TRUSTED_MONITORS
+        );
         let cli = Cli::try_parse_from([
             "magnetar-server",
             "--nip66",
             "false",
             "--nip66-monitors",
             "wss://a.example.com, ,wss://b.example.com",
+            "--nip66-trusted",
+            &"ab".repeat(32),
             "serve",
         ])
         .unwrap();
@@ -94,6 +109,10 @@ mod tests {
         assert_eq!(
             nip66_config(&cli.config).monitor_relays,
             vec!["wss://a.example.com", "wss://b.example.com"]
+        );
+        assert_eq!(
+            nip66_config(&cli.config).trusted_monitors,
+            vec!["ab".repeat(32)]
         );
     }
 }
