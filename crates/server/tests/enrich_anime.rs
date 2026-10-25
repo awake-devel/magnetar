@@ -159,10 +159,9 @@ async fn imports_datasets_and_matches_torrents() {
     let (aod, fribb) = write_datasets(&dir);
     let cfg = cfg(&aod, &fribb);
 
-    // Without the contract tables the run refuses (the daemon just waits).
-    assert!(!enrich_anime::contract_tables_exist(&pool).await.unwrap());
-    assert!(enrich_anime::run_once(&pool, &cfg, false).await.is_err());
+    // The media tables come from the enrich/imdb migration (D40); the mirror is a no-op.
     contract_tables(&pool).await;
+    assert!(enrich_anime::contract_tables_exist(&pool).await.unwrap());
 
     // Another matcher already knows JJK as a series by its IMDb id.
     pool.execute(
