@@ -29,7 +29,7 @@ CREATE UNIQUE INDEX media_anilist ON media (anilist) WHERE anilist IS NOT NULL;
 CREATE UNIQUE INDEX media_anidb ON media (anidb) WHERE anidb IS NOT NULL;
 
 CREATE TABLE torrent_media (
-    infohash        text PRIMARY KEY,
+    infohash        text COLLATE "C" PRIMARY KEY,
     media_id        bigint NOT NULL REFERENCES media ON DELETE CASCADE,
     season          integer,
     episode         integer,

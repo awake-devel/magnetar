@@ -343,7 +343,7 @@ pub struct TorrentSummary {
     pub rank: f32,
     pub pinned: bool,
     pub hidden: bool,
-    /// Identified media (enrichment, D40); None when unmatched or from an older server.
+    /// Linked title (D40), only when the link is confident enough to show.
     #[serde(default)]
     pub media_title: Option<String>,
     #[serde(default)]
@@ -376,13 +376,12 @@ pub struct TorrentDetail {
     pub trust: TrustScore,
     pub events: Vec<EventRef>,
     pub comments: Vec<Comment>,
-    /// Identified media with server-side decoration (D40, D42).
+    /// Identified film/series/anime (D40); None when unknown or below the display threshold.
     #[serde(default)]
     pub media: Option<MediaInfo>,
 }
 
-// ---- media enrichment (shared contract D40; owned by enrich/imdb, D42 adds `episode_title`)
-
+/// What a `media` row describes (D40).
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaKind {
@@ -413,36 +412,49 @@ impl std::str::FromStr for MediaKind {
     }
 }
 
-/// What a torrent was identified as (`media` + `torrent_media`), plus TMDB decoration.
+/// A torrent's identified title, from the server's `media` + `torrent_media` rows (D40).
+/// Enriched data is never republished to Nostr (IMDb/TMDB terms, metadata-enrichment.md §5).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct MediaInfo {
+    pub media_id: i64,
     pub kind: MediaKind,
     pub title: String,
+    #[serde(default)]
     pub original_title: Option<String>,
+    #[serde(default)]
     pub year: Option<i32>,
+    #[serde(default)]
     pub end_year: Option<i32>,
+    #[serde(default)]
     pub genres: Vec<String>,
+    #[serde(default)]
     pub rating: Option<f32>,
+    #[serde(default)]
     pub votes: Option<u32>,
+    #[serde(default)]
     pub runtime_min: Option<i32>,
+    /// Season/episode of this torrent (from its name or link), not of the title.
+    #[serde(default)]
     pub season: Option<i32>,
+    #[serde(default)]
     pub episode: Option<i32>,
-    /// "tt1234567".
+    #[serde(default)]
     pub imdb: Option<String>,
-    /// (Movie, id) for /movie/{id}, (Series, id) for /tv/{id}.
+    /// (Movie, id) = themoviedb.org/movie/id, (Series, id) = themoviedb.org/tv/id.
+    #[serde(default)]
     pub tmdb: Option<(MediaKind, u32)>,
+    #[serde(default)]
     pub mal: Option<u32>,
+    #[serde(default)]
     pub anilist: Option<u32>,
-    /// `torrent_media.method`: itag | desc_link | offline_title | api_search | manual.
+    /// "itag" | "desc_link" | "offline_title" | "api_search" | "manual"
     pub method: String,
     pub confidence: f32,
-    /// TMDB overview in the first configured language that has one (D42).
     #[serde(default)]
     pub overview: Option<String>,
-    /// Server-relative poster URL (`/api/v1/media/{id}/poster`), fetched with the bearer token.
+    /// Server-relative URL such as `/api/v1/media/{id}/poster`.
     #[serde(default)]
     pub poster: Option<String>,
-    pub media_id: i64,
     /// TMDB episode name when `season` and `episode` are known (D42, additive).
     #[serde(default)]
     pub episode_title: Option<String>,
