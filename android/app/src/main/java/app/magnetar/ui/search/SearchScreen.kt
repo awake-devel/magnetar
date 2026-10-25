@@ -148,7 +148,16 @@ fun SearchScreen(onOpen: (String) -> Unit, vm: SearchViewModel = viewModel()) {
                 state.error != null && state.hits.isEmpty() ->
                     CenteredMessage(state.error!!, "Retry", vm::submit)
                 state.hits.isEmpty() -> if (!state.loading) {
-                    CenteredMessage(if (state.text.isBlank()) "Nothing cached yet. Crawl from the Status tab." else "No results")
+                    // "Nothing cached" only fits an unfiltered local browse; an empty server page
+                    // (e.g. trust threshold above every score) is just "no results".
+                    val emptyCache = state.text.isBlank() && state.source == "local" && state.filters.activeCount == 0
+                    CenteredMessage(
+                        if (emptyCache) {
+                            "Nothing cached yet. Crawl from the Status tab."
+                        } else {
+                            "No results. Filters and the trust threshold (${settings.trustThreshold}) apply."
+                        },
+                    )
                 }
                 else -> ResultList(state, settings.trustThreshold, onOpen, vm::loadMore)
             }
