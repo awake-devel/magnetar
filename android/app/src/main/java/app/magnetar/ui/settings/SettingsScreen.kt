@@ -69,7 +69,7 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
             Field(
                 "Server URL", form.serverUrl, { v -> vm.edit { it.copy(serverUrl = v) } },
                 error = state.serverUrlError,
-                hint = state.serverWarning ?: "Empty = offline only. Default http://127.0.0.1:8787 (Termux).",
+                hint = state.serverWarning ?: "Empty = offline only. Example: https://myhost.tailnet.ts.net",
                 keyboard = KeyboardType.Uri,
             )
             OutlinedTextField(

@@ -19,7 +19,7 @@ use tokio::sync::broadcast;
 use crate::filter::{Filter, indexed_tags};
 use crate::search;
 
-/// sqlx pool cap (Termux phantom-process budget, ARCHITECTURE.md §9).
+/// sqlx pool cap (ARCHITECTURE.md §9).
 pub const MAX_CONNECTIONS: u32 = 5;
 /// Relay retry backoff: 5 min doubling per consecutive failure, capped at 24 h.
 pub const BACKOFF_BASE_SECS: i64 = 300;

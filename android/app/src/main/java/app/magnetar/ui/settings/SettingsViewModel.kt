@@ -63,19 +63,38 @@ fun validateServerUrl(url: String): Pair<String?, String?> {
     if (scheme != "http" && scheme != "https" || parsed.host.isNullOrEmpty()) {
         return "Must be an http:// or https:// URL" to null
     }
-    val warning = if (scheme == "http" && parsed.host.lowercase() !in setOf("127.0.0.1", "localhost")) {
-        "Plain HTTP is only allowed to 127.0.0.1/localhost. Use https (e.g. tailscale cert)."
+    val warning = if (scheme == "http" && !isPrivateTransport(parsed.host)) {
+        "Plain HTTP: the API token and results can be read by anyone on this network. " +
+            "Prefer https:// (tailscale serve or a reverse proxy)."
     } else {
         null
     }
     return null to warning
 }
 
+/**
+ * Hosts where plain http:// is not exposed on the wire (D39): loopback, and Tailscale, whose
+ * WireGuard tunnel already encrypts it (100.64.0.0/10, fd7a:115c:a1e0::/48, MagicDNS `*.ts.net`).
+ * A short MagicDNS name (`http://nas:8787`) cannot be told apart from a LAN name and still warns.
+ */
+fun isPrivateTransport(host: String): Boolean {
+    val h = host.lowercase().removePrefix("[").removeSuffix("]")
+    if (h == "localhost" || h == "::1" || h.endsWith(".ts.net")) return true
+    val v4 = h.split('.').takeIf { it.size == 4 }?.map { it.toIntOrNull() ?: return false }
+    if (v4 != null) {
+        if (v4.any { it !in 0..255 }) return false
+        return v4[0] == 127 || (v4[0] == 100 && v4[1] in 64..127)
+    }
+    return h.startsWith("fd7a:115c:a1e0:")
+}
+
 fun invalidRelays(text: String): List<String> = text.lines().map { it.trim() }.filter { it.isNotEmpty() }
     .filterNot { it.startsWith("wss://") || it.startsWith("ws://") }
 
 class SettingsViewModel(application: Application) : BaseViewModel(application) {
-    private val _state = MutableStateFlow(SettingsUiState(SettingsForm.from(magApp.settings.value)))
+    private val _state = MutableStateFlow(
+        SettingsForm.from(magApp.settings.value).let { SettingsUiState(it, serverWarning = validateServerUrl(it.serverUrl).second) },
+    )
     val state: StateFlow<SettingsUiState> = _state.asStateFlow()
 
     val appVersion = BuildConfigInfo.versionName(application)

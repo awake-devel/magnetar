@@ -28,7 +28,8 @@ data class AppSettings(
     )
 
     companion object {
-        const val DEFAULT_SERVER_URL = "http://127.0.0.1:8787"
+        /** No server by default: the app crawls and searches offline until one is set (D39). */
+        const val DEFAULT_SERVER_URL = ""
     }
 }
 
