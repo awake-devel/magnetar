@@ -126,8 +126,7 @@ impl Downloader {
     }
 
     pub async fn add_magnet(&self, magnet: &str) -> Result<DownloadInfo> {
-        let parsed =
-            Magnet::parse(magnet).map_err(|e| Error::Invalid(format!("magnet: {e:#}")))?;
+        let parsed = Magnet::parse(magnet).map_err(|e| Error::Invalid(format!("magnet: {e:#}")))?;
         let hash = parsed
             .as_id20()
             .ok_or_else(|| Error::Invalid("magnet has no BitTorrent v1 infohash".into()))?;
@@ -326,7 +325,10 @@ mod tests {
             if let Some(x) = l.iter().find(|x| x.id < PENDING_BASE) {
                 break x.clone();
             }
-            assert!(std::time::Instant::now() < deadline, "metadata never resolved: {l:?}");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "metadata never resolved: {l:?}"
+            );
             tokio::time::sleep(Duration::from_secs(1)).await;
         };
         eprintln!("resolved: {resolved:?}");
@@ -336,7 +338,11 @@ mod tests {
         eprintln!("after 10 s: {now:?}");
         d.pause(resolved.id).await.unwrap();
         assert_eq!(
-            d.list().into_iter().find(|x| x.id == resolved.id).unwrap().state,
+            d.list()
+                .into_iter()
+                .find(|x| x.id == resolved.id)
+                .unwrap()
+                .state,
             "paused"
         );
         d.resume(resolved.id).await.unwrap();

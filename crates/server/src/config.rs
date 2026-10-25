@@ -7,7 +7,11 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "magnetar-server", version, about = "Magnetar NIP-35 torrent index server")]
+#[command(
+    name = "magnetar-server",
+    version,
+    about = "Magnetar NIP-35 torrent index server"
+)]
 pub struct Cli {
     #[command(flatten)]
     pub config: Config,

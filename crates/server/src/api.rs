@@ -156,8 +156,12 @@ async fn auth(State(st): State<AppState>, req: Request, next: Next) -> Response 
     if header_ok || query_ok {
         next.run(req).await
     } else {
-        ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", "missing or bad bearer token")
-            .into_response()
+        ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "missing or bad bearer token",
+        )
+        .into_response()
     }
 }
 
@@ -165,14 +169,23 @@ pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/v1/search", get(search_get).post(search_post))
         .route("/api/v1/torrents/{infohash}", get(torrent))
-        .route("/api/v1/torrents/{infohash}/liveness", post(refresh_liveness))
+        .route(
+            "/api/v1/torrents/{infohash}/liveness",
+            post(refresh_liveness),
+        )
         .route("/api/v1/events/batch", post(batch))
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/relays", get(relays).put(set_relay))
         .route("/api/v1/trust/{pubkey}", get(trust_of))
-        .route("/api/v1/settings/trust", get(trust_settings).put(set_trust_settings))
+        .route(
+            "/api/v1/settings/trust",
+            get(trust_settings).put(set_trust_settings),
+        )
         .route("/api/v1/overrides/{pubkey}", put(set_override))
-        .route("/api/v1/saved-searches", get(saved_searches).post(put_saved_search))
+        .route(
+            "/api/v1/saved-searches",
+            get(saved_searches).post(put_saved_search),
+        )
         .route("/api/v1/saved-searches/{id}", delete(delete_saved_search))
         .route("/api/v1/downloads", get(downloads).post(add_download))
         .route("/api/v1/downloads/{id}", delete(remove_download))
@@ -226,7 +239,9 @@ pub fn parse_search_query(raw: Option<&str>) -> ApiResult<SearchQuery> {
             "q" => q.text = v.into_owned(),
             "cat" => {
                 for c in v.split(',').map(str::trim).filter(|c| !c.is_empty()) {
-                    let c: Category = c.parse().map_err(|e: Error| ApiError::bad_request(e.to_string()))?;
+                    let c: Category = c
+                        .parse()
+                        .map_err(|e: Error| ApiError::bad_request(e.to_string()))?;
                     if !q.categories.contains(&c) {
                         q.categories.push(c);
                     }
@@ -257,7 +272,10 @@ pub fn parse_search_query(raw: Option<&str>) -> ApiResult<SearchQuery> {
     Ok(q)
 }
 
-async fn search_get(State(st): State<AppState>, RawQuery(raw): RawQuery) -> ApiResult<Json<SearchPage>> {
+async fn search_get(
+    State(st): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> ApiResult<Json<SearchPage>> {
     let q = parse_search_query(raw.as_deref())?;
     Ok(Json(st.store.search(&q, magnetar_core::now()).await?))
 }
@@ -444,7 +462,10 @@ async fn set_trust_settings(
         None => None,
     };
     st.store
-        .set_setting(keys::TRUST_ROOT, &serde_json::to_string(&root).expect("json"))
+        .set_setting(
+            keys::TRUST_ROOT,
+            &serde_json::to_string(&root).expect("json"),
+        )
         .await?;
     st.store
         .set_setting(keys::TRUST_THRESHOLD, &s.threshold.to_string())
@@ -561,7 +582,10 @@ mod tests {
         assert_eq!((q.min_size, q.max_size), (Some(10), Some(99)));
         assert!(q.hide_dead && !q.descending);
         assert_eq!(q.sort, Sort::Size);
-        assert_eq!((q.limit, q.offset, q.min_trust, q.min_seeders), (5, 10, Some(0), Some(2)));
+        assert_eq!(
+            (q.limit, q.offset, q.min_trust, q.min_seeders),
+            (5, 10, Some(0), Some(2))
+        );
         assert_eq!((q.since, q.until), (Some(1), Some(2)));
         let d = parse_search_query(None).unwrap();
         assert!(d.descending && d.text.is_empty() && d.min_trust.is_none());

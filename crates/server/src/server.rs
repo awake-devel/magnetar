@@ -92,7 +92,11 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(cfg.bind)
         .await
         .with_context(|| format!("bind {}", cfg.bind))?;
-    tracing::info!("magnetar-server {} listening on {}", magnetar_core::VERSION, cfg.bind);
+    tracing::info!(
+        "magnetar-server {} listening on {}",
+        magnetar_core::VERSION,
+        cfg.bind
+    );
     let mut wait = stop_rx.clone();
     tokio::spawn(async move {
         shutdown_signal().await;

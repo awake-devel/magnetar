@@ -52,7 +52,9 @@ async fn check_dns(host: &str) -> anyhow::Result<String> {
 
 /// NIP-11 document over HTTPS (rustls + ring + webpki roots, D21).
 async fn check_tls(relay: &str) -> anyhow::Result<String> {
-    let https = relay.replacen("wss://", "https://", 1).replacen("ws://", "http://", 1);
+    let https = relay
+        .replacen("wss://", "https://", 1)
+        .replacen("ws://", "http://", 1);
     let client = magnetar_core::http::client(TIMEOUT)?;
     let resp = client
         .get(&https)
@@ -67,7 +69,9 @@ async fn check_tls(relay: &str) -> anyhow::Result<String> {
         .get("supported_nips")
         .and_then(|v| v.as_array())
         .map_or(0, Vec::len);
-    Ok(format!("{https}: name={name:?} software={software:?} nips={nips}"))
+    Ok(format!(
+        "{https}: name={name:?} software={software:?} nips={nips}"
+    ))
 }
 
 /// BEP 15 connect round trip.
@@ -89,7 +93,9 @@ async fn check_udp(tracker: &str) -> anyhow::Result<String> {
         sock.send_to(&req, addr).await?;
         match tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf)).await {
             Ok(Ok((n, _))) if n >= 16 && buf[..4] == [0; 4] && buf[4..8] == tid.to_be_bytes() => {
-                return Ok(format!("{tracker} ({addr}) answered connect, attempt {attempt}"));
+                return Ok(format!(
+                    "{tracker} ({addr}) answered connect, attempt {attempt}"
+                ));
             }
             Ok(Ok((n, _))) => anyhow::bail!("unexpected {n}-byte reply from {addr}"),
             Ok(Err(e)) => return Err(e.into()),

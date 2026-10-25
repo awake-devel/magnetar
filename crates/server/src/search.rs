@@ -37,7 +37,10 @@ impl HitRow {
             infohash: self.infohash,
             event_id: self.event_id,
             title: self.title,
-            category: self.category.parse().unwrap_or(magnetar_core::model::Category::Other),
+            category: self
+                .category
+                .parse()
+                .unwrap_or(magnetar_core::model::Category::Other),
             total_size: self.total_size.and_then(|s| u64::try_from(s).ok()),
             file_count: u32::try_from(self.file_count).unwrap_or(0),
             created_at: self.created_at,
@@ -90,7 +93,11 @@ fn push_hits_cte(qb: &mut QueryBuilder<Postgres>, q: &SearchQuery, min_trust: u8
         .push(" OR EXISTS (SELECT 1 FROM local_overrides o WHERE o.pubkey = t.pubkey ")
         .push("AND o.action = 'trust'))");
     if !q.categories.is_empty() {
-        let cats: Vec<String> = q.categories.iter().map(|c| c.as_str().to_string()).collect();
+        let cats: Vec<String> = q
+            .categories
+            .iter()
+            .map(|c| c.as_str().to_string())
+            .collect();
         qb.push(" AND t.category = ANY(").push_bind(cats).push(")");
     }
     if let Some(min) = q.min_size {
@@ -164,7 +171,9 @@ pub(crate) fn hits_query(q: &SearchQuery, now: i64, min_trust: u8) -> QueryBuild
         Sort::Size => format!("total_size {dir} NULLS LAST, created_at DESC"),
         Sort::Seeders => format!("best_peers {dir} NULLS LAST, created_at DESC"),
     };
-    qb.push(" ORDER BY ").push(order).push(", infohash ASC LIMIT ");
+    qb.push(" ORDER BY ")
+        .push(order)
+        .push(", infohash ASC LIMIT ");
     qb.push_bind(i64::from(q.effective_limit()));
     qb.push(" OFFSET ").push_bind(i64::from(q.offset));
     qb

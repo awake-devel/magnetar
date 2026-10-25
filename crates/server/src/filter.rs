@@ -49,9 +49,9 @@ impl Filter {
                 "since" => f.since = Some(int(key, val)?),
                 "until" => f.until = Some(int(key, val)?),
                 "limit" => {
-                    let n = val
-                        .as_u64()
-                        .ok_or_else(|| "invalid: limit must be a non-negative integer".to_string())?;
+                    let n = val.as_u64().ok_or_else(|| {
+                        "invalid: limit must be a non-negative integer".to_string()
+                    })?;
                     f.limit = Some(n.min(MAX_LIMIT as u64) as usize);
                 }
                 k if k.len() == 2 && k.starts_with('#') => {
@@ -104,7 +104,8 @@ impl Filter {
         {
             return false;
         }
-        if self.since.is_some_and(|s| ev.created_at < s) || self.until.is_some_and(|u| ev.created_at > u)
+        if self.since.is_some_and(|s| ev.created_at < s)
+            || self.until.is_some_and(|u| ev.created_at > u)
         {
             return false;
         }
@@ -190,16 +191,36 @@ mod tests {
 
     #[test]
     fn rejects_bad_filters() {
-        assert!(Filter::from_json(&json!({"search":"x"})).unwrap_err().starts_with("unsupported:"));
-        assert!(Filter::from_json(&json!({"ids":["ABC"]})).unwrap_err().starts_with("invalid:"));
+        assert!(
+            Filter::from_json(&json!({"search":"x"}))
+                .unwrap_err()
+                .starts_with("unsupported:")
+        );
+        assert!(
+            Filter::from_json(&json!({"ids":["ABC"]}))
+                .unwrap_err()
+                .starts_with("invalid:")
+        );
         assert!(Filter::from_json(&json!({"kinds":[70000]})).is_err());
         assert!(Filter::from_json(&json!([])).is_err());
-        assert!(Filter::from_json(&json!({"authors":["b".repeat(64)]})).unwrap().neg_compatible());
+        assert!(
+            Filter::from_json(&json!({"authors":["b".repeat(64)]}))
+                .unwrap()
+                .neg_compatible()
+        );
     }
 
     #[test]
     fn tag_index() {
-        let e = ev(2003, vec![vec!["x", "1"], vec!["x", "1"], vec!["title", "t"], vec!["t"]]);
+        let e = ev(
+            2003,
+            vec![
+                vec!["x", "1"],
+                vec!["x", "1"],
+                vec!["title", "t"],
+                vec!["t"],
+            ],
+        );
         assert_eq!(indexed_tags(&e), vec![("x".into(), "1".into())]);
     }
 }

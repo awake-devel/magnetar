@@ -30,11 +30,12 @@ pub async fn test_db() -> Option<TestDb> {
         .await
     {
         // Concurrent creation by a parallel test: fine as long as it exists now.
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm')")
-                .fetch_one(&mut admin)
-                .await
-                .unwrap();
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm')",
+        )
+        .fetch_one(&mut admin)
+        .await
+        .unwrap();
         assert!(exists, "pg_trgm: {e}");
     }
     admin
@@ -85,7 +86,9 @@ impl Drop for TestDb {
                     .execute(&mut c)
                     .await;
                     let _ = c
-                        .execute(AssertSqlSafe(format!("DROP SCHEMA IF EXISTS {schema} CASCADE")))
+                        .execute(AssertSqlSafe(format!(
+                            "DROP SCHEMA IF EXISTS {schema} CASCADE"
+                        )))
                         .await;
                 }
             });
@@ -227,7 +230,12 @@ pub async fn spawn_server(store: &PgStore) -> String {
 }
 
 /// A real signed event (for paths that verify signatures).
-pub fn signed(keys: &nostr::prelude::Keys, kind: u16, tags: Vec<Vec<String>>, content: &str) -> RawEvent {
+pub fn signed(
+    keys: &nostr::prelude::Keys,
+    kind: u16,
+    tags: Vec<Vec<String>>,
+    content: &str,
+) -> RawEvent {
     use nostr::prelude::*;
     let tags: Vec<Tag> = tags.into_iter().map(|t| Tag::parse(t).unwrap()).collect();
     let ev = EventBuilder::new(Kind::from(kind), content)

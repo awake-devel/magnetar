@@ -142,7 +142,11 @@ impl Session {
         let Some(v) = v else {
             return notice("invalid: EVENT without an event");
         };
-        let id = v.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+        let id = v
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         let raw: RawEvent = match serde_json::from_value(v.clone()) {
             Ok(raw) => raw,
             Err(_) if id.is_empty() => return notice("invalid: bad event json"),
@@ -178,7 +182,11 @@ impl Session {
                 }
             }
         }
-        events.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.id.cmp(&b.id)));
+        events.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         events.dedup_by(|a, b| a.id == b.id);
         let mut out: Vec<String> = events.iter().map(|e| event_msg(&sub, e)).collect();
         out.push(json!(["EOSE", sub]).to_string());

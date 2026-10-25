@@ -46,15 +46,26 @@ async fn crud_and_idempotent_ingest() {
         .size(12)
         .build();
     assert!(s.put_torrent(&p, &raw).await.unwrap());
-    assert!(!s.put_torrent(&p, &raw).await.unwrap(), "second insert is a duplicate");
+    assert!(
+        !s.put_torrent(&p, &raw).await.unwrap(),
+        "second insert is a duplicate"
+    );
     assert!(s.has_event(&raw.id).await.unwrap());
     assert!(s.known_torrent_event(&raw.id).await.unwrap());
     assert!(!s.has_event(&hex64(999)).await.unwrap());
-    assert_eq!(s.get_raw_events(&[raw.id.clone()]).await.unwrap(), vec![raw.clone()]);
+    assert_eq!(
+        s.get_raw_events(std::slice::from_ref(&raw.id))
+            .await
+            .unwrap(),
+        vec![raw.clone()]
+    );
 
     put(s, torrent(2, 100, NOW - 40, 2, "Other")).await;
     put(s, torrent(3, 200, NOW - 30, 3, "Third")).await;
-    assert_eq!(s.publishers(10).await.unwrap(), vec![hex64(100), hex64(200)]);
+    assert_eq!(
+        s.publishers(10).await.unwrap(),
+        vec![hex64(100), hex64(200)]
+    );
     assert_eq!(s.publishers(1).await.unwrap().len(), 1);
 
     let c = Comment {
@@ -77,14 +88,24 @@ async fn crud_and_idempotent_ingest() {
     assert!(s.put_comment(&c, &craw).await.unwrap());
     assert!(!s.put_comment(&c, &craw).await.unwrap());
     assert_eq!(
-        s.comment_authors_on(&hex64(100), &[hex64(300), hex64(301)]).await.unwrap(),
+        s.comment_authors_on(&hex64(100), &[hex64(300), hex64(301)])
+            .await
+            .unwrap(),
         vec![hex64(300)]
     );
     // The raw event keeps the NUL; the comment row drops it.
-    assert_eq!(s.get_raw_events(&[craw.id.clone()]).await.unwrap()[0], craw);
+    assert_eq!(
+        s.get_raw_events(std::slice::from_ref(&craw.id))
+            .await
+            .unwrap()[0],
+        craw
+    );
 
     let st = s.stats().await.unwrap();
-    assert_eq!((st.torrents, st.events, st.publishers, st.comments), (3, 4, 2, 1));
+    assert_eq!(
+        (st.torrents, st.events, st.publishers, st.comments),
+        (3, 4, 2, 1)
+    );
     assert!(st.db_bytes > 0);
 }
 
@@ -92,29 +113,51 @@ async fn crud_and_idempotent_ingest() {
 async fn text_search_release_names_prefix_typo() {
     let Some(db) = test_db().await else { return };
     let s = &db.store;
-    put(s, torrent(1, 1, NOW - 100, 1, "Big.Buck.Bunny.2008.1080p.x264-GRP")).await;
+    put(
+        s,
+        torrent(1, 1, NOW - 100, 1, "Big.Buck.Bunny.2008.1080p.x264-GRP"),
+    )
+    .await;
     put(s, torrent(2, 1, NOW - 90, 2, "Ubuntu 24.04 desktop amd64")).await;
-    put(s, torrent(3, 1, NOW - 80, 3, "Unrelated").desc("A story about rabbits and carrots")).await;
-    put(s, torrent(4, 1, NOW - 70, 4, "Pack").files(&[("Season.01/Show.S01E01.mkv", 1)])).await;
+    put(
+        s,
+        torrent(3, 1, NOW - 80, 3, "Unrelated").desc("A story about rabbits and carrots"),
+    )
+    .await;
+    put(
+        s,
+        torrent(4, 1, NOW - 70, 4, "Pack").files(&[("Season.01/Show.S01E01.mkv", 1)]),
+    )
+    .await;
 
     let page = s.search(&q("bunny 1080p"), NOW).await.unwrap();
     assert_eq!(titles(&page), vec!["Big.Buck.Bunny.2008.1080p.x264-GRP"]);
     assert_eq!(page.total, 1);
     assert_eq!(page.source, "server");
-    assert!(page.hits[0].rank > 0.5, "full-text hits rank above fuzzy ones");
+    assert!(
+        page.hits[0].rank > 0.5,
+        "full-text hits rank above fuzzy ones"
+    );
 
     // Prefix on the last token.
-    assert_eq!(titles(&s.search(&q("Big Buck Bun"), NOW).await.unwrap()), vec![
-        "Big.Buck.Bunny.2008.1080p.x264-GRP"
-    ]);
+    assert_eq!(
+        titles(&s.search(&q("Big Buck Bun"), NOW).await.unwrap()),
+        vec!["Big.Buck.Bunny.2008.1080p.x264-GRP"]
+    );
     // Typo via trigram word_similarity.
     let typo = s.search(&q("ubunto"), NOW).await.unwrap();
     assert_eq!(titles(&typo), vec!["Ubuntu 24.04 desktop amd64"]);
     assert!(typo.hits[0].rank > 0.0 && typo.hits[0].rank <= 0.5);
     // English stemming on the description.
-    assert_eq!(titles(&s.search(&q("rabbit"), NOW).await.unwrap()), vec!["Unrelated"]);
+    assert_eq!(
+        titles(&s.search(&q("rabbit"), NOW).await.unwrap()),
+        vec!["Unrelated"]
+    );
     // File paths are indexed with separators split.
-    assert_eq!(titles(&s.search(&q("s01e01"), NOW).await.unwrap()), vec!["Pack"]);
+    assert_eq!(
+        titles(&s.search(&q("s01e01"), NOW).await.unwrap()),
+        vec!["Pack"]
+    );
     // Sanitized junk does not error.
     assert_eq!(s.search(&q("'):*&|!"), NOW).await.unwrap().total, 4);
     assert_eq!(s.search(&q("zzzzqqq"), NOW).await.unwrap().total, 0);
@@ -124,10 +167,32 @@ async fn text_search_release_names_prefix_typo() {
 async fn search_filters() {
     let Some(db) = test_db().await else { return };
     let s = &db.store;
-    put(s, torrent(1, 1, NOW - 300, 1, "video small").cat(Category::Video).size(100)).await;
-    put(s, torrent(2, 1, NOW - 200, 2, "video big").cat(Category::Video).size(10_000)).await;
-    put(s, torrent(3, 1, NOW - 100, 3, "audio unknown size").cat(Category::Audio)).await;
-    put(s, torrent(4, 2, NOW - 50, 4, "pow bot").cat(Category::Anime).pow(21)).await;
+    put(
+        s,
+        torrent(1, 1, NOW - 300, 1, "video small")
+            .cat(Category::Video)
+            .size(100),
+    )
+    .await;
+    put(
+        s,
+        torrent(2, 1, NOW - 200, 2, "video big")
+            .cat(Category::Video)
+            .size(10_000),
+    )
+    .await;
+    put(
+        s,
+        torrent(3, 1, NOW - 100, 3, "audio unknown size").cat(Category::Audio),
+    )
+    .await;
+    put(
+        s,
+        torrent(4, 2, NOW - 50, 4, "pow bot")
+            .cat(Category::Anime)
+            .pow(21),
+    )
+    .await;
 
     let mut f = q("");
     f.categories = vec![Category::Video];
@@ -140,7 +205,10 @@ async fn search_filters() {
     assert_eq!(titles(&s.search(&f, NOW).await.unwrap()), vec!["video big"]);
     f.min_size = None;
     f.max_size = Some(500);
-    assert_eq!(titles(&s.search(&f, NOW).await.unwrap()), vec!["video small"]);
+    assert_eq!(
+        titles(&s.search(&f, NOW).await.unwrap()),
+        vec!["video small"]
+    );
 
     let mut f = q("");
     f.since = Some(NOW - 200);
@@ -159,13 +227,23 @@ async fn search_filters() {
     assert_eq!(s.search(&f, NOW).await.unwrap().total, 0);
 
     // Blocked publishers are excluded even with min_trust 0; trusted ones pass any threshold.
-    s.set_override(&hex64(1), Some(OverrideAction::Block)).await.unwrap();
-    assert_eq!(titles(&s.search(&q(""), NOW).await.unwrap()), vec!["pow bot"]);
-    s.set_override(&hex64(1), Some(OverrideAction::Trust)).await.unwrap();
+    s.set_override(&hex64(1), Some(OverrideAction::Block))
+        .await
+        .unwrap();
+    assert_eq!(
+        titles(&s.search(&q(""), NOW).await.unwrap()),
+        vec!["pow bot"]
+    );
+    s.set_override(&hex64(1), Some(OverrideAction::Trust))
+        .await
+        .unwrap();
     let mut f = q("");
     f.min_trust = Some(90);
     assert_eq!(s.search(&f, NOW).await.unwrap().total, 3);
-    assert_eq!(s.overrides().await.unwrap(), vec![(hex64(1), OverrideAction::Trust)]);
+    assert_eq!(
+        s.overrides().await.unwrap(),
+        vec![(hex64(1), OverrideAction::Trust)]
+    );
     s.set_override(&hex64(1), None).await.unwrap();
     assert!(s.overrides().await.unwrap().is_empty());
 }
@@ -174,17 +252,38 @@ async fn search_filters() {
 async fn search_liveness_filters() {
     let Some(db) = test_db().await else { return };
     let s = &db.store;
-    for (n, title) in [(1, "dead fresh"), (2, "dead stale"), (3, "alive"), (4, "unknown"), (5, "dht only")] {
+    for (n, title) in [
+        (1, "dead fresh"),
+        (2, "dead stale"),
+        (3, "alive"),
+        (4, "unknown"),
+        (5, "dht only"),
+    ] {
         put(s, torrent(n, 1, NOW - n as i64, n, title)).await;
     }
-    s.put_liveness(&live(1, Some(0), None, NOW + 100)).await.unwrap();
-    s.put_liveness(&live(2, Some(0), None, NOW - 1)).await.unwrap();
-    s.put_liveness(&live(3, Some(7), None, NOW + 100)).await.unwrap();
-    s.put_liveness(&live(5, None, Some(3), NOW + 100)).await.unwrap();
-    assert_eq!(s.get_liveness(&ih(3)).await.unwrap().unwrap().seeders, Some(7));
+    s.put_liveness(&live(1, Some(0), None, NOW + 100))
+        .await
+        .unwrap();
+    s.put_liveness(&live(2, Some(0), None, NOW - 1))
+        .await
+        .unwrap();
+    s.put_liveness(&live(3, Some(7), None, NOW + 100))
+        .await
+        .unwrap();
+    s.put_liveness(&live(5, None, Some(3), NOW + 100))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.get_liveness(&ih(3)).await.unwrap().unwrap().seeders,
+        Some(7)
+    );
 
     let all = s.search(&q(""), NOW).await.unwrap();
-    let dead: Vec<_> = all.hits.iter().map(|h| (h.title.as_str(), h.dead)).collect();
+    let dead: Vec<_> = all
+        .hits
+        .iter()
+        .map(|h| (h.title.as_str(), h.dead))
+        .collect();
     assert!(dead.contains(&("dead fresh", Some(true))));
     assert!(dead.contains(&("dead stale", None)));
     assert!(dead.contains(&("alive", Some(false))));
@@ -216,7 +315,10 @@ async fn search_liveness_filters() {
     let due = s.liveness_due(NOW, 10).await.unwrap();
     let due_ih: Vec<_> = due.iter().map(|(h, _)| h.clone()).collect();
     assert_eq!(due_ih, vec![ih(2), ih(4)]);
-    assert_eq!(due[0].1, vec!["udp://tracker.opentrackr.org:1337/announce".to_string()]);
+    assert_eq!(
+        due[0].1,
+        vec!["udp://tracker.opentrackr.org:1337/announce".to_string()]
+    );
     assert_eq!(s.liveness_due(NOW, 1).await.unwrap().len(), 1);
 }
 
@@ -230,15 +332,27 @@ async fn search_sorts_and_paging() {
 
     let mut f = q("");
     f.sort = Sort::Date;
-    assert_eq!(titles(&s.search(&f, NOW).await.unwrap()), vec!["linux gamma linux", "linux beta", "linux alpha"]);
+    assert_eq!(
+        titles(&s.search(&f, NOW).await.unwrap()),
+        vec!["linux gamma linux", "linux beta", "linux alpha"]
+    );
     f.descending = false;
-    assert_eq!(titles(&s.search(&f, NOW).await.unwrap()), vec!["linux alpha", "linux beta", "linux gamma linux"]);
+    assert_eq!(
+        titles(&s.search(&f, NOW).await.unwrap()),
+        vec!["linux alpha", "linux beta", "linux gamma linux"]
+    );
 
     let mut f = q("");
     f.sort = Sort::Size;
-    assert_eq!(titles(&s.search(&f, NOW).await.unwrap()), vec!["linux alpha", "linux gamma linux", "linux beta"]);
+    assert_eq!(
+        titles(&s.search(&f, NOW).await.unwrap()),
+        vec!["linux alpha", "linux gamma linux", "linux beta"]
+    );
     f.descending = false;
-    assert_eq!(titles(&s.search(&f, NOW).await.unwrap()), vec!["linux gamma linux", "linux alpha", "linux beta"]);
+    assert_eq!(
+        titles(&s.search(&f, NOW).await.unwrap()),
+        vec!["linux gamma linux", "linux alpha", "linux beta"]
+    );
 
     // Relevance (default sort with text): ts_rank_cd favours the repeated term.
     let page = s.search(&q("linux"), NOW).await.unwrap();
@@ -247,7 +361,10 @@ async fn search_sorts_and_paging() {
     // Relevance without text falls back to date.
     let mut f = q("  ");
     f.sort = Sort::Relevance;
-    assert_eq!(s.search(&f, NOW).await.unwrap().hits[0].title, "linux gamma linux");
+    assert_eq!(
+        s.search(&f, NOW).await.unwrap().hits[0].title,
+        "linux gamma linux"
+    );
 
     let mut f = q("");
     f.limit = 2;
@@ -279,7 +396,9 @@ async fn grouping_by_infohash() {
     assert!(g.npub.starts_with("npub1"));
 
     // Without the PoW copy (blocked) the earliest wins.
-    s.set_override(&hex64(3), Some(OverrideAction::Block)).await.unwrap();
+    s.set_override(&hex64(3), Some(OverrideAction::Block))
+        .await
+        .unwrap();
     let page = s.search(&q("copy"), NOW).await.unwrap();
     assert_eq!(titles(&page), vec!["copy early"]);
     assert_eq!(page.hits[0].publisher_count, 2);
@@ -307,11 +426,18 @@ async fn trust_denormalisation_and_graph_version() {
         graph_version: 1,
     };
     s.put_trust(&score(40, "FOLLOW_D2")).await.unwrap();
-    assert_eq!(s.get_trust(&hex64(1)).await.unwrap(), Some(score(40, "FOLLOW_D2")));
+    assert_eq!(
+        s.get_trust(&hex64(1)).await.unwrap(),
+        Some(score(40, "FOLLOW_D2"))
+    );
     assert_eq!(s.get_trust(&hex64(2)).await.unwrap(), None);
     let trust_of = |title: &'static str| async move {
         let page = s.search(&q(title), NOW).await.unwrap();
-        page.hits.into_iter().find(|h| h.title == title).unwrap().trust
+        page.hits
+            .into_iter()
+            .find(|h| h.title == title)
+            .unwrap()
+            .trust
     };
     assert_eq!(trust_of("no pow").await, 40);
     assert_eq!(trust_of("pow 16").await, 52); // 40 + 25*8/16
@@ -329,11 +455,22 @@ async fn trust_denormalisation_and_graph_version() {
 
     let v = s.graph_version().await.unwrap();
     assert_eq!(s.bump_graph_version().await.unwrap(), v + 1);
-    s.set_setting(keys::TRUST_ROOT, &json!(hex64(9)).to_string()).await.unwrap();
+    s.set_setting(keys::TRUST_ROOT, &json!(hex64(9)).to_string())
+        .await
+        .unwrap();
     assert_eq!(s.graph_version().await.unwrap(), v + 2, "root change bumps");
-    s.set_setting(keys::TRUST_ROOT, &json!(hex64(9)).to_string()).await.unwrap();
-    assert_eq!(s.graph_version().await.unwrap(), v + 2, "same root does not");
-    assert_eq!(s.get_setting(keys::TRUST_ROOT).await.unwrap(), Some(json!(hex64(9)).to_string()));
+    s.set_setting(keys::TRUST_ROOT, &json!(hex64(9)).to_string())
+        .await
+        .unwrap();
+    assert_eq!(
+        s.graph_version().await.unwrap(),
+        v + 2,
+        "same root does not"
+    );
+    assert_eq!(
+        s.get_setting(keys::TRUST_ROOT).await.unwrap(),
+        Some(json!(hex64(9)).to_string())
+    );
     assert_eq!(s.get_setting("nope").await.unwrap(), None);
 }
 
@@ -352,7 +489,10 @@ async fn publisher_stats_window() {
     assert_eq!(st.max_per_hour, 3);
     assert!(!st.is_bridge && !st.has_profile && !st.has_relay_list);
     assert!(s.publisher_stats(&hex64(2)).await.unwrap().is_bridge);
-    assert_eq!(s.publisher_stats(&hex64(3)).await.unwrap(), PublisherStats::default());
+    assert_eq!(
+        s.publisher_stats(&hex64(3)).await.unwrap(),
+        PublisherStats::default()
+    );
 }
 
 #[tokio::test]
@@ -364,25 +504,46 @@ async fn relays_cursors_backoff() {
     s.set_relay_enabled(url, false).await.unwrap();
     s.upsert_relay(url, "nip65").await.unwrap();
     let r = &s.list_relays().await.unwrap()[0];
-    assert_eq!((r.source.as_str(), r.enabled, r.next_try_at), ("seed", false, 0));
+    assert_eq!(
+        (r.source.as_str(), r.enabled, r.next_try_at),
+        ("seed", false, 0)
+    );
     s.upsert_relay(url, "manual").await.unwrap();
     s.upsert_relay(url, "hint").await.unwrap();
     let r = &s.list_relays().await.unwrap()[0];
-    assert_eq!((r.source.as_str(), r.enabled), ("manual", false), "manual sticks, enabled untouched");
+    assert_eq!(
+        (r.source.as_str(), r.enabled),
+        ("manual", false),
+        "manual sticks, enabled untouched"
+    );
 
-    s.record_relay_result(url, false, Some("timeout"), 0, NOW).await.unwrap();
-    s.record_relay_result(url, false, Some("timeout again"), 2, NOW).await.unwrap();
+    s.record_relay_result(url, false, Some("timeout"), 0, NOW)
+        .await
+        .unwrap();
+    s.record_relay_result(url, false, Some("timeout again"), 2, NOW)
+        .await
+        .unwrap();
     let r = &s.list_relays().await.unwrap()[0];
     assert_eq!(r.consecutive_failures, 2);
     assert_eq!(r.next_try_at, NOW + 600);
     assert_eq!(r.last_err.as_deref(), Some("timeout again"));
     for _ in 0..20 {
-        s.record_relay_result(url, false, None, 0, NOW).await.unwrap();
+        s.record_relay_result(url, false, None, 0, NOW)
+            .await
+            .unwrap();
     }
-    assert_eq!(s.list_relays().await.unwrap()[0].next_try_at, NOW + 24 * 3600);
-    s.record_relay_result(url, true, None, 5, NOW + 1).await.unwrap();
+    assert_eq!(
+        s.list_relays().await.unwrap()[0].next_try_at,
+        NOW + 24 * 3600
+    );
+    s.record_relay_result(url, true, None, 5, NOW + 1)
+        .await
+        .unwrap();
     let r = &s.list_relays().await.unwrap()[0];
-    assert_eq!((r.consecutive_failures, r.last_ok, r.events_found), (0, Some(NOW + 1), 7));
+    assert_eq!(
+        (r.consecutive_failures, r.last_ok, r.events_found),
+        (0, Some(NOW + 1), 7)
+    );
     assert_eq!(r.last_err, None);
     assert_eq!(r.supports_neg, None);
     s.set_relay_supports_neg(url, true).await.unwrap();
@@ -398,7 +559,11 @@ async fn relays_cursors_backoff() {
     };
     s.put_cursor(&c).await.unwrap();
     assert_eq!(s.get_cursor(url, 2003).await.unwrap(), Some(c.clone()));
-    let c2 = Cursor { backfill_done: true, backfill_until: None, ..c };
+    let c2 = Cursor {
+        backfill_done: true,
+        backfill_until: None,
+        ..c
+    };
     s.put_cursor(&c2).await.unwrap();
     assert_eq!(s.get_cursor(url, 2003).await.unwrap(), Some(c2));
     assert_eq!(s.get_cursor(url, 2004).await.unwrap(), None);
@@ -431,7 +596,14 @@ async fn saved_searches_crud() {
     ss.last_seen_created_at = Some(NOW - 5);
     assert_eq!(s.put_saved_search(&ss).await.unwrap(), id);
     assert_eq!(s.list_saved_searches().await.unwrap(), vec![ss.clone()]);
-    assert!(s.put_saved_search(&SavedSearch { id: id + 100, ..ss.clone() }).await.is_err());
+    assert!(
+        s.put_saved_search(&SavedSearch {
+            id: id + 100,
+            ..ss.clone()
+        })
+        .await
+        .is_err()
+    );
     s.delete_saved_search(id).await.unwrap();
     assert!(s.list_saved_searches().await.unwrap().is_empty());
 }
@@ -462,12 +634,20 @@ async fn graph_queries() {
         .execute(s.pool())
         .await
         .unwrap();
-    assert_eq!(s.follows_of(&hex64(1)).await.unwrap(), vec![hex64(2), hex64(3)]);
     assert_eq!(
-        s.followers_among(&[hex64(4), hex64(9)], &[hex64(2), hex64(3)]).await.unwrap(),
+        s.follows_of(&hex64(1)).await.unwrap(),
+        vec![hex64(2), hex64(3)]
+    );
+    assert_eq!(
+        s.followers_among(&[hex64(4), hex64(9)], &[hex64(2), hex64(3)])
+            .await
+            .unwrap(),
         vec![(hex64(4), vec![hex64(2), hex64(3)])]
     );
-    assert_eq!(s.mutes_by(&[hex64(2)]).await.unwrap(), vec![(hex64(2), hex64(6))]);
+    assert_eq!(
+        s.mutes_by(&[hex64(2)]).await.unwrap(),
+        vec![(hex64(2), hex64(6))]
+    );
     assert_eq!(
         s.reports_by(&[hex64(3)]).await.unwrap(),
         vec![(hex64(3), hex64(6), "spam".to_string())]
@@ -485,31 +665,60 @@ async fn relay_filter_queries() {
     let f = |v: serde_json::Value| Filter::from_json(&v).unwrap();
     let ids = |evs: Vec<RawEvent>| evs.into_iter().map(|e| e.id).collect::<Vec<_>>();
     // Newest first, ties by lowest id.
-    assert_eq!(ids(s.query_events(&f(json!({"kinds":[2003]}))).await.unwrap()), vec![
-        b.id.clone(),
-        c.id.clone(),
-        a.id.clone()
-    ]);
-    assert_eq!(ids(s.query_events(&f(json!({"#t":["movie"]}))).await.unwrap()), vec![
-        c.id.clone(),
-        a.id.clone()
-    ]);
-    assert_eq!(ids(s.query_events(&f(json!({"#x":[ih(2)]}))).await.unwrap()), vec![b.id.clone()]);
-    assert_eq!(ids(s.query_events(&f(json!({"authors":[hex64(1)],"limit":1}))).await.unwrap()), vec![
-        c.id.clone()
-    ]);
-    assert_eq!(ids(s.query_events(&f(json!({"ids":[a.id],"since":NOW-30,"until":NOW-30}))).await.unwrap()), vec![
-        a.id.clone()
-    ]);
-    assert!(s.query_events(&f(json!({"kinds":[]}))).await.unwrap().is_empty());
-    assert!(s.query_events(&f(json!({"limit":0}))).await.unwrap().is_empty());
-    assert!(s.query_events(&f(json!({"kinds":[1]}))).await.unwrap().is_empty());
+    assert_eq!(
+        ids(s.query_events(&f(json!({"kinds":[2003]}))).await.unwrap()),
+        vec![b.id.clone(), c.id.clone(), a.id.clone()]
+    );
+    assert_eq!(
+        ids(s.query_events(&f(json!({"#t":["movie"]}))).await.unwrap()),
+        vec![c.id.clone(), a.id.clone()]
+    );
+    assert_eq!(
+        ids(s.query_events(&f(json!({"#x":[ih(2)]}))).await.unwrap()),
+        vec![b.id.clone()]
+    );
+    assert_eq!(
+        ids(s
+            .query_events(&f(json!({"authors":[hex64(1)],"limit":1})))
+            .await
+            .unwrap()),
+        vec![c.id.clone()]
+    );
+    assert_eq!(
+        ids(s
+            .query_events(&f(json!({"ids":[a.id],"since":NOW-30,"until":NOW-30})))
+            .await
+            .unwrap()),
+        vec![a.id.clone()]
+    );
+    assert!(
+        s.query_events(&f(json!({"kinds":[]})))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        s.query_events(&f(json!({"limit":0})))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        s.query_events(&f(json!({"kinds":[1]})))
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     let items = s.neg_items(&f(json!({"kinds":[2003]})), 10).await.unwrap();
     assert_eq!(items.len(), 3);
     assert_eq!(items[0].0, (NOW - 30) as u64);
     assert_eq!(hex::encode(items[0].1), a.id);
-    assert_eq!(s.neg_items(&f(json!({})), 1).await.unwrap().len(), 2, "max + 1 sentinel");
+    assert_eq!(
+        s.neg_items(&f(json!({})), 1).await.unwrap().len(),
+        2,
+        "max + 1 sentinel"
+    );
     assert_eq!(s.trackers_for(&ih(1)).await.unwrap().unwrap().len(), 1);
     assert_eq!(s.trackers_for(&ih(99)).await.unwrap(), None);
 }
@@ -567,21 +776,51 @@ async fn replaceable_newer_wins_tie_lowest_id() {
     assert!(s.has_event(&tie_low.id).await.unwrap());
 
     // Graph version: bumps for the root's and D1 members' lists only.
-    s.set_setting(keys::TRUST_ROOT, &json!(hex64(1)).to_string()).await.unwrap();
+    s.set_setting(keys::TRUST_ROOT, &json!(hex64(1)).to_string())
+        .await
+        .unwrap();
     let v = s.graph_version().await.unwrap();
-    assert!(s.put_replaceable(&replaceable(50, 1, 3, NOW, vec![vec!["p", &a]])).await.unwrap());
+    assert!(
+        s.put_replaceable(&replaceable(50, 1, 3, NOW, vec![vec!["p", &a]]))
+            .await
+            .unwrap()
+    );
     assert_eq!(s.graph_version().await.unwrap(), v + 1);
-    assert!(s.put_replaceable(&replaceable(51, 2, 10000, NOW, vec![vec!["p", &c]])).await.unwrap());
-    assert_eq!(s.graph_version().await.unwrap(), v + 2, "D1 member mute list");
-    assert_eq!(s.mutes_by(&[a.clone()]).await.unwrap(), vec![(a.clone(), c.clone())]);
-    assert!(s.put_replaceable(&replaceable(52, 9, 3, NOW, vec![vec!["p", &a]])).await.unwrap());
+    assert!(
+        s.put_replaceable(&replaceable(51, 2, 10000, NOW, vec![vec!["p", &c]]))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        s.graph_version().await.unwrap(),
+        v + 2,
+        "D1 member mute list"
+    );
+    assert_eq!(
+        s.mutes_by(std::slice::from_ref(&a)).await.unwrap(),
+        vec![(a.clone(), c.clone())]
+    );
+    assert!(
+        s.put_replaceable(&replaceable(52, 9, 3, NOW, vec![vec!["p", &a]]))
+            .await
+            .unwrap()
+    );
     assert_eq!(s.graph_version().await.unwrap(), v + 2, "stranger");
 
     // Profiles and relay lists.
     let mut prof = replaceable(60, 5, 0, NOW, vec![]);
     prof.content = r#"{"name":"alice"}"#.into();
     assert!(s.put_replaceable(&prof).await.unwrap());
-    let rl = replaceable(61, 5, 10002, NOW, vec![vec!["r", "wss://nos.lol"], vec!["r", "wss://relay.damus.io", "read"]]);
+    let rl = replaceable(
+        61,
+        5,
+        10002,
+        NOW,
+        vec![
+            vec!["r", "wss://nos.lol"],
+            vec!["r", "wss://relay.damus.io", "read"],
+        ],
+    );
     assert!(s.put_replaceable(&rl).await.unwrap());
     let st = s.publisher_stats(&hex64(5)).await.unwrap();
     assert!(st.has_profile && st.has_relay_list);
@@ -599,7 +838,10 @@ async fn reports_are_extracted() {
     let r = replaceable(70, 3, 1984, NOW, vec![vec!["p", &target, "spam"]]);
     assert!(s.put_report(&r).await.unwrap());
     assert!(!s.put_report(&r).await.unwrap());
-    assert_eq!(s.reports_by(&[hex64(3)]).await.unwrap(), vec![(hex64(3), target, "spam".into())]);
+    assert_eq!(
+        s.reports_by(&[hex64(3)]).await.unwrap(),
+        vec![(hex64(3), target, "spam".into())]
+    );
 }
 
 #[tokio::test]
@@ -607,16 +849,27 @@ async fn reports_are_extracted() {
 async fn torrent_detail_groups_events() {
     let Some(db) = test_db().await else { return };
     let s = &db.store;
-    put(s, torrent(1, 1, NOW - 10, 7, "late").files(&[("a.mkv", 5)]).size(5)).await;
+    put(
+        s,
+        torrent(1, 1, NOW - 10, 7, "late")
+            .files(&[("a.mkv", 5)])
+            .size(5),
+    )
+    .await;
     put(s, torrent(2, 2, NOW - 50, 7, "early")).await;
-    s.put_liveness(&live(7, Some(4), None, NOW + 100)).await.unwrap();
+    s.put_liveness(&live(7, Some(4), None, NOW + 100))
+        .await
+        .unwrap();
     let d = s.torrent_detail(&ih(7), NOW).await.unwrap().unwrap();
     assert_eq!(d.summary.title, "early");
     assert_eq!(d.summary.publisher_count, 2);
     assert_eq!(d.summary.seeders, Some(4));
     assert_eq!(d.summary.dead, Some(false));
     assert_eq!(d.events.len(), 2);
-    assert!(d.magnet.starts_with(&format!("magnet:?xt=urn:btih:{}", ih(7))));
+    assert!(
+        d.magnet
+            .starts_with(&format!("magnet:?xt=urn:btih:{}", ih(7)))
+    );
     assert_eq!(d.trust.score, 0);
     assert!(s.torrent_detail(&ih(8), NOW).await.unwrap().is_none());
 }
@@ -630,21 +883,34 @@ async fn ingest_fixtures() {
     let mut inserted = 0;
     for f in ["kind2003_sample.jsonl", "kind2004_sample.jsonl"] {
         for ev in fixture_events(f) {
-            let out = magnetar_core::ingest::ingest_into(s, ev.clone(), now).await.unwrap();
+            let out = magnetar_core::ingest::ingest_into(s, ev.clone(), now)
+                .await
+                .unwrap();
             if out == magnetar_core::ingest::IngestOutcome::Inserted {
                 inserted += 1;
                 assert_eq!(
-                    magnetar_core::ingest::ingest_into(s, ev, now).await.unwrap(),
+                    magnetar_core::ingest::ingest_into(s, ev, now)
+                        .await
+                        .unwrap(),
                     magnetar_core::ingest::IngestOutcome::Duplicate
                 );
             }
         }
     }
     let st = s.stats().await.unwrap();
-    assert!(inserted >= 52, "every kind 2003 fixture verifies and parses ({inserted})");
+    assert!(
+        inserted >= 52,
+        "every kind 2003 fixture verifies and parses ({inserted})"
+    );
     assert!(st.torrents > 0);
     let page = s
-        .search(&SearchQuery { min_trust: Some(0), ..Default::default() }, now)
+        .search(
+            &SearchQuery {
+                min_trust: Some(0),
+                ..Default::default()
+            },
+            now,
+        )
         .await
         .unwrap();
     assert_eq!(page.total, st.torrents);

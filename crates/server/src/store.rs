@@ -363,7 +363,11 @@ impl PgStore {
         push_filter(&mut qb, f);
         qb.push(" ORDER BY e.created_at, e.id LIMIT ");
         qb.push_bind(max as i64 + 1);
-        let rows: Vec<(i64, String)> = qb.build_query_as().fetch_all(&self.pool).await.map_err(db)?;
+        let rows: Vec<(i64, String)> = qb
+            .build_query_as()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
         rows.into_iter()
             .map(|(ts, id)| {
                 let mut out = [0u8; 32];
@@ -757,8 +761,10 @@ impl Store for PgStore {
             }
         }
 
-        if matches!(raw.kind, KIND_CONTACTS | KIND_MUTE_LIST | KIND_KIND_MUTE_SET)
-            && let Some(root) = Self::root(&mut tx).await?
+        if matches!(
+            raw.kind,
+            KIND_CONTACTS | KIND_MUTE_LIST | KIND_KIND_MUTE_SET
+        ) && let Some(root) = Self::root(&mut tx).await?
         {
             let in_graph = root == raw.pubkey || {
                 sqlx::query_scalar::<_, bool>(
@@ -935,13 +941,15 @@ impl Store for PgStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(db)?;
-        Ok(row.map(|(newest_seen, backfill_until, backfill_done)| Cursor {
-            relay: relay.to_string(),
-            kind,
-            newest_seen,
-            backfill_until,
-            backfill_done,
-        }))
+        Ok(
+            row.map(|(newest_seen, backfill_until, backfill_done)| Cursor {
+                relay: relay.to_string(),
+                kind,
+                newest_seen,
+                backfill_until,
+                backfill_done,
+            }),
+        )
     }
 
     async fn put_cursor(&self, c: &Cursor) -> Result<()> {
@@ -1009,7 +1017,11 @@ impl Store for PgStore {
             .await
             .map_err(db)?;
         let mut rows = search::hits_query(q, now, min_trust);
-        let hits: Vec<search::HitRow> = rows.build_query_as().fetch_all(&self.pool).await.map_err(db)?;
+        let hits: Vec<search::HitRow> = rows
+            .build_query_as()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
         Ok(SearchPage {
             hits: hits.into_iter().map(|h| h.into_summary(now)).collect(),
             total: u64::try_from(total).unwrap_or(0),
@@ -1407,9 +1419,7 @@ impl Store for PgStore {
         .await
         .map_err(db)?;
         // A new root invalidates every cached score.
-        if key == keys::TRUST_ROOT
-            && old.as_deref().and_then(json_string) != json_string(value)
-        {
+        if key == keys::TRUST_ROOT && old.as_deref().and_then(json_string) != json_string(value) {
             bump(&mut tx).await?;
         }
         tx.commit().await.map_err(db)
@@ -1511,7 +1521,8 @@ mod tests {
     fn backoff() {
         assert_eq!(backoff_secs(1), 300);
         assert_eq!(backoff_secs(2), 600);
-        assert_eq!(backoff_secs(9), BACKOFF_MAX_SECS);
+        assert_eq!(backoff_secs(9), 76_800);
+        assert_eq!(backoff_secs(10), BACKOFF_MAX_SECS);
         assert_eq!(backoff_secs(500), BACKOFF_MAX_SECS);
     }
 

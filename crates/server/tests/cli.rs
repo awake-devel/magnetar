@@ -56,7 +56,11 @@ async fn migrate_serve_and_graceful_shutdown() {
         .env("DATABASE_URL", &url)
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let port = free_port();
     let state = std::env::temp_dir().join(format!("magnetar-serve-{port}"));
@@ -87,7 +91,11 @@ async fn migrate_serve_and_graceful_shutdown() {
         assert!(Instant::now() < deadline, "server never became healthy");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    let r = http.get(format!("{base}/api/v1/stats")).send().await.unwrap();
+    let r = http
+        .get(format!("{base}/api/v1/stats"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
     let r = http
         .get(format!("{base}/api/v1/stats"))
@@ -107,7 +115,10 @@ async fn migrate_serve_and_graceful_shutdown() {
         if let Some(s) = child.try_wait().unwrap() {
             break s;
         }
-        assert!(Instant::now() < deadline, "serve did not exit after SIGTERM");
+        assert!(
+            Instant::now() < deadline,
+            "serve did not exit after SIGTERM"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     assert!(status.success(), "exit status {status:?}");
@@ -122,12 +133,18 @@ async fn crawl_once_end_to_end() {
     let out = Command::new(BIN)
         .args(["crawl-once", "--seconds", "60"])
         .env("DATABASE_URL", db.scoped_url())
-        .env("MAGNETAR_SEED_RELAYS", "wss://nos.lol,wss://relay.primal.net")
+        .env(
+            "MAGNETAR_SEED_RELAYS",
+            "wss://nos.lol,wss://relay.primal.net",
+        )
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let report: magnetar_core::crawler::CrawlReport =
-        serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: magnetar_core::crawler::CrawlReport = serde_json::from_slice(&out.stdout).unwrap();
     eprintln!("{report:?}");
     assert!(report.inserted > 0);
     let st = db.store.stats().await.unwrap();
