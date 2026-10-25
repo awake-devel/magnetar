@@ -7,8 +7,8 @@ whether swarms are alive, and gives you search, details and downloads in an Andr
 
 It runs in two places, and both of them crawl:
 
-- **Server**: `magnetar-server`, which uses Postgres. It can run **on the phone itself
-  inside Termux** or on any Linux machine.
+- **Server**: `magnetar-server`, which uses Postgres. It runs anywhere Docker or Linux runs:
+  a Linux PC, a VPS, a Synology NAS, a Raspberry Pi, or Docker Desktop on Mac and Windows.
 - **Android app**: keeps a local SQLite cache, so search still works offline. Whatever the
   phone finds is synced up to the server.
 
@@ -27,17 +27,17 @@ It runs in two places, and both of them crawl:
        |                                              |
        v                                              v
 +--------------------------------+      +------------------------------------+
-| magnetar-server (Termux/Linux) |      | Android app (Kotlin + Compose)     |
+| magnetar-server (Docker/Linux) |      | Android app (Kotlin + Compose)     |
 |  crawler loop (every 15 min)   |      |  WorkManager: crawl -> sync ->     |
 |  liveness: UDP/HTTP scrape,    |      |    cleanup -> saved-search poll    |
 |    DHT BEP 33 fallback         |      |  magnetar-ffi (Rust, uniffi):      |
 |  trust: depth-2 web of trust   |      |    SQLite + FTS5 cache, crawler,   |
 |  saved searches -> ntfy        |      |    API client, librqbit downloads  |
 |  librqbit downloads            |      +-----------------+------------------+
-|  axum API 127.0.0.1:8787       |<-- HTTP + Bearer token -+ search / detail /
+|  axum API 127.0.0.1:8787       |<-- HTTPS + Bearer token + search / detail /
 |  /relay WS (NIP-01 + NIP-77)   |<-- negentropy sync up --+ downloads / settings
-+---------------+----------------+       (batch POST fallback)
-               | unix socket
++---------------+----------------+   (Tailscale serve or a reverse proxy;
+               | TCP or unix socket          batch POST fallback for sync)
                v
      Postgres 18 (tsvector + pg_trgm)
 ```
@@ -66,80 +66,66 @@ of the app on an Android 17 (API 37) x86_64 emulator against a live server crawl
 | Phone to server sync: NIP-77 negentropy, batch POST fallback | core, server | Tested (also interop with nostr-sdk) |
 | Saved searches with ntfy push (server) and local notifications (phone) | server, app | Tested (local notifications; ntfy against a fake server only) |
 | Downloads with librqbit on the server and on the phone (fallback: open the magnet in another app) | server, ffi | Tested on x86_64; **arm64 phone downloads UNVERIFIED** |
-| Termux server: one-command setup, runit services, boot start | scripts | Tested in termux-docker with the real binary (64/64 checks); not yet on a real phone |
-| Cross-compiled server binary for Termux (API 24, aarch64 + x86_64) | scripts | Built; needs only bionic libc/libm/libdl |
+| Docker image `ghcr.io/awake-devel/magnetar` (linux/amd64 + linux/arm64) with Postgres 18 in `compose.yml` | Docker, CI | New: see docs/DOCKER.md for what was verified. arm64 is built natively on GitHub's arm64 runners only, **UNVERIFIED** on a device |
+| Static Linux server binaries (x86_64, aarch64) on every release, with `SHA256SUMS` | CI | New: see docs/LINUX.md. aarch64 built on GitHub's arm64 runners only, **UNVERIFIED** on a device |
 
 No analytics, no Google services, no accounts. The app talks to relays, trackers, your own
 server and, if you set it up, ntfy.
 
-## Quick start: everything on one phone
+## Install
 
-This setup runs the server in Termux on the same phone as the app, so it needs no other
-machine. It takes about 10 minutes, most of which is package downloads.
+[docs/DEPLOY.md](docs/DEPLOY.md) explains which setup suits which machine (Linux PC, Synology
+NAS, Raspberry Pi, VPS, Mac or Windows) and how the phone reaches the server. The short
+version, with Docker Compose:
 
-1. **Install Termux and Termux:Boot from F-Droid.** Both apps must come from the same source,
-   because Termux:Boot has to share Termux's signature. The Play Store build of Termux is a
-   different app. Open **Termux:Boot** once so that Android lets it run at boot.
-2. **Get the setup script** in Termux:
-   ```sh
-   pkg install -y curl jq
-   curl -fsSLO https://github.com/awake-devel/magnetar/releases/download/v0.1.0/termux-setup.sh
-   MAGNETAR_VERSION=v0.1.0 bash termux-setup.sh
-   ```
-   The script installs Postgres 18 and creates the database. It downloads the server binary
-   that matches `uname -m` and checks it against `SHA256SUMS`. It then runs the migrations,
-   installs the runit services and the boot script, and waits for `/health`. You can run it
-   again at any time, and it never regenerates secrets. Prereleases are not "latest":
-   install one with `MAGNETAR_VERSION=v0.1.0-rc1 bash termux-setup.sh`.
-3. **Copy the API token** printed at the end. To print it again later, run `magnetar-ctl token`.
-4. **Disable the phantom process killer** (Android 12 and later). Without this, Android kills
-   Postgres and the server sooner or later.
-   - Android 14+: Settings > System > Developer options > **Disable child process restrictions**.
-     Leave Developer options switched on, or the setting reverts.
-   - Android 12L/13: from a PC, `adb shell settings put global settings_enable_monitor_phantom_procs false`.
-   - Also exempt Termux from battery optimisation.
-5. **Install the APK** (`magnetar-<tag>.apk` from the same release). You need to allow
-   "install unknown apps" for your browser or file manager.
-6. **Open the app, go to Settings** and set:
-   - Server URL: `http://127.0.0.1:8787`
-   - API token: the value from step 3. Long-press in Termux to copy it.
-   - Root npub (optional): your own npub, so the web of trust starts from your follows.
+```sh
+git clone https://github.com/awake-devel/magnetar && cd magnetar
+cp .env.example .env && $EDITOR .env      # set MAGNETAR_API_TOKEN (openssl rand -hex 32) and the DB password
+docker compose pull && docker compose up -d
+tailscale serve --bg 127.0.0.1:8787       # optional: https://<machine>.<tailnet>.ts.net for the phone
+```
 
-   The Status screen should then show the server as reachable.
+Then install `magnetar-<tag>.apk` from the release on the phone, and in Settings enter the
+server URL (`https://<machine>.<tailnet>.ts.net`) and the API token.
 
-Manage the server with `magnetar-ctl start|stop|restart|status|logs|token|update`.
-[docs/TERMUX.md](docs/TERMUX.md) covers the details, flags (`--no-services`,
-`--uninstall-services`, `MAGNETAR_BINARY=`, `MAGNETAR_BUILD=local`) and troubleshooting.
+- Docker details (variables, volumes, upgrades, backups): [docs/DOCKER.md](docs/DOCKER.md)
+- Without Docker, with the static binary and your own Postgres: [docs/LINUX.md](docs/LINUX.md)
+- Nothing here installs systemd units, timers or udev rules. Docker's restart policy keeps
+  the containers up; LINUX.md has examples you can adapt if you want the binary started at
+  boot.
 
-**Why a token on localhost?** Every app on an Android phone can reach `127.0.0.1`. The server
-binds to loopback only and requires `Authorization: Bearer <token>` on everything except
-`GET /health`. Postgres accepts TCP only with a password and the server itself uses the
-private unix socket.
+**Why a token?** The server listens on loopback by default and expects a proxy in front.
+Every endpoint except `GET /health` requires `Authorization: Bearer <token>`, so whatever
+can reach the port (other local users, the tailnet, the LAN) still cannot use the API without
+it.
 
 ## Configuration
 
 See [docs/CONFIG.md](docs/CONFIG.md) for all the details.
 
-### Server environment (`~/.config/magnetar/env` in Termux)
+### Server environment
+
+The most used variables. Docker reads them from `.env`; the native binary from its env file.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `DATABASE_URL` | Termux: `postgres:///magnetar?host=$PREFIX/tmp&user=magnetar` | Postgres connection (socket form in Termux) |
-| `MAGNETAR_BIND` | `127.0.0.1:8787` | API + `/relay` listen address. Keep it on loopback or a Tailscale IP |
+| `DATABASE_URL` | required | Postgres connection, e.g. `postgres://magnetar:<pw>@db:5432/magnetar` (set by `compose.yml`) |
+| `MAGNETAR_BIND` | `127.0.0.1:8787` (`0.0.0.0:8787` inside the image) | API + `/relay` listen address |
 | `MAGNETAR_API_TOKEN` | required for `serve` | Bearer token for every endpoint except `/health` |
 | `MAGNETAR_ROOT_NPUB` | unset | Root of the web of trust (npub or hex) |
-| `MAGNETAR_NTFY_URL` | `https://ntfy.sh` in the generated env | ntfy server for saved-search notifications |
-| `MAGNETAR_NTFY_TOPIC` | random `magnetar-…` | ntfy topic. Treat it as a secret |
-| `MAGNETAR_DOWNLOAD_DIR` | `~/storage/downloads/magnetar` (or `~/magnetar/downloads`) | Server-side download output |
-| `MAGNETAR_CRAWL_INTERVAL_SECS` | `900` | Pause between crawler passes. `0` crawls continuously (30 s between passes), for an always-on Linux server |
+| `MAGNETAR_NTFY_URL`, `MAGNETAR_NTFY_TOPIC` | unset | ntfy server and topic for saved-search notifications. Treat the topic as a secret |
+| `MAGNETAR_DOWNLOADS` | `true` | Start the librqbit download engine. `false` on a small device that only indexes |
+| `MAGNETAR_DOWNLOAD_DIR` | `~/Downloads/magnetar` (`/data/downloads` in the image) | Server-side download output |
+| `MAGNETAR_CRAWL_INTERVAL_SECS` | `900` | Pause between crawler passes. `0` crawls continuously (30 s between passes) |
 | `MAGNETAR_CRAWL_MAX_RELAYS` | `30` | Relays crawled per pass |
 | `MAGNETAR_CRAWL_EXPLORE_RELAYS` | `10` | Of those, slots for newly discovered relays that have not yielded events yet |
 | `MAGNETAR_SEED_RELAYS` | built-in list (ARCHITECTURE.md §9) | Comma-separated relay URLs |
+| `MAGNETAR_NIP66` | `true` | NIP-66 relay discovery every 6 h |
+| `MAGNETAR_DB_POOL` | `10` | Postgres connections the server may open |
 | `RUST_LOG` | `info` | tracing filter |
 
-The setup script also writes `MAGNETAR_DB_PASSWORD`, which is the `magnetar` role's password
-for TCP connections to 127.0.0.1:5432, and `TMPDIR`. Server commands:
-`magnetar-server serve | migrate | crawl-once [--seconds N] | selftest | --version`.
+Server commands: `magnetar-server serve | migrate | crawl-once [--seconds N] | selftest | --version`.
+`serve` applies migrations itself.
 
 ### App settings
 
@@ -147,60 +133,39 @@ Server URL, API token, root npub, trust threshold (default 20), cache cap (MB), 
 ntfy, and download directory. The app works without a server: it then crawls and searches
 locally only.
 
-## Using a real server over Tailscale (later)
-
-The same server runs on a Linux box (see [docs/SETUP.md](docs/SETUP.md)). To reach it from the
-phone, leave `MAGNETAR_BIND=127.0.0.1:8787` and publish the port to your tailnet with HTTPS:
-
-```sh
-tailscale serve --bg 127.0.0.1:8787     # https://<machine>.<tailnet>.ts.net -> 127.0.0.1:8787
-tailscale serve status
-```
-
-This needs MagicDNS and HTTPS certificates enabled for the tailnet (admin console, DNS page).
-In the app, set the server URL to `https://<machine>.<tailnet>.ts.net` and keep the token.
-
-The app allows cleartext HTTP only to `127.0.0.1` and `localhost`. To use plain
-`http://<magicdns-name>:8787` or a `100.x` address instead, you would have to add that host
-to `android/app/src/main/res/xml/network_security_config.xml` and rebuild the APK, and bind
-the server to its Tailscale IP. HTTPS through `tailscale serve` avoids both. **UNVERIFIED:**
-Android 16+ "local network access" rules may affect Tailscale addresses, but loopback is
-expected to be exempt.
-
 ## Building from source (laptop)
 
 ```sh
-# Arch's /usr/bin/cargo has no Android std; the rustup toolchain must come first:
+docker build -t magnetar .                 # the server image, for this machine's architecture
+scripts/build-linux.sh x86_64              # dist/magnetar-server-x86_64-linux (static); aarch64 on an arm64 host
+cargo build --release -p magnetar-server   # plain native build
+
+# Android: Arch's /usr/bin/cargo has no Android std; the rustup toolchain must come first:
 export PATH=$HOME/.cargo/bin:$HOME/.local/bin:$PATH
 export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/29.0.14206865
-
-scripts/build-termux.sh          # dist/magnetar-server-{aarch64,x86_64}-linux-android (cargo-ndk, API 24)
-scripts/build-android.sh         # .so via cargo-ndk + Kotlin bindings + APK
-cargo build --release -p magnetar-server   # native Linux server
+scripts/build-android.sh                   # .so via cargo-ndk + Kotlin bindings + APK
 ```
 
-You need the rustup stable toolchain with the `aarch64-linux-android` and
+The Android build needs the rustup stable toolchain with the `aarch64-linux-android` and
 `x86_64-linux-android` targets, `cargo-ndk` 4.x, NDK r29, JDK 17+ (27 works with Gradle
 9.8.2), and the Android SDK with compileSdk 37. Do not install aws-lc or OpenSSL: TLS is
-rustls with ring and webpki-roots. Copying a binary to a phone without a release:
-`scp -P 8022 dist/magnetar-server-aarch64-linux-android <phone>:` then
-`MAGNETAR_BINARY=~/magnetar-server-aarch64-linux-android bash termux-setup.sh`.
-More in [docs/SETUP.md](docs/SETUP.md).
+rustls with ring and webpki-roots. More in [docs/SETUP.md](docs/SETUP.md).
 
-Releases: `scripts/release.sh` prints the plan (dry run), `--build` fills `dist/` and writes
-`SHA256SUMS`, and only `--publish` calls `gh release create v<version>[-suffix]`.
+Releases: pushing a tag `vX.Y.Z` makes CI build the image (both architectures) and the Linux
+binaries and attach them to a draft release. `scripts/release.sh` then builds and signs the
+APK locally, uploads it and publishes the release (dry run by default, `--publish` to act).
 
 ## Testing
 
 ```sh
 scripts/test.sh                  # fmt --check, clippy -D warnings, all tests with Postgres 18, Android build
 scripts/test.sh --ignored        # + network tests against real relays and trackers
-scripts/test.sh --termux         # + termux-setup.sh inside termux/termux-docker:x86_64
-scripts/termux-docker-test.sh --binary dist/magnetar-server-x86_64-linux-android   # with the real server
 ```
 
 `scripts/test.sh` starts (or creates) the docker container `magnetar-pg` (`postgres:18` on
 `127.0.0.1:54329`) and exports `MAGNETAR_TEST_DATABASE_URL`. Every test uses its own schema.
+GitHub Actions (`.github/workflows/ci.yml`) runs fmt, clippy and the tests against a
+`postgres:18` service on every push and pull request.
 
 ## Limitations
 
@@ -226,13 +191,10 @@ has the full list with sources.
   pause and notify at the cap. Use server downloads for long ones.
 - **librqbit's own HTTPS tracker requests may fail on Android.** Its platform TLS verifier
   needs JNI. UDP trackers and DHT still work.
-- **The phantom process killer** (Android 12+) kills Termux services unless you disable it.
-  The setup keeps the process count low (Postgres `max_connections 20`, `io_workers 1`, a
-  sqlx pool of 5 or fewer).
-- **Loopback is shared by all apps**, which is why there is a token. Anyone who can read
-  `~/.config/magnetar/env` in Termux has full API access.
-- The Termux server binary has not run on a physical phone yet (**UNVERIFIED**). It was built
-  for API 24 and checked only in termux-docker on x86_64.
+- **The token is the only lock.** Anyone who has it, or who can read the server's `.env`, has
+  full API access. Put HTTPS in front of the server (Tailscale serve or a reverse proxy).
+- **arm64 server builds are UNVERIFIED on hardware.** The image and binary for arm64 are built
+  on GitHub's native arm64 runners; they have not run on a Raspberry Pi or an ARM NAS yet.
 
 ## Legal
 

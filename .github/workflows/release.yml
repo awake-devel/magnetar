@@ -1,0 +1,119 @@
+# Server binaries for a tag vX.Y.Z[-suffix] (ARCHITECTURE.md D39): scripts/build-linux.sh on a
+# native runner per architecture, then SHA256SUMS, attached to the GitHub release for the tag.
+# The release is created as a draft when it does not exist yet. scripts/release.sh (run
+# locally) adds the signed APK and the deployment files, and publishes the draft.
+# The Docker image for the same tag comes from docker.yml.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to (re)build and attach, e.g. v0.2.0
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  binaries:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - name: Tag matches the workspace version
+        run: |
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p' Cargo.toml)
+          base=${TAG#v}
+          base=${base%%-*}
+          [ "$base" = "$version" ] || { echo "::error::tag $TAG does not match Cargo.toml version $version"; exit 1; }
+      - name: Toolchain
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q musl-tools
+          rustup toolchain install stable --profile minimal --target "$ARCH-unknown-linux-musl"
+          rustup default stable
+      - name: Build
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: bash scripts/build-linux.sh "$ARCH"
+      - name: Check the binary
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          bin=dist/magnetar-server-$ARCH-linux
+          file "$bin"
+          out=$("$bin" --version)
+          echo "$out"
+          base=${TAG#v}
+          [ "$out" = "magnetar-server ${base%%-*}" ] || { echo "::error::unexpected --version output: $out"; exit 1; }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: magnetar-server-${{ matrix.arch }}-linux
+          path: dist/magnetar-server-${{ matrix.arch }}-linux
+          if-no-files-found: error
+          retention-days: 7
+
+  attach:
+    needs: binaries
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          pattern: magnetar-server-*-linux
+          merge-multiple: true
+      - name: Release exists (draft if new)
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG exists"
+            exit 0
+          fi
+          flags=(--draft --verify-tag --title "Magnetar $TAG"
+            --notes "Draft created by CI. Run scripts/release.sh --publish to add the APK and publish.")
+          case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+          # A concurrent creator (scripts/release.sh) may win the race: then the view succeeds.
+          gh release create "$TAG" "${flags[@]}" || gh release view "$TAG" >/dev/null
+      - name: SHA256SUMS (merged with what the release already lists)
+        working-directory: dist
+        run: |
+          chmod 755 magnetar-server-*-linux
+          gh release download "$TAG" --pattern SHA256SUMS --output old.sums 2>/dev/null || : >old.sums
+          mine=(magnetar-server-*-linux)
+          {
+            # Keep the other assets' lines (APK etc.), replace ours.
+            awk 'NR == FNR { ours[$0]; next } !($2 in ours)' <(printf '%s\n' "${mine[@]}") old.sums
+            sha256sum "${mine[@]}"
+          } | sort -k2 >SHA256SUMS
+          rm old.sums
+          cat SHA256SUMS
+      - name: Upload
+        working-directory: dist
+        run: gh release upload "$TAG" --clobber magnetar-server-*-linux SHA256SUMS

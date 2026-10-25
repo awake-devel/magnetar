@@ -43,16 +43,16 @@ JNA has not been tested with R8.
 
 ## Server URL, cleartext and Tailscale
 
-The default server is the Termux server on the phone itself, `http://127.0.0.1:8787`.
-`res/xml/network_security_config.xml` allows cleartext HTTP **only** to `127.0.0.1` and `localhost`.
-For a server reached over Tailscale:
+There is no default server: an empty URL means offline only (local crawl and search). The
+server runs elsewhere (docs/DEPLOY.md), typically behind `tailscale serve`, so the usual URL
+is `https://<host>.<tailnet>.ts.net`.
 
-- preferred: serve it over HTTPS (`tailscale cert` / `tailscale serve`) and use
-  `https://<host>.<tailnet>.ts.net`;
-- or add the MagicDNS name or `100.x.y.z` address as another `<domain>` in the network security
-  config and rebuild.
-
-Settings warns when a plain `http://` URL points anywhere other than loopback.
+`res/xml/network_security_config.xml` permits cleartext, because the host is only known at
+runtime and a network security config can only name hosts at build time. All server traffic
+goes through the Rust client on native sockets anyway, which that file does not govern.
+Instead, Settings shows a warning when an `http://` URL points at a host where the traffic
+would be readable: anything but loopback and Tailscale (`100.64.0.0/10`,
+`fd7a:115c:a1e0::/48`, `*.ts.net`). See ARCHITECTURE.md D39.
 
 ## App structure
 

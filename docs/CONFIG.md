@@ -17,34 +17,42 @@ magnetar-server --version
 
 | Variable | Default | Notes |
 |---|---|---|
-| `DATABASE_URL` | none (required) | Termux socket form: `postgres:///magnetar?host=/data/data/com.termux/files/usr/tmp&user=magnetar`. Also accepted: `postgres://magnetar@localhost/magnetar?host=<dir>`, or TCP `postgres://magnetar:<pw>@127.0.0.1:5432/magnetar`. sqlx pool of 5 or fewer |
-| `MAGNETAR_BIND` | `127.0.0.1:8787` | Never `0.0.0.0` on a phone: every app can reach loopback, and on Wi-Fi other hosts could reach the port too |
+| `DATABASE_URL` | none (required) | TCP `postgres://magnetar:<pw>@127.0.0.1:5432/magnetar` (in `compose.yml` the host is the `db` service), or a unix socket `postgres://magnetar@localhost/magnetar?host=/run/postgresql` |
+| `MAGNETAR_DB_POOL` | `10` | sqlx pool size: Postgres connections the server may open (ARCHITECTURE.md D37). Keep it below the server's `max_connections` |
+| `MAGNETAR_BIND` | `127.0.0.1:8787` | The image sets `0.0.0.0:8787` (inside the container; the host side is `MAGNETAR_PUBLISH`). Natively, keep loopback and put Tailscale serve or a reverse proxy in front (docs/DEPLOY.md) |
 | `MAGNETAR_API_TOKEN` | none (required for `serve`) | `Authorization: Bearer <token>` on everything except `GET /health`. The `/relay` WebSocket also accepts `?token=` |
 | `MAGNETAR_ROOT_NPUB` | unset | npub or hex. The root of the web of trust. Can also be set via `PUT /api/v1/settings/trust` |
-| `MAGNETAR_NTFY_URL` | unset (Termux env: `https://ntfy.sh`) | Root URL. Publishing uses the JSON form (`POST <root>/`) |
-| `MAGNETAR_NTFY_TOPIC` | unset (Termux env: random `magnetar-<24 hex>`) | Topics are public secrets. ntfy.sh allows 250 messages a day; Magnetar sends at most one per poll (every 15 min, so ≤ 96 a day) covering all saved searches with new hits (D34) |
-| `MAGNETAR_DOWNLOAD_DIR` | Termux env: `~/storage/downloads/magnetar` if `termux-setup-storage` was run, else `~/magnetar/downloads` | librqbit output for server downloads |
-| `MAGNETAR_CRAWL_INTERVAL_SECS` | `900` | Pause between crawl passes, at least 60. `0` = continuous: passes run back to back with a 30 s pause (120 s after a failed pass or when every relay is backed off). Use it on an always-on Linux server; keep 900 on a phone. Indexer metadata and saved-search notifications still run at most every 15 min (ARCHITECTURE.md D32) |
+| `MAGNETAR_NTFY_URL` | unset (e.g. `https://ntfy.sh`) | Root URL. Publishing uses the JSON form (`POST <root>/`) |
+| `MAGNETAR_NTFY_TOPIC` | unset (e.g. `magnetar-$(openssl rand -hex 12)`) | Topics are public secrets. ntfy.sh allows 250 messages a day; Magnetar sends at most one per poll (every 15 min, so ≤ 96 a day) covering all saved searches with new hits (D34) |
+| `MAGNETAR_DOWNLOADS` | `true` | Start the librqbit download engine with `serve`. `false` saves memory and disk on a device that only indexes; download requests then answer `downloads_unavailable` |
+| `MAGNETAR_DOWNLOAD_DIR` | `~/Downloads/magnetar` (image: `/data/downloads`) | librqbit output for server downloads |
+| `MAGNETAR_CRAWL_INTERVAL_SECS` | `900` | Pause between crawl passes, at least 60. `0` = continuous: passes run back to back with a 30 s pause (120 s after a failed pass or when every relay is backed off). Use it on an always-on server with bandwidth to spare. Indexer metadata and saved-search notifications still run at most every 15 min (ARCHITECTURE.md D32) |
 | `MAGNETAR_CRAWL_MAX_RELAYS` | `30` | Relays crawled per pass (at least 1). Seeds come first, then the best-yielding stored relays |
 | `MAGNETAR_CRAWL_EXPLORE_RELAYS` | `10` | Of `MAGNETAR_CRAWL_MAX_RELAYS`, slots kept for relays with no events yet: never-tried first, then the one whose last success is oldest. This is how newly discovered relays (NIP-65 lists, relay hints, kind-3 maps) get crawled. `0` disables exploration |
 | `MAGNETAR_SEED_RELAYS` | built-in list | comma-separated `wss://` URLs |
 | `MAGNETAR_NIP66` | `true` | NIP-66 relay discovery with `serve`: at startup, then every 6 h, new relays from monitor events are added with source `nip66` (ARCHITECTURE.md D35) |
 | `MAGNETAR_NIP66_MONITORS` | `wss://relaypag.es, wss://monitorlizard.nostr1.com, wss://relay.nostr.watch, wss://nos.lol, wss://relay.damus.io` | comma-separated relays queried for kind 10166/30166 monitor events |
 | `MAGNETAR_NIP66_TRUSTED` | built-in list of 12 monitor pubkeys (`nip66::DEFAULT_TRUSTED_MONITORS`) | comma-separated hex pubkeys of trusted NIP-66 monitors. They get their own request and page budget, and only relays they report escape the cap of 100 new relays per run from other announced monitors (ARCHITECTURE.md D36) |
-| `RUST_LOG` | `info` (Termux env) | tracing `EnvFilter` syntax, e.g. `info,magnetar_core=debug` |
+| `RUST_LOG` | `info` | tracing `EnvFilter` syntax, e.g. `info,magnetar_core=debug` |
 
 `GET /api/v1/stats` reports the crawler under `crawler`: `running`, `last_run` (unix end time of
 the last pass), `last_report`, `passes` since start, `last_error` and `next_run` (while pausing).
 
-The Termux setup also writes these:
+librqbit keeps its session and DHT state in `<state dir>/downloads`, where the state dir is
+`$XDG_STATE_HOME/magnetar` (default `~/.local/state/magnetar`). The image keeps it under
+`/data/state` (docs/DOCKER.md).
 
-| Variable | Used by |
-|---|---|
-| `MAGNETAR_DB_PASSWORD` | the setup script, as the scram password of role `magnetar` for TCP on 127.0.0.1:5432. The server uses the socket and does not need it |
-| `TMPDIR` | `$PREFIX/tmp`. Rust's `temp_dir()` would otherwise fall back to the unwritable `/data/local/tmp` on Android |
+### Docker Compose only
 
-The env file is sourced by `sh` with `set -a`, so keep the values single-quoted
-(`DATABASE_URL` contains `&`).
+`compose.yml` reads `.env` (template: `.env.example`); docs/DOCKER.md lists which of the
+variables above it passes to the server. Two more are used by compose itself:
+
+| Variable | Default | Notes |
+|---|---|---|
+| `MAGNETAR_VERSION` | `latest` | image tag of `ghcr.io/awake-devel/magnetar`: `latest` (newest non-prerelease), `X.Y.Z`, `X.Y.Z-rc1`, or `edge` (newest `main`) |
+| `MAGNETAR_PUBLISH` | `127.0.0.1:8787` | where the host publishes the API (exact format in docs/DOCKER.md). Change it only to put it on a LAN or Tailscale address |
+
+The Postgres credentials and volumes are described in docs/DOCKER.md.
 
 ### Settings stored in the database (key/value)
 
@@ -64,26 +72,14 @@ wss://nostr.wine, wss://nostr.land, wss://offchain.pub, wss://nostr.bitcoiner.so
 The indexers used for kinds 0/3/10000/10002 are `wss://purplepag.es`,
 `wss://user.kindpag.es` and `wss://indexer.coracle.social`.
 
-## Termux Postgres
-
-| Setting | Value | Why |
-|---|---|---|
-| data dir | `$PREFIX/var/lib/postgresql` | the only path the stock runit service uses |
-| socket | `$PREFIX/tmp/.s.PGSQL.5432` | Termux's compiled default, app-private |
-| `listen_addresses` | `127.0.0.1` | |
-| `max_connections` | 20 | process budget |
-| `io_workers` | 1 | PG 18 defaults to 3 worker processes |
-| `shared_buffers` | 64MB | |
-| `pg_hba` | `local all all trust`, `host all all 127.0.0.1/32 scram-sha-256` | loopback is shared with all apps |
-
 ## Android app settings
 
 Settings map to `FfiConfig` (ARCHITECTURE.md §8.1):
 
 | Setting | `FfiConfig` field | Default / notes |
 |---|---|---|
-| Server URL | `server_url` | `http://127.0.0.1:8787`. Empty means offline-only (local crawl and search) |
-| API token | `api_token` | the value of `magnetar-ctl token` |
+| Server URL | `server_url` | empty, meaning offline only (local crawl and search). Typically `https://<machine>.<tailnet>.ts.net`. `http://` works too, with a warning unless the host is loopback or Tailscale (ARCHITECTURE.md D39) |
+| API token | `api_token` | the server's `MAGNETAR_API_TOKEN` |
 | Root npub | `root_pubkey` | npub, nprofile or hex |
 | Trust threshold | `trust_threshold` | 20. Results below it are hidden (`min_trust`) |
 | Cache cap (MB) | `cache_cap_mb` | `cleanup` evicts only torrents that are synced and not pinned, by LRU |
