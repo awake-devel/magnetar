@@ -1,0 +1,196 @@
+#!/bin/sh
+# magnetar-ctl: run the Magnetar server on a Linux host as a plain background process.
+#
+#   magnetar-ctl up | down | restart | status | logs [-f] | token | health | update | stop-all
+#   magnetar-ctl run          foreground (for a process supervisor or a terminal)
+#
+# No systemd, no timers: run `magnetar-ctl up` after a reboot, or hook it into whatever
+# your system already uses (docs/LINUX.md has optional examples).
+#
+#   up        start the Postgres container (if MAGNETAR_DB_CONTAINER is set), migrate, start
+#             the server in the background, wait for /health; with MAGNETAR_TAILSCALE_SERVE=1
+#             also publish it on the tailnet with `tailscale serve`
+#   down      stop the server (SIGTERM, then SIGKILL after 30 s); the database keeps running
+#   stop-all  down, stop the Postgres container, remove the tailscale serve entry (if enabled)
+#   update    fetch a new binary (MAGNETAR_VERSION, default latest) with install-linux.sh
+#             --update, then restart if the server was running
+#
+# Files (override with the variables in brackets):
+#   config  ${XDG_CONFIG_HOME:-~/.config}/magnetar/server.env  [MAGNETAR_ENV_FILE]
+#   state   ${XDG_STATE_HOME:-~/.local/state}/magnetar/server.{pid,log}  [MAGNETAR_STATE_DIR]
+#   binary  magnetar-server next to this script, else on PATH  [MAGNETAR_SERVER_BIN]
+set -eu
+
+self_dir=$(cd "$(dirname "$0")" && pwd)
+ENV_FILE=${MAGNETAR_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/magnetar/server.env}
+STATE_DIR=${MAGNETAR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/magnetar}
+PIDFILE=$STATE_DIR/server.pid
+LOG=$STATE_DIR/server.log
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+case ${1:-} in -h | --help | help) usage ;; esac
+
+[ -f "$ENV_FILE" ] || die "$ENV_FILE not found: run install-linux.sh first (or set MAGNETAR_ENV_FILE)"
+# The env file is the single source of config: exported to the server as is.
+set -a
+# shellcheck source=/dev/null
+. "$ENV_FILE"
+set +a
+
+if [ -n "${MAGNETAR_SERVER_BIN:-}" ]; then BIN=$MAGNETAR_SERVER_BIN
+elif [ -x "$self_dir/magnetar-server" ]; then BIN=$self_dir/magnetar-server
+else BIN=$(command -v magnetar-server 2>/dev/null) || die "magnetar-server not found (set MAGNETAR_SERVER_BIN)"
+fi
+
+BIND=${MAGNETAR_BIND:-127.0.0.1:8787}
+PORT=${BIND##*:}
+HOST=${BIND%:*}
+case "$HOST" in 0.0.0.0 | "[::]" | "") HOST=127.0.0.1 ;; esac
+HEALTH_URL=http://$HOST:$PORT/health
+
+mkdir -p "$STATE_DIR"
+
+server_pid() {
+  [ -f "$PIDFILE" ] || return 1
+  pid=$(cat "$PIDFILE")
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
+  echo "$pid"
+}
+
+http_get() {
+  if command -v curl >/dev/null 2>&1; then curl -fsS --max-time 3 "$1"
+  elif command -v wget >/dev/null 2>&1; then wget -q -T 3 -O - "$1"
+  else die "neither curl nor wget is installed"
+  fi
+}
+
+have_docker_db() {
+  [ -n "${MAGNETAR_DB_CONTAINER:-}" ] && command -v docker >/dev/null 2>&1
+}
+
+db_up() {
+  have_docker_db || return 0
+  docker start "$MAGNETAR_DB_CONTAINER" >/dev/null || die "cannot start container $MAGNETAR_DB_CONTAINER"
+  i=0
+  until docker exec "$MAGNETAR_DB_CONTAINER" pg_isready -q -U magnetar >/dev/null 2>&1; do
+    i=$((i + 1)); [ "$i" -lt 60 ] || die "postgres in $MAGNETAR_DB_CONTAINER not ready after 60 s"
+    sleep 1
+  done
+}
+
+migrate() {
+  [ -n "${DATABASE_URL:-}" ] || die "DATABASE_URL is not set in $ENV_FILE"
+  # A distro or remote Postgres may still be starting: retry for 30 s.
+  i=0
+  until "$BIN" migrate >>"$LOG" 2>&1; do
+    i=$((i + 1)); [ "$i" -lt 30 ] || { tail -n 20 "$LOG" >&2; die "migrate failed (log: $LOG)"; }
+    sleep 1
+  done
+}
+
+tailscale_on() { [ "${MAGNETAR_TAILSCALE_SERVE:-0}" = 1 ]; }
+ts_https_port() { echo "${MAGNETAR_TAILSCALE_HTTPS_PORT:-443}"; }
+
+tailscale_url() {
+  json=$(tailscale status --json 2>/dev/null) || return 0
+  if command -v jq >/dev/null 2>&1; then
+    name=$(printf '%s' "$json" | jq -r '.Self.DNSName // empty')
+  else
+    # "Self" precedes "Peer" in tailscale's output, so the first DNSName is this node's.
+    name=$(printf '%s' "$json" | sed -n 's/.*"DNSName": *"\([^"]*\)".*/\1/p' | head -n 1)
+  fi
+  name=${name%.}
+  [ -n "$name" ] || return 0
+  p=$(ts_https_port)
+  [ "$p" = 443 ] && echo "https://$name" || echo "https://$name:$p"
+}
+
+tailscale_publish() {
+  tailscale_on || return 0
+  command -v tailscale >/dev/null 2>&1 || { echo "MAGNETAR_TAILSCALE_SERVE=1 but tailscale is not installed" >&2; return 0; }
+  if tailscale serve --bg --https="$(ts_https_port)" "http://127.0.0.1:$PORT" >/dev/null; then
+    echo "tailnet URL: $(tailscale_url)"
+  else
+    echo "tailscale serve failed (logged in? operator rights: sudo tailscale set --operator=\$USER)" >&2
+  fi
+}
+
+do_up() {
+  db_up
+  if pid=$(server_pid); then
+    echo "server already running (pid $pid)"
+  else
+    migrate
+    # setsid: the server survives the terminal (and its SIGHUP) that started it.
+    if command -v setsid >/dev/null 2>&1; then
+      setsid nohup "$BIN" serve >>"$LOG" 2>&1 </dev/null &
+    else
+      nohup "$BIN" serve >>"$LOG" 2>&1 </dev/null &
+    fi
+    echo $! >"$PIDFILE"
+    i=0
+    until http_get "$HEALTH_URL" >/dev/null 2>&1; do
+      if ! server_pid >/dev/null; then
+        rm -f "$PIDFILE"; tail -n 20 "$LOG" >&2; die "server exited (log: $LOG)"
+      fi
+      i=$((i + 1)); [ "$i" -lt 30 ] || { tail -n 20 "$LOG" >&2; die "no answer on $HEALTH_URL after 30 s"; }
+      sleep 1
+    done
+    echo "server started (pid $(cat "$PIDFILE")), listening on $BIND"
+  fi
+  tailscale_publish
+}
+
+do_down() {
+  if ! pid=$(server_pid); then rm -f "$PIDFILE"; echo "server not running"; return 0; fi
+  kill "$pid"
+  i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    i=$((i + 1))
+    if [ "$i" -ge 30 ]; then echo "no exit after 30 s: SIGKILL" >&2; kill -9 "$pid" 2>/dev/null || true; break; fi
+    sleep 1
+  done
+  rm -f "$PIDFILE"
+  echo "server stopped"
+}
+
+do_status() {
+  if pid=$(server_pid); then echo "server: running (pid $pid, $BIND)"; else echo "server: stopped"; fi
+  if body=$(http_get "$HEALTH_URL" 2>/dev/null); then echo "health: $body"; else echo "health: no answer on $HEALTH_URL"; fi
+  if have_docker_db; then
+    echo "db: $(docker inspect -f '{{.State.Status}}' "$MAGNETAR_DB_CONTAINER" 2>/dev/null || echo missing) ($MAGNETAR_DB_CONTAINER)"
+  fi
+  if tailscale_on && command -v tailscale >/dev/null 2>&1; then tailscale serve status || true; fi
+  echo "binary: $BIN ($("$BIN" --version 2>/dev/null || echo '?'))"
+  echo "config: $ENV_FILE"
+  echo "log: $LOG"
+}
+
+do_update() {
+  installer=${MAGNETAR_INSTALLER:-$self_dir/../share/magnetar/install-linux.sh}
+  [ -f "$installer" ] || die "installer not found at $installer (set MAGNETAR_INSTALLER)"
+  was_running=0
+  server_pid >/dev/null && was_running=1
+  sh "$installer" --update
+  if [ "$was_running" = 1 ]; then do_down; do_up; fi
+}
+
+case ${1:-status} in
+  up | start) do_up ;;
+  down | stop) do_down ;;
+  restart) do_down; do_up ;;
+  status) do_status ;;
+  run) db_up; migrate; exec "$BIN" serve ;;
+  logs) if [ "${2:-}" = -f ]; then tail -n 50 -f "$LOG"; else tail -n 100 "$LOG"; fi ;;
+  token) echo "${MAGNETAR_API_TOKEN:?MAGNETAR_API_TOKEN is not set in $ENV_FILE}" ;;
+  health) http_get "$HEALTH_URL"; echo ;;
+  update) do_update ;;
+  stop-all)
+    do_down
+    if tailscale_on && command -v tailscale >/dev/null 2>&1; then tailscale serve --https="$(ts_https_port)" off || true; fi
+    if have_docker_db; then docker stop "$MAGNETAR_DB_CONTAINER" >/dev/null && echo "db stopped ($MAGNETAR_DB_CONTAINER)"; fi ;;
+  -h | --help | help) usage ;;
+  *) usage 2 ;;
+esac
