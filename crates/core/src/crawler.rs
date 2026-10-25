@@ -270,7 +270,13 @@ async fn select_relays<S: Store + ?Sized>(
     let mut rest: Vec<(u64, u32, String)> = infos
         .values()
         .filter(|i| i.enabled && i.next_try_at <= now)
-        .map(|i| (i.events_found, freq.get(&i.url).copied().unwrap_or(0), i.url.clone()))
+        .map(|i| {
+            (
+                i.events_found,
+                freq.get(&i.url).copied().unwrap_or(0),
+                i.url.clone(),
+            )
+        })
         .chain(
             freq.iter()
                 .filter(|(u, _)| !infos.contains_key(*u))
@@ -319,8 +325,14 @@ impl RelayRun {
 fn sweeps() -> [(u16, Value); 3] {
     [
         (KIND_TORRENT, json!({"kinds": [KIND_TORRENT]})),
-        (KIND_TORRENT_COMMENT, json!({"kinds": [KIND_TORRENT_COMMENT]})),
-        (KIND_COMMENT, json!({"kinds": [KIND_COMMENT], "#K": ["2003"]})),
+        (
+            KIND_TORRENT_COMMENT,
+            json!({"kinds": [KIND_TORRENT_COMMENT]}),
+        ),
+        (
+            KIND_COMMENT,
+            json!({"kinds": [KIND_COMMENT], "#K": ["2003"]}),
+        ),
     ]
 }
 
@@ -372,6 +384,12 @@ impl<'a, S: Store + ?Sized> Ctx<'a, S> {
             {
                 return;
             }
+            if kind == KIND_TORRENT
+                && let Err(h) = self.comments_of_new(run, deadline, true).await
+                && self.halt(run, h)
+            {
+                return;
+            }
         }
     }
 
@@ -379,15 +397,27 @@ impl<'a, S: Store + ?Sized> Ctx<'a, S> {
         if run.conn.is_none() {
             return;
         }
-        if let Err(h) = self.backfill(run, KIND_TORRENT, sweeps()[0].1.clone(), deadline).await
+        if let Err(h) = self
+            .backfill(run, KIND_TORRENT, sweeps()[0].1.clone(), deadline)
+            .await
             && self.halt(run, h)
         {
             return;
         }
-        if let Err(h) = self.comments_of_new(run, deadline).await
+        if let Err(h) = self.comments_of_new(run, deadline, true).await
             && self.halt(run, h)
         {
             return;
+        }
+        // Comment history only once this relay's torrent history is complete: earlier, most of
+        // its comments would be rejected as orphans and the cursor would move past them for good.
+        match self.cursor(&run.url, KIND_TORRENT).await {
+            Ok(c) if c.backfill_done => {}
+            Ok(_) => return,
+            Err(h) => {
+                self.halt(run, h);
+                return;
+            }
         }
         for (kind, base) in sweeps().into_iter().skip(1) {
             if let Err(h) = self.backfill(run, kind, base, deadline).await
@@ -453,7 +483,7 @@ impl<'a, S: Store + ?Sized> Ctx<'a, S> {
             return Ok(());
         };
         let mut pager = Pager::new(
-            base,
+            vec![base],
             Some(newest - self.cfg.overlap_secs),
             None,
             self.cfg.page_limit,
@@ -462,9 +492,13 @@ impl<'a, S: Store + ?Sized> Ctx<'a, S> {
         let mut max_seen = newest;
         loop {
             match pager.next(run, deadline).await? {
-                Step::Page { events, max_created } => {
+                Step::Page {
+                    events,
+                    max_created,
+                } => {
                     max_seen = max_seen.max(max_created.min(self.now));
                     self.ingest_all(run, events).await?;
+                    self.comments_of_new(run, deadline, false).await?;
                 }
                 Step::Exhausted => {
                     cur.newest_seen = Some(max_seen);
@@ -491,7 +525,7 @@ impl<'a, S: Store + ?Sized> Ctx<'a, S> {
             return Ok(());
         }
         let mut pager = Pager::new(
-            base,
+            vec![base],
             None,
             cur.backfill_until,
             self.cfg.page_limit,
@@ -499,7 +533,10 @@ impl<'a, S: Store + ?Sized> Ctx<'a, S> {
         );
         loop {
             match pager.next(run, deadline).await? {
-                Step::Page { events, max_created } => {
+                Step::Page {
+                    events,
+                    max_created,
+                } => {
                     if cur.newest_seen.is_none() {
                         // First contact: the forward sweep will start from the head of this page.
                         cur.newest_seen = Some(max_created.min(self.now));
@@ -507,6 +544,7 @@ impl<'a, S: Store + ?Sized> Ctx<'a, S> {
                     cur.backfill_until = pager.until;
                     self.ingest_all(run, events).await?;
                     self.save_cursor(&cur).await?;
+                    self.comments_of_new(run, deadline, false).await?;
                 }
                 Step::Exhausted => {
                     cur.backfill_done = true;
@@ -525,22 +563,34 @@ impl<'a, S: Store + ?Sized> Ctx<'a, S> {
     }
 
     /// Comments (2004 by `e`, 1111 by `E` or `e`) on the torrents this run inserted from `run`.
-    async fn comments_of_new(&self, run: &mut RelayRun, deadline: Instant) -> Result<(), Halt> {
-        let ids = std::mem::take(&mut run.new_torrents);
-        for batch in ids.chunks(COMMENT_BATCH) {
-            for base in [
+    /// Runs after every torrent page (full batches only) so a budget cut never leaves inserted
+    /// torrents without their comment lookup; `all` flushes the remainder.
+    async fn comments_of_new(
+        &self,
+        run: &mut RelayRun,
+        deadline: Instant,
+        all: bool,
+    ) -> Result<(), Halt> {
+        while run.new_torrents.len() >= COMMENT_BATCH || (all && !run.new_torrents.is_empty()) {
+            let n = run.new_torrents.len().min(COMMENT_BATCH);
+            let batch: Vec<String> = run.new_torrents.drain(..n).collect();
+            let filters = vec![
                 json!({"kinds": [KIND_TORRENT_COMMENT, KIND_COMMENT], "#e": batch}),
                 json!({"kinds": [KIND_COMMENT], "#E": batch}),
-            ] {
-                self.drain(run, base, deadline).await?;
-            }
+            ];
+            self.drain(run, filters, deadline).await?;
         }
         Ok(())
     }
 
     /// Paginate a cursor-less query to its end (bounded by MAX_TARGET_PAGES).
-    async fn drain(&self, run: &mut RelayRun, base: Value, deadline: Instant) -> Result<(), Halt> {
-        let mut pager = Pager::new(base, None, None, self.cfg.page_limit, MAX_TARGET_PAGES);
+    async fn drain(
+        &self,
+        run: &mut RelayRun,
+        filters: Vec<Value>,
+        deadline: Instant,
+    ) -> Result<(), Halt> {
+        let mut pager = Pager::new(filters, None, None, self.cfg.page_limit, MAX_TARGET_PAGES);
         loop {
             match pager.next(run, deadline).await? {
                 Step::Page { events, .. } => self.ingest_all(run, events).await?,
@@ -663,7 +713,11 @@ impl<'a, S: Store + ?Sized> Ctx<'a, S> {
         }
         let mut authors: Vec<String> = Vec::new();
         if let Some(root) = root {
-            if self.authors_meta(run, &[root.to_string()], deadline).await.is_err() {
+            if self
+                .authors_meta(run, &[root.to_string()], deadline)
+                .await
+                .is_err()
+            {
                 return;
             }
             // Follows are known once the root's kind 3 is stored.
@@ -686,7 +740,7 @@ impl<'a, S: Store + ?Sized> Ctx<'a, S> {
         deadline: Instant,
     ) -> Result<(), ()> {
         let base = json!({"kinds": METADATA_KINDS, "authors": authors});
-        match self.drain(run, base, deadline).await {
+        match self.drain(run, vec![base], deadline).await {
             Ok(()) => Ok(()),
             Err(h) => {
                 if self.halt(run, h) {
@@ -737,7 +791,7 @@ enum Step {
 
 /// D8 pagination state for one query on one connection.
 struct Pager {
-    base: Map<String, Value>,
+    bases: Vec<Map<String, Value>>,
     since: Option<i64>,
     /// `until` of the next page (inclusive).
     until: Option<i64>,
@@ -750,17 +804,20 @@ struct Pager {
 
 impl Pager {
     fn new(
-        base: Value,
+        bases: Vec<Value>,
         since: Option<i64>,
         until: Option<i64>,
         limit: usize,
         max_pages: usize,
     ) -> Self {
         Self {
-            base: match base {
-                Value::Object(m) => m,
-                _ => Map::new(),
-            },
+            bases: bases
+                .into_iter()
+                .map(|b| match b {
+                    Value::Object(m) => m,
+                    _ => Map::new(),
+                })
+                .collect(),
             since,
             until,
             limit: limit.max(1),
@@ -771,16 +828,21 @@ impl Pager {
         }
     }
 
-    fn filter(&self) -> Value {
-        let mut f = self.base.clone();
-        f.insert("limit".into(), json!(self.limit));
-        if let Some(s) = self.since {
-            f.insert("since".into(), json!(s));
-        }
-        if let Some(u) = self.until {
-            f.insert("until".into(), json!(u));
-        }
-        Value::Object(f)
+    fn filters(&self) -> Vec<Value> {
+        self.bases
+            .iter()
+            .map(|base| {
+                let mut f = base.clone();
+                f.insert("limit".into(), json!(self.limit));
+                if let Some(s) = self.since {
+                    f.insert("since".into(), json!(s));
+                }
+                if let Some(u) = self.until {
+                    f.insert("until".into(), json!(u));
+                }
+                Value::Object(f)
+            })
+            .collect()
     }
 
     fn fresh(&mut self, events: Vec<RawEvent>) -> Vec<RawEvent> {
@@ -807,7 +869,7 @@ impl Pager {
                 return Ok(Step::Stopped("budget".into(), Vec::new()));
             }
             let page = conn
-                .fetch_page(self.filter(), left.min(PAGE_TIMEOUT))
+                .fetch_page_multi(self.filters(), left.min(PAGE_TIMEOUT))
                 .await
                 .map_err(|e| Halt::Hard(e.to_string()))?;
             if let Some(msg) = &page.closed {
@@ -872,7 +934,11 @@ mod tests {
             created_at: 1,
             kind: KIND_CONTACTS,
             tags: vec![
-                vec!["p".into(), "22".repeat(32), "wss://relay.example.com/".into()],
+                vec![
+                    "p".into(),
+                    "22".repeat(32),
+                    "wss://relay.example.com/".into(),
+                ],
                 vec!["p".into(), "33".repeat(32), "ws://127.0.0.1:1".into()],
                 vec!["t".into(), "x".into(), "wss://ignored.example.com".into()],
             ],
@@ -890,12 +956,15 @@ mod tests {
 
     #[test]
     fn pager_filter_shape() {
-        let mut p = Pager::new(json!({"kinds": [2003]}), Some(10), None, 500, 3);
-        assert_eq!(p.filter(), json!({"kinds": [2003], "limit": 500, "since": 10}));
+        let mut p = Pager::new(vec![json!({"kinds": [2003]})], Some(10), None, 500, 3);
+        assert_eq!(
+            p.filters(),
+            vec![json!({"kinds": [2003], "limit": 500, "since": 10})]
+        );
         p.until = Some(20);
         assert_eq!(
-            p.filter(),
-            json!({"kinds": [2003], "limit": 500, "since": 10, "until": 20})
+            p.filters(),
+            vec![json!({"kinds": [2003], "limit": 500, "since": 10, "until": 20})]
         );
     }
 }

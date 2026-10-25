@@ -46,7 +46,12 @@ pub fn classify(raw: RawEvent, now: i64) -> Result<IngestItem, Rejection> {
     if !is_hex32(&raw.pubkey) {
         return Err(Rejection::BadJson);
     }
-    if raw.sig.len() != 128 || !raw.sig.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+    if raw.sig.len() != 128
+        || !raw
+            .sig
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
         return Err(Rejection::BadSig);
     }
     raw.verify().map_err(|e| match e {
@@ -101,9 +106,9 @@ pub async fn ingest_into<S: Store + ?Sized>(
 }
 
 fn has_tag(raw: &RawEvent, name: &str, value: &str) -> bool {
-    raw.tags
-        .iter()
-        .any(|t| t.first().map(String::as_str) == Some(name) && t.get(1).map(|v| v.trim()) == Some(value))
+    raw.tags.iter().any(|t| {
+        t.first().map(String::as_str) == Some(name) && t.get(1).map(|v| v.trim()) == Some(value)
+    })
 }
 
 /// Byte length of the NIP-01 wire JSON, without allocating it.

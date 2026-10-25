@@ -62,11 +62,20 @@ mod tests {
     #[test]
     fn committed_target_caps_bits() {
         let id = "0000000095014be2da27c57d0632d1e6015cba4a0d055a8c6dd2f20d6af6902b";
-        assert_eq!(effective_pow(id, &tags(&[&["nonce", "7", "21"]])), (21, Some(21)));
-        assert_eq!(effective_pow(id, &tags(&[&["nonce", "7", "40"]])), (32, Some(40)));
+        assert_eq!(
+            effective_pow(id, &tags(&[&["nonce", "7", "21"]])),
+            (21, Some(21))
+        );
+        assert_eq!(
+            effective_pow(id, &tags(&[&["nonce", "7", "40"]])),
+            (32, Some(40))
+        );
         // No or unparsable commitment: actual bits.
         assert_eq!(effective_pow(id, &tags(&[&["nonce", "7"]])), (32, None));
-        assert_eq!(effective_pow(id, &tags(&[&["nonce", "7", "x"]])), (32, None));
+        assert_eq!(
+            effective_pow(id, &tags(&[&["nonce", "7", "x"]])),
+            (32, None)
+        );
         assert_eq!(effective_pow("zz", &[]), (0, None));
     }
 }

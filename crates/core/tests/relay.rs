@@ -16,7 +16,9 @@ const T: Duration = Duration::from_secs(5);
 fn generated(n: u32) -> Vec<magnetar_core::model::RawEvent> {
     let keys = Keys::generate();
     let base = now() - 1000;
-    (0..n).map(|i| torrent(&keys, i, base - i64::from(i / 3))).collect()
+    (0..n)
+        .map(|i| torrent(&keys, i, base - i64::from(i / 3)))
+        .collect()
 }
 
 #[tokio::test]
@@ -42,10 +44,7 @@ async fn fetch_page_clamps_and_closes() {
     assert!(page2.events.iter().all(|e| e.created_at <= min));
     assert!(page2.events.iter().any(|e| e.created_at == min));
 
-    let none = conn
-        .fetch_page(json!({"kinds": [2004]}), T)
-        .await
-        .unwrap();
+    let none = conn.fetch_page(json!({"kinds": [2004]}), T).await.unwrap();
     assert!(none.events.is_empty());
     conn.close().await;
 
@@ -70,7 +69,11 @@ async fn closed_page_keeps_connection() {
     assert!(closed.events.is_empty());
     // The connection is still usable after a CLOSED.
     assert_eq!(
-        conn.fetch_page(json!({"kinds": [2003]}), T).await.unwrap().events.len(),
+        conn.fetch_page(json!({"kinds": [2003]}), T)
+            .await
+            .unwrap()
+            .events
+            .len(),
         10
     );
     conn.close().await;
@@ -87,7 +90,9 @@ async fn notices_and_recv_timeout() {
     conn.send_json(&json!(["COUNT", "c1", {"kinds": [2003]}]))
         .await
         .unwrap();
-    assert!(matches!(conn.recv(T).await.unwrap(), Some(RelayMsg::Notice(m)) if m.contains("unknown cmd")));
+    assert!(
+        matches!(conn.recv(T).await.unwrap(), Some(RelayMsg::Notice(m)) if m.contains("unknown cmd"))
+    );
     // Nothing more to read: recv times out.
     let started = Instant::now();
     assert!(matches!(
@@ -169,7 +174,10 @@ async fn live_fetch_page_tls() {
         .await
         .unwrap();
     let page = conn
-        .fetch_page(json!({"kinds": [2003], "limit": 20}), Duration::from_secs(20))
+        .fetch_page(
+            json!({"kinds": [2003], "limit": 20}),
+            Duration::from_secs(20),
+        )
         .await
         .unwrap();
     println!(
@@ -184,4 +192,42 @@ async fn live_fetch_page_tls() {
         assert_eq!(ev.kind, 2003);
     }
     conn.close().await;
+}
+
+#[tokio::test]
+#[ignore = "network: live relays"]
+async fn live_comment_lookup_two_filters() {
+    // Real dtan comments (fixtures) on torrents; nos.lol stores no 2004 (nostr-nips.md §2.3), the
+    // two archives do.
+    let comments: Vec<_> = ["09b1fb02", "3a996454", "0116b532"].map(fixture).to_vec();
+    let roots: Vec<String> = comments.iter().map(|c| c.tags[0][1].clone()).collect();
+    let mut found = 0;
+    for url in ["wss://nostr.oxtr.dev", "wss://relay.nostr.net"] {
+        let Ok(mut conn) = RelayConn::connect(url, Duration::from_secs(10)).await else {
+            println!("{url}: connect failed");
+            continue;
+        };
+        let page = conn
+            .fetch_page_multi(
+                vec![
+                    json!({"kinds": [2004, 1111], "#e": roots, "limit": 500}),
+                    json!({"kinds": [1111], "#E": roots, "limit": 500}),
+                ],
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap();
+        let hits = comments
+            .iter()
+            .filter(|c| page.events.iter().any(|e| e.id == c.id))
+            .count();
+        println!(
+            "{url}: {} events, {hits}/3 fixture comments (closed={:?})",
+            page.events.len(),
+            page.closed
+        );
+        found += hits;
+        conn.close().await;
+    }
+    assert!(found > 0);
 }

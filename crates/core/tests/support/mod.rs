@@ -8,7 +8,9 @@ use magnetar_core::model::RawEvent;
 use nostr::prelude::*;
 
 pub fn fixture_path(name: &str) -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/research/fixtures").join(name)
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/research/fixtures")
+        .join(name)
 }
 
 pub fn load_jsonl(name: &str) -> Vec<RawEvent> {
@@ -41,7 +43,10 @@ pub fn fixture(prefix: &str) -> RawEvent {
 
 /// Sign an event with arbitrary tags and timestamp.
 pub fn sign(keys: &Keys, kind: u16, created_at: i64, tags: &[&[&str]], content: &str) -> RawEvent {
-    let tags: Vec<Tag> = tags.iter().map(|t| Tag::parse(t.iter().copied()).unwrap()).collect();
+    let tags: Vec<Tag> = tags
+        .iter()
+        .map(|t| Tag::parse(t.iter().copied()).unwrap())
+        .collect();
     let ev = EventBuilder::new(Kind::from_u16(kind), content)
         .tags(tags)
         .custom_created_at(Timestamp::from(created_at as u64))
@@ -52,7 +57,11 @@ pub fn sign(keys: &Keys, kind: u16, created_at: i64, tags: &[&[&str]], content: 
 
 /// A valid kind 2003 with a deterministic infohash derived from `n`.
 pub fn torrent(keys: &Keys, n: u32, created_at: i64) -> RawEvent {
-    let ih = hex::encode(sha1_smol::Sha1::from(format!("torrent-{n}")).digest().bytes());
+    let ih = hex::encode(
+        sha1_smol::Sha1::from(format!("torrent-{n}"))
+            .digest()
+            .bytes(),
+    );
     let title = format!("Generated torrent {n}");
     sign(
         keys,

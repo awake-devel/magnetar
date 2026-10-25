@@ -115,7 +115,8 @@ pub fn parse_torrent(raw: &RawEvent) -> Result<ParsedTorrent, Rejection> {
         .find(|s| is_web_url(s))
         .map(str::to_string);
 
-    let published_at = values("published_at").find_map(|s| s.parse::<i64>().ok().filter(|t| *t > 0));
+    let published_at =
+        values("published_at").find_map(|s| s.parse::<i64>().ok().filter(|t| *t > 0));
 
     let title = values("title")
         .map(|t| cap(t, MAX_TITLE_BYTES))
@@ -277,8 +278,9 @@ fn nip10_root(tags: &[Vec<String>]) -> Option<String> {
 /// parent `e` equals the root, so `e` is the fallback when `E` is missing.
 fn nip22_root(tags: &[Vec<String>]) -> Option<String> {
     let has = |name: &str, value: &str| {
-        tags.iter()
-            .any(|t| t.first().map(String::as_str) == Some(name) && t.get(1).map(|v| v.trim()) == Some(value))
+        tags.iter().any(|t| {
+            t.first().map(String::as_str) == Some(name) && t.get(1).map(|v| v.trim()) == Some(value)
+        })
     };
     if !has("K", "2003") {
         return None;
@@ -347,9 +349,15 @@ mod tests {
 
     #[test]
     fn categories() {
-        assert_eq!(category_of(&s(&["video", "movie", "4k"]), &[]), Category::Video);
+        assert_eq!(
+            category_of(&s(&["video", "movie", "4k"]), &[]),
+            Category::Video
+        );
         assert_eq!(category_of(&s(&["anime", "video"]), &[]), Category::Anime);
-        assert_eq!(category_of(&s(&["Audio", "lossless"]), &[]), Category::Audio);
+        assert_eq!(
+            category_of(&s(&["Audio", "lossless"]), &[]),
+            Category::Audio
+        );
         assert_eq!(category_of(&s(&["software"]), &[]), Category::Application);
         assert_eq!(category_of(&s(&["pictures"]), &[]), Category::Picture);
         assert_eq!(category_of(&s(&["manga"]), &[]), Category::Book);
@@ -382,7 +390,11 @@ mod tests {
         let got: Vec<String> = tracker_candidates(glued).collect();
         assert_eq!(
             got,
-            s(&["udp://a.example:6969", "udp://b.example:80", "udp://c.example:1337"])
+            s(&[
+                "udp://a.example:6969",
+                "udp://b.example:80",
+                "udp://c.example:1337"
+            ])
         );
     }
 

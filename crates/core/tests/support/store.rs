@@ -107,22 +107,29 @@ impl Store for MemStore {
         self.with(|i| Ok(i.torrents.contains_key(id)))
     }
     async fn get_raw_events(&self, ids: &[String]) -> Result<Vec<RawEvent>> {
-        self.with(|i| Ok(ids.iter().filter_map(|id| i.events.get(id).cloned()).collect()))
+        self.with(|i| {
+            Ok(ids
+                .iter()
+                .filter_map(|id| i.events.get(id).cloned())
+                .collect())
+        })
     }
 
     async fn upsert_relay(&self, url: &str, source: &str) -> Result<()> {
         self.with(|i| {
-            i.relays.entry(url.to_string()).or_insert_with(|| RelayInfo {
-                url: url.to_string(),
-                source: source.to_string(),
-                enabled: true,
-                last_ok: None,
-                last_err: None,
-                consecutive_failures: 0,
-                next_try_at: 0,
-                events_found: 0,
-                supports_neg: None,
-            });
+            i.relays
+                .entry(url.to_string())
+                .or_insert_with(|| RelayInfo {
+                    url: url.to_string(),
+                    source: source.to_string(),
+                    enabled: true,
+                    last_ok: None,
+                    last_err: None,
+                    consecutive_failures: 0,
+                    next_try_at: 0,
+                    events_found: 0,
+                    supports_neg: None,
+                });
             Ok(())
         })
     }
@@ -188,7 +195,10 @@ impl Store for MemStore {
             }
             let mut v: Vec<(&str, usize)> = counts.into_iter().collect();
             v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-            Ok(v.into_iter().take(limit).map(|(p, _)| p.to_string()).collect())
+            Ok(v.into_iter()
+                .take(limit)
+                .map(|(p, _)| p.to_string())
+                .collect())
         })
     }
     async fn relay_lists_for(
@@ -230,7 +240,10 @@ impl Store for MemStore {
             Ok(i.replaceable
                 .get(&(pubkey.to_string(), KIND_RELAY_LIST, String::new()))
                 .is_some_and(|ev| {
-                    ev.tags.iter().filter(|t| t.first().map(String::as_str) == Some("r")).count()
+                    ev.tags
+                        .iter()
+                        .filter(|t| t.first().map(String::as_str) == Some("r"))
+                        .count()
                         > MAX_RELAY_LIST
                 }))
         })
@@ -284,7 +297,11 @@ impl Store for MemStore {
     async fn reports_by(&self, _reporters: &[String]) -> Result<Vec<(String, String, String)>> {
         Ok(Vec::new())
     }
-    async fn comment_authors_on(&self, _publisher: &str, _authors: &[String]) -> Result<Vec<String>> {
+    async fn comment_authors_on(
+        &self,
+        _publisher: &str,
+        _authors: &[String],
+    ) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
     async fn publisher_stats(&self, _pubkey: &str) -> Result<PublisherStats> {

@@ -35,8 +35,8 @@ impl Default for Behaviour {
 #[derive(Default)]
 pub struct State {
     pub events: Vec<RawEvent>,
-    /// Every REQ filter received (first filter of each REQ), in order.
-    pub reqs: Vec<Value>,
+    /// The filters of every REQ received, in order.
+    pub reqs: Vec<Vec<Value>>,
     pub closes: usize,
     pub connections: usize,
     pub published: Vec<RawEvent>,
@@ -79,8 +79,25 @@ impl FakeRelay {
         self.state.lock().unwrap().events.extend(events);
     }
 
+    /// First filter of every REQ.
     pub fn reqs(&self) -> Vec<Value> {
-        self.state.lock().unwrap().reqs.clone()
+        let s = self.state.lock().unwrap();
+        s.reqs
+            .iter()
+            .map(|f| f.first().cloned().unwrap_or(Value::Null))
+            .collect()
+    }
+
+    /// Every filter of every REQ, flattened.
+    pub fn all_filters(&self) -> Vec<Value> {
+        self.state
+            .lock()
+            .unwrap()
+            .reqs
+            .iter()
+            .flatten()
+            .cloned()
+            .collect()
     }
 }
 
@@ -92,7 +109,8 @@ async fn serve(
     let mut ws = tokio_tungstenite::accept_async(tcp).await?;
     st.lock().unwrap().connections += 1;
     if b.notice_on_connect {
-        ws.send(text(json!(["NOTICE", "welcome to the fake relay"]))).await?;
+        ws.send(text(json!(["NOTICE", "welcome to the fake relay"])))
+            .await?;
     }
     while let Some(msg) = ws.next().await {
         let msg = msg?;
@@ -100,7 +118,8 @@ async fn serve(
             continue;
         };
         let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(t.as_str()) else {
-            ws.send(text(json!(["NOTICE", "ERROR: bad msg: not json"]))).await?;
+            ws.send(text(json!(["NOTICE", "ERROR: bad msg: not json"])))
+                .await?;
             continue;
         };
         match arr.first().and_then(Value::as_str) {
@@ -109,7 +128,7 @@ async fn serve(
                 let filters: Vec<Value> = arr.iter().skip(2).cloned().collect();
                 let (n, out) = {
                     let mut s = st.lock().unwrap();
-                    s.reqs.push(filters.first().cloned().unwrap_or(Value::Null));
+                    s.reqs.push(filters.clone());
                     let n = s.reqs.len();
                     (n, query(&s.events, &filters, b.page_clamp))
                 };
@@ -117,7 +136,8 @@ async fn serve(
                     continue;
                 }
                 if b.closed_reqs.contains(&n) {
-                    ws.send(text(json!(["CLOSED", sub, "rate-limited: slow down"]))).await?;
+                    ws.send(text(json!(["CLOSED", sub, "rate-limited: slow down"])))
+                        .await?;
                     continue;
                 }
                 for ev in out {
@@ -127,7 +147,9 @@ async fn serve(
             }
             Some("CLOSE") => st.lock().unwrap().closes += 1,
             Some("EVENT") => {
-                let Some(ev) = arr.get(1).and_then(|v| serde_json::from_value::<RawEvent>(v.clone()).ok())
+                let Some(ev) = arr
+                    .get(1)
+                    .and_then(|v| serde_json::from_value::<RawEvent>(v.clone()).ok())
                 else {
                     ws.send(text(json!(["NOTICE", "ERROR: bad event"]))).await?;
                     continue;
@@ -141,11 +163,16 @@ async fn serve(
                     }
                     dup
                 };
-                let msg = if dup { "duplicate: already have this event" } else { "" };
+                let msg = if dup {
+                    "duplicate: already have this event"
+                } else {
+                    ""
+                };
                 ws.send(text(json!(["OK", ev.id, true, msg]))).await?;
             }
             _ => {
-                ws.send(text(json!(["NOTICE", "ERROR: bad msg: unknown cmd"]))).await?;
+                ws.send(text(json!(["NOTICE", "ERROR: bad msg: unknown cmd"])))
+                    .await?;
             }
         }
     }
@@ -193,7 +220,8 @@ fn matches(e: &RawEvent, f: &Value) -> bool {
                 let wanted = list();
                 e.tags.iter().any(|t| {
                     t.first().map(String::as_str) == Some(name)
-                        && t.get(1).is_some_and(|val| wanted.iter().any(|w| w.as_str() == Some(val)))
+                        && t.get(1)
+                            .is_some_and(|val| wanted.iter().any(|w| w.as_str() == Some(val)))
                 })
             }
             _ => false,

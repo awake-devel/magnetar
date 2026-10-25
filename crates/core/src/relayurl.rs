@@ -93,7 +93,10 @@ mod tests {
     #[test]
     fn research_vectors() {
         // wot-relays.md §3.
-        assert_eq!(n("wss://relay.damus.io/").as_deref(), Some("wss://relay.damus.io"));
+        assert_eq!(
+            n("wss://relay.damus.io/").as_deref(),
+            Some("wss://relay.damus.io")
+        );
         assert_eq!(
             n("WSS://Relay.Damus.IO:443/").as_deref(),
             Some("wss://relay.damus.io")
@@ -113,7 +116,10 @@ mod tests {
             n("wss://relay.x.com/haven-marble-ivory").as_deref(),
             Some("wss://relay.x.com/haven-marble-ivory")
         );
-        assert_eq!(n("ws://relay.x.com:80").as_deref(), Some("ws://relay.x.com"));
+        assert_eq!(
+            n("ws://relay.x.com:80").as_deref(),
+            Some("ws://relay.x.com")
+        );
         assert_eq!(
             n("wss://relay.x.com:8443/").as_deref(),
             Some("wss://relay.x.com:8443")

@@ -136,9 +136,17 @@ fn tls() -> Arc<rustls::ClientConfig> {
 /// unsupported REQs with a NOTICE only).
 fn notice_is_fatal(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
-    ["error", "invalid", "bad req", "bad msg", "rate-limit", "too many", "blocked"]
-        .iter()
-        .any(|p| m.contains(p))
+    [
+        "error",
+        "invalid",
+        "bad req",
+        "bad msg",
+        "rate-limit",
+        "too many",
+        "blocked",
+    ]
+    .iter()
+    .any(|p| m.contains(p))
 }
 
 impl RelayConn {
@@ -260,8 +268,19 @@ impl RelayConn {
         filter: serde_json::Value,
         timeout: Duration,
     ) -> Result<Page> {
+        self.fetch_page_multi(vec![filter], timeout).await
+    }
+
+    /// Like [`fetch_page`](Self::fetch_page) with several filters ORed in one REQ.
+    pub async fn fetch_page_multi(
+        &mut self,
+        filters: Vec<serde_json::Value>,
+        timeout: Duration,
+    ) -> Result<Page> {
         let sub = self.new_sub();
-        self.send_json(&json!(["REQ", sub, filter])).await?;
+        let mut req = vec![json!("REQ"), json!(sub)];
+        req.extend(filters);
+        self.send_json(&Value::Array(req)).await?;
         let deadline = Instant::now() + timeout;
         let mut page = Page::default();
         let mut need_close = true;
@@ -353,7 +372,9 @@ mod tests {
             RelayMsg::Eose { sub: "s1".into() }
         );
         assert_eq!(
-            RelayMsg::parse(r#"["CLOSED","s1","ERROR: bad req: unrecognised filter item: search"]"#),
+            RelayMsg::parse(
+                r#"["CLOSED","s1","ERROR: bad req: unrecognised filter item: search"]"#
+            ),
             RelayMsg::Closed {
                 sub: "s1".into(),
                 msg: "ERROR: bad req: unrecognised filter item: search".into()
@@ -404,7 +425,13 @@ mod tests {
                 msg: "closed".into()
             }
         );
-        for junk in [r#"["COUNT","c",{"count":3}]"#, "not json", "{}", "[]", r#"["EVENT","s",{"id":1}]"#] {
+        for junk in [
+            r#"["COUNT","c",{"count":3}]"#,
+            "not json",
+            "{}",
+            "[]",
+            r#"["EVENT","s",{"id":1}]"#,
+        ] {
             assert_eq!(RelayMsg::parse(junk), RelayMsg::Other(junk.into()));
         }
     }
