@@ -146,6 +146,7 @@ impl From<TorrentSummary> for FfiTorrentSummary {
             media_title: t.media_title,
             media_year: t.media_year,
             media_kind: t.media_kind.map(Into::into),
+            matched_file: t.matched_file,
         }
     }
 }
@@ -201,6 +202,7 @@ pub fn page(p: SearchPage, server_error: Option<String>) -> FfiSearchPage {
     FfiSearchPage {
         hits: p.hits.into_iter().map(Into::into).collect(),
         total: p.total,
+        total_is_lower_bound: p.total_is_lower_bound,
         source: p.source,
         server_error,
     }

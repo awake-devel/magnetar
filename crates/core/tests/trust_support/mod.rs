@@ -63,6 +63,7 @@ pub fn summary(infohash: &str, title: &str, created_at: i64) -> TorrentSummary {
         media_title: None,
         media_year: None,
         media_kind: None,
+        matched_file: None,
     }
 }
 
@@ -146,6 +147,7 @@ impl Store for MemStore {
             hits,
             total,
             source: "local".into(),
+            total_is_lower_bound: false,
         })
     }
     async fn torrent_detail(&self, _: &str, _: i64) -> Result<Option<TorrentDetail>> {

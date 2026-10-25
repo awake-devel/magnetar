@@ -350,6 +350,9 @@ pub struct TorrentSummary {
     pub media_year: Option<i32>,
     #[serde(default)]
     pub media_kind: Option<MediaKind>,
+    /// The file name the search text matched when the title did not (D43); search hits only.
+    #[serde(default)]
+    pub matched_file: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

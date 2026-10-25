@@ -1,5 +1,6 @@
 //! Search SQL (ARCHITECTURE.md §5, rust-crates.md §9): eligible events are filtered first, then
-//! grouped by infohash with one canonical event (highest trust, then earliest).
+//! grouped by infohash with one canonical event (highest trust, then earliest). Since D43 this is
+//! the fallback while the Tantivy index (`search_index`) is disabled or still building.
 
 use magnetar_core::enrich::MIN_DISPLAY_CONFIDENCE;
 use magnetar_core::enrich::ids::split_media_token;
@@ -63,6 +64,7 @@ impl HitRow {
             media_title: self.media_title,
             media_year: self.media_year,
             media_kind: self.media_kind.and_then(|k| k.parse().ok()),
+            matched_file: None,
         }
     }
 }
@@ -169,11 +171,16 @@ fn push_hit_filters(qb: &mut QueryBuilder<Postgres>, q: &SearchQuery, now: i64) 
     }
 }
 
+/// The fallback count stops here: above it `total` is a lower bound ("1,000+", D43).
+pub(crate) const COUNT_CAP: i64 = 1000;
+
+/// Counts at most `COUNT_CAP + 1` hits.
 pub(crate) fn count_query(q: &SearchQuery, now: i64, min_trust: u8) -> QueryBuilder<Postgres> {
     let mut qb = QueryBuilder::new("");
     push_hits_cte(&mut qb, q, min_trust);
-    qb.push("SELECT count(*) FROM hits");
+    qb.push("SELECT count(*) FROM (SELECT 1 FROM hits");
     push_hit_filters(&mut qb, q, now);
+    qb.push(" LIMIT ").push_bind(COUNT_CAP + 1).push(") capped");
     qb
 }
 

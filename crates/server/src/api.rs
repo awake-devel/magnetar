@@ -189,6 +189,7 @@ pub fn router(state: AppState) -> Router {
             post(refresh_liveness),
         )
         .route("/api/v1/media/{id}/torrents", get(media_torrents))
+        .route("/api/v1/facets", get(facets))
         .route("/api/v1/events/batch", post(batch))
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/relays", get(relays).put(set_relay))
@@ -314,6 +315,36 @@ async fn media_torrents(
     let mut q = parse_search_query(raw.as_deref())?;
     q.text = format!("media:{id} {}", q.text);
     Ok(Json(st.store.search(&q, magnetar_core::now()).await?))
+}
+
+/// `GET /api/v1/facets?field=category&size=20&<search parameters>` (D43): value counts of one
+/// facet over the results of the search parameters. 503 until the search index is built.
+async fn facets(
+    State(st): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> ApiResult<Json<FacetsResponse>> {
+    let q = parse_search_query(raw.as_deref())?;
+    let mut field = None;
+    let mut size = 20usize;
+    for (k, v) in url::form_urlencoded::parse(raw.as_deref().unwrap_or_default().as_bytes()) {
+        match k.as_ref() {
+            "field" => field = Some(v.into_owned()),
+            "size" => size = parse_num(&k, &v)?,
+            _ => {}
+        }
+    }
+    let field = field.ok_or_else(|| ApiError::bad_request("field is required"))?;
+    st.store
+        .facets(&q, &field, size, magnetar_core::now())
+        .await?
+        .map(Json)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "search_index_unavailable",
+                "the search index is disabled or still building",
+            )
+        })
 }
 
 fn infohash_param(s: &str) -> ApiResult<String> {
@@ -471,7 +502,12 @@ async fn batch(
 async fn stats(State(st): State<AppState>) -> ApiResult<Json<StatsResponse>> {
     let store = st.store.stats().await?;
     let crawler = st.crawler.lock().unwrap().clone();
-    Ok(Json(StatsResponse { store, crawler }))
+    let search_index = st.store.search_index_status().await;
+    Ok(Json(StatsResponse {
+        store,
+        crawler,
+        search_index,
+    }))
 }
 
 async fn relays(State(st): State<AppState>) -> ApiResult<Json<Vec<RelayInfo>>> {

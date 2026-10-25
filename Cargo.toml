@@ -46,6 +46,7 @@ flate2 = "=1.1.10"
 httpdate = "=1.0.3"
 anitomy-ng = { version = "=1.0.10", default-features = false }
 ruzstd = "=0.9.0"
+tantivy = { version = "=0.27.0", default-features = false, features = ["mmap", "lz4-compression"] }
 
 [profile.release]
 opt-level = 3

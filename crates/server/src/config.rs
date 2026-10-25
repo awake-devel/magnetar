@@ -146,6 +146,12 @@ pub struct Config {
     /// Background TMDB prefetch of recently matched media per hour; 0 = only on detail views.
     #[arg(long, env = "MAGNETAR_TMDB_PREFETCH_PER_HOUR", default_value_t = 60)]
     pub tmdb_prefetch_per_hour: u32,
+    /// Embedded Tantivy search index (D43); false = every search runs in Postgres.
+    #[arg(long, env = "MAGNETAR_SEARCH_INDEX", default_value_t = true, action = clap::ArgAction::Set)]
+    pub search_index: bool,
+    /// Where the search index lives (default <state dir>/search-index).
+    #[arg(long, env = "MAGNETAR_SEARCH_INDEX_DIR")]
+    pub search_index_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -189,6 +195,13 @@ impl Config {
         self.dataset_dir
             .clone()
             .unwrap_or_else(|| self.state_dir().join("datasets"))
+    }
+
+    /// `MAGNETAR_SEARCH_INDEX_DIR`, else `<state dir>/search-index` (D43).
+    pub fn search_index_dir(&self) -> PathBuf {
+        self.search_index_dir
+            .clone()
+            .unwrap_or_else(|| self.state_dir().join("search-index"))
     }
 
     pub fn image_cache_dir(&self) -> PathBuf {

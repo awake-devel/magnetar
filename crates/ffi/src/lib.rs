@@ -117,6 +117,8 @@ pub struct FfiTorrentSummary {
     pub media_title: Option<String>,
     pub media_year: Option<i32>,
     pub media_kind: Option<FfiMediaKind>,
+    /// The file name the search matched when the title did not (server index, D43).
+    pub matched_file: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -162,6 +164,8 @@ pub struct FfiMediaInfo {
 pub struct FfiSearchPage {
     pub hits: Vec<FfiTorrentSummary>,
     pub total: u64,
+    /// `total` is a lower bound: show "1,000+" (D43).
+    pub total_is_lower_bound: bool,
     /// "server" | "local"
     pub source: String,
     /// Set when the server was preferred but failed (UI shows "offline results").

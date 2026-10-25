@@ -37,6 +37,7 @@ fn summary() -> TorrentSummary {
         media_title: Some("Big Buck Bunny".into()),
         media_year: Some(2008),
         media_kind: Some(MediaKind::Movie),
+        matched_file: None,
     }
 }
 
@@ -186,6 +187,7 @@ async fn server() -> api_support::FakeHttp {
                     hits: vec![summary()],
                     total: q.limit as u64,
                     source: "server".into(),
+                    total_is_lower_bound: false,
                 })
             }
             ("GET", p) if p == format!("/api/v1/torrents/{IH}") => j(&detail()),
@@ -206,6 +208,7 @@ async fn server() -> api_support::FakeHttp {
                     last_report: None,
                     ..Default::default()
                 },
+                search_index: None,
             }),
             ("GET", "/api/v1/relays") => j(&vec![relay_info()]),
             ("PUT", "/api/v1/relays") => {

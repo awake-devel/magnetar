@@ -60,6 +60,48 @@ pub struct StatsResponse {
     #[serde(flatten)]
     pub store: StoreStats,
     pub crawler: CrawlerStatus,
+    /// The server's search index (D43); None from older servers or when it is disabled.
+    #[serde(default)]
+    pub search_index: Option<SearchIndexStatus>,
+}
+
+/// State of the server's Tantivy search index (D43).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SearchIndexStatus {
+    /// "building" (searches use Postgres meanwhile) | "ready" | "error".
+    pub state: String,
+    /// Documents (infohashes) searchable now.
+    pub docs: u64,
+    /// Full build progress, infohashes done of total (while building).
+    pub build_done: u64,
+    pub build_total: u64,
+    /// Seconds the last full build took.
+    pub build_secs: Option<u64>,
+    /// Unix time of the last index commit.
+    pub last_commit: Option<i64>,
+    /// Changes queued for the index, and the age in seconds of the oldest one.
+    pub pending: u64,
+    pub lag_secs: Option<i64>,
+    pub bytes: u64,
+    pub error: Option<String>,
+}
+
+/// One value of a facet and how many results have it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct FacetCount {
+    pub value: String,
+    pub count: u64,
+}
+
+/// `GET /api/v1/facets?field=…` (D43): value counts over the results of the search parameters.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct FacetsResponse {
+    pub field: String,
+    /// Results the counts are taken over.
+    pub total: u64,
+    /// Most frequent first (ties by value).
+    pub counts: Vec<FacetCount>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -242,6 +284,22 @@ impl ApiClient {
     }
     pub async fn stats(&self) -> crate::Result<StatsResponse> {
         self.json(self.req(Method::GET, "/api/v1/stats")).await
+    }
+    /// Value counts of one facet over the results of `text` (D43). Servers without a ready
+    /// search index answer 503 (`Error::Server`), older ones 404.
+    pub async fn facets(
+        &self,
+        field: &str,
+        text: &str,
+        size: u32,
+    ) -> crate::Result<FacetsResponse> {
+        let query = [
+            ("field", field.to_string()),
+            ("q", text.to_string()),
+            ("size", size.to_string()),
+        ];
+        self.json(self.req(Method::GET, "/api/v1/facets").query(&query))
+            .await
     }
     pub async fn relays(&self) -> crate::Result<Vec<RelayInfo>> {
         self.json(self.req(Method::GET, "/api/v1/relays")).await

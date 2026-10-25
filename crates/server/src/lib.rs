@@ -9,6 +9,7 @@ pub mod enrich_anime;
 pub mod filter;
 pub mod relay;
 mod search;
+pub mod search_index;
 pub mod selftest;
 pub mod server;
 pub mod store;

@@ -254,6 +254,7 @@ impl Store for MemStore {
             hits: Vec::new(),
             total: 0,
             source: "local".into(),
+            total_is_lower_bound: false,
         })
     }
     async fn torrent_detail(&self, _infohash: &str, _now: i64) -> Result<Option<TorrentDetail>> {

@@ -82,6 +82,7 @@ async fn others(State(f): State<Fake>, Path(id): Path<i64>) -> Response {
         hits: vec![d.summary.clone(), d.summary],
         total: 2,
         source: "x".into(),
+        total_is_lower_bound: false,
     })
     .into_response()
 }

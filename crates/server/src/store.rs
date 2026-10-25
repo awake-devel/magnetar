@@ -4,8 +4,10 @@
 //! channel so `/relay` subscriptions see crawler, batch and relay ingests live.
 
 use std::borrow::Cow;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use magnetar_core::api::{FacetsResponse, SearchIndexStatus};
 use magnetar_core::error::{Error, Result};
 use magnetar_core::model::*;
 use magnetar_core::query::{SearchPage, SearchQuery};
@@ -18,6 +20,7 @@ use tokio::sync::broadcast;
 
 use crate::filter::{Filter, indexed_tags};
 use crate::search;
+use crate::search_index::{self, SearchIndex};
 
 /// Default sqlx pool cap (`MAGNETAR_DB_POOL`, ARCHITECTURE.md §9, D37).
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 10;
@@ -31,6 +34,8 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 pub struct PgStore {
     pool: PgPool,
     live: broadcast::Sender<RawEvent>,
+    /// Tantivy index used by `search` once built (D43); attached by `serve`.
+    search_index: Arc<OnceLock<Arc<SearchIndex>>>,
 }
 
 pub(crate) fn db(e: sqlx::Error) -> Error {
@@ -309,7 +314,61 @@ impl PgStore {
 
     pub fn from_pool(pool: PgPool) -> Self {
         let (live, _) = broadcast::channel(1024);
-        Self { pool, live }
+        Self {
+            pool,
+            live,
+            search_index: Arc::default(),
+        }
+    }
+
+    /// Route searches through `idx` once its first build is complete (D43). Only the first
+    /// attached index counts.
+    pub fn attach_search_index(&self, idx: Arc<SearchIndex>) {
+        let _ = self.search_index.set(idx);
+    }
+
+    pub fn search_index(&self) -> Option<&Arc<SearchIndex>> {
+        self.search_index.get()
+    }
+
+    fn ready_index(&self) -> Option<&Arc<SearchIndex>> {
+        self.search_index.get().filter(|i| i.is_ready())
+    }
+
+    /// Index state for `/api/v1/stats`; None when no index is attached (disabled).
+    pub async fn search_index_status(&self) -> Option<SearchIndexStatus> {
+        let idx = self.search_index.get()?;
+        let mut st = idx.status();
+        match search_index::load::backlog(&self.pool, magnetar_core::now()).await {
+            Ok((pending, lag)) => {
+                st.pending = pending;
+                st.lag_secs = lag;
+            }
+            Err(e) => tracing::warn!("search index backlog: {e}"),
+        }
+        Some(st)
+    }
+
+    /// Facet value counts over a search's results (D43). Err(Invalid) for an unknown facet;
+    /// Ok(None) while the index is not ready.
+    pub async fn facets(
+        &self,
+        q: &SearchQuery,
+        field: &str,
+        size: usize,
+        now: i64,
+    ) -> Result<Option<FacetsResponse>> {
+        let Some(idx) = self.ready_index() else {
+            return Ok(None);
+        };
+        let min_trust = match q.min_trust {
+            Some(t) => t,
+            None => self.threshold().await?,
+        };
+        search_index::facets(&self.pool, idx, q, field, size, min_trust, now)
+            .await?
+            .map(Some)
+            .ok_or_else(|| Error::Invalid(format!("unknown facet {field:?}")))
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -982,8 +1041,9 @@ impl Store for PgStore {
     }
 
     async fn publishers(&self, limit: usize) -> Result<Vec<String>> {
+        // Trigger-maintained (D43): the GROUP BY over torrents read the whole wide table.
         sqlx::query_scalar(
-            "SELECT pubkey FROM torrents GROUP BY pubkey ORDER BY count(*) DESC, pubkey LIMIT $1",
+            "SELECT pubkey FROM publisher_counts ORDER BY torrents DESC, pubkey LIMIT $1",
         )
         .bind(limit as i64)
         .fetch_all(&self.pool)
@@ -1021,12 +1081,21 @@ impl Store for PgStore {
             Some(t) => t,
             None => self.threshold().await?,
         };
+        if let Some(idx) = self.ready_index() {
+            match search_index::search(&self.pool, idx, q, min_trust, now).await {
+                Ok(page) => return Ok(page),
+                Err(e) => tracing::warn!("search index: {e}; using Postgres"),
+            }
+        }
+        // Postgres fallback (index disabled or still building): the count stops at a cap.
         let mut count = search::count_query(q, now, min_trust);
-        let total: i64 = count
+        let counted: i64 = count
             .build_query_scalar()
             .fetch_one(&self.pool)
             .await
             .map_err(db)?;
+        let lower_bound = counted > search::COUNT_CAP;
+        let total = counted.min(search::COUNT_CAP);
         let mut rows = search::hits_query(q, now, min_trust);
         let hits: Vec<search::HitRow> = rows
             .build_query_as()
@@ -1037,6 +1106,7 @@ impl Store for PgStore {
             hits: hits.into_iter().map(|h| h.into_summary(now)).collect(),
             total: u64::try_from(total).unwrap_or(0),
             source: "server".into(),
+            total_is_lower_bound: lower_bound,
         })
     }
 
@@ -1114,6 +1184,7 @@ impl Store for PgStore {
             media_title: media.as_ref().map(|m| m.title.clone()),
             media_year: media.as_ref().and_then(|m| m.year),
             media_kind: media.as_ref().map(|m| m.kind),
+            matched_file: None,
         };
         let events = rows
             .iter()
@@ -1497,9 +1568,10 @@ impl Store for PgStore {
 
     async fn stats(&self) -> Result<StoreStats> {
         let r: StatsRow = sqlx::query_as(
-            "SELECT (SELECT count(DISTINCT infohash) FROM torrents) AS torrents,
+            // Distinct infohashes / publishers come from trigger-kept counters (D43).
+            "SELECT coalesce((SELECT value FROM meta WHERE key = 'infohash_count'), 0) AS torrents,
                     (SELECT count(*) FROM events) AS events,
-                    (SELECT count(DISTINCT pubkey) FROM torrents) AS publishers,
+                    (SELECT count(*) FROM publisher_counts) AS publishers,
                     (SELECT count(*) FROM comments) AS comments,
                     (SELECT count(*) FROM relays) AS relays,
                     pg_database_size(current_database()) AS db_bytes",

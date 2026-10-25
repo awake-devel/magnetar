@@ -812,6 +812,7 @@ impl SqliteStore {
                     media_title: r.get(26)?,
                     media_year: r.get(27)?,
                     media_kind: r.get::<_, Option<String>>(28)?.and_then(|k| k.parse().ok()),
+                    matched_file: None,
                 })
             })
             .db()?
@@ -821,6 +822,7 @@ impl SqliteStore {
             hits,
             total: total.max(0) as u64,
             source: "local".into(),
+            total_is_lower_bound: false,
         })
     }
 
@@ -962,6 +964,7 @@ impl SqliteStore {
             media_title: media.as_ref().map(|m| m.title.clone()),
             media_year: media.as_ref().and_then(|m| m.year),
             media_kind: media.as_ref().map(|m| m.kind),
+            matched_file: None,
         };
         let events = rows
             .iter()

@@ -62,6 +62,10 @@ pub struct SearchPage {
     pub total: u64,
     /// "server" | "local"
     pub source: String,
+    /// `total` is a lower bound ("1,000+"): the exact count was too expensive (D43). Older
+    /// servers never send it.
+    #[serde(default)]
+    pub total_is_lower_bound: bool,
 }
 
 /// Split user text into safe word tokens (letters/digits in any script), lowercased.

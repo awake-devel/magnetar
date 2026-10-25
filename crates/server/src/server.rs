@@ -9,6 +9,7 @@ use tokio::sync::watch;
 
 use crate::api::{self, AppState};
 use crate::config::Config;
+use crate::search_index::{self, SearchIndex};
 use crate::store::PgStore;
 use crate::tmdb::{self, Tmdb, TmdbConfig};
 use crate::{daemons, discovery, enrich, enrich_anime};
@@ -44,6 +45,43 @@ pub async fn open_store(cfg: &Config) -> anyhow::Result<Arc<PgStore>> {
         .context("connect to Postgres")?;
     store.migrate().await?;
     Ok(Arc::new(store))
+}
+
+/// Open (or start building) the search index and attach it to the store, so searches use it
+/// once ready (D43). Disabled or failing to open: searches stay on Postgres.
+async fn start_search_index(
+    store: &Arc<PgStore>,
+    cfg: &Config,
+    stop: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    let dir = cfg.search_index_dir();
+    if !cfg.search_index {
+        // Nobody follows the change log now, so an index left there would go stale.
+        if dir.join("meta.json").exists() {
+            tracing::info!("search index off: removing {}", dir.display());
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+        }
+        return tokio::spawn(search_index::discard_loop(store.pool().clone(), stop));
+    }
+    let opened = match search_index::load::database_id(store.pool()).await {
+        Ok(id) => SearchIndex::open_async(dir.clone(), id).await,
+        Err(e) => Err(e),
+    };
+    match opened {
+        Ok(idx) => {
+            tracing::info!(
+                "search index in {} ({})",
+                dir.display(),
+                if idx.is_ready() { "ready" } else { "to build" }
+            );
+            store.attach_search_index(idx.clone());
+            tokio::spawn(search_index::index_loop(store.pool().clone(), idx, stop))
+        }
+        Err(e) => {
+            tracing::error!("search index disabled: {e}");
+            tokio::spawn(async {})
+        }
+    }
 }
 
 pub async fn serve(cfg: Config) -> anyhow::Result<()> {
@@ -118,6 +156,7 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
             stop_rx.clone(),
         )),
     ];
+    daemons.push(start_search_index(&store, &cfg, stop_rx.clone()).await);
     if let Some(t) = &tmdb {
         daemons.extend(t.spawn_workers(stop_rx.clone()));
         daemons.push(tokio::spawn(tmdb::prefetch_loop(
