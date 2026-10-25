@@ -233,6 +233,21 @@ async fn import_link_search() {
         torrent(10, 104, NOW, 10, "Some.Book.Title.epub").cat(Category::Book),
     )
     .await;
+    // Deliberate i tags: the TMDB id is attached to the IMDb row.
+    put(
+        s,
+        itag(
+            itag(
+                torrent(15, 101, NOW, 15, "Matrix tagged"),
+                "imdb",
+                "tt0133093",
+            ),
+            "tmdb",
+            "movie:603",
+        )
+        .cat(Category::Video),
+    )
+    .await;
     // A manual link is never overwritten.
     put(
         s,
@@ -278,7 +293,7 @@ async fn import_link_search() {
     }
 
     let r = enrich::drain(s, &ecfg).await.unwrap();
-    assert_eq!(r.checked, 12, "{r:?}");
+    assert_eq!(r.checked, 13, "{r:?}");
     assert_eq!(r.anime_skipped, 1);
 
     let media = |n: u64| async move { s.torrent_detail(&ih(n), NOW).await.unwrap().unwrap().media };
@@ -296,11 +311,16 @@ async fn import_link_search() {
     assert_eq!(dune.imdb.as_deref(), Some("tt1160419"));
     assert!(dune.confidence >= 0.9);
     let m4 = media(4).await.unwrap();
-    assert_eq!((m4.media_id, m4.method.as_str()), (matrix, "desc_link"));
     assert_eq!(
-        m4.tmdb,
+        (m4.media_id, m4.method.as_str(), m4.confidence),
+        (matrix, "desc_link", 1.0)
+    );
+    let m15 = media(15).await.unwrap();
+    assert_eq!((m15.media_id, m15.method.as_str()), (matrix, "itag"));
+    assert_eq!(
+        m15.tmdb,
         Some((MediaKind::Movie, 603)),
-        "tmdb id attached to the IMDb row"
+        "tagged tmdb id attached to the IMDb row"
     );
     let m5 = media(5).await.unwrap();
     assert_eq!(
@@ -341,14 +361,14 @@ async fn import_link_search() {
     let page = s.search(&q("imdb:tt0133093"), NOW).await.unwrap();
     let mut got: Vec<String> = page.hits.iter().map(|h| h.infohash.clone()).collect();
     got.sort();
-    assert_eq!(got, vec![ih(1), ih(4), ih(11), ih(13)]);
+    assert_eq!(got, vec![ih(1), ih(4), ih(11), ih(13), ih(15)]);
     assert!(
         page.hits
             .iter()
             .all(|h| h.media_title.as_deref() == Some("The Matrix"))
     );
     assert_eq!(page.hits[0].media_year, Some(1999));
-    assert_eq!(page.total, 4);
+    assert_eq!(page.total, 5);
     assert_eq!(
         s.search(&q("imdb:tt0133093 remux"), NOW)
             .await
@@ -384,12 +404,13 @@ async fn import_link_search() {
     let base = spawn_server(s).await;
     let api = ApiClient::new(&base, Some(TOKEN.into())).unwrap();
     let page = api.media_torrents(matrix, 10, 0).await.unwrap();
-    assert_eq!(page.total, 4);
-    let detail = api.torrent(&ih(4)).await.unwrap().unwrap();
+    assert_eq!(page.total, 5);
+    let detail = api.torrent(&ih(15)).await.unwrap().unwrap();
     assert_eq!(detail.media.unwrap().tmdb, Some((MediaKind::Movie, 603)));
 
-    // A later event for torrent 5 links IMDb: the infohash is due again, the tmdb-only row is
-    // merged into the IMDb row (links move, the duplicate goes).
+    // A later event for torrent 5 links IMDb: the infohash is due again. Its first event's main
+    // link is the TMDB id, so the pair is deliberate: the tmdb-only row is merged into the IMDb
+    // row (links move, the duplicate goes).
     put(
         s,
         torrent(12, 105, NOW + 1, 5, "Some.Movie.2020.1080p")
@@ -401,8 +422,8 @@ async fn import_link_search() {
     assert_eq!(r.checked, 1);
     let m5b = media(5).await.unwrap();
     assert_eq!(
-        (m5b.imdb.as_deref(), m5b.tmdb),
-        (Some("tt0234215"), Some((MediaKind::Movie, 777)))
+        (m5b.imdb.as_deref(), m5b.tmdb, m5b.confidence),
+        (Some("tt0234215"), Some((MediaKind::Movie, 777)), 1.0)
     );
     let dupes: i64 = sqlx::query_scalar("SELECT count(*) FROM media WHERE tmdb_movie = 777")
         .fetch_one(pool)
@@ -410,6 +431,69 @@ async fn import_link_search() {
         .unwrap();
     assert_eq!(dupes, 1);
     assert_ne!(m5b.media_id, m5.media_id);
+
+    // A description's other link is not attached on its own, however often the pair is seen
+    // (an uploader repeats the same wrong link): no TMDB-only row with a matching title.
+    let fargo96 = "https://www.imdb.com/title/tt0116282/ https://www.themoviedb.org/movie/275";
+    put(
+        s,
+        torrent(16, 105, NOW, 16, "Fargo 1996 remux")
+            .cat(Category::Video)
+            .desc(fargo96),
+    )
+    .await;
+    enrich::drain(s, &ecfg).await.unwrap();
+    assert_eq!(media(16).await.unwrap().tmdb, None, "seen once");
+    put(
+        s,
+        torrent(17, 105, NOW, 17, "Fargo 1996 x265")
+            .cat(Category::Video)
+            .desc(fargo96),
+    )
+    .await;
+    enrich::drain(s, &ecfg).await.unwrap();
+    assert_eq!(media(17).await.unwrap().tmdb, None, "seen twice");
+
+    // Pairs are recorded against the series: two episodes' IMDb ids next to one TMDB series
+    // link agree (not a template).
+    put(
+        s,
+        itag(
+            torrent(18, 105, NOW, 18, "Fargo.S01E01.1080p"),
+            "imdb",
+            "tt3593662",
+        )
+        .cat(Category::Video)
+        .desc("https://www.themoviedb.org/tv/60622"),
+    )
+    .await;
+    put(
+        s,
+        torrent(19, 105, NOW, 19, "Fargo.S01.COMPLETE.1080p")
+            .cat(Category::Video)
+            .desc("https://www.imdb.com/title/tt2802850/ https://www.themoviedb.org/tv/60622"),
+    )
+    .await;
+    enrich::drain(s, &ecfg).await.unwrap();
+    let m19 = media(19).await.unwrap();
+    assert_eq!(
+        (m19.media_id, m19.tmdb),
+        (fargo.media_id, Some((MediaKind::Series, 60622)))
+    );
+
+    // Rows D41 owns (kind anime + an anime id) keep their fields on import; an anime-kind row
+    // without anime ids is still refreshed (kind kept).
+    sqlx::query(
+        "UPDATE media SET kind = 'anime', mal = 42, title = 'Anime Reloaded', rating = 9.9
+         WHERE imdb = 'tt0234215'",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE media SET kind = 'anime', title = 'Stale' WHERE imdb = 'tt0116282'")
+        .execute(pool)
+        .await
+        .unwrap();
 
     // Re-import (unchanged files): media rows untouched, unmatched title lookups retried.
     let rep = imdb::import(
@@ -423,7 +507,24 @@ async fn import_link_search() {
     )
     .await
     .unwrap();
-    assert_eq!(rep.media_refreshed, 0);
+    assert_eq!(
+        rep.media_refreshed, 1,
+        "only the anime-kind row without anime ids"
+    );
+    let rows: Vec<(String, String, Option<f32>)> = sqlx::query_as(
+        "SELECT imdb, title, rating FROM media WHERE imdb IN ('tt0234215', 'tt0116282')
+         ORDER BY imdb",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("tt0116282".into(), "Fargo".into(), Some(8.1)),
+            ("tt0234215".into(), "Anime Reloaded".into(), Some(9.9)),
+        ]
+    );
     let cov = enrich::coverage(pool).await.unwrap();
     assert!(
         cov.iter()
@@ -484,4 +585,361 @@ async fn strong_ids_without_imdb_dataset() {
         (m.imdb.as_deref(), m.title.as_str(), m.year),
         (Some("tt7654321"), "Thing", Some(2020))
     );
+}
+
+/// Template links of another kind (review of D40): YGG's `themoviedb.org/movie/324544` (In the
+/// Lost Lands) under Holy Ghost releases next to their own IMDb link, in both orders.
+#[tokio::test]
+async fn template_links_never_relink_other_titles() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    let pool = s.pool();
+    let ecfg = EnrichConfig {
+        imdb: None,
+        refresh: std::time::Duration::from_secs(3600),
+        fuzzy: false,
+    };
+    const LOST: &str = "https://www.themoviedb.org/movie/324544-in-the-lost-lands";
+    let holy = |tt: &str| format!("<a href=\"https://www.imdb.com/title/{tt}/\">IMDb</a> {LOST}");
+    let media = |n: u64| async move { s.torrent_detail(&ih(n), NOW).await.unwrap().unwrap().media };
+
+    // Lost Lands first (its only id is the TMDB link), then Holy Ghost.
+    put(
+        s,
+        torrent(1, 100, NOW, 1, "In.the.Lost.Lands.2025.MULTi.1080p.WEB")
+            .cat(Category::Video)
+            .desc(LOST),
+    )
+    .await;
+    enrich::drain(s, &ecfg).await.unwrap();
+    put(
+        s,
+        torrent(2, 100, NOW, 2, "Holy.Ghost.2025.FRENCH.1080p.WEB")
+            .cat(Category::Video)
+            .desc(&holy("tt36364273")),
+    )
+    .await;
+    enrich::drain(s, &ecfg).await.unwrap();
+    let lost = media(1).await.unwrap();
+    let ghost = media(2).await.unwrap();
+    assert_eq!(
+        (lost.title.as_str(), lost.tmdb, lost.imdb.as_deref()),
+        ("In the Lost Lands", Some((MediaKind::Movie, 324544)), None)
+    );
+    assert_eq!(
+        (ghost.title.as_str(), ghost.imdb.as_deref(), ghost.tmdb),
+        ("Holy Ghost", Some("tt36364273"), None)
+    );
+    assert_ne!(lost.media_id, ghost.media_id);
+    assert_eq!(
+        ghost.confidence, 1.0,
+        "a row without IMDb id is no contradiction"
+    );
+
+    // A second Holy Ghost release: the pair is seen twice, still no merge (titles differ).
+    put(
+        s,
+        torrent(6, 100, NOW, 6, "Holy.Ghost.2025.MULTi.1080p.WEB")
+            .cat(Category::Video)
+            .desc(&holy("tt36364273")),
+    )
+    .await;
+    enrich::drain(s, &ecfg).await.unwrap();
+    assert_eq!(media(1).await.unwrap().media_id, lost.media_id);
+    assert_eq!(media(6).await.unwrap().media_id, ghost.media_id);
+
+    // Deliberate tags adopt at once; the same id next to another IMDb id later is a template:
+    // it comes off the first row and that row's torrents are relinked without it.
+    put(
+        s,
+        itag(
+            itag(
+                torrent(8, 100, NOW, 8, "Tagged.Film.2025.1080p"),
+                "imdb",
+                "tt4444444",
+            ),
+            "tmdb",
+            "movie:999",
+        )
+        .cat(Category::Video),
+    )
+    .await;
+    enrich::drain(s, &ecfg).await.unwrap();
+    let tagged = media(8).await.unwrap();
+    assert_eq!(tagged.tmdb, Some((MediaKind::Movie, 999)));
+    put(
+        s,
+        torrent(7, 100, NOW, 7, "Third.Film.2025.1080p")
+            .cat(Category::Video)
+            .desc("https://www.imdb.com/title/tt3333333/ https://www.themoviedb.org/movie/999"),
+    )
+    .await;
+    let r = enrich::drain(s, &ecfg).await.unwrap();
+    assert_eq!(
+        r.checked, 2,
+        "torrent 7, then torrent 8 requeued by the heal"
+    );
+    let tagged = media(8).await.unwrap();
+    assert_eq!(
+        (tagged.imdb.as_deref(), tagged.tmdb),
+        (Some("tt4444444"), None)
+    );
+    assert_eq!(media(7).await.unwrap().tmdb, None);
+
+    // Another template pair seen once, then a release with only the TMDB link.
+    put(
+        s,
+        torrent(3, 100, NOW, 3, "Other.Film.2025.1080p")
+            .cat(Category::Video)
+            .desc("https://www.imdb.com/title/tt1111111/ https://www.themoviedb.org/movie/1530875"),
+    )
+    .await;
+    enrich::drain(s, &ecfg).await.unwrap();
+    put(
+        s,
+        torrent(4, 100, NOW, 4, "Template.Film.2024.1080p")
+            .cat(Category::Video)
+            .desc("https://www.themoviedb.org/movie/1530875"),
+    )
+    .await;
+    enrich::drain(s, &ecfg).await.unwrap();
+    let other = media(3).await.unwrap();
+    let tmpl = media(4).await.unwrap();
+    assert_eq!(
+        other.tmdb, None,
+        "description extra link seen once: not attached"
+    );
+    assert_ne!(other.media_id, tmdb_media(pool, 1530875).await);
+    assert_eq!(
+        (tmpl.title.as_str(), tmpl.imdb.as_deref()),
+        ("Template Film", None)
+    );
+
+    // Once the TMDB id is known to belong to another IMDb title (D42's external ids), a release
+    // carrying it next to a different IMDb link is linked at 0.9.
+    sqlx::query("UPDATE media SET imdb = 'tt2222222' WHERE tmdb_movie = 324544")
+        .execute(pool)
+        .await
+        .unwrap();
+    put(
+        s,
+        torrent(5, 100, NOW, 5, "Holy.Ghost.2025.MULTi.2160p.WEB")
+            .cat(Category::Video)
+            .desc(&holy("tt36364273")),
+    )
+    .await;
+    enrich::drain(s, &ecfg).await.unwrap();
+    let ghost5 = media(5).await.unwrap();
+    assert_eq!((ghost5.media_id, ghost5.confidence), (ghost.media_id, 0.9));
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM media")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows, 6,
+        "Lost Lands, Holy Ghost, Tagged Film, Third Film, Other Film, Template Film"
+    );
+}
+
+async fn tmdb_media(pool: &sqlx::PgPool, tmdb: i32) -> i64 {
+    sqlx::query_scalar("SELECT id FROM media WHERE tmdb_movie = $1")
+        .bind(tmdb)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// D41's rows are linked to as they are, never merged, deleted or rewritten (review of D40).
+#[tokio::test]
+async fn anime_rows_belong_to_d41() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    let pool = s.pool();
+    let ecfg = EnrichConfig {
+        imdb: None,
+        refresh: std::time::Duration::from_secs(3600),
+        fuzzy: false,
+    };
+    let anime: i64 = sqlx::query_scalar(
+        "INSERT INTO media (kind, mal, title, updated_at)
+         VALUES ('anime', 5114, 'Hagane no Renkinjutsushi: Fullmetal Alchemist', 0) RETURNING id",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let media = |n: u64| async move { s.torrent_detail(&ih(n), NOW).await.unwrap().unwrap().media };
+    // An IMDb row for the same work already exists (a video release).
+    put(
+        s,
+        itag(
+            torrent(
+                1,
+                100,
+                NOW,
+                1,
+                "Fullmetal.Alchemist.Brotherhood.S01E01.1080p",
+            ),
+            "imdb",
+            "tt1355642",
+        )
+        .cat(Category::Video),
+    )
+    .await;
+    // Anime release with both tags.
+    put(
+        s,
+        itag(
+            itag(
+                torrent(
+                    2,
+                    100,
+                    NOW,
+                    2,
+                    "[Group] Fullmetal Alchemist Brotherhood - 01",
+                ),
+                "imdb",
+                "tt1355642",
+            ),
+            "mal",
+            "anime:5114",
+        )
+        .cat(Category::Anime),
+    )
+    .await;
+    // An anime release with an IMDb id unknown so far: its new row is kind anime.
+    put(
+        s,
+        itag(
+            torrent(3, 100, NOW, 3, "[Group] Some Show - 02"),
+            "imdb",
+            "tt9876543",
+        )
+        .cat(Category::Anime),
+    )
+    .await;
+    enrich::drain(s, &ecfg).await.unwrap();
+    let m1 = media(1).await.unwrap();
+    let m2 = media(2).await.unwrap();
+    let m3 = media(3).await.unwrap();
+    assert_eq!(
+        (m1.kind, m1.imdb.as_deref(), m1.mal),
+        (MediaKind::Series, Some("tt1355642"), None),
+        "MAL id not moved onto the IMDb row"
+    );
+    assert_eq!(
+        (m2.media_id, m2.kind, m2.mal, m2.confidence),
+        (anime, MediaKind::Anime, Some(5114), 1.0)
+    );
+    assert_eq!(
+        m2.title, "Hagane no Renkinjutsushi: Fullmetal Alchemist",
+        "D41's row untouched"
+    );
+    assert_eq!(m2.imdb, None);
+    assert_eq!(
+        (m3.kind, m3.imdb.as_deref()),
+        (MediaKind::Anime, Some("tt9876543"))
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM media")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 3);
+    assert_eq!(s.search(&q("mal:5114"), NOW).await.unwrap().total, 1);
+}
+
+/// A description's other link is adopted when the TMDB-only row's title is one of the IMDb
+/// title's names, whichever torrent is linked first (review of D40).
+#[tokio::test]
+async fn pairs_agree_by_title_in_any_order() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    let pool = s.pool();
+    let ecfg = EnrichConfig {
+        imdb: None,
+        refresh: std::time::Duration::from_secs(3600),
+        fuzzy: false,
+    };
+    let media = |n: u64| async move { s.torrent_detail(&ih(n), NOW).await.unwrap().unwrap().media };
+    let both = |tt: &str, tv: u32| {
+        format!("https://www.imdb.com/title/{tt}/ https://www.themoviedb.org/tv/{tv}")
+    };
+    // TMDB-only releases first, then one release with both links.
+    for n in 1..=2u64 {
+        put(
+            s,
+            torrent(n, 100, NOW, n, &format!("Acapulco.S01E0{n}.1080p.WEB"))
+                .cat(Category::Video)
+                .desc("https://www.themoviedb.org/tv/133727"),
+        )
+        .await;
+    }
+    enrich::drain(s, &ecfg).await.unwrap();
+    put(
+        s,
+        torrent(3, 100, NOW, 3, "Acapulco.S01E03.1080p.WEB")
+            .cat(Category::Video)
+            .desc(&both("tt13567344", 133727)),
+    )
+    .await;
+    enrich::drain(s, &ecfg).await.unwrap();
+    let m3 = media(3).await.unwrap();
+    assert_eq!(
+        (m3.imdb.as_deref(), m3.tmdb),
+        (Some("tt13567344"), Some((MediaKind::Series, 133727)))
+    );
+    for n in 1..=2 {
+        assert_eq!(media(n).await.unwrap().media_id, m3.media_id, "merged");
+    }
+
+    // The release with both links first, then a TMDB-only release.
+    put(
+        s,
+        torrent(4, 100, NOW, 4, "Palm.Royale.S01E01.1080p.WEB")
+            .cat(Category::Video)
+            .desc(&both("tt8888540", 157367)),
+    )
+    .await;
+    enrich::drain(s, &ecfg).await.unwrap();
+    assert_eq!(
+        media(4).await.unwrap().tmdb,
+        None,
+        "seen once, no row to compare"
+    );
+    put(
+        s,
+        torrent(5, 100, NOW, 5, "Palm.Royale.S01E02.1080p.WEB")
+            .cat(Category::Video)
+            .desc("https://www.themoviedb.org/tv/157367"),
+    )
+    .await;
+    // A TMDB-only release of another title with an id paired once elsewhere stays apart.
+    put(
+        s,
+        torrent(6, 100, NOW, 6, "Holy.Ghost.2025.1080p")
+            .cat(Category::Video)
+            .desc(&both("tt36364273", 324544)),
+    )
+    .await;
+    enrich::drain(s, &ecfg).await.unwrap();
+    put(
+        s,
+        torrent(7, 100, NOW, 7, "In.the.Lost.Lands.2025.1080p")
+            .cat(Category::Video)
+            .desc("https://www.themoviedb.org/movie/324544"),
+    )
+    .await;
+    enrich::drain(s, &ecfg).await.unwrap();
+    let m4 = media(4).await.unwrap();
+    let m5 = media(5).await.unwrap();
+    assert_eq!(
+        (m5.media_id, m5.tmdb),
+        (m4.media_id, Some((MediaKind::Series, 157367)))
+    );
+    let m7 = media(7).await.unwrap();
+    assert_eq!((m7.title.as_str(), m7.imdb), ("In the Lost Lands", None));
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM media")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 4);
 }

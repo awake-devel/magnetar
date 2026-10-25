@@ -19,6 +19,7 @@ responses from its own server, and never contacts IMDb or TMDB.
 | `media` | shared | One identified title: `kind` (`movie`/`series`/`anime`), external ids (`imdb` unique, partial unique indexes on `tmdb_movie`, `tmdb_tv`, `tvdb`, `mal`, `anilist`, `anidb`), title, year, genres, rating, votes, runtime. Created lazily, only for titles a torrent links to |
 | `torrent_media` | shared | One link per infohash: `media_id`, `season`/`episode` of this torrent, `method`, `confidence`, `matcher_version`, `matched_at` |
 | `enrich_checked` | imdb | Infohashes looked at, by matcher version; `pending_title` = title matching found nothing yet (retried after each dataset import). `PgStore::put_torrent` deletes the row when a new event arrives for the infohash, so links in a later description are picked up |
+| `enrich_id_pairs` | imdb | (kind, value, infohash) → IMDb id: the non-IMDb ids each IMDb-linked torrent carries, to tell agreed pairs from template links (§1 ownership rules) |
 | `imdb_titles`, `imdb_names`, `imdb_episodes` | imdb | The dataset, UNLOGGED (rebuilt from files, no WAL). `imdb_names` = normalised primary/original titles (+ akas) with a btree and a trigram index; `imdb_episodes` packs ~9.7M episodes into 168k rows (`tconst >> 8` → 9-byte records) |
 | `imdb_datasets` | imdb | `Last-Modified`, size and row count of each imported file |
 
@@ -33,11 +34,32 @@ responses from its own server, and never contacts IMDb or TMDB.
   confidence is ≥ the existing link's; nothing is deleted. Title matching is D41's.
 - A strong ID for a title without an IMDb row (TMDB-, MAL-, AniList- or AniDB-only) creates a
   media row with the torrent's parsed title and year; D41/D42 fill the details later.
-- When a torrent links both an IMDb id and an id already held by an IMDb-less row, that row is
-  merged into the IMDb row (its links move, the duplicate is deleted; its `media_extra` rows go
-  with it and are re-fetched lazily). An id held by a row with a *different* IMDb id is left alone.
+- Ids that choose, create or extend a row: `i` tags (deliberate) and each description's *main
+  link* (its IMDb link, else its earliest link). A description's other links are only
+  *evidence*, because a template link sits next to other films' own IMDb links: YGG's
+  `themoviedb.org/movie/324544` (In the Lost Lands, ~750 production descriptions) under Holy
+  Ghost releases, and `themoviedb.org/movie/1530875` next to two IMDb ids.
+- Pairs (`enrich_id_pairs`, private): every non-IMDb id of a torrent linked to an IMDb title is
+  recorded with that title (the series for an episode id). A pair is *agreed* when the id was
+  never seen next to another IMDb id and it is deliberate, or it is held by a TMDB-only row whose
+  title is one of the IMDb title's names (dataset names, else the row's). How often a pair was
+  seen is no evidence: one uploader puts the same wrong IMDb link (Pékin express) under every
+  episode of Les Apprentis Aventuriers next to its right TMDB link. Agreed ids are added to the
+  IMDb row where free, or the IMDb-less, non-anime row holding them is merged into it (its links
+  move, the duplicate is deleted; its `media_extra` rows go with it and are re-fetched lazily).
+  The same test runs the other way round, so the order does not matter: a TMDB-only release
+  whose id is paired with one IMDb title having the release's title among its names links to that
+  title. Ids are never moved between rows that both have an IMDb id.
+- An id seen next to a second IMDb id is a template: it is taken off the IMDb rows it was added
+  to through pairs, their torrents are requeued and relinked without it, and it is never adopted
+  again. When one of a torrent's ids sits on a row with another
+  IMDb id (e.g. set by D42 from TMDB's external ids), the link gets confidence 0.9.
+- Rows of kind `anime` are D41's: a torrent whose MAL/AniList/AniDB id is on such a row links to
+  it as is (nothing is attached to it), whatever its IMDb id. A new IMDb row created for an anime
+  torrent (category `anime`, or an anime id) gets kind `anime`; D41 adopts it.
 - `enrich::imdb::refresh_media` rewrites title/year/genres/rating/votes/runtime of every row with
-  an `imdb` id after an import (kind too, unless it is `anime`).
+  an `imdb` id after an import (kind too, unless it is `anime`), except rows of kind `anime` that
+  carry an anime id: D41 writes those columns from its own dataset.
 
 ---
 
@@ -55,7 +77,8 @@ All events of the infohash are read, canonical first (highest trust, then earlie
      `thetvdb.com/?tab=series&id=N`, `myanimelist.net/anime/N`, `anilist.co/anime/N`,
      `anidb.net/anime/N`, `anidb.net/aN`, `animedb.pl?show=anime&aid=N`. Person pages, image
      paths and slug-only TVDB links are not IDs.
-   - Tags win over links; the first link of each kind wins. Several *different* links of one
+   - Tags win over links; the first link of each kind wins; a description's other links are
+     only adopted through agreed pairs (§1 ownership rules). Several *different* links of one
      kind in a description (the YGG uploader template links `themoviedb.org/movie/324544` under
      607 releases, always after the real link) give confidence 0.9.
    - An IMDb episode id resolves to its series, with that episode's season/episode.
@@ -104,7 +127,9 @@ above 0.5 about 97–98%.
 |---|---|
 | Files | `title.basics` 229 MB, `title.episode` 55 MB, `title.ratings` 8.7 MB (+ `title.akas` 519 MB with `MAGNETAR_IMDB_AKAS=true`), from `https://datasets.imdbws.com/` |
 | Download | `If-Modified-Since` from the stored `Last-Modified` (sidecar `<file>.last-modified`, else the file mtime); an unchanged file is one 304. A failed download keeps the local copy |
-| Import | ratings into memory, then title.basics streamed (gzip → TSV → COPY) into `imdb_*_new` through two concurrent COPYs (titles, names), then episodes (and akas); indexes built on the staging tables, one transaction swaps them in. Readers never see a mix. An advisory lock keeps two processes from importing at once; fewer than 500,000 titles is refused (truncated file) |
+| Import | ratings into memory, then title.basics streamed (gzip → TSV → COPY) into `imdb_*_new` through two concurrent COPYs (titles, names), then episodes (and akas); indexes built on the staging tables, one transaction swaps them in. Readers never see a mix. An advisory lock keeps two processes from importing at once (held on the import's own
+connection, closed if the import is cancelled); the import uses at most 2 of the server's 5 pool
+connections (the lock connection + one more while the names COPY runs, akas included); fewer than 500,000 titles is refused (truncated file) |
 | Kept | movie, tvMovie, video, tvSeries, tvMiniSeries, tvSpecial, non-adult: 1,563,990 titles, 1,776,289 names, 9,692,697 episodes |
 | Refresh | `MAGNETAR_IMDB_REFRESH_HOURS` (168). Re-import only when a file changed, the akas setting changed, or the UNLOGGED tables are empty (crash) |
 | Loop (`serve`) | drain what is due in batches of 200 → refresh check → sleep 60 s. New torrents are linked within about a minute; a fresh install links strong IDs before the first download finishes, title matches right after the import |
@@ -184,6 +209,17 @@ Video torrents (145,989 infohashes):
 Anime: 12.0% `desc_link` (MAL/AniDB/AniList links), the other 88% left to D41. Other
 categories: only strong IDs (47 of 22,376 `other`). 36,015 media rows (25,711 movie, 9,323
 series, 981 anime); `media` + `torrent_media` + `enrich_checked` = 93 MB.
+
+After the review fixes (template links, D41 rows, pairs), same copy, from scratch: 963 s, the
+same 143,299 links shown; 3,891 of 145,121 linked infohashes point elsewhere than before:
+~2,800 anime releases on their anime rows (MAL/AniList/AniDB, D41's) instead of rows merged
+into IMDb titles; 38 Les
+Apprentis Aventuriers releases back on their own row (one uploader's wrong Pékin express IMDb
+link had merged them); the two template ids (324544, 1530875) never adopted, so Holy Ghost and
+In the Lost Lands stay apart; ~690 releases of titles named differently on TMDB and IMDb
+("Star Wars Skeleton Crew" / "Skeleton Crew", "Mask Singer" / "Mask Singer (III)") stay on
+TMDB-only rows (the price of not trusting unverified pairs; D42 still decorates them by TMDB id).
+36,406 media rows; `enrich_id_pairs` 19,976 rows, 3.7 MB.
 
 ---
 

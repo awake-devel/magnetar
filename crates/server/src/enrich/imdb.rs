@@ -21,8 +21,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, bail};
 use magnetar_core::enrich::imdb_match::{Candidate, NameSource, TitleType, name_keys};
 use serde::Serialize;
-use sqlx::postgres::PgPoolCopyExt;
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgConnection, PgPool};
 use tokio::sync::mpsc;
 
 pub const BASE_URL: &str = "https://datasets.imdbws.com";
@@ -289,16 +288,17 @@ impl Sink {
 
 /// Run `COPY <table> FROM STDIN` fed by `rx` until the producer hangs up.
 async fn copy_from(
-    pool: PgPool,
+    conn: &mut PgConnection,
     table: &'static str,
     mut rx: mpsc::Receiver<Vec<u8>>,
 ) -> anyhow::Result<u64> {
-    let mut copy = pool
+    let mut copy = conn
         .copy_in_raw(&format!("COPY {table} FROM STDIN"))
         .await
         .with_context(|| format!("COPY {table}"))?;
     while let Some(buf) = rx.recv().await {
         if let Err(e) = copy.send(buf).await {
+            let _ = copy.abort("send failed").await;
             return Err(e).with_context(|| format!("COPY {table}"));
         }
     }
@@ -521,6 +521,9 @@ pub async fn import(
 ) -> anyhow::Result<ImportReport> {
     let started = Instant::now();
     let mut lock = pool.acquire().await?;
+    // A cancelled import (shutdown) must not hand a connection holding the session lock back
+    // to the pool: closing it releases the lock.
+    lock.close_on_drop();
     let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
         .bind(IMPORT_LOCK)
         .fetch_one(&mut *lock)
@@ -528,22 +531,26 @@ pub async fn import(
     if !got {
         bail!("another IMDb import is running");
     }
-    let res = import_locked(pool, cfg, versions, started).await;
-    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(IMPORT_LOCK)
-        .execute(&mut *lock)
-        .await;
+    let res = import_locked(pool, &mut lock, cfg, versions, started).await;
     if res.is_err() {
         let _ =
             sqlx::query("DROP TABLE IF EXISTS imdb_titles_new, imdb_names_new, imdb_episodes_new")
                 .execute(pool)
                 .await;
     }
+    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(IMPORT_LOCK)
+        .execute(&mut *lock)
+        .await;
     res
 }
 
+/// The import itself, on the lock connection plus one more while titles and names are copied
+/// concurrently: at most 2 of the server's `store::MAX_CONNECTIONS` (the API, ingest and the
+/// other daemons share the pool).
 async fn import_locked(
     pool: &PgPool,
+    conn: &mut PgConnection,
     cfg: &ImdbConfig,
     versions: &[Fetched],
     started: Instant,
@@ -554,7 +561,7 @@ async fn import_locked(
          CREATE UNLOGGED TABLE imdb_names_new (LIKE imdb_names INCLUDING DEFAULTS);
          CREATE UNLOGGED TABLE imdb_episodes_new (LIKE imdb_episodes INCLUDING DEFAULTS);",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
     let basics = cfg.path(BASICS);
@@ -565,8 +572,8 @@ async fn import_locked(
     let (titles_tx, titles_rx) = mpsc::channel::<Vec<u8>>(8);
     let (names_tx, names_rx) = mpsc::channel::<Vec<u8>>(8);
     let (ep_tx, ep_rx) = mpsc::channel::<Vec<u8>>(8);
-    let titles_copy = tokio::spawn(copy_from(pool.clone(), "imdb_titles_new", titles_rx));
-    let names_copy = tokio::spawn(copy_from(pool.clone(), "imdb_names_new", names_rx));
+    let mut names_conn = pool.acquire().await?;
+    names_conn.close_on_drop();
     let producer = tokio::task::spawn_blocking(move || -> anyhow::Result<(u64, u64, u64, u64)> {
         let t0 = Instant::now();
         let ratings = read_ratings(&ratings_path)?;
@@ -596,12 +603,15 @@ async fn import_locked(
         tracing::info!("imdb: {n_eps} episodes in {buckets} buckets");
         Ok((n_titles, n_names, n_eps, n_akas))
     });
-    // Episodes are produced after titles and names are done (their senders are dropped then),
-    // so their COPY takes the connection the others give back: at most 3 connections here.
-    let c_titles = titles_copy.await.context("COPY titles")?;
-    let c_names = names_copy.await.context("COPY names")?;
-    let eps_copy = tokio::spawn(copy_from(pool.clone(), "imdb_episodes_new", ep_rx));
-    let c_eps = eps_copy.await.context("COPY episodes")?;
+    // Titles and names are produced together, so their COPYs run together (lock connection +
+    // one more, given back when the names, akas included, are done). Episodes are produced
+    // after both (their senders are dropped then) and reuse the lock connection.
+    let (c_titles, c_names) = tokio::join!(
+        copy_from(&mut *conn, "imdb_titles_new", titles_rx),
+        copy_from(&mut names_conn, "imdb_names_new", names_rx),
+    );
+    drop(names_conn);
+    let c_eps = copy_from(&mut *conn, "imdb_episodes_new", ep_rx).await;
     let produced = producer.await.context("import thread")?;
     let copied = (c_titles, c_names, c_eps);
     let (n_titles, n_names, n_eps, n_akas) = produced?;
@@ -617,7 +627,6 @@ async fn import_locked(
         started.elapsed().as_secs()
     );
 
-    let mut conn = pool.acquire().await?;
     sqlx::raw_sql(
         "SET maintenance_work_mem = '128MB';
          ALTER TABLE imdb_titles_new ADD CONSTRAINT imdb_titles_new_pkey PRIMARY KEY (id);
@@ -629,10 +638,9 @@ async fn import_locked(
     )
     .execute(&mut *conn)
     .await?;
-    drop(conn);
 
     let now = magnetar_core::now();
-    let mut tx = pool.begin().await?;
+    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
     sqlx::raw_sql(
         "DROP TABLE imdb_titles;
          ALTER TABLE imdb_titles_new RENAME TO imdb_titles;
@@ -676,7 +684,7 @@ async fn import_locked(
         "SELECT (pg_total_relation_size('imdb_titles') + pg_total_relation_size('imdb_names')
                  + pg_total_relation_size('imdb_episodes'))::bigint",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     let report = ImportReport {
         titles: n_titles,
@@ -691,7 +699,9 @@ async fn import_locked(
     Ok(report)
 }
 
-/// Copy fresh IMDb fields onto existing media rows (only rows that changed).
+/// Copy fresh IMDb fields onto existing media rows (only rows that changed). Rows of kind
+/// `anime` that carry an anime id are D41's (it writes the same columns from its own dataset)
+/// and are left alone.
 async fn refresh_media(conn: &mut sqlx::PgConnection, now: i64) -> anyhow::Result<u64> {
     let r = sqlx::query(
         "UPDATE media m SET title = t.title, original_title = t.original_title,
@@ -702,6 +712,8 @@ async fn refresh_media(conn: &mut sqlx::PgConnection, now: i64) -> anyhow::Resul
                 updated_at = $1
          FROM imdb_titles t
          WHERE m.imdb ~ '^tt[0-9]{1,9}$' AND substr(m.imdb, 3)::int = t.id
+           AND NOT (m.kind = 'anime'
+                    AND (m.mal IS NOT NULL OR m.anilist IS NOT NULL OR m.anidb IS NOT NULL))
            AND (m.title, m.original_title, m.year, m.end_year, m.genres, m.rating, m.votes, m.runtime_min)
                IS DISTINCT FROM
                (t.title, t.original_title, t.year::int, t.end_year::int, t.genres, t.rating, t.votes, t.runtime_min)",

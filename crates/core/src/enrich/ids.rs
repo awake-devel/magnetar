@@ -11,7 +11,9 @@
 //! Descriptions sometimes carry a second, unrelated link of the same kind (the YGG template
 //! links themoviedb.org/movie/324544 under every release of one uploader), always after the real
 //! one: the first link of each kind wins and a description with several distinct IDs of one kind
-//! is flagged `ambiguous` (confidence 0.9 instead of 1.0).
+//! is flagged `ambiguous` (confidence 0.9 instead of 1.0). The same template link also sits next
+//! to the real link of *another* kind (an imdb.com link), so a description is trusted only for
+//! its [`StrongIds::main_link`]; its other links are evidence, never attached to a media row.
 
 use crate::enrich::method;
 
@@ -33,6 +35,20 @@ pub struct StrongIds {
     pub ambiguous: bool,
     /// `method::ITAG` if any ID came from an `i` tag, else `method::DESC_LINK`.
     pub method: &'static str,
+    /// Description only: the kind of the earliest link (template links come after the real one).
+    pub lead: Option<IdKind>,
+}
+
+/// One external id column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdKind {
+    Imdb,
+    TmdbMovie,
+    TmdbTv,
+    Tvdb,
+    Mal,
+    Anilist,
+    Anidb,
 }
 
 impl StrongIds {
@@ -51,10 +67,44 @@ impl StrongIds {
         if self.ambiguous { 0.9 } else { 1.0 }
     }
 
+    /// The IDs a description is trusted for on its own: its IMDb link, else its earliest link
+    /// (with that link's season/episode). The others may be template noise (module docs).
+    pub fn main_link(&self) -> StrongIds {
+        let kind = if self.imdb.is_some() {
+            Some(IdKind::Imdb)
+        } else {
+            self.lead
+        };
+        let mut out = StrongIds {
+            ambiguous: self.ambiguous,
+            method: self.method,
+            lead: kind,
+            ..Default::default()
+        };
+        match kind {
+            Some(IdKind::Imdb) => out.imdb = self.imdb.clone(),
+            Some(IdKind::TmdbMovie) => out.tmdb_movie = self.tmdb_movie,
+            Some(IdKind::TmdbTv) => {
+                out.tmdb_tv = self.tmdb_tv;
+                out.season = self.season;
+                out.episode = self.episode;
+            }
+            Some(IdKind::Tvdb) => out.tvdb = self.tvdb,
+            Some(IdKind::Mal) => out.mal = self.mal,
+            Some(IdKind::Anilist) => out.anilist = self.anilist,
+            Some(IdKind::Anidb) => out.anidb = self.anidb,
+            None => {}
+        }
+        out
+    }
+
     /// Fill every field still None from `other` (self wins).
     pub fn merge(&mut self, other: StrongIds) {
         if self.is_empty() && !other.is_empty() {
             self.method = other.method;
+        }
+        if self.lead.is_none() {
+            self.lead = other.lead;
         }
         self.ambiguous |= other.ambiguous;
         fill(&mut self.imdb, other.imdb);
@@ -93,6 +143,21 @@ fn first<T: PartialEq>(slot: &mut Option<T>, v: T, ambiguous: &mut bool) {
         Some(old) if *old != v => *ambiguous = true,
         Some(_) => {}
     }
+}
+
+/// `first`, also remembering the kind of the earliest link (`at` = its offset).
+fn first_at<T: PartialEq>(
+    slot: &mut Option<T>,
+    v: T,
+    ambiguous: &mut bool,
+    at: usize,
+    kind: IdKind,
+    lead: &mut Option<(usize, IdKind)>,
+) {
+    if lead.is_none_or(|(p, _)| at < p) {
+        *lead = Some((at, kind));
+    }
+    first(slot, v, ambiguous);
 }
 
 /// `tt` + digits anywhere in `s` (bare id or URL), normalised to at least 7 digits.
@@ -245,13 +310,21 @@ pub fn from_description(description: &str) -> StrongIds {
     }
     let d = description.to_ascii_lowercase();
     let mut amb = false;
+    let mut lead: Option<(usize, IdKind)> = None;
 
     for at in after_all(&d, "imdb.com/") {
         let rest = skip_locale(&d[at..]);
         if let Some(r) = rest.strip_prefix("title/tt")
             && let Some((n, _)) = digits(r)
         {
-            first(&mut ids.imdb, format_imdb(n), &mut amb);
+            first_at(
+                &mut ids.imdb,
+                format_imdb(n),
+                &mut amb,
+                at,
+                IdKind::Imdb,
+                &mut lead,
+            );
         }
     }
     let mut tmdb_tv_first: Option<u32> = None;
@@ -259,13 +332,20 @@ pub fn from_description(description: &str) -> StrongIds {
         let rest = skip_locale(&d[at..]);
         if let Some(r) = rest.strip_prefix("movie/") {
             if let Some(n) = id32(r) {
-                first(&mut ids.tmdb_movie, n, &mut amb);
+                first_at(
+                    &mut ids.tmdb_movie,
+                    n,
+                    &mut amb,
+                    at,
+                    IdKind::TmdbMovie,
+                    &mut lead,
+                );
             }
         } else if let Some(r) = rest.strip_prefix("tv/")
             && let Some((n, len)) = digits(r)
             && let Ok(n) = u32::try_from(n)
         {
-            first(&mut ids.tmdb_tv, n, &mut amb);
+            first_at(&mut ids.tmdb_tv, n, &mut amb, at, IdKind::TmdbTv, &mut lead);
             // Season/episode only from links to the series we kept.
             if tmdb_tv_first.is_none_or(|f| f == n) {
                 tmdb_tv_first = Some(n);
@@ -299,7 +379,7 @@ pub fn from_description(description: &str) -> StrongIds {
             None
         };
         if let Some(n) = n {
-            first(&mut ids.tvdb, n, &mut amb);
+            first_at(&mut ids.tvdb, n, &mut amb, at, IdKind::Tvdb, &mut lead);
         }
     }
     for at in after_all(&d, "myanimelist.net/anime") {
@@ -312,12 +392,19 @@ pub fn from_description(description: &str) -> StrongIds {
             None
         };
         if let Some(n) = n {
-            first(&mut ids.mal, n, &mut amb);
+            first_at(&mut ids.mal, n, &mut amb, at, IdKind::Mal, &mut lead);
         }
     }
     for at in after_all(&d, "anilist.co/anime/") {
         if let Some(n) = id32(&d[at..]) {
-            first(&mut ids.anilist, n, &mut amb);
+            first_at(
+                &mut ids.anilist,
+                n,
+                &mut amb,
+                at,
+                IdKind::Anilist,
+                &mut lead,
+            );
         }
     }
     for at in after_all(&d, "anidb.net/") {
@@ -340,10 +427,11 @@ pub fn from_description(description: &str) -> StrongIds {
             None
         };
         if let Some(n) = n {
-            first(&mut ids.anidb, n, &mut amb);
+            first_at(&mut ids.anidb, n, &mut amb, at, IdKind::Anidb, &mut lead);
         }
     }
     ids.ambiguous = amb;
+    ids.lead = lead.map(|(_, k)| k);
     ids
 }
 
@@ -543,5 +631,37 @@ mod tests {
             split_media_token("imdb top 250"),
             ("imdb top 250".into(), None)
         );
+    }
+
+    #[test]
+    fn main_link_is_imdb_else_earliest() {
+        // A Holy Ghost release: its own IMDb link next to the YGG template TMDB link of another
+        // film (In the Lost Lands). Different kinds, so not `ambiguous`; only IMDb is trusted.
+        let d = "https://www.imdb.com/title/tt36364273/ \
+                 https://www.themoviedb.org/movie/324544-in-the-lost-lands";
+        let ids = from_description(d);
+        assert_eq!(ids.tmdb_movie, Some(324544));
+        assert!(!ids.ambiguous);
+        let m = ids.main_link();
+        assert_eq!(
+            (m.imdb.as_deref(), m.tmdb_movie, m.lead),
+            (Some("tt36364273"), None, Some(IdKind::Imdb))
+        );
+        // Template after the real link: the earliest one wins, with its season/episode.
+        let d = "https://www.themoviedb.org/tv/1399/season/2/episode/5 \
+                 https://www.themoviedb.org/movie/324544 https://myanimelist.net/anime/5114";
+        let ids = from_description(d);
+        assert_eq!(ids.lead, Some(IdKind::TmdbTv));
+        let m = ids.main_link();
+        assert_eq!(
+            (m.tmdb_tv, m.season, m.episode, m.tmdb_movie, m.mal),
+            (Some(1399), Some(2), Some(5), None, None)
+        );
+        let ids =
+            from_description("x https://anilist.co/anime/5114 https://myanimelist.net/anime/1");
+        assert_eq!(ids.main_link().anilist, Some(5114));
+        assert_eq!(ids.main_link().mal, None);
+        assert!(from_description("nothing").main_link().is_empty());
+        assert_eq!(from_itags(&[]).lead, None);
     }
 }

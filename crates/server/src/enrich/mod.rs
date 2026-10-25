@@ -3,6 +3,9 @@
 //! Per infohash (all its events, canonical first):
 //! 1. Strong IDs (`core::enrich::ids`) from `i` tags and description links, on **every**
 //!    category: method `itag` / `desc_link`, confidence 1.0 (0.9 for conflicting links).
+//!    Only `i` tags and each description's main link (`StrongIds::main_link`) choose or create
+//!    a media row; a description's other links are adopted only through agreed pairs
+//!    (`agreed_pair`, `enrich_id_pairs`), since template links sit next to other films' IMDb links.
 //! 2. Otherwise, for `video` only: offline IMDb title match (`offline_title`), with a pg_trgm
 //!    fallback capped below 0.6. Anime is left to the anime enricher (D41), which owns
 //!    `offline_title` links on anime torrents.
@@ -11,6 +14,11 @@
 //! non-anime torrents this loop replaces or deletes its own methods (`itag`, `desc_link`,
 //! `offline_title`); on anime torrents it only writes a strong ID whose confidence is at least
 //! the existing link's, and never deletes.
+//!
+//! An id is added to a row only where no row holds it; an IMDb-less, non-anime row is merged into
+//! an IMDb row only through an agreed pair, and an id seen next to two IMDb ids is taken back off
+//! (`IdSql::heal`). Rows of kind `anime` belong to D41: a torrent with a matching
+//! MAL/AniList/AniDB id links to such a row as is, and nothing here writes to or merges it.
 //!
 //! `enrich_checked` remembers what was looked at with which `MATCHER_VERSION`; a new event for
 //! an infohash clears its row (PgStore::put_torrent), and unmatched title lookups are retried
@@ -117,7 +125,10 @@ struct Group {
     category: Category,
     title: String,
     files: Vec<TorrentFile>,
+    /// Every id found (evidence).
     ids: StrongIds,
+    /// `i` tags + each description's main link: the ids rows are chosen and extended with.
+    trusted: StrongIds,
 }
 
 /// A decided link (or none).
@@ -162,15 +173,24 @@ async fn load_groups(pool: &PgPool, infohashes: &[String]) -> anyhow::Result<Vec
     .await?;
     let mut out: Vec<Group> = Vec::new();
     for r in rows {
-        let ids = StrongIds::from_torrent(&r.external_ids.0, &r.description);
+        let tags = ids::from_itags(&r.external_ids.0);
+        let desc = ids::from_description(&r.description);
+        let mut trusted = tags.clone();
+        trusted.merge(desc.main_link());
+        let mut all = tags;
+        all.merge(desc);
         match out.last_mut() {
-            Some(g) if g.infohash == r.infohash => g.ids.merge(ids),
+            Some(g) if g.infohash == r.infohash => {
+                g.ids.merge(all);
+                g.trusted.merge(trusted);
+            }
             _ => out.push(Group {
                 category: r.category.parse().unwrap_or(Category::Other),
                 infohash: r.infohash,
                 title: r.title,
                 files: r.files.0,
-                ids,
+                ids: all,
+                trusted,
             }),
         }
     }
@@ -350,7 +370,7 @@ async fn decide(
     let mut out = Vec::with_capacity(groups.len());
     for (g, ps) in groups.iter().zip(parsed) {
         if !g.ids.is_empty() {
-            out.push(Decision::Strong(g.ids.clone(), ps.into_iter().next()));
+            out.push(Decision::Strong(g.trusted.clone(), ps.into_iter().next()));
             continue;
         }
         if g.category == Category::Anime {
@@ -392,33 +412,90 @@ struct Fallback<'a> {
     year: Option<i32>,
 }
 
-/// (find the row holding an id, set the id where unset) per external id column, in
-/// `id_values` order. Static strings: the column names are not data.
-const ID_SQL: [(&str, &str); 6] = [
-    (
-        "SELECT id, imdb IS NOT NULL FROM media WHERE tmdb_movie = $1",
-        "UPDATE media SET tmdb_movie = $1 WHERE id = $2 AND tmdb_movie IS NULL",
-    ),
-    (
-        "SELECT id, imdb IS NOT NULL FROM media WHERE tmdb_tv = $1",
-        "UPDATE media SET tmdb_tv = $1 WHERE id = $2 AND tmdb_tv IS NULL",
-    ),
-    (
-        "SELECT id, imdb IS NOT NULL FROM media WHERE tvdb = $1",
-        "UPDATE media SET tvdb = $1 WHERE id = $2 AND tvdb IS NULL",
-    ),
-    (
-        "SELECT id, imdb IS NOT NULL FROM media WHERE mal = $1",
-        "UPDATE media SET mal = $1 WHERE id = $2 AND mal IS NULL",
-    ),
-    (
-        "SELECT id, imdb IS NOT NULL FROM media WHERE anilist = $1",
-        "UPDATE media SET anilist = $1 WHERE id = $2 AND anilist IS NULL",
-    ),
-    (
-        "SELECT id, imdb IS NOT NULL FROM media WHERE anidb = $1",
-        "UPDATE media SET anidb = $1 WHERE id = $2 AND anidb IS NULL",
-    ),
+/// SQL per external id column, in `id_values` order (index = `enrich_id_pairs.kind`). Static
+/// strings: the column names are not data. Rows of kind `anime` are D41's and are never written
+/// here.
+struct IdSql {
+    /// The row holding an id: `Held`.
+    find: &'static str,
+    /// Set the id where unset.
+    set: &'static str,
+    /// A template id: take it off the IMDb rows it was attached to through a pair, and requeue
+    /// their torrents (links made through it are redone).
+    heal: &'static str,
+}
+
+/// (id, has an IMDb id, kind, title) of the row holding an id.
+type Held = (i64, bool, String, String);
+
+const ID_SQL: [IdSql; 6] = [
+    IdSql {
+        find: "SELECT id, imdb IS NOT NULL, kind, title FROM media WHERE tmdb_movie = $1",
+        set: "UPDATE media SET tmdb_movie = $1 WHERE id = $2 AND tmdb_movie IS NULL AND kind <> 'anime'",
+        heal:
+            "WITH h AS (UPDATE media SET tmdb_movie = NULL WHERE tmdb_movie = $1 AND kind <> 'anime'
+                   AND imdb ~ '^tt[0-9]{1,9}$' AND substr(imdb, 3)::int IN
+                       (SELECT imdb FROM enrich_id_pairs WHERE kind = 0 AND value = $1)
+                   RETURNING id)
+               DELETE FROM enrich_checked WHERE infohash IN (
+                   SELECT infohash FROM torrent_media WHERE media_id IN (SELECT id FROM h)
+                     AND method IN ('itag', 'desc_link', 'offline_title'))",
+    },
+    IdSql {
+        find: "SELECT id, imdb IS NOT NULL, kind, title FROM media WHERE tmdb_tv = $1",
+        set: "UPDATE media SET tmdb_tv = $1 WHERE id = $2 AND tmdb_tv IS NULL AND kind <> 'anime'",
+        heal: "WITH h AS (UPDATE media SET tmdb_tv = NULL WHERE tmdb_tv = $1 AND kind <> 'anime'
+                   AND imdb ~ '^tt[0-9]{1,9}$' AND substr(imdb, 3)::int IN
+                       (SELECT imdb FROM enrich_id_pairs WHERE kind = 1 AND value = $1)
+                   RETURNING id)
+               DELETE FROM enrich_checked WHERE infohash IN (
+                   SELECT infohash FROM torrent_media WHERE media_id IN (SELECT id FROM h)
+                     AND method IN ('itag', 'desc_link', 'offline_title'))",
+    },
+    IdSql {
+        find: "SELECT id, imdb IS NOT NULL, kind, title FROM media WHERE tvdb = $1",
+        set: "UPDATE media SET tvdb = $1 WHERE id = $2 AND tvdb IS NULL AND kind <> 'anime'",
+        heal: "WITH h AS (UPDATE media SET tvdb = NULL WHERE tvdb = $1 AND kind <> 'anime'
+                   AND imdb ~ '^tt[0-9]{1,9}$' AND substr(imdb, 3)::int IN
+                       (SELECT imdb FROM enrich_id_pairs WHERE kind = 2 AND value = $1)
+                   RETURNING id)
+               DELETE FROM enrich_checked WHERE infohash IN (
+                   SELECT infohash FROM torrent_media WHERE media_id IN (SELECT id FROM h)
+                     AND method IN ('itag', 'desc_link', 'offline_title'))",
+    },
+    IdSql {
+        find: "SELECT id, imdb IS NOT NULL, kind, title FROM media WHERE mal = $1",
+        set: "UPDATE media SET mal = $1 WHERE id = $2 AND mal IS NULL AND kind <> 'anime'",
+        heal: "WITH h AS (UPDATE media SET mal = NULL WHERE mal = $1 AND kind <> 'anime'
+                   AND imdb ~ '^tt[0-9]{1,9}$' AND substr(imdb, 3)::int IN
+                       (SELECT imdb FROM enrich_id_pairs WHERE kind = 3 AND value = $1)
+                   RETURNING id)
+               DELETE FROM enrich_checked WHERE infohash IN (
+                   SELECT infohash FROM torrent_media WHERE media_id IN (SELECT id FROM h)
+                     AND method IN ('itag', 'desc_link', 'offline_title'))",
+    },
+    IdSql {
+        find: "SELECT id, imdb IS NOT NULL, kind, title FROM media WHERE anilist = $1",
+        set: "UPDATE media SET anilist = $1 WHERE id = $2 AND anilist IS NULL AND kind <> 'anime'",
+        heal: "WITH h AS (UPDATE media SET anilist = NULL WHERE anilist = $1 AND kind <> 'anime'
+                   AND imdb ~ '^tt[0-9]{1,9}$' AND substr(imdb, 3)::int IN
+                       (SELECT imdb FROM enrich_id_pairs WHERE kind = 4 AND value = $1)
+                   RETURNING id)
+               DELETE FROM enrich_checked WHERE infohash IN (
+                   SELECT infohash FROM torrent_media WHERE media_id IN (SELECT id FROM h)
+                     AND method IN ('itag', 'desc_link', 'offline_title'))",
+    },
+    IdSql {
+        find: "SELECT id, imdb IS NOT NULL, kind, title FROM media WHERE anidb = $1",
+        set: "UPDATE media SET anidb = $1 WHERE id = $2 AND anidb IS NULL AND kind <> 'anime'",
+        heal: "WITH h AS (UPDATE media SET anidb = NULL WHERE anidb = $1 AND kind <> 'anime'
+                   AND imdb ~ '^tt[0-9]{1,9}$' AND substr(imdb, 3)::int IN
+                       (SELECT imdb FROM enrich_id_pairs WHERE kind = 5 AND value = $1)
+                   RETURNING id)
+               DELETE FROM enrich_checked WHERE infohash IN (
+                   SELECT infohash FROM torrent_media WHERE media_id IN (SELECT id FROM h)
+                     AND method IN ('itag', 'desc_link', 'offline_title'))",
+    },
 ];
 
 fn id_values(ids: &StrongIds) -> [Option<u32>; 6] {
@@ -437,6 +514,7 @@ fn to_i32(v: u32) -> i32 {
 }
 
 /// Get or create the media row for an IMDb title. An episode id resolves to its series.
+/// A new row takes its kind from the IMDb title type, or `anime` when the torrent is anime.
 /// Returns (media id, season, episode).
 async fn media_for_imdb(
     conn: &mut PgConnection,
@@ -445,9 +523,12 @@ async fn media_for_imdb(
     now: i64,
 ) -> anyhow::Result<(i64, Option<i32>, Option<i32>)> {
     if let Some((row, s, e)) = imdb::resolve_title(conn, tt).await? {
-        let kind = imdb_match::TitleType::from_code(row.title_type)
-            .map(|t| t.media_kind())
-            .unwrap_or(fb.kind);
+        let kind = match fb.kind {
+            MediaKind::Anime => MediaKind::Anime,
+            _ => imdb_match::TitleType::from_code(row.title_type)
+                .map(|t| t.media_kind())
+                .unwrap_or(fb.kind),
+        };
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO media (kind, imdb, title, original_title, year, end_year, genres, rating,
                                votes, runtime_min, updated_at)
@@ -488,34 +569,220 @@ async fn media_for_imdb(
     Ok((id, None, None))
 }
 
-/// Attach the other external ids to `media_id`. An id already on a row without IMDb id is
-/// merged into an IMDb-backed `media_id` (its links move over, the row is deleted); an id on a
-/// row with another IMDb id is a conflict and is left alone.
+/// Add the trusted non-IMDb ids that no row holds yet to `media_id` (not to an anime row). An
+/// id already on another row stays there.
 async fn attach_ids(conn: &mut PgConnection, media_id: i64, ids: &StrongIds) -> anyhow::Result<()> {
-    let has_imdb: bool = sqlx::query_scalar("SELECT imdb IS NOT NULL FROM media WHERE id = $1")
-        .bind(media_id)
-        .fetch_one(&mut *conn)
-        .await?;
-    for ((find, set), v) in ID_SQL.iter().zip(id_values(ids)) {
+    for (q, v) in ID_SQL.iter().zip(id_values(ids)) {
         let Some(v) = v.map(to_i32) else { continue };
-        let other: Option<(i64, bool)> = sqlx::query_as(*find)
+        let held: Option<Held> = sqlx::query_as(q.find)
             .bind(v)
             .fetch_optional(&mut *conn)
             .await?;
-        match other {
-            None => {
-                sqlx::query(*set)
-                    .bind(v)
-                    .bind(media_id)
-                    .execute(&mut *conn)
-                    .await?;
-            }
-            Some((o, _)) if o == media_id => {}
-            Some((o, false)) if has_imdb => merge_into(conn, media_id, o).await?,
-            Some(_) => {}
+        if held.is_none() {
+            sqlx::query(q.set)
+                .bind(v)
+                .bind(media_id)
+                .execute(&mut *conn)
+                .await?;
         }
     }
     Ok(())
+}
+
+/// Whether `title` (a torrent-derived name) is one of IMDb title `tt`'s names: the dataset's
+/// names (primary, original, akas when imported), else the media row's titles.
+async fn title_agrees(conn: &mut PgConnection, tt: i32, title: &str) -> anyhow::Result<bool> {
+    let keys = imdb_match::name_keys(title);
+    if keys.is_empty() {
+        return Ok(false);
+    }
+    let named: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM imdb_names WHERE norm = ANY($1) AND id = $2)",
+    )
+    .bind(&keys)
+    .bind(tt)
+    .fetch_one(&mut *conn)
+    .await?;
+    if named {
+        return Ok(true);
+    }
+    let row: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT title, original_title FROM media WHERE imdb = $1")
+            .bind(ids::format_imdb(u64::try_from(tt).unwrap_or(0)))
+            .fetch_optional(&mut *conn)
+            .await?;
+    Ok(row.is_some_and(|(t, o)| {
+        std::iter::once(t)
+            .chain(o)
+            .any(|n| imdb_match::name_keys(&n).iter().any(|k| keys.contains(k)))
+    }))
+}
+
+/// Record that `infohash` carries id `v` (column `kind`) next to IMDb title `tt` (a series,
+/// never an episode), and say whether the pair may be used: `v` was never seen next to another
+/// IMDb id, and it is `deliberate` (an `i` tag or a description's main link) or held by a row
+/// whose title (`held_title`) is one of `tt`'s names. How often a pair was seen is no evidence:
+/// one uploader repeats the same wrong IMDb link under every episode. A pair that shows `v`
+/// next to a second IMDb id heals what earlier pairs attached.
+async fn agreed_pair(
+    conn: &mut PgConnection,
+    kind: usize,
+    v: i32,
+    tt: i32,
+    infohash: &str,
+    deliberate: bool,
+    held_title: Option<&str>,
+) -> anyhow::Result<bool> {
+    let k = i16::try_from(kind).unwrap_or(i16::MAX);
+    sqlx::query(
+        "INSERT INTO enrich_id_pairs (kind, value, infohash, imdb) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (kind, value, infohash) DO UPDATE SET imdb = excluded.imdb",
+    )
+    .bind(k)
+    .bind(v)
+    .bind(infohash)
+    .bind(tt)
+    .execute(&mut *conn)
+    .await?;
+    let imdbs: i64 = sqlx::query_scalar(
+        "SELECT count(DISTINCT imdb) FROM enrich_id_pairs WHERE kind = $1 AND value = $2",
+    )
+    .bind(k)
+    .bind(v)
+    .fetch_one(&mut *conn)
+    .await?;
+    if imdbs > 1 {
+        sqlx::query(ID_SQL[kind].heal)
+            .bind(v)
+            .execute(&mut *conn)
+            .await?;
+        return Ok(false);
+    }
+    if deliberate {
+        return Ok(true);
+    }
+    match held_title {
+        Some(t) => title_agrees(conn, tt, t).await,
+        None => Ok(false),
+    }
+}
+
+/// The IMDb title (a series, never an episode) that the pairs tie one of `ids` to: a single
+/// IMDb id with `title` among its names.
+async fn paired_imdb(
+    conn: &mut PgConnection,
+    ids: &StrongIds,
+    title: &str,
+) -> anyhow::Result<Option<u32>> {
+    for (k, v) in id_values(ids).into_iter().enumerate() {
+        let Some(v) = v.map(to_i32) else { continue };
+        let rows: Vec<i32> = sqlx::query_scalar(
+            "SELECT DISTINCT imdb FROM enrich_id_pairs WHERE kind = $1 AND value = $2 LIMIT 2",
+        )
+        .bind(i16::try_from(k).unwrap_or(i16::MAX))
+        .bind(v)
+        .fetch_all(&mut *conn)
+        .await?;
+        if let [tt] = rows[..]
+            && title_agrees(conn, tt, title).await?
+        {
+            return Ok(u32::try_from(tt).ok());
+        }
+    }
+    Ok(None)
+}
+
+/// Put id `k`/`v` on IMDb row `media_id`: set where free, or merge the IMDb-less, non-anime row
+/// holding it (links move, the row goes; its `media_extra` follows the cascade and is
+/// re-fetched). Nothing is written to an anime row.
+async fn adopt_id(
+    conn: &mut PgConnection,
+    media_id: i64,
+    k: usize,
+    v: i32,
+    held: Option<Held>,
+) -> anyhow::Result<()> {
+    match held {
+        None => {
+            sqlx::query(ID_SQL[k].set)
+                .bind(v)
+                .bind(media_id)
+                .execute(&mut *conn)
+                .await?;
+        }
+        Some((o, false, kind, _)) if o != media_id && kind != "anime" => {
+            merge_into(conn, media_id, o).await?
+        }
+        Some(_) => {}
+    }
+    Ok(())
+}
+
+/// `adopt_id` for each id of `ids` whose `ok` flag is set, unless `media_id` is an anime row.
+async fn adopt_ids(
+    conn: &mut PgConnection,
+    media_id: i64,
+    ids: &StrongIds,
+    ok: &[bool; 6],
+) -> anyhow::Result<()> {
+    let kind: String = sqlx::query_scalar("SELECT kind FROM media WHERE id = $1")
+        .bind(media_id)
+        .fetch_one(&mut *conn)
+        .await?;
+    if kind == "anime" {
+        return Ok(());
+    }
+    for (k, v) in id_values(ids).into_iter().enumerate() {
+        let Some(v) = v.map(to_i32).filter(|_| ok[k]) else {
+            continue;
+        };
+        let held: Option<Held> = sqlx::query_as(ID_SQL[k].find)
+            .bind(v)
+            .fetch_optional(&mut *conn)
+            .await?;
+        adopt_id(conn, media_id, k, v, held).await?;
+    }
+    Ok(())
+}
+
+/// The other ids of a torrent linked to IMDb row `media_id`: each one is recorded as a pair
+/// with the row's IMDb id, and the agreed ones (`agreed_pair`) are adopted (`adopt_id`).
+async fn link_ids(conn: &mut PgConnection, media_id: i64, g: &Group) -> anyhow::Result<()> {
+    let imdb: Option<String> = sqlx::query_scalar("SELECT imdb FROM media WHERE id = $1")
+        .bind(media_id)
+        .fetch_one(&mut *conn)
+        .await?;
+    let Some(tt) = imdb
+        .as_deref()
+        .and_then(ids::imdb_num)
+        .and_then(|n| i32::try_from(n).ok())
+    else {
+        return Ok(());
+    };
+    let deliberate = id_values(&g.trusted);
+    let mut ok = [false; 6];
+    for (k, v) in id_values(&g.ids).into_iter().enumerate() {
+        let Some(v) = v else { continue };
+        let held: Option<Held> = sqlx::query_as(ID_SQL[k].find)
+            .bind(to_i32(v))
+            .fetch_optional(&mut *conn)
+            .await?;
+        let held_title = held
+            .as_ref()
+            .filter(|(o, has_imdb, kind, _)| *o != media_id && !has_imdb && kind != "anime")
+            .map(|h| h.3.as_str());
+        ok[k] = agreed_pair(
+            conn,
+            k,
+            to_i32(v),
+            tt,
+            &g.infohash,
+            deliberate[k] == Some(v),
+            held_title,
+        )
+        .await?;
+    }
+    adopt_ids(conn, media_id, &g.ids, &ok).await
 }
 
 /// tmdb_movie, tmdb_tv, tvdb, mal, anilist, anidb.
@@ -563,6 +830,53 @@ async fn merge_into(conn: &mut PgConnection, keep: i64, drop: i64) -> anyhow::Re
     Ok(())
 }
 
+/// The D41 row (kind `anime`) holding one of the torrent's MAL/AniList/AniDB ids, if any.
+async fn anime_row(conn: &mut PgConnection, ids: &StrongIds) -> anyhow::Result<Option<i64>> {
+    if ids.mal.is_none() && ids.anilist.is_none() && ids.anidb.is_none() {
+        return Ok(None);
+    }
+    Ok(sqlx::query_scalar(
+        "SELECT id FROM media WHERE kind = 'anime' AND (mal = $1 OR anilist = $2 OR anidb = $3)
+         ORDER BY (mal = $1) IS TRUE DESC, (anilist = $2) IS TRUE DESC, id LIMIT 1",
+    )
+    .bind(ids.mal.map(to_i32))
+    .bind(ids.anilist.map(to_i32))
+    .bind(ids.anidb.map(to_i32))
+    .fetch_optional(&mut *conn)
+    .await?)
+}
+
+/// True when one of the torrent's non-IMDb ids (any link, trusted or not) sits on another row
+/// that has an IMDb id other than the torrent's own: the evidence contradicts the link (e.g. a
+/// template TMDB link that TMDB maps to another IMDb title). Rows without an IMDb id are not
+/// evidence: they may be the same title, created from a TMDB-only release.
+async fn contradicted(
+    conn: &mut PgConnection,
+    media_id: i64,
+    ids: &StrongIds,
+) -> anyhow::Result<bool> {
+    let vals = id_values(ids).map(|v| v.map(to_i32));
+    if vals.iter().all(Option::is_none) {
+        return Ok(false);
+    }
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM media o WHERE o.id <> $1 AND o.imdb IS NOT NULL
+             AND o.imdb IS DISTINCT FROM $8
+             AND (o.tmdb_movie = $2 OR o.tmdb_tv = $3 OR o.tvdb = $4 OR o.mal = $5
+                  OR o.anilist = $6 OR o.anidb = $7))",
+    )
+    .bind(media_id)
+    .bind(vals[0])
+    .bind(vals[1])
+    .bind(vals[2])
+    .bind(vals[3])
+    .bind(vals[4])
+    .bind(vals[5])
+    .bind(ids.imdb.as_deref())
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
 /// Get or create the media row for strong IDs without an IMDb id.
 async fn media_for_ids(
     conn: &mut PgConnection,
@@ -570,6 +884,13 @@ async fn media_for_ids(
     fb: &Fallback<'_>,
     now: i64,
 ) -> anyhow::Result<i64> {
+    // Another release tied one of these ids to an IMDb title: that row (order-independent
+    // counterpart of `link_ids`).
+    if let Some(tt) = paired_imdb(conn, ids, fb.title).await? {
+        let (id, _, _) = media_for_imdb(conn, tt, fb, now).await?;
+        adopt_ids(conn, id, ids, &[true; 6]).await?;
+        return Ok(id);
+    }
     let vals = id_values(ids).map(|v| v.map(to_i32));
     let existing: Option<i64> = sqlx::query_scalar(
         "SELECT id FROM media WHERE tmdb_movie = $1 OR tmdb_tv = $2 OR tvdb = $3 OR mal = $4
@@ -695,20 +1016,29 @@ async fn apply(
                         .unwrap_or(g.title.as_str()),
                     year: parsed.as_ref().and_then(|p| p.year),
                 };
-                let (media_id, s, e) = match ids.imdb.as_deref().and_then(ids::imdb_num) {
-                    Some(tt) => {
-                        let r = match imdb_cache.get(&tt) {
-                            Some(r) => *r,
-                            None => {
-                                let r = media_for_imdb(&mut tx, tt, &fb, now).await?;
-                                imdb_cache.insert(tt, r);
-                                r
-                            }
-                        };
-                        attach_ids(&mut tx, r.0, &ids).await?;
-                        r
-                    }
-                    None => (media_for_ids(&mut tx, &ids, &fb, now).await?, None, None),
+                let anime_media = anime_row(&mut tx, &ids).await?;
+                let (media_id, s, e) =
+                    match (anime_media, ids.imdb.as_deref().and_then(ids::imdb_num)) {
+                        // D41's row: linked as is.
+                        (Some(id), _) => (id, None, None),
+                        (None, Some(tt)) => {
+                            let r = match imdb_cache.get(&tt) {
+                                Some(r) => *r,
+                                None => {
+                                    let r = media_for_imdb(&mut tx, tt, &fb, now).await?;
+                                    imdb_cache.insert(tt, r);
+                                    r
+                                }
+                            };
+                            link_ids(&mut tx, r.0, g).await?;
+                            r
+                        }
+                        (None, None) => (media_for_ids(&mut tx, &ids, &fb, now).await?, None, None),
+                    };
+                let confidence = if contradicted(&mut tx, media_id, &g.ids).await? {
+                    0.9
+                } else {
+                    g.ids.confidence()
                 };
                 // Episode from the linked IMDb episode, else a TMDB episode link, else the name.
                 let (season, episode) = match (s, e, ids.season) {
@@ -726,7 +1056,7 @@ async fn apply(
                     season,
                     episode,
                     ids.method,
-                    ids.confidence(),
+                    confidence,
                     anime,
                     now,
                 )
