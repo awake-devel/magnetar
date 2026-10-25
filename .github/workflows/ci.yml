@@ -20,6 +20,10 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
+  # Pinned, so a new stable's clippy lints cannot turn main red without a code change, and what
+  # CI checks is what ships: same version as the Dockerfile's builder image and release.yml.
+  # Bump all three on purpose (the fmt job checks the Dockerfile agrees).
+  RUST_TOOLCHAIN: "1.99.0"
 
 jobs:
   fmt:
@@ -30,9 +34,13 @@ jobs:
           persist-credentials: false
       - name: Rust toolchain
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt
-          rustup default stable
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt
+          rustup default "$RUST_TOOLCHAIN"
       - run: cargo fmt --all --check
+      - name: Dockerfile uses the same Rust
+        run: |
+          grep -Eq "^ARG RUST_IMAGE=rust:${RUST_TOOLCHAIN//./\\.}-" Dockerfile ||
+            { echo "::error::Dockerfile RUST_IMAGE is not rust:$RUST_TOOLCHAIN (bump RUST_TOOLCHAIN in ci.yml and release.yml with it)"; exit 1; }
 
   test:
     runs-on: ubuntu-24.04
@@ -60,8 +68,8 @@ jobs:
           persist-credentials: false
       - name: Rust toolchain
         run: |
-          rustup toolchain install stable --profile minimal --component clippy
-          rustup default stable
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+          rustup default "$RUST_TOOLCHAIN"
           rustc --version
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:

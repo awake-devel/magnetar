@@ -63,29 +63,44 @@ fun validateServerUrl(url: String): Pair<String?, String?> {
     if (scheme != "http" && scheme != "https" || parsed.host.isNullOrEmpty()) {
         return "Must be an http:// or https:// URL" to null
     }
-    val warning = if (scheme == "http" && !isPrivateTransport(parsed.host)) {
-        "Plain HTTP: the API token and results can be read by anyone on this network. " +
-            "Prefer https:// (tailscale serve or a reverse proxy)."
-    } else {
-        null
+    val warning = when {
+        scheme != "http" || isPrivateTransport(parsed.host) -> null
+        isTailscaleCgnat(parsed.host) ->
+            "Plain HTTP to a 100.x address: encrypted only while Tailscale is connected on this " +
+                "phone. Without it, 100.64.0.0/10 is carrier-grade NAT space and the API token " +
+                "travels readable. Prefer the *.ts.net name or https://."
+        else ->
+            "Plain HTTP: the API token and results can be read by anyone on this network. " +
+                "Prefer https:// (tailscale serve or a reverse proxy)."
     }
     return null to warning
 }
 
 /**
- * Hosts where plain http:// is not exposed on the wire (D39): loopback, and Tailscale, whose
- * WireGuard tunnel already encrypts it (100.64.0.0/10, fd7a:115c:a1e0::/48, MagicDNS `*.ts.net`).
+ * Hosts where plain http:// is not exposed on the wire (D39): loopback, and Tailscale names and
+ * addresses that cannot be reached any other way: MagicDNS `*.ts.net` (does not resolve without
+ * the tunnel) and the Tailscale IPv6 range fd7a:115c:a1e0::/48 (not routed outside it). Tailscale
+ * IPv4 addresses (100.64.0.0/10) are not here: that range is also carrier-grade NAT (RFC 6598),
+ * routed in clear by mobile and ISP networks when the tunnel is down; see [isTailscaleCgnat].
  * A short MagicDNS name (`http://nas:8787`) cannot be told apart from a LAN name and still warns.
  */
 fun isPrivateTransport(host: String): Boolean {
     val h = host.lowercase().removePrefix("[").removeSuffix("]")
     if (h == "localhost" || h == "::1" || h.endsWith(".ts.net")) return true
-    val v4 = h.split('.').takeIf { it.size == 4 }?.map { it.toIntOrNull() ?: return false }
-    if (v4 != null) {
-        if (v4.any { it !in 0..255 }) return false
-        return v4[0] == 127 || (v4[0] == 100 && v4[1] in 64..127)
-    }
+    val v4 = ipv4(h)
+    if (v4 != null) return v4[0] == 127
     return h.startsWith("fd7a:115c:a1e0:")
+}
+
+/** 100.64.0.0/10: a Tailscale IPv4 address, or carrier-grade NAT when the tunnel is down. */
+fun isTailscaleCgnat(host: String): Boolean {
+    val v4 = ipv4(host) ?: return false
+    return v4[0] == 100 && v4[1] in 64..127
+}
+
+private fun ipv4(host: String): List<Int>? {
+    val parts = host.split('.').takeIf { it.size == 4 }?.map { it.toIntOrNull() ?: return null } ?: return null
+    return parts.takeIf { p -> p.all { it in 0..255 } }
 }
 
 fun invalidRelays(text: String): List<String> = text.lines().map { it.trim() }.filter { it.isNotEmpty() }

@@ -24,6 +24,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   TAG: ${{ inputs.tag || github.ref_name }}
+  # Same pin as ci.yml and the Dockerfile's builder image.
+  RUST_TOOLCHAIN: "1.99.0"
 
 jobs:
   binaries:
@@ -53,12 +55,15 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q musl-tools
-          rustup toolchain install stable --profile minimal --target "$ARCH-unknown-linux-musl"
-          rustup default stable
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "$ARCH-unknown-linux-musl"
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
       - name: Build
         env:
           ARCH: ${{ matrix.arch }}
-        run: bash scripts/build-linux.sh "$ARCH"
+        # --native: the toolchain above, not build-linux.sh's default (docker, with the mutable
+        # rust:<ver>-alpine tag, whenever docker works, which it does on these runners).
+        run: bash scripts/build-linux.sh "$ARCH" --native
       - name: Check the binary
         env:
           ARCH: ${{ matrix.arch }}

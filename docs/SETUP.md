@@ -53,11 +53,16 @@ The Android app is not built in CI: the signing key stays on the laptop.
    then `scripts/release.sh` (plan), `scripts/release.sh --publish` (add `--suffix rc1` for a
    prerelease tag). It refuses to run with a dirty tree, with HEAD not at the pushed tag, or
    before CI attached both binaries.
+4. Once, after the first `docker.yml` run (the first push to `main` with it): that run
+   creates the package `ghcr.io/awake-devel/magnetar`, and GitHub makes a new package on a
+   personal account private. Make it public (github.com/awake-devel > Packages > magnetar > Package settings > Change
+   visibility > Public), or `docker compose pull` fails with `denied` for everyone not logged in.
+   The `merge` job of `docker.yml` warns while an anonymous pull is still refused.
 
 Release assets: `magnetar-server-x86_64-linux`, `magnetar-server-aarch64-linux` (CI),
-`magnetar-<tag>.apk`, `compose.yml`, `.env.example` (release.sh) and one `SHA256SUMS` that
-both sides merge into. A debug-signed APK is shipped (with a warning) when no release APK
-was built.
+`magnetar-<tag>.apk`, `compose.yml`, `.env.example`, `tailscale-serve.json` (from `docker/`;
+release.sh) and one `SHA256SUMS` that both sides merge into. A debug-signed APK is shipped
+(with a warning) when no release APK was built.
 
 ## Running the server
 

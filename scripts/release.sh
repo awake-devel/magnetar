@@ -7,8 +7,9 @@
 # CI does the server side when the tag vX.Y.Z[-suffix] is pushed: .github/workflows/release.yml
 # attaches magnetar-server-{x86_64,aarch64}-linux and SHA256SUMS to a draft release, and
 # docker.yml pushes ghcr.io/awake-devel/magnetar. This script builds and signs the APK here
-# (the key never leaves android/keystore/), uploads it with compose.yml and .env.example,
-# merges their hashes into SHA256SUMS, sets the notes and publishes the draft.
+# (the key never leaves android/keystore/), uploads it with compose.yml, .env.example and
+# tailscale-serve.json (from docker/; release assets are flat, docs/DEPLOY.md says where it
+# goes), merges their hashes into SHA256SUMS, sets the notes and publishes the draft.
 #
 # Default is a dry run: print the plan, build nothing, call nothing.
 # --build     build dist/magnetar-<tag>.apk and dist/SHA256SUMS.local, but do not call gh
@@ -59,7 +60,8 @@ repo=${repo:-awake-devel/magnetar}
 commit=$(git rev-parse HEAD)
 server_assets=(magnetar-server-x86_64-linux magnetar-server-aarch64-linux)
 extra_files=()
-for f in compose.yml .env.example; do [ -f "$f" ] && extra_files+=("$f"); done
+# compose.yml bind-mounts ./docker/tailscale-serve.json for its tailscale profile.
+for f in compose.yml .env.example docker/tailscale-serve.json; do [ -f "$f" ] && extra_files+=("$f"); done
 prev=""
 
 if [ -z "$notes" ] && [ -f "docs/release-notes/$tag.md" ]; then notes=docs/release-notes/$tag.md; fi
@@ -72,7 +74,8 @@ else
 fi
 planned=()
 [ "$apk" = 1 ] && planned+=("magnetar-$tag.apk")
-planned+=("${extra_files[@]}" "SHA256SUMS (merged with CI's)")
+for f in "${extra_files[@]}"; do planned+=("$(basename "$f")"); done
+planned+=("SHA256SUMS (merged with CI's)")
 
 say "Release plan ($mode)"
 say "  repo        $repo"

@@ -42,8 +42,20 @@ docker compose up -d
 curl -s http://127.0.0.1:8787/health
 ```
 
-Releases after v0.1.0 also carry `compose.yml` and `.env.example` as assets, so a git
-checkout is optional.
+Without git: releases after v0.1.0 also carry `compose.yml`, `.env.example` and
+`tailscale-serve.json` as assets. `compose.yml` looks for the last one in a `docker/`
+subfolder (only the `tailscale` profile uses it):
+
+```sh
+mkdir magnetar && cd magnetar
+base=https://github.com/awake-devel/magnetar/releases/download/vX.Y.Z
+for f in compose.yml .env.example tailscale-serve.json SHA256SUMS; do curl -fLO "$base/$f"; done
+sha256sum -c --ignore-missing SHA256SUMS
+mkdir -p docker && mv tailscale-serve.json docker/
+```
+
+This only pulls the published image: `docker compose up -d --build` needs the git checkout
+(the Dockerfile and the sources).
 [docs/DOCKER.md](DOCKER.md) has every variable, the volumes, `selftest`, logs, backups and
 upgrades. By default the API is published on `127.0.0.1:8787` only (`MAGNETAR_PUBLISH`
 changes that). The image tag follows `MAGNETAR_VERSION` (default `latest`, which only ever
@@ -106,8 +118,10 @@ On Synology, Control Panel > Login Portal > Advanced > Reverse Proxy does the sa
 Possible, not recommended. Publish the port on the LAN address (`MAGNETAR_PUBLISH` for
 Docker, `MAGNETAR_BIND` for the native binary, e.g. `192.168.1.20:8787`) and use
 `http://192.168.1.20:8787` in the app. The app accepts it and shows a warning: anyone on that
-network can read the token and the traffic. Plain `http://` to a Tailscale address
-(`100.x.y.z` or a `*.ts.net` name) does not warn, because WireGuard already encrypts it.
+network can read the token and the traffic. Plain `http://` to a `*.ts.net` name does not
+warn, because WireGuard already encrypts it and the name does not resolve without Tailscale.
+A `100.x.y.z` address still warns: it is only encrypted while Tailscale is connected on the
+phone, and outside the tunnel the same range is carrier-grade NAT. Use the `*.ts.net` name.
 
 ## App setup
 

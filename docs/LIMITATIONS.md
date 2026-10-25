@@ -70,10 +70,13 @@ real hardware are marked **UNVERIFIED**.
   client. [android.md §4]
 - **Background crawl only runs while unmetered and charging**, once an hour. The phone crawl
   is also bounded: at most 8 relays and a time budget.
-- **Plain `http://` server URLs are accepted, with a warning** unless the host is loopback or
-  a Tailscale address (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`, `*.ts.net`). On any other
-  network the token and the results travel readable: use HTTPS (`tailscale serve` or a
-  reverse proxy). The warning cannot tell a short MagicDNS name (`http://nas:8787`) from a LAN
+- **Plain `http://` server URLs are accepted, with a warning** unless the host is loopback, a
+  MagicDNS `*.ts.net` name or a Tailscale IPv6 address (`fd7a:115c:a1e0::/48`), which only
+  resolve or route through the tunnel. On any other network the token and the results travel
+  readable: use HTTPS (`tailscale serve` or a reverse proxy). A Tailscale IPv4 address
+  (`100.64.0.0/10`) gets its own warning: that range is also carrier-grade NAT (RFC 6598), so
+  with Tailscale off on the phone the request goes over the carrier's network in clear; the
+  check sees the address, not whether the tunnel is up. The warning cannot tell a short MagicDNS name (`http://nas:8787`) from a LAN
   name, so it warns for those too. [D39] **UNVERIFIED:** whether Android 16+ local-network
   permission rules affect LAN or Tailscale addresses.
 - **ntfy click actions:** whether ntfy-android opens `magnet:` or `magnetar://` links is

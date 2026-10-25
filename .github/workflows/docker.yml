@@ -124,3 +124,21 @@ jobs:
         env:
           VERSION: ${{ steps.meta.outputs.version }}
         run: docker buildx imagetools inspect "$IMAGE:$VERSION"
+      - name: Anonymous pull works
+        # A new GHCR package on a personal account starts private; docs/SETUP.md "Making a
+        # release" step 4. Warn rather than fail: the push itself succeeded.
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          repo=${IMAGE#ghcr.io/}
+          code=$(curl -s -o token.json -w '%{http_code}' "https://ghcr.io/token?scope=repository:$repo:pull")
+          token=$(jq -r '.token // empty' token.json 2>/dev/null || true)
+          rm -f token.json
+          if [ "$code" = 200 ] && [ -n "$token" ] &&
+            curl -sf -o /dev/null -H "Authorization: Bearer $token" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json' \
+              "https://ghcr.io/v2/$repo/manifests/$VERSION"; then
+            echo "$IMAGE:$VERSION is pullable without login"
+          else
+            echo "::warning::$IMAGE is not pullable without login (token endpoint HTTP $code): make the package public (docs/SETUP.md, Making a release, step 4)"
+          fi
