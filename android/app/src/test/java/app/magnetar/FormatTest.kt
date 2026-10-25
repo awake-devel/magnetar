@@ -29,6 +29,14 @@ class FormatTest {
     }
 
     @Test
+    fun ago() {
+        val now = 1_000_000_000L
+        assertEquals("just now", formatAgo(now - 5, now))
+        assertEquals("5m ago", formatAgo(now - 300, now))
+        assertEquals("3d ago", formatAgo(now - 3 * 86_400, now))
+    }
+
+    @Test
     fun htmlIsStripped() {
         val html = "<p>Big <b>Buck</b> Bunny</p><br/>Rated &amp; reviewed &lt;4K&gt; &#169; &#x2014;<script>x</script>"
         assertEquals("Big Buck Bunny\n\nRated & reviewed <4K> © —x", stripHtml(html))

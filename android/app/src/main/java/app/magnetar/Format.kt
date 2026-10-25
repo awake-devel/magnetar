@@ -30,6 +30,10 @@ fun formatAge(epochSec: Long, nowSec: Long = System.currentTimeMillis() / 1000):
     }
 }
 
+/** "just now", "5m ago", "3d ago": [formatAge] for "… ago" phrases. */
+fun formatAgo(epochSec: Long, nowSec: Long = System.currentTimeMillis() / 1000): String =
+    formatAge(epochSec, nowSec).let { if (it == "now") "just now" else "$it ago" }
+
 fun formatTimestamp(epochSec: Long): String =
     java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT)
         .format(java.util.Date(epochSec * 1000))

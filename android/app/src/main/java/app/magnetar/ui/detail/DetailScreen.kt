@@ -63,6 +63,7 @@ import app.magnetar.ffi.FfiLiveness
 import app.magnetar.ffi.FfiTorrentDetail
 import app.magnetar.ffi.FfiTrust
 import app.magnetar.formatAge
+import app.magnetar.formatAgo
 import app.magnetar.formatBytes
 import app.magnetar.formatTimestamp
 import app.magnetar.stripHtml
@@ -431,7 +432,7 @@ private fun TrustCard(trust: FfiTrust, threshold: Int, open: Boolean, onToggle: 
                         }
                     }
                 }
-                Text("Computed ${formatAge(trust.computedAt)} ago", style = MaterialTheme.typography.labelSmall)
+                Text("Computed ${formatAgo(trust.computedAt)}", style = MaterialTheme.typography.labelSmall)
             }
         }
     }
@@ -457,7 +458,7 @@ private fun LivenessCard(l: FfiLiveness?, checking: Boolean, onCheck: () -> Unit
                 l.dhtPeersEst?.let { Text("≈$it DHT peers", style = MaterialTheme.typography.bodyMedium) }
                 Text(
                     "via ${l.source} · trackers ${l.trackersOk} ok / ${l.trackersFailed} failed · " +
-                        "checked ${formatAge(l.checkedAt)} ago",
+                        "checked ${formatAgo(l.checkedAt)}",
                     style = MaterialTheme.typography.labelSmall,
                 )
             }

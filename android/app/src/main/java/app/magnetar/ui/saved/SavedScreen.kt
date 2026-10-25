@@ -36,7 +36,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import app.magnetar.ffi.FfiSavedSearch
 import app.magnetar.ffi.FfiSearchQuery
-import app.magnetar.formatAge
+import app.magnetar.formatAgo
 import app.magnetar.formatBytes
 import app.magnetar.ui.common.CenteredMessage
 import app.magnetar.ui.common.categoryLabel
@@ -73,7 +73,7 @@ fun SavedScreen(onRun: () -> Unit, vm: SavedViewModel = viewModel()) {
                             supportingContent = {
                                 Text(
                                     describe(s.query) +
-                                        (s.lastChecked?.let { "\nchecked ${formatAge(it)} ago" } ?: ""),
+                                        (s.lastChecked?.let { "\nchecked ${formatAgo(it)}" } ?: ""),
                                 )
                             },
                             trailingContent = {

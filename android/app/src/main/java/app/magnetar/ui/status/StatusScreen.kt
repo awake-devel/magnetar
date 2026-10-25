@@ -35,7 +35,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import app.magnetar.ffi.FfiStats
-import app.magnetar.formatAge
+import app.magnetar.formatAgo
 import app.magnetar.formatBytes
 import app.magnetar.ui.common.Banner
 import app.magnetar.ui.common.SectionTitle
@@ -87,7 +87,7 @@ fun StatusScreen(vm: StatusViewModel = viewModel()) {
                             listOfNotNull(
                                 r.source,
                                 "${r.eventsFound} events",
-                                r.lastOk?.let { "ok ${formatAge(it)} ago" },
+                                r.lastOk?.let { "ok ${formatAgo(it)}" },
                                 r.lastErr?.let { "error: $it" },
                             ).joinToString(" · "),
                             maxLines = 2,
@@ -113,8 +113,8 @@ private fun StatsCard(s: FfiStats) {
             StatLine("Relays", s.relays.toString())
             StatLine("Not yet synced", s.unsynced.toString())
             StatLine("Database size", formatBytes(s.dbBytes))
-            StatLine("Last crawl", s.lastCrawl?.let { formatAge(it) + " ago" } ?: "never")
-            StatLine("Last sync", s.lastSync?.let { formatAge(it) + " ago" } ?: "never")
+            StatLine("Last crawl", s.lastCrawl?.let { formatAgo(it) } ?: "never")
+            StatLine("Last sync", s.lastSync?.let { formatAgo(it) } ?: "never")
         }
     }
 }
