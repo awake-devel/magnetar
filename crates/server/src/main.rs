@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use magnetar_server::config::{Cli, Command};
-use magnetar_server::{daemons, selftest, server};
+use magnetar_server::{daemons, enrich_anime, selftest, server};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -42,5 +42,11 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Selftest => selftest::run(&cli.config).await,
+        Command::EnrichAnime { force } => {
+            let store = server::open_store(&cli.config).await?;
+            let report = enrich_anime::run_once(store.pool(), &cli.config, force).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
     }
 }

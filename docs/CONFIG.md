@@ -32,6 +32,9 @@ magnetar-server --version
 | `MAGNETAR_NIP66_MONITORS` | `wss://relaypag.es, wss://monitorlizard.nostr1.com, wss://relay.nostr.watch, wss://nos.lol, wss://relay.damus.io` | comma-separated relays queried for kind 10166/30166 monitor events |
 | `MAGNETAR_NIP66_TRUSTED` | built-in list of 12 monitor pubkeys (`nip66::DEFAULT_TRUSTED_MONITORS`) | comma-separated hex pubkeys of trusted NIP-66 monitors. They get their own request and page budget, and only relays they report escape the cap of 100 new relays per run from other announced monitors (ARCHITECTURE.md D36) |
 | `RUST_LOG` | `info` (Termux env) | tracing `EnvFilter` syntax, e.g. `info,magnetar_core=debug` |
+| `MAGNETAR_ANIME_DB` | `true` | Offline anime identification with `serve` (docs/ENRICHMENT-ANIME.md, D41): imports anime-offline-database + Fribb anime-lists (checked weekly, conditional GET, ~14 MB download, ~40 k rows) and links anime-category torrents to `media`. `false` = no download, no matching. One-shot: `magnetar-server enrich-anime [--force]` prints a JSON report. Needs the `media`/`torrent_media` tables of the IMDb enrichment |
+| `MAGNETAR_ANIME_AOD_URL` | `https://github.com/cedya77/anime-offline-database/releases/latest/download/anime-offline-database.jsonl.zst` | URL or local path of the AOD JSONL (`.zst` or plain). Use `…/releases/download/2026-43/…` to pin a weekly release, or a local file for offline / air-gapped installs |
+| `MAGNETAR_ANIME_FRIBB_URL` | `https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json` | URL or local path of Fribb `anime-list-full.json`; pin with a commit SHA instead of `master`. `none` = AOD only: no season remap and no IMDb/TMDB/TVDB ids (Fribb has no licence file, see docs/ENRICHMENT-ANIME.md) |
 
 `GET /api/v1/stats` reports the crawler under `crawler`: `running`, `last_run` (unix end time of
 the last pass), `last_report`, `passes` since start, `last_error` and `next_run` (while pausing).

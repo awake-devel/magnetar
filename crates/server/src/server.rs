@@ -10,7 +10,7 @@ use tokio::sync::watch;
 use crate::api::{self, AppState};
 use crate::config::Config;
 use crate::store::PgStore;
-use crate::{daemons, discovery};
+use crate::{daemons, discovery, enrich_anime};
 
 /// Grace period for daemons after the HTTP server stopped.
 const DAEMON_GRACE: Duration = Duration::from_secs(10);
@@ -89,6 +89,11 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
         tokio::spawn(daemons::trust_loop(store.clone(), stop_rx.clone())),
         tokio::spawn(discovery::discovery_loop(
             store.clone(),
+            cfg.clone(),
+            stop_rx.clone(),
+        )),
+        tokio::spawn(enrich_anime::anime_loop(
+            store.pool().clone(),
             cfg.clone(),
             stop_rx.clone(),
         )),

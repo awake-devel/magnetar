@@ -31,6 +31,11 @@ anyhow.workspace = true
 nostr.workspace = true
 rand.workspace = true
 url.workspace = true
+sha2.workspace = true
+reqwest.workspace = true
+parse-torrent-title.workspace = true
+anitomy-ng.workspace = true
+ruzstd.workspace = true
 
 [dev-dependencies]
 tokio-tungstenite.workspace = true
