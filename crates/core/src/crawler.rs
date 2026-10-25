@@ -441,7 +441,12 @@ impl<'a, S: Store + ?Sized> Ctx<'a, S> {
             }
             Halt::Hard(msg) => {
                 self.error(&run.url, &msg);
-                run.fatal = Some(msg);
+                // A store failure is not the relay's fault: no backoff for it.
+                if msg.starts_with("store:") {
+                    run.note = Some(msg);
+                } else {
+                    run.fatal = Some(msg);
+                }
                 run.conn = None;
                 true
             }
@@ -613,7 +618,8 @@ impl<'a, S: Store + ?Sized> Ctx<'a, S> {
     async fn ingest_one(&self, run: &mut RelayRun, ev: RawEvent) -> Result<(), Halt> {
         let (id, kind) = (ev.id.clone(), ev.kind);
         let hints = relay_hints(&ev);
-        let outcome = ingest_into(self.store, ev, self.now)
+        // Fresh clock: a long run must not reject events that are only "future" against its start.
+        let outcome = ingest_into(self.store, ev, crate::now())
             .await
             .map_err(|e| Halt::Hard(format!("store: {e}")))?;
         let mut r = self.report.lock().unwrap();
