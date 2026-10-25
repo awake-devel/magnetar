@@ -2,7 +2,7 @@
 //! grouped by infohash with one canonical event (highest trust, then earliest).
 
 use magnetar_core::model::{Liveness, TorrentSummary, npub};
-use magnetar_core::query::{SearchQuery, Sort, pg_tsquery};
+use magnetar_core::query::{MIN_PREFIX_CHARS, SearchQuery, Sort, pg_tsquery};
 use sqlx::{FromRow, Postgres, QueryBuilder};
 
 #[derive(FromRow)]
@@ -117,9 +117,15 @@ fn push_hits_cte(qb: &mut QueryBuilder<Postgres>, q: &SearchQuery, min_trust: u8
     if let Some(tsq) = &tsq {
         qb.push(" AND (t.search_tsv @@ to_tsquery('simple', ")
             .push_bind(tsq.clone())
-            .push(") OR ")
-            .push_bind(text.clone())
-            .push(" <% lower(t.title))");
+            .push(")");
+        // Fuzzy title matching needs a few characters: below that pg_trgm cannot use its
+        // index and `<%` scans every title.
+        if text.chars().count() >= MIN_PREFIX_CHARS {
+            qb.push(" OR ")
+                .push_bind(text.clone())
+                .push(" <% lower(t.title)");
+        }
+        qb.push(")");
     }
     qb.push(
         "), grp AS (SELECT infohash, count(DISTINCT pubkey) AS publisher_count, max(rank) AS rank \

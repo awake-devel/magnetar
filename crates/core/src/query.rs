@@ -93,6 +93,9 @@ pub fn fts5_match(text: &str) -> Option<String> {
 }
 
 /// Postgres `to_tsquery('simple', ..)` expression: tokens ANDed, last one prefix. None if no tokens.
+/// Shortest last word that is still matched as a prefix (typed-as-you-go search).
+pub const MIN_PREFIX_CHARS: usize = 3;
+
 pub fn pg_tsquery(text: &str) -> Option<String> {
     let toks = tokens(text);
     if toks.is_empty() {
@@ -104,7 +107,8 @@ pub fn pg_tsquery(text: &str) -> Option<String> {
             .enumerate()
             .map(|(i, t)| {
                 let t = t.replace(['\'', '\\', ':', '&', '|', '!', '(', ')', '<', '>'], "");
-                if i + 1 == n {
+                // A 1–2 letter prefix matches most of the index (`'o':*` took 42 s on 400k rows).
+                if i + 1 == n && t.chars().count() >= MIN_PREFIX_CHARS {
                     format!("'{t}':*")
                 } else {
                     format!("'{t}'")
@@ -126,7 +130,10 @@ mod tests {
             Some("\"big\" \"buck\" \"bun\"*".into())
         );
         assert_eq!(fts5_match("  ..  "), None);
-        assert_eq!(pg_tsquery("ubuntu 24"), Some("'ubuntu' & '24':*".into()));
+        assert_eq!(pg_tsquery("ubuntu 24"), Some("'ubuntu' & '24'".into()));
+        assert_eq!(pg_tsquery("ubuntu 240"), Some("'ubuntu' & '240':*".into()));
+        assert_eq!(pg_tsquery("o"), Some("'o'".into()));
+        assert_eq!(pg_tsquery("onl"), Some("'onl':*".into()));
         assert_eq!(tokens("Été 1080p"), vec!["été", "1080p"]);
     }
 }
