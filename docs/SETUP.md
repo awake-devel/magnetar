@@ -25,52 +25,58 @@
 
 | Script | What |
 |---|---|
-| `scripts/build-termux.sh [--target arm64-v8a\|x86_64] [--out DIR]` | `cargo ndk -t arm64-v8a -t x86_64 --platform 24 build --release -p magnetar-server` → `dist/magnetar-server-{aarch64,x86_64}-linux-android`; prints size, sha256, interpreter, `NEEDED` (must be only `libc.so libm.so libdl.so`) |
-| `scripts/build-android.sh` | `.so` (cargo-ndk `-P 26`) + Kotlin bindings + APK (owned by the Android build) |
-| `scripts/test.sh [--ignored] [--termux] [--no-android]` | the "done" gate (see README) |
-| `scripts/termux-docker-test.sh [--mode services\|nohup\|both] [--binary PATH] [--keep]` | runs `termux-setup.sh` inside `termux/termux-docker:x86_64` |
-| `scripts/release.sh [--version V] [--suffix S] [--prerelease] [--notes FILE] [--no-apk] [--build\|--publish]` | dry run by default; `--build` fills `dist/` + `SHA256SUMS`; only `--publish` runs `gh release create` |
-| `scripts/termux-setup.sh`, `scripts/termux-ctl.sh` | run **inside Termux**, see docs/TERMUX.md |
+| `scripts/build-linux.sh <x86_64\|aarch64>` | static server binary `dist/magnetar-server-<arch>-linux` for that architecture, on a matching host (docs/LINUX.md). CI's release workflow calls it |
+| `scripts/build-android.sh` | `.so` (cargo-ndk `-P 26`) + Kotlin bindings + APK (android/README.md) |
+| `scripts/test.sh [--ignored] [--no-android]` | the "done" gate (see README) |
+| `scripts/release.sh [--version V] [--suffix S] [--prerelease] [--notes FILE] [--no-apk] [--build\|--publish]` | finishes a release CI started: dry run by default; `--build` builds the APK into `dist/`; `--publish` uploads it and publishes |
+| `docker build .` / `docker compose up -d --build` | the server image from source (docs/DOCKER.md) |
 
 `CARGO_BUILD_JOBS` defaults to 3 in the scripts. Set it higher when nothing else is building.
 
-## Release assets
+## Continuous integration (`.github/workflows/`, ARCHITECTURE.md D39)
 
-`scripts/release.sh --publish` uploads everything in `dist/`:
-`magnetar-server-aarch64-linux-android`, `magnetar-server-x86_64-linux-android`,
-`magnetar-<tag>.apk`, `termux-setup.sh`, `termux-ctl.sh` and `SHA256SUMS`. The Termux setup
-fetches the binary, `SHA256SUMS` and the two scripts by these exact names. Publishing
-refuses to run with a dirty tree, an unpushed commit or an existing tag. A debug-signed APK
-is shipped (with a warning) when no release APK was built. **UNVERIFIED:** the APK path
-`android/app/build/outputs/apk/**` depends on the Android build, which is not on this
-branch yet.
+| Workflow | When | What |
+|---|---|---|
+| `ci.yml` | push to `main`, pull requests | `cargo fmt --check`, clippy `-D warnings`, `cargo test --workspace --all-features` against a `postgres:18` service (`MAGNETAR_TEST_DATABASE_URL` set, so the DB tests run), and an amd64 image build without push. Network tests stay `#[ignore]` |
+| `docker.yml` | push to `main`, tags `v*` | image per architecture on native runners (`ubuntu-24.04`, `ubuntu-24.04-arm`), pushed by digest, merged into one manifest list `ghcr.io/awake-devel/magnetar`: `X.Y.Z` and `latest` for a release tag, only `X.Y.Z-rc1` for a prerelease tag, `edge` for `main` |
+| `release.yml` | tags `v*` (or run by hand with a tag) | checks tag = Cargo version, `scripts/build-linux.sh` on both runners, `--version` smoke run, `SHA256SUMS`, attached to the release (created as a draft if missing) |
 
-## Running the server on a Linux machine
+The Android app is not built in CI: the signing key stays on the laptop.
 
-1. Install Postgres 18 with contrib (`pg_trgm`, `unaccent`). Create the role and database,
-   then the extensions:
-   ```sql
-   CREATE ROLE magnetar LOGIN PASSWORD '...';
-   CREATE DATABASE magnetar OWNER magnetar;
-   \c magnetar
-   CREATE EXTENSION IF NOT EXISTS pg_trgm;
-   CREATE EXTENSION IF NOT EXISTS unaccent;
-   ```
-2. Run `cargo build --release -p magnetar-server`.
-3. Create an env file with `DATABASE_URL`, `MAGNETAR_API_TOKEN` (`openssl rand -hex 32`),
-   `MAGNETAR_BIND=127.0.0.1:8787`, and optionally `MAGNETAR_ROOT_NPUB` and ntfy (see
-   docs/CONFIG.md).
-4. Run `magnetar-server migrate`, then `magnetar-server selftest`, then
-   `magnetar-server serve`, under whatever supervisor you prefer.
-5. Expose it to the phone with `tailscale serve --bg 127.0.0.1:8787` (HTTPS on
-   `https://<machine>.<tailnet>.ts.net`; MagicDNS and HTTPS certificates must be enabled for
-   the tailnet). See the README's Tailscale section.
+## Making a release
+
+1. Bump `version` in `Cargo.toml` (`[workspace.package]`), add `docs/release-notes/v<version>.md`,
+   commit and push `main`.
+2. `git tag v<version> && git push origin v<version>` (a suffix like `v0.2.0-rc1` makes a
+   prerelease). CI builds the image and the Linux binaries and creates the draft release.
+3. Wait for the `release` workflow (`gh run list --workflow release.yml`), check out the tag,
+   then `scripts/release.sh` (plan), `scripts/release.sh --publish` (add `--suffix rc1` for a
+   prerelease tag). It refuses to run with a dirty tree, with HEAD not at the pushed tag, or
+   before CI attached both binaries.
+4. Once, after the first `docker.yml` run (the first push to `main` with it): that run
+   creates the package `ghcr.io/awake-devel/magnetar`, and GitHub makes a new package on a
+   personal account private. Make it public (github.com/awake-devel > Packages > magnetar > Package settings > Change
+   visibility > Public), or `docker compose pull` fails with `denied` for everyone not logged in.
+   The `merge` job of `docker.yml` warns while an anonymous pull is still refused.
+
+Release assets: `magnetar-server-x86_64-linux`, `magnetar-server-aarch64-linux` (CI),
+`magnetar-<tag>.apk`, `compose.yml`, `.env.example`, `tailscale-serve.json` (from `docker/`;
+release.sh) and one `SHA256SUMS` that both sides merge into. A debug-signed APK is shipped
+(with a warning) when no release APK was built.
+
+## Running the server
+
+See [docs/DEPLOY.md](DEPLOY.md): Docker Compose ([docs/DOCKER.md](DOCKER.md)) or the native
+binary with your own Postgres 18 ([docs/LINUX.md](LINUX.md)). For a quick local run from the
+checkout: create the role, database and the `pg_trgm` and `unaccent` extensions, set
+`DATABASE_URL` and `MAGNETAR_API_TOKEN`, then `cargo run --release -p magnetar-server -- selftest`
+and `-- serve`.
 
 ## Tests and Postgres
 
 Tests that need Postgres read `MAGNETAR_TEST_DATABASE_URL`. Locally that is
 `postgres://magnetar:magnetar@127.0.0.1:54329/magnetar`, from the docker container
-`magnetar-pg` running `postgres:18` (18.6, the same major as Termux). Each test creates and
+`magnetar-pg` running `postgres:18` (the image `compose.yml` uses too). Each test creates and
 drops its own schema `t_<random>`. If the variable is unset, the DB tests print
 `SKIPPED (no MAGNETAR_TEST_DATABASE_URL)` and pass. `scripts/test.sh` always sets it, so a
 green `test.sh` means they actually ran. Network tests against real relays and trackers

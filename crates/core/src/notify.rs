@@ -28,7 +28,7 @@ fn truncate(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-/// JSON publish to the root URL (termux.md §4). `click` e.g. a magnet or magnetar:// link.
+/// JSON publish to the root URL (ntfy docs, publish.md "Publish as JSON"). `click` e.g. a magnet or magnetar:// link.
 pub async fn ntfy_publish(
     cfg: &NtfyConfig,
     title: &str,

@@ -1,4 +1,5 @@
-//! `magnetar-server selftest`: the checks that tend to break on a phone (termux.md §2).
+//! `magnetar-server selftest`: the checks that tend to break on a new host (database and
+//! extensions, DNS, TLS roots, outbound UDP), e.g. in a container or behind a NAS firewall.
 
 use std::time::Duration;
 

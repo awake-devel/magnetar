@@ -1,0 +1,101 @@
+# fmt, clippy -D warnings and the workspace tests against Postgres 18 (ARCHITECTURE.md §10, D39).
+# Network tests against real relays and trackers stay #[ignore]: run them locally with
+# scripts/test.sh --ignored. The Android app is not built here (NDK + signing key are local).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  # Pinned, so a new stable's clippy lints cannot turn main red without a code change, and what
+  # CI checks is what ships: same version as the Dockerfile's builder image and release.yml.
+  # Bump all three on purpose (the fmt job checks the Dockerfile agrees).
+  RUST_TOOLCHAIN: "1.99.0"
+
+jobs:
+  fmt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt
+          rustup default "$RUST_TOOLCHAIN"
+      - run: cargo fmt --all --check
+      - name: Dockerfile uses the same Rust
+        run: |
+          grep -Eq "^ARG RUST_IMAGE=rust:${RUST_TOOLCHAIN//./\\.}-" Dockerfile ||
+            { echo "::error::Dockerfile RUST_IMAGE is not rust:$RUST_TOOLCHAIN (bump RUST_TOOLCHAIN in ci.yml and release.yml with it)"; exit 1; }
+
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: magnetar
+          POSTGRES_PASSWORD: magnetar
+          POSTGRES_DB: magnetar
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U magnetar -d magnetar"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # Set, so the DB tests run (unset they print SKIPPED and pass; unreachable they fail).
+      # Every DB test creates and drops its own schema, so they share one database.
+      MAGNETAR_TEST_DATABASE_URL: postgres://magnetar:magnetar@localhost:5432/magnetar
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Only main writes the cache; PRs restore it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: test
+        run: cargo test --workspace --all-features
+
+  docker:
+    # Build the image for amd64 without pushing, so Dockerfile breakage shows up on PRs.
+    # docker.yml publishes it (both architectures) from main and from tags.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: magnetar:ci
+          cache-from: type=gha,scope=linux/amd64
+      - name: Image runs
+        run: docker run --rm --entrypoint /usr/local/bin/magnetar-server magnetar:ci --version

@@ -70,35 +70,34 @@ real hardware are marked **UNVERIFIED**.
   client. [android.md §4]
 - **Background crawl only runs while unmetered and charging**, once an hour. The phone crawl
   is also bounded: at most 8 relays and a time budget.
-- **Cleartext HTTP is allowed only to 127.0.0.1 and localhost.** Other servers need HTTPS
-  (for example `tailscale serve`) or a rebuilt APK. **UNVERIFIED:** whether Android 16+
-  local-network permission rules affect loopback or Tailscale addresses.
+- **Plain `http://` server URLs are accepted, with a warning** unless the host is loopback, a
+  MagicDNS `*.ts.net` name or a Tailscale IPv6 address (`fd7a:115c:a1e0::/48`), which only
+  resolve or route through the tunnel. On any other network the token and the results travel
+  readable: use HTTPS (`tailscale serve` or a reverse proxy). A Tailscale IPv4 address
+  (`100.64.0.0/10`) gets its own warning: that range is also carrier-grade NAT (RFC 6598), so
+  with Tailscale off on the phone the request goes over the carrier's network in clear; the
+  check sees the address, not whether the tunnel is up. The warning cannot tell a short MagicDNS name (`http://nas:8787`) from a LAN
+  name, so it warns for those too. [D39] **UNVERIFIED:** whether Android 16+ local-network
+  permission rules affect LAN or Tailscale addresses.
 - **ntfy click actions:** whether ntfy-android opens `magnet:` or `magnetar://` links is
   **UNVERIFIED**. [termux.md §4]
 
-## Termux server
+## Server deployment
 
-- **Phantom process killer.** Android 12+ kills app child processes beyond 32 across all apps,
-  and any that use too much CPU, with `signal 9`. It must be disabled (see docs/TERMUX.md).
-  Magnetar keeps about 20 processes: `max_connections 20`, `io_workers 1`, a sqlx pool of 5
-  or fewer. [termux.md §3.3]
-- **Loopback is shared by every app** on the phone. That is why the API needs a bearer token
-  on everything except `/health`, and why Postgres requires scram on TCP. Anyone who can read
-  `~/.config/magnetar/env` (Termux's private dir, or root) has full access. [D20]
-- **Battery optimisation and OEM killers** (see dontkillmyapp.com) can still stop Termux. Hold
-  the wake lock and exempt Termux.
-- **The real server binary has not run on a phone yet (UNVERIFIED).** It is built with
-  cargo-ndk for API 24, the same level as Termux's own packages, and links only bionic
-  libc/libm/libdl. DNS through bionic `getaddrinfo` and TLS with webpki-roots are expected to
-  work: check with `magnetar-server selftest`. The setup script itself was verified in
-  termux-docker (x86_64), not on a device.
-- **Termux:Boot and wake lock** could not be tested in docker. Termux:Boot must come from the
-  same source as Termux (F-Droid), and must be opened once.
-- **On-device builds** (`MAGNETAR_BUILD=local`) are slow, and `aws-lc-sys` building natively
-  in Termux is **UNVERIFIED**.
-- **Private repository:** until the repo is public, installing needs a GitHub token. The
-  plain `releases/latest/download` URL returns 404. `latest` also skips prereleases (use
-  `MAGNETAR_VERSION`).
+- **The token is the only lock.** Every endpoint except `/health` needs it, but anyone who
+  has it, or can read the server's `.env`, has full API access. The default publish address
+  is loopback; expose the server through HTTPS (docs/DEPLOY.md). [D20, D39]
+- **arm64 is UNVERIFIED on hardware.** The arm64 image and the `aarch64` binary are built on
+  GitHub's native arm64 runners and smoke-tested there (`--version`); they have not run on a
+  Raspberry Pi or an ARM NAS. ARM Synology models are not a target, and 32-bit ARM has no
+  build. [D39]
+- **The CI workflows have not run yet** at the time of writing: they were checked with
+  actionlint only, since GitHub Actions cannot run locally. [D39]
+- **No service manager integration.** Nothing installs systemd units, timers or udev rules.
+  Docker's restart policy keeps the containers running; for the native binary, starting it
+  at boot is up to you (docs/LINUX.md has examples to adapt).
+- **The phone is not a server any more.** The Termux setup of v0.1.0 was removed (Android's
+  phantom process killer and battery management made it fragile). [D39]
 
 ## Search
 

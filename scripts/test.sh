@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # The "done" gate: fmt, clippy -D warnings, workspace tests against Postgres 18, Android build.
 #
-#   scripts/test.sh [--ignored] [--termux] [--no-android] [-- <extra cargo test args>]
+#   scripts/test.sh [--ignored] [--no-android] [-- <extra cargo test args>]
 #
 # --ignored     also run the #[ignore] network tests (real relays/trackers) afterwards
-# --termux      also run scripts/termux-docker-test.sh (termux-setup.sh inside termux-docker)
 # --no-android  skip scripts/build-android.sh
 #
 # MAGNETAR_TEST_DATABASE_URL is used as given; when unset, the docker container magnetar-pg
@@ -16,16 +15,14 @@ export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-3}
 
 ignored=0
-termux=0
 android=1
 extra=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --ignored) ignored=1 ;;
-    --termux) termux=1 ;;
     --no-android) android=0 ;;
     --) shift; extra=("$@"); break ;;
-    -h | --help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
   shift
@@ -75,11 +72,6 @@ cargo test --workspace --all-features -- "${extra[@]}"
 if [ "$ignored" = 1 ]; then
   step "cargo test -- --ignored (network tests: real relays and trackers)"
   cargo test --workspace --all-features -- --ignored "${extra[@]}"
-fi
-
-if [ "$termux" = 1 ]; then
-  step "termux-docker test of termux-setup.sh"
-  bash "$root/scripts/termux-docker-test.sh"
 fi
 
 if [ "$android" = 1 ]; then

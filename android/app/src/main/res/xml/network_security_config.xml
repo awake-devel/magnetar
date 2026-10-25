@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Cleartext HTTP only for the Termux server on this phone. A server reached over
-  Tailscale should use HTTPS (`tailscale cert`); to allow plain HTTP to a tailnet
-  host instead, add its MagicDNS name or 100.x address as another <domain>.
+  The server is chosen by the user at runtime (any host: a NAS on the LAN, a Raspberry Pi,
+  a VPS, a Tailscale name), and a network security config cannot list hosts that are only
+  known at runtime. All server traffic also goes through the Rust client (reqwest and
+  tokio-tungstenite on raw sockets), which Android does not hold to this file anyway.
+  So cleartext is permitted here, and Settings warns when an http:// URL points at a host
+  where the traffic would be readable on the wire (ARCHITECTURE.md D39). Prefer HTTPS:
+  `tailscale serve` or a reverse proxy.
 -->
 <network-security-config>
-    <base-config cleartextTrafficPermitted="false" />
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="false">127.0.0.1</domain>
-        <domain includeSubdomains="false">localhost</domain>
-    </domain-config>
+    <base-config cleartextTrafficPermitted="true" />
 </network-security-config>
