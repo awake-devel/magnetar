@@ -22,7 +22,7 @@ fn report(name: &str, res: &anyhow::Result<String>) -> bool {
 }
 
 async fn check_db(cfg: &Config) -> anyhow::Result<String> {
-    let store = PgStore::connect(cfg.database_url()?).await?;
+    let store = PgStore::connect(cfg.database_url()?, cfg.db_pool).await?;
     let version: String = sqlx::query_scalar("SHOW server_version")
         .fetch_one(store.pool())
         .await?;

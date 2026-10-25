@@ -19,8 +19,8 @@ use tokio::sync::broadcast;
 use crate::filter::{Filter, indexed_tags};
 use crate::search;
 
-/// sqlx pool cap (Termux phantom-process budget, ARCHITECTURE.md §9).
-pub const MAX_CONNECTIONS: u32 = 5;
+/// Default sqlx pool cap (`MAGNETAR_DB_POOL`, ARCHITECTURE.md §9, D37).
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 10;
 /// Relay retry backoff: 5 min doubling per consecutive failure, capped at 24 h.
 pub const BACKOFF_BASE_SECS: i64 = 300;
 pub const BACKOFF_MAX_SECS: i64 = 24 * 3600;
@@ -296,10 +296,10 @@ enum Derived {
 }
 
 impl PgStore {
-    /// Connect with the server pool settings (≤ 5 connections).
-    pub async fn connect(url: &str) -> Result<Self> {
+    /// Connect with at most `max_connections` pooled connections (`MAGNETAR_DB_POOL`).
+    pub async fn connect(url: &str, max_connections: u32) -> Result<Self> {
         let pool = PgPoolOptions::new()
-            .max_connections(MAX_CONNECTIONS)
+            .max_connections(max_connections.max(1))
             .acquire_timeout(Duration::from_secs(5))
             .connect(url)
             .await
