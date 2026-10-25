@@ -1,0 +1,51 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# Stand-in for magnetar-server used by scripts/termux-docker-test.sh. It implements just
+# enough of the CLI contract (ARCHITECTURE.md §9) to exercise termux-setup.sh:
+#   --version, migrate (checks DATABASE_URL + extensions), serve (GET /health, bearer auth).
+set -eu
+case "${1:-}" in
+  --version)
+    echo "magnetar-server 0.0.0-fake"
+    ;;
+  migrate)
+    exts=$(psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAc \
+      "select string_agg(extname, ',' order by extname) from pg_extension")
+    case "$exts" in *pg_trgm*unaccent*) ;; *) echo "missing extensions: $exts" >&2; exit 1 ;; esac
+    psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 \
+      -c 'create table if not exists fake_migrations (applied_at timestamptz not null default now())' \
+      -c 'insert into fake_migrations default values'
+    echo "fake migrate ok as $(psql "$DATABASE_URL" -X -tAc 'select current_user') ($exts)"
+    ;;
+  serve)
+    : "${MAGNETAR_API_TOKEN:?MAGNETAR_API_TOKEN is required for serve}"
+    host=${MAGNETAR_BIND%:*}
+    port=${MAGNETAR_BIND##*:}
+    echo "fake serve on $host:$port"
+    exec socat "TCP-LISTEN:$port,bind=$host,reuseaddr,fork" "EXEC:$0 _respond"
+    ;;
+  _respond)
+    cr=$(printf '\r')
+    read -r _method path _ || exit 0
+    auth=""
+    while read -r line; do
+      line=${line%"$cr"}
+      [ -z "$line" ] && break
+      case "$line" in [Aa]uthorization:*) auth=${line#*: } ;; esac
+    done
+    if [ "$path" = /health ]; then
+      db=false
+      pg_isready -q -h "$TMPDIR" && db=true
+      status="200 OK" body="{\"status\":\"ok\",\"version\":\"0.0.0-fake\",\"db\":$db}"
+    elif [ "$auth" = "Bearer $MAGNETAR_API_TOKEN" ]; then
+      status="200 OK" body='{}'
+    else
+      status="401 Unauthorized" body='{"error":"unauthorized","message":"missing or bad token"}'
+    fi
+    printf 'HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' \
+      "$status" "${#body}" "$body"
+    ;;
+  *)
+    echo "usage: $0 --version|migrate|serve" >&2
+    exit 2
+    ;;
+esac
