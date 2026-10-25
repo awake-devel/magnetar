@@ -38,7 +38,7 @@ pub async fn scrape(
     if hashes.is_empty() {
         return Ok(Vec::new());
     }
-    let addr = resolve(tracker).await?;
+    let addr = resolve(tracker, timeout).await?;
     let bind: SocketAddr = if addr.is_ipv4() {
         ([0u8; 4], 0).into()
     } else {
@@ -83,7 +83,7 @@ pub async fn scrape(
 }
 
 /// `udp://host:port[/path]` → socket address, IPv4 preferred.
-async fn resolve(tracker: &str) -> Result<SocketAddr> {
+async fn resolve(tracker: &str, timeout: Duration) -> Result<SocketAddr> {
     let url = url::Url::parse(tracker.trim())
         .map_err(|e| Error::Invalid(format!("tracker url {tracker}: {e}")))?;
     if url.scheme() != "udp" {
@@ -97,10 +97,12 @@ async fn resolve(tracker: &str) -> Result<SocketAddr> {
         .ok_or_else(|| Error::Invalid(format!("udp tracker without port: {tracker}")))?;
     // IPv6 literals come back bracketed from host_str.
     let host = host.trim_start_matches('[').trim_end_matches(']');
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(net(tracker))?
-        .collect();
+    let addrs: Vec<SocketAddr> =
+        tokio::time::timeout(timeout, tokio::net::lookup_host((host, port)))
+            .await
+            .map_err(|_| Error::Timeout(format!("{tracker}: DNS lookup")))?
+            .map_err(net(tracker))?
+            .collect();
     addrs
         .iter()
         .find(|a| a.is_ipv4())
