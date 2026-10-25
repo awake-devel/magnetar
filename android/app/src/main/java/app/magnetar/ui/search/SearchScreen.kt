@@ -57,8 +57,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -173,6 +175,15 @@ fun SearchScreen(onOpen: (String) -> Unit, vm: SearchViewModel = viewModel()) {
 @Composable
 private fun ResultList(state: SearchUiState, threshold: Int, onOpen: (String) -> Unit, loadMore: () -> Unit) {
     val listState = rememberLazyListState()
+    // A new search (text, filters, sort, saved search, settings) starts at the top, not at the
+    // scroll position of the previous result list (which also kept triggering loadMore).
+    var shownGeneration by rememberSaveable { mutableIntStateOf(state.generation) }
+    LaunchedEffect(state.generation) {
+        if (state.generation != shownGeneration) {
+            listState.scrollToItem(0)
+            shownGeneration = state.generation
+        }
+    }
     val nearEnd by remember {
         derivedStateOf {
             val last = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0

@@ -62,6 +62,8 @@ data class SearchUiState(
     /** "server" | "local" for the last page. */
     val source: String? = null,
     val serverError: String? = null,
+    /** Bumped for every fresh first page, so the list can scroll back to the top. */
+    val generation: Int = 0,
 )
 
 private const val MB = 1024L * 1024L
@@ -163,6 +165,7 @@ class SearchViewModel(application: Application) : BaseViewModel(application) {
                         it.copy(
                             hits = page.hits, total = page.total, loading = false, source = page.source,
                             serverError = page.serverError, endReached = page.hits.size.toUInt() < PAGE,
+                            generation = it.generation + 1,
                         )
                     }
                 }
