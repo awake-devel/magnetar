@@ -9,6 +9,8 @@ import app.magnetar.ffi.FfiSavedSearch
 import app.magnetar.ffi.FfiSearchQuery
 import app.magnetar.ffi.FfiSort
 import app.magnetar.ffi.FfiTorrentDetail
+import app.magnetar.ffi.FfiTorrentSummary
+import kotlinx.coroutines.delay
 import app.magnetar.ffiCatching
 import app.magnetar.ui.common.BaseViewModel
 import app.magnetar.ui.common.fallbackMagnet
@@ -26,6 +28,11 @@ data class DetailUiState(
     val detail: FfiTorrentDetail? = null,
     val error: String? = null,
     val checkingLiveness: Boolean = false,
+    /** Local file of the media poster (fetched from the server, cached by ffi). */
+    val posterPath: String? = null,
+    /** Other releases of the same media; null = not loaded. */
+    val releases: List<FfiTorrentSummary>? = null,
+    val loadingReleases: Boolean = false,
 )
 
 class DetailViewModel(application: Application, handle: SavedStateHandle) : BaseViewModel(application) {
@@ -53,8 +60,48 @@ class DetailViewModel(application: Application, handle: SavedStateHandle) : Base
         _state.update { it.copy(loading = true, error = null) }
         viewModelScope.launch {
             ffiCatching { magApp.magnetar().detail(infohash, magApp.settings.value.hasServer) }
-                .onSuccess { d -> _state.update { it.copy(loading = false, detail = d) } }
+                .onSuccess { d ->
+                    _state.update { it.copy(loading = false, detail = d) }
+                    onMedia(d, retry = true)
+                }
                 .onFailure { e -> _state.update { it.copy(loading = false, error = e.userMessage()) } }
+        }
+    }
+
+    /**
+     * Poster for the media, and one quiet re-fetch: the server answers with what it has cached
+     * and asks TMDB in the background (D42), so overview/poster may appear a moment later.
+     */
+    private fun onMedia(d: FfiTorrentDetail?, retry: Boolean) {
+        val m = d?.media ?: return
+        val poster = m.poster
+        if (poster != null) {
+            viewModelScope.launch {
+                ffiCatching { magApp.magnetar().mediaPoster(m.mediaId, poster) }
+                    .onSuccess { path -> _state.update { it.copy(posterPath = path) } }
+            }
+        }
+        if (retry && d.source == "server" && (poster == null || m.overview == null)) {
+            viewModelScope.launch {
+                delay(4_000)
+                ffiCatching { magApp.magnetar().detail(infohash, true) }.onSuccess { again ->
+                    if (again?.media != null) {
+                        _state.update { it.copy(detail = again) }
+                        onMedia(again, retry = false)
+                    }
+                }
+            }
+        }
+    }
+
+    fun loadReleases() {
+        val m = _state.value.detail?.media ?: return
+        _state.update { it.copy(loadingReleases = true) }
+        launchFfi(onError = { msg -> _state.update { it.copy(loadingReleases = false) }; message(msg) }) { mag ->
+            val page = mag.mediaTorrents(m.mediaId)
+            _state.update { s ->
+                s.copy(loadingReleases = false, releases = page.hits.filter { it.infohash != infohash })
+            }
         }
     }
 

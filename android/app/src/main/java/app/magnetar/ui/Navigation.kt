@@ -103,9 +103,10 @@ fun MagnetarNavHost(openRequests: MutableStateFlow<OpenRequest?>) {
                     },
                 ),
             ) {
-                DetailScreen(onBack = {
-                    if (!nav.popBackStack()) nav.navigate(Tab.SEARCH.route)
-                })
+                DetailScreen(
+                    onBack = { if (!nav.popBackStack()) nav.navigate(Tab.SEARCH.route) },
+                    onOpenTorrent = { nav.navigate(detailRoute(it)) },
+                )
             }
         }
     }
