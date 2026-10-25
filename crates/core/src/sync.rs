@@ -26,9 +26,11 @@ pub const NEG_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUND_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_MESSAGE_BYTES: usize = 16 << 20;
-/// Unsynced rows the server already holds never show up in `have`; re-send up to this many per
-/// run so their `OK duplicate:` marks them synced.
+/// Unsynced rows outside the reconciled set (stored after the negentropy snapshot) are re-sent,
+/// up to this many per run, so their `OK duplicate:` / `OK true` marks them synced.
 const RESEND_UNSYNCED: usize = 500;
+/// `mark_synced` chunk for ids the server already holds.
+const MARK_CHUNK: usize = 1_000;
 const SUB_ID: &str = "magnetar-up";
 
 #[async_trait::async_trait]
@@ -64,7 +66,8 @@ impl SyncReport {
 }
 
 /// Negentropy Up-sync over `relay_ws_url` (e.g. ws://127.0.0.1:8787/relay?token=..), falling back to
-/// `api.post_batch` with `unsynced()`. Marks synced only on OK true (incl. duplicate:).
+/// `api.post_batch` with `unsynced()`. Marks synced on OK true (incl. duplicate:), and, after a
+/// completed reconciliation, every reconciled id the server already holds.
 pub async fn sync_up<S: SyncSource + ?Sized>(
     src: &S,
     relay_ws_url: &str,
@@ -76,11 +79,24 @@ pub async fn sync_up<S: SyncSource + ?Sized>(
         report.method = "none".into();
         return Ok(report);
     }
+    let reconciled: Vec<String> = items.iter().map(|(_, id)| hex::encode(id)).collect();
     match reconcile(relay_ws_url, items).await {
         Ok((mut ws, have, need)) => {
             report.method = "negentropy".into();
             report.have = have.len() as u64;
             report.need_ignored = need;
+            // Every reconciled id that is not in `have` is already on the server: mark it synced
+            // now instead of re-sending it for an `OK duplicate:` (a crawl usually brings
+            // thousands of events the server crawled too; re-sending a few hundred per run would
+            // leave them unsynced, and so never evictable, for days).
+            let have_set: HashSet<&str> = have.iter().map(String::as_str).collect();
+            let held: Vec<String> = reconciled
+                .into_iter()
+                .filter(|id| !have_set.contains(id.as_str()))
+                .collect();
+            for chunk in held.chunks(MARK_CHUNK) {
+                src.mark_synced(chunk).await?;
+            }
             let mut queue: Vec<String> = have;
             let mut queued: HashSet<String> = queue.iter().cloned().collect();
             for ev in src.unsynced(RESEND_UNSYNCED).await? {

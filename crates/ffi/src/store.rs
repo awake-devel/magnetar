@@ -1507,7 +1507,9 @@ impl SqliteStore {
         let tx = conn.transaction().db()?;
         {
             let mut st = tx
-                .prepare_cached("UPDATE sync_ids SET synced = 1, failure = NULL WHERE id = ?1")
+                .prepare_cached(
+                    "UPDATE sync_ids SET synced = 1, failure = NULL WHERE id = ?1 AND synced = 0",
+                )
                 .db()?;
             for id in ids {
                 st.execute([id]).db()?;

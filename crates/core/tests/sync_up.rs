@@ -278,12 +278,14 @@ async fn negentropy_upload_marks_only_ok_true() {
     );
     assert_eq!(r.failed, 3);
     // 40 have − 3 rejected − 2 duplicate-on-OK = 35 accepted;
-    // 40..60 were unsynced but already on the server → re-sent, OK duplicate.
+    // 40..60 were unsynced but already on the server → marked synced without a re-send.
     assert_eq!(r.uploaded, 35);
-    assert_eq!(r.duplicates, 2 + 20);
+    assert_eq!(r.duplicates, 2);
 
     let synced = src.synced();
-    let want: HashSet<String> = ids(&all[3..60]);
+    // The evicted 70 is synced already in a real store; re-marking it is a no-op.
+    let mut want: HashSet<String> = ids(&all[3..60]);
+    want.insert(all[70].id.clone());
     assert_eq!(synced, want);
     assert!(synced.is_disjoint(&reject));
     let failures = src.failures();
@@ -292,7 +294,7 @@ async fn negentropy_upload_marks_only_ok_true() {
     assert!(http.requests().is_empty());
     assert_eq!(relay.queries.lock().unwrap().as_slice(), ["token=s3cr%2Bt"]);
     let received = relay.received.lock().unwrap().clone();
-    assert_eq!(received.len(), 60);
+    assert_eq!(received.len(), 40, "only the phone-only ids are sent");
     assert!(
         !received.contains(&all[70].id),
         "evicted body is never sent"
@@ -310,7 +312,7 @@ async fn negentropy_upload_marks_only_ok_true() {
         ),
         ("negentropy", 3, 0, 0, 3)
     );
-    assert_eq!(src.synced().len(), 57);
+    assert_eq!(src.synced().len(), 58, "57 events + the evicted 70");
 }
 
 #[tokio::test]
