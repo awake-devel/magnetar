@@ -114,13 +114,20 @@ class DetailViewModel(application: Application, handle: SavedStateHandle) : Base
     }
 
     fun saveSearch(name: String, notify: Boolean) = launchFfi { m ->
-        val q = (magApp.lastQuery ?: defaultQuery()).copy(offset = 0u)
+        val q = queryToSave().copy(offset = 0u)
         io { m.saveSearch(FfiSavedSearch(id = 0, name = name, query = q, notify = notify, lastChecked = null)) }
         message("Saved \"$name\"")
     }
 
     fun suggestedSearchName(): String =
-        magApp.lastQuery?.text?.takeIf { it.isNotBlank() } ?: _state.value.detail?.summary?.title ?: infohash
+        queryToSave().text.ifBlank { infohash }
+
+    /**
+     * The last text search, else this torrent's title. A blank last query (plain browse) is not
+     * used: the dialog would offer the title as the name while saving "any text".
+     */
+    private fun queryToSave(): FfiSearchQuery =
+        magApp.lastQuery?.takeIf { it.text.isNotBlank() } ?: defaultQuery()
 
     private fun defaultQuery() = FfiSearchQuery(
         text = _state.value.detail?.summary?.title ?: "",
