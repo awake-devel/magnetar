@@ -138,6 +138,11 @@ Checked green in both runit and nohup mode (2026-10-25, 62 checks):
 - `magnetar-ctl` stop, start, restart and update
 - `--uninstall-services` keeps data
 
+`scripts/build-termux.sh` produced both binaries on 2026-10-25. They need only
+`libc.so libdl.so` and request the interpreter `/system/bin/linker64`. The x86_64 binary ran
+(`--version`) inside termux-docker. That build was the contracts-only `main.rs`, so its size
+(about 450 KB) says nothing about the real server.
+
 These were not testable in docker: `termux-wake-lock` (no Android `am`), Termux:Boot, the
 phantom process killer, the GitHub release download (the repo is private and has no
 release yet), and the real `magnetar-server`. To run the same suite against the real

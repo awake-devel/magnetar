@@ -45,8 +45,9 @@ real hardware are marked **UNVERIFIED**.
 
 - **DHT numbers are estimates.** The BEP 33 scrape returns Bloom filters. The swarm size is
   estimated from them, saturates around 8000, and only covers DHT peers. In live tests, a
-  torrent with 491 seeders and 256 leechers on its tracker gave a DHT estimate of about 97
-  seeders. DHT is used only when no tracker answered, and it fills `dht_peers_est`, never
+  torrent with 491 seeders and 256 leechers on its tracker gave DHT estimates of about 97
+  seeds and 811 peers. Seeds are undercounted because many clients never announce `seed=1`.
+  DHT is used only when no tracker answered, and it fills `dht_peers_est`, never
   `seeders`. [bittorrent.md §4]
 - **Unknown is not dead.** No answer means unknown. "Hide dead" drops a torrent only when it
   has a *fresh* liveness result with 0 peers. The TTLs are 6 h for alive, 24 h for dead and
