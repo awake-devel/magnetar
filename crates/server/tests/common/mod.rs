@@ -18,6 +18,14 @@ pub struct TestDb {
 
 /// None (and a SKIPPED line) when no test database is configured.
 pub async fn test_db() -> Option<TestDb> {
+    let db = bare_db().await?;
+    contract_media_tables(&db.store).await;
+    db.store.migrate().await.expect("migrate");
+    Some(db)
+}
+
+/// A fresh, empty schema: nothing created, nothing migrated.
+pub async fn bare_db() -> Option<TestDb> {
     let Ok(url) = std::env::var("MAGNETAR_TEST_DATABASE_URL") else {
         eprintln!("SKIPPED (no MAGNETAR_TEST_DATABASE_URL)");
         return None;
@@ -61,8 +69,23 @@ pub async fn test_db() -> Option<TestDb> {
         .await
         .unwrap();
     let store = PgStore::from_pool(pool);
-    store.migrate().await.expect("migrate");
     Some(TestDb { store, url, schema })
+}
+
+/// TEST-ONLY: the enrichment contract tables (`media`, `torrent_media`) belong to the
+/// enrich/imdb migration, which this branch does not have yet. Create a mirror of the contract
+/// before migrating, unless a migration in this build already creates `media`.
+async fn contract_media_tables(store: &PgStore) {
+    let owned = magnetar_server::store::MIGRATOR
+        .iter()
+        .any(|m| m.sql.as_str().contains("CREATE TABLE media "));
+    if !owned {
+        store
+            .pool()
+            .execute(include_str!("contract_media.sql"))
+            .await
+            .expect("contract media tables");
+    }
 }
 
 impl Drop for TestDb {

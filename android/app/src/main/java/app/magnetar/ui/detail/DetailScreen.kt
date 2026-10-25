@@ -83,7 +83,7 @@ private const val MAX_FILE_ROWS = 300
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DetailScreen(onBack: () -> Unit, vm: DetailViewModel = viewModel()) {
+fun DetailScreen(onBack: () -> Unit, onOpenTorrent: (String) -> Unit = {}, vm: DetailViewModel = viewModel()) {
     val state by vm.state.collectAsStateWithLifecycle()
     val settings by vm.settings.collectAsStateWithLifecycle()
     val context = LocalContext.current
@@ -167,6 +167,18 @@ fun DetailScreen(onBack: () -> Unit, vm: DetailViewModel = viewModel()) {
                     onDownloadPhone = vm::downloadOnPhone,
                     onDownloadServer = vm::downloadOnServer,
                     onCheckLiveness = vm::checkLiveness,
+                    media = {
+                        detail.media?.let { m ->
+                            MediaCard(
+                                m = m,
+                                posterPath = state.posterPath,
+                                releases = state.releases,
+                                loadingReleases = state.loadingReleases,
+                                onLoadReleases = vm::loadReleases,
+                                onOpenTorrent = onOpenTorrent,
+                            )
+                        }
+                    },
                 )
             }
         }
@@ -234,6 +246,7 @@ private fun DetailBody(
     onDownloadPhone: () -> Unit,
     onDownloadServer: () -> Unit,
     onCheckLiveness: () -> Unit,
+    media: @Composable () -> Unit = {},
 ) {
     val s = detail.summary
     val tree = remember(detail.files) { buildFileTree(detail.files) }
@@ -293,6 +306,8 @@ private fun DetailBody(
                 )
             }
         }
+
+        if (detail.media != null) item { media() }
 
         item {
             SectionTitle("Infohash")

@@ -41,6 +41,5 @@ ruzstd.workspace = true
 
 [dev-dependencies]
 tokio-tungstenite.workspace = true
-reqwest.workspace = true
 nostr-sdk = "0.45.4"
 nostr-memory = "0.45.2"

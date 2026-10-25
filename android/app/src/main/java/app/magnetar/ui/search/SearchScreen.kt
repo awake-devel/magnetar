@@ -83,6 +83,7 @@ import app.magnetar.ui.common.CenteredMessage
 import app.magnetar.ui.common.SaveSearchDialog
 import app.magnetar.ui.common.TrustBadge
 import app.magnetar.ui.common.categoryLabel
+import app.magnetar.ui.detail.mediaHeadline
 import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -129,7 +130,7 @@ fun SearchScreen(onOpen: (String) -> Unit, vm: SearchViewModel = viewModel()) {
                 value = state.text,
                 onValueChange = vm::onTextChange,
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-                placeholder = { Text("Search torrents") },
+                placeholder = { Text("Search torrents or imdb:tt…") },
                 leadingIcon = { Icon(Icons.Filled.Search, null) },
                 trailingIcon = {
                     if (state.text.isNotEmpty()) {
@@ -232,6 +233,9 @@ private fun ResultRow(hit: FfiTorrentSummary, threshold: Int, modifier: Modifier
     ListItem(
         modifier = modifier,
         leadingContent = { CategoryIcon(hit.category) },
+        overlineContent = hit.mediaTitle?.let { t ->
+            { Text(mediaHeadline(t, hit.mediaYear), maxLines = 1, overflow = TextOverflow.Ellipsis) }
+        },
         headlineContent = { Text(hit.title, maxLines = 2, overflow = TextOverflow.Ellipsis) },
         supportingContent = {
             val dead = if (hit.dead == true) " · dead" else ""

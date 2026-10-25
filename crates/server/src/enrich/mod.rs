@@ -1350,6 +1350,7 @@ impl From<MediaRow> for MediaInfo {
             // Filled by the TMDB decorator (D42) from media_extra.
             overview: None,
             poster: None,
+            episode_title: None,
         }
     }
 }

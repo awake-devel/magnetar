@@ -12,6 +12,7 @@ mod search;
 pub mod selftest;
 pub mod server;
 pub mod store;
+pub mod tmdb;
 
 pub use api::{AppState, router};
 pub use store::PgStore;

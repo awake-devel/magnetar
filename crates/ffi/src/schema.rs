@@ -3,7 +3,7 @@
 use rusqlite::Connection;
 
 /// Migration N (1-based) brings `user_version` from N-1 to N. Append only.
-const MIGRATIONS: &[&str] = &[V1, V2];
+const MIGRATIONS: &[&str] = &[V1, V2, V3];
 
 const V1: &str = r#"
 CREATE TABLE events(
@@ -183,6 +183,31 @@ WHERE NOT EXISTS (
     WHERE c.pubkey = torrents.pubkey
       AND json_array_length(c.factors) = 1
       AND json_extract(c.factors, '$[0].code') IN ('BLOCKED', 'TRUSTED', 'ROOT_MUTED'));
+"#;
+
+/// Identified media as last seen from the server (D42), for offline detail/search, and the
+/// poster files fetched from the server (LRU by `last_access`). Idempotent (`IF NOT EXISTS`).
+const V3: &str = r#"
+CREATE TABLE IF NOT EXISTS media_cache(
+    infohash TEXT PRIMARY KEY,
+    media_id INTEGER NOT NULL,
+    imdb TEXT,
+    title TEXT NOT NULL,
+    year INTEGER,
+    kind TEXT NOT NULL,
+    json TEXT NOT NULL,
+    fetched_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS media_cache_imdb ON media_cache(imdb);
+CREATE INDEX IF NOT EXISTS media_cache_media ON media_cache(media_id);
+CREATE TABLE IF NOT EXISTS poster_cache(
+    media_id INTEGER PRIMARY KEY,
+    file TEXT NOT NULL,
+    etag TEXT,
+    bytes INTEGER NOT NULL,
+    fetched_at INTEGER NOT NULL,
+    last_access INTEGER NOT NULL
+);
 "#;
 
 /// Bring the database to the latest schema. A brand-new file gets incremental auto-vacuum so

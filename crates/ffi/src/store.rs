@@ -68,7 +68,7 @@ pub struct SqliteStore {
     conn: Mutex<Connection>,
 }
 
-trait DbExt<T> {
+pub(crate) trait DbExt<T> {
     fn db(self) -> Result<T>;
 }
 
@@ -216,7 +216,7 @@ impl SqliteStore {
         })
     }
 
-    fn conn(&self) -> MutexGuard<'_, Connection> {
+    pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -638,7 +638,8 @@ impl SqliteStore {
             Some(t) => t,
             None => Self::threshold(&conn)?,
         };
-        let matcher = fts5_match(&q.text);
+        let (text, media_tokens) = crate::media::split_media_tokens(&q.text);
+        let matcher = fts5_match(&text);
         let mut args: Vec<Value> = vec![Value::Integer(min_trust as i64)];
         let eligible = format!("t.trust >= ?1 AND t.pubkey NOT IN ({BLOCKED_SQL})");
 
@@ -681,7 +682,7 @@ impl SqliteStore {
                 COALESCE(f.pinned, 0), COALESCE(f.hidden, 0),
                 (SELECT COUNT(DISTINCT t.pubkey) FROM torrents t
                     WHERE t.infohash = c.infohash AND {eligible}) AS pubs,
-                {LIVENESS_COLS}, {best} AS best
+                {LIVENESS_COLS}, {best} AS best, mc.title, mc.year, mc.kind
              FROM canon c "
         ));
         if matcher.is_some() {
@@ -690,6 +691,7 @@ impl SqliteStore {
         sql.push_str(
             "LEFT JOIN liveness l ON l.infohash = c.infohash
              LEFT JOIN torrent_flags f ON f.infohash = c.infohash
+             LEFT JOIN media_cache mc ON mc.infohash = c.infohash
              WHERE c.rn = 1",
         );
 
@@ -756,6 +758,10 @@ impl SqliteStore {
         if !q.include_hidden {
             sql.push_str(" AND COALESCE(f.hidden, 0) = 0");
         }
+        for t in &media_tokens {
+            let (cond, v) = crate::media::token_condition(t);
+            push(&mut sql, &mut args, &format!(" AND {cond}"), v);
+        }
 
         let total: i64 = conn
             .query_row(
@@ -803,9 +809,9 @@ impl SqliteStore {
                     rank: r.get::<_, f64>(11)? as f32,
                     pinned: r.get(12)?,
                     hidden: r.get(13)?,
-                    media_title: None,
-                    media_year: None,
-                    media_kind: None,
+                    media_title: r.get(26)?,
+                    media_year: r.get(27)?,
+                    media_kind: r.get::<_, Option<String>>(28)?.and_then(|k| k.parse().ok()),
                 })
             })
             .db()?
@@ -915,6 +921,7 @@ impl SqliteStore {
             params![infohash, now],
         )
         .db()?;
+        let media = crate::media::cached_media(&conn, infohash, now)?;
         drop(conn);
 
         let publishers: HashSet<&str> = rows
@@ -952,9 +959,9 @@ impl SqliteStore {
             rank: 0.0,
             pinned,
             hidden,
-            media_title: None,
-            media_year: None,
-            media_kind: None,
+            media_title: media.as_ref().map(|m| m.title.clone()),
+            media_year: media.as_ref().and_then(|m| m.year),
+            media_kind: media.as_ref().map(|m| m.kind),
         };
         let events = rows
             .iter()
@@ -981,7 +988,7 @@ impl SqliteStore {
             trust,
             events,
             comments,
-            media: None,
+            media,
         }))
     }
 
@@ -1592,6 +1599,7 @@ impl SqliteStore {
                 compact(&conn)?;
             }
         }
+        crate::media::prune(&conn)?;
         let bytes_after = db_bytes(&conn)?;
         let unsynced_kept = conn
             .query_row("SELECT COUNT(*) FROM sync_ids WHERE synced = 0", [], |r| {

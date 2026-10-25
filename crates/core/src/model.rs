@@ -455,6 +455,9 @@ pub struct MediaInfo {
     /// Server-relative URL such as `/api/v1/media/{id}/poster`.
     #[serde(default)]
     pub poster: Option<String>,
+    /// TMDB episode name when `season` and `episode` are known (D42, additive).
+    #[serde(default)]
+    pub episode_title: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

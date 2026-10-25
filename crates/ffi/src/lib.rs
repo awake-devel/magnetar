@@ -13,6 +13,7 @@ use magnetar_core::{crawler, magnet, notify, sync, trust};
 
 mod app;
 mod convert;
+pub mod media;
 mod schema;
 pub mod store;
 
@@ -112,6 +113,49 @@ pub struct FfiTorrentSummary {
     pub rank: f32,
     pub pinned: bool,
     pub hidden: bool,
+    /// Identified media (D40), when the server matched this torrent.
+    pub media_title: Option<String>,
+    pub media_year: Option<i32>,
+    pub media_kind: Option<FfiMediaKind>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiMediaKind {
+    Movie,
+    Series,
+    Anime,
+}
+
+/// `core::model::MediaInfo` (D40) with TMDB decoration (D42).
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiMediaInfo {
+    pub media_id: i64,
+    pub kind: FfiMediaKind,
+    pub title: String,
+    pub original_title: Option<String>,
+    pub year: Option<i32>,
+    pub end_year: Option<i32>,
+    pub genres: Vec<String>,
+    pub rating: Option<f32>,
+    pub votes: Option<u32>,
+    pub runtime_min: Option<i32>,
+    pub season: Option<i32>,
+    pub episode: Option<i32>,
+    pub episode_title: Option<String>,
+    /// "tt…".
+    pub imdb: Option<String>,
+    /// https://www.imdb.com/title/tt…/ when `imdb` is known.
+    pub imdb_url: Option<String>,
+    /// Movie or Series (TMDB /movie or /tv).
+    pub tmdb_kind: Option<FfiMediaKind>,
+    pub tmdb_id: Option<u32>,
+    pub mal: Option<u32>,
+    pub anilist: Option<u32>,
+    pub method: String,
+    pub confidence: f32,
+    pub overview: Option<String>,
+    /// Server-relative poster URL; load it with `Magnetar::media_poster`.
+    pub poster: Option<String>,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -202,6 +246,8 @@ pub struct FfiTorrentDetail {
     pub comments: Vec<FfiComment>,
     /// "server" | "local"
     pub source: String,
+    /// Identified media; offline it comes from the phone's copy of the last server answer.
+    pub media: Option<FfiMediaInfo>,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -330,7 +376,11 @@ impl Magnetar {
             })?;
         }
         let store = Arc::new(SqliteStore::open(&db_path)?);
-        let inner = Arc::new(Inner::new(store, config.clone()));
+        let posters = std::path::Path::new(&db_path)
+            .parent()
+            .map(|d| d.join("posters"))
+            .unwrap_or_else(|| "posters".into());
+        let inner = Arc::new(Inner::new(store, config.clone()).with_poster_dir(posters));
         let this = Magnetar {
             inner,
             handle: runtime.handle().clone(),
@@ -392,6 +442,8 @@ impl Magnetar {
                         d.summary.pinned = pinned;
                         d.summary.hidden = hidden;
                         inner.store.touch(&ih, now)?;
+                        // Kept for offline viewing (the torrent body itself is not cached here).
+                        inner.store.put_media(&ih, d.media.as_ref(), now)?;
                         return Ok(Some(convert::detail(d, "server")));
                     }
                     Ok(None) => {}
@@ -402,6 +454,48 @@ impl Magnetar {
                 .store
                 .torrent_detail_sync(&ih, now)?
                 .map(|d| convert::detail(d, "local")))
+        })
+        .await
+    }
+
+    /// Local file holding the poster of a media (`FfiMediaInfo.poster` is its server URL).
+    /// Fetched from the server with the bearer token and cached (LRU, ≤ 30 MB); revalidated by
+    /// ETag after 30 days. Offline, or when the server has none, the cached copy or None.
+    pub async fn media_poster(
+        &self,
+        media_id: i64,
+        poster_url: String,
+    ) -> Result<Option<String>, FfiError> {
+        self.run(move |inner| async move { inner.media_poster(media_id, &poster_url).await })
+            .await
+    }
+
+    /// Other releases of the same media: the server's list (`GET /api/v1/media/{id}/torrents`,
+    /// enrich/imdb), else the cached torrents linked to it, under the configured trust threshold
+    /// like any other local search.
+    pub async fn media_torrents(&self, media_id: i64) -> Result<FfiSearchPage, FfiError> {
+        self.run(move |inner| async move {
+            let mut server_error = None;
+            if let Some(api) = inner.api() {
+                match api.media_torrents(media_id, media::MEDIA_RELEASES, 0).await {
+                    Ok(mut p) => {
+                        p.source = "server".into();
+                        inner.overlay_flags(&mut p, false)?;
+                        return Ok(convert::page(p, None));
+                    }
+                    Err(e) => server_error = Some(e.to_string()),
+                }
+            }
+            let q = magnetar_core::query::SearchQuery {
+                text: format!("media:{media_id}"),
+                min_trust: Some(inner.state().config.trust_threshold),
+                sort: magnetar_core::query::Sort::Seeders,
+                descending: true,
+                limit: media::MEDIA_RELEASES,
+                ..Default::default()
+            };
+            let p = inner.store.search_sync(&q, magnetar_core::now())?;
+            Ok(convert::page(p, server_error))
         })
         .await
     }
@@ -445,7 +539,13 @@ impl Magnetar {
 
     pub fn cleanup(&self) -> Result<FfiCleanupReport, FfiError> {
         let cap_mb = self.inner.state().config.cache_cap_mb as u64;
-        Ok(self.inner.store.cleanup(cap_mb * 1024 * 1024)?.into())
+        let report = self.inner.store.cleanup(cap_mb * 1024 * 1024)?;
+        // TMDB content kept at most media::TMDB_MAX_AGE_SECS (D42).
+        let (_, files) = self.inner.store.expire_tmdb(magnetar_core::now())?;
+        for f in files {
+            let _ = std::fs::remove_file(f);
+        }
+        Ok(report.into())
     }
 
     /// Local liveness check (trackers + DHT); also stored in the cache.

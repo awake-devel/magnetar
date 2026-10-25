@@ -143,6 +143,56 @@ impl From<TorrentSummary> for FfiTorrentSummary {
             rank: t.rank,
             pinned: t.pinned,
             hidden: t.hidden,
+            media_title: t.media_title,
+            media_year: t.media_year,
+            media_kind: t.media_kind.map(Into::into),
+        }
+    }
+}
+
+impl From<MediaKind> for FfiMediaKind {
+    fn from(k: MediaKind) -> Self {
+        match k {
+            MediaKind::Movie => FfiMediaKind::Movie,
+            MediaKind::Series => FfiMediaKind::Series,
+            MediaKind::Anime => FfiMediaKind::Anime,
+        }
+    }
+}
+
+impl From<MediaInfo> for FfiMediaInfo {
+    fn from(m: MediaInfo) -> Self {
+        let imdb_url = m
+            .imdb
+            .as_deref()
+            .filter(|i| {
+                i.len() > 2 && i.starts_with("tt") && i[2..].bytes().all(|b| b.is_ascii_digit())
+            })
+            .map(|i| format!("https://www.imdb.com/title/{i}/"));
+        FfiMediaInfo {
+            media_id: m.media_id,
+            kind: m.kind.into(),
+            title: m.title,
+            original_title: m.original_title,
+            year: m.year,
+            end_year: m.end_year,
+            genres: m.genres,
+            rating: m.rating,
+            votes: m.votes,
+            runtime_min: m.runtime_min,
+            season: m.season,
+            episode: m.episode,
+            episode_title: m.episode_title,
+            imdb: m.imdb,
+            imdb_url,
+            tmdb_kind: m.tmdb.map(|(k, _)| k.into()),
+            tmdb_id: m.tmdb.map(|(_, id)| id),
+            mal: m.mal,
+            anilist: m.anilist,
+            method: m.method,
+            confidence: m.confidence,
+            overview: m.overview,
+            poster: m.poster,
         }
     }
 }
@@ -247,6 +297,7 @@ pub fn detail(d: TorrentDetail, source: &str) -> FfiTorrentDetail {
             })
             .collect(),
         source: source.into(),
+        media: d.media.map(Into::into),
     }
 }
 

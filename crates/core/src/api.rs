@@ -85,6 +85,26 @@ pub struct DownloadRequest {
     pub magnet: String,
 }
 
+/// Result of a conditional binary GET (`ApiClient::get_bytes`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Fetched {
+    /// 304: the copy matching the sent ETag is still current.
+    NotModified,
+    Body {
+        bytes: Vec<u8>,
+        content_type: Option<String>,
+        etag: Option<String>,
+    },
+}
+
+/// A server-relative `/api/v1/…` path (what `MediaInfo.poster` carries), nothing else.
+pub fn is_api_path(path: &str) -> bool {
+    path.starts_with("/api/v1/") && !path.contains("..") && !path.contains("://")
+}
+
+/// Largest binary body `get_bytes` accepts (posters are ~30 KiB).
+pub const MAX_BYTES_BODY: usize = 4 << 20;
+
 /// Typed client for the server API. All methods send `Authorization: Bearer <token>`.
 #[derive(Clone)]
 pub struct ApiClient {
@@ -153,6 +173,54 @@ impl ApiClient {
             ("offset", offset.to_string()),
         ];
         self.json(self.req(Method::GET, &path).query(&query)).await
+    }
+    /// GET a server-relative binary resource (e.g. `MediaInfo.poster`) with the bearer token.
+    /// Only `/api/v1/` paths are accepted, so a URL from the server cannot point elsewhere.
+    /// Ok(None) on 404.
+    pub async fn get_bytes(
+        &self,
+        path: &str,
+        etag: Option<&str>,
+    ) -> crate::Result<Option<Fetched>> {
+        if !is_api_path(path) {
+            return Err(crate::Error::Invalid(format!(
+                "not a server API path: {path:?}"
+            )));
+        }
+        let mut rb = self.req(Method::GET, path);
+        if let Some(e) = etag {
+            rb = rb.header(reqwest::header::IF_NONE_MATCH, e);
+        }
+        let resp = match self.send(rb).await {
+            Err(crate::Error::Server { status: 404, .. }) => return Ok(None),
+            // `send` treats every non-2xx as an error, 304 included.
+            Err(crate::Error::Server { status: 304, .. }) => return Ok(Some(Fetched::NotModified)),
+            Err(e) => return Err(e),
+            Ok(r) => r,
+        };
+        let header = |h: reqwest::header::HeaderName| {
+            resp.headers()
+                .get(h)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let content_type = header(reqwest::header::CONTENT_TYPE);
+        let etag = header(reqwest::header::ETAG);
+        if resp
+            .content_length()
+            .is_some_and(|n| n > MAX_BYTES_BODY as u64)
+        {
+            return Err(crate::Error::Invalid(format!("{path}: body too large")));
+        }
+        let bytes = resp.bytes().await?;
+        if bytes.len() > MAX_BYTES_BODY {
+            return Err(crate::Error::Invalid(format!("{path}: body too large")));
+        }
+        Ok(Some(Fetched::Body {
+            bytes: bytes.to_vec(),
+            content_type,
+            etag,
+        }))
     }
     pub async fn refresh_liveness(&self, infohash: &str) -> crate::Result<Liveness> {
         let path = format!("/api/v1/torrents/{}/liveness", encode(infohash));

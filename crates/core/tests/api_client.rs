@@ -116,6 +116,7 @@ fn detail() -> TorrentDetail {
             confidence: 1.0,
             overview: None,
             poster: Some("/api/v1/media/7/poster".into()),
+            episode_title: None,
         }),
     }
 }

@@ -148,6 +148,7 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
                 "Magnetar ${vm.appVersion} · core ${state.coreVersion ?: "…"}",
                 style = MaterialTheme.typography.labelSmall,
             )
+            TmdbAttribution()
             Spacer(Modifier.height(24.dp))
         }
     }

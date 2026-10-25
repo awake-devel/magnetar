@@ -126,6 +126,26 @@ pub struct Config {
     /// Fribb `anime-list-full.json` source: URL or local file (default: master on GitHub).
     #[arg(long, env = "MAGNETAR_ANIME_FRIBB_URL")]
     pub anime_fribb_url: Option<String>,
+    /// TMDB API read access token (or v3 key) for posters/overviews; unset = TMDB off (D42).
+    #[arg(long, env = "MAGNETAR_TMDB_TOKEN", hide_env_values = true)]
+    pub tmdb_token: Option<String>,
+    /// Comma-separated TMDB languages, preferred first.
+    #[arg(
+        long,
+        env = "MAGNETAR_TMDB_LANGS",
+        value_delimiter = ',',
+        default_value = "en-US,fr-FR"
+    )]
+    pub tmdb_langs: Vec<String>,
+    /// Poster cache (default `$XDG_CACHE_HOME/magnetar/images` or ~/.cache/magnetar/images).
+    #[arg(long, env = "MAGNETAR_IMAGE_CACHE_DIR")]
+    pub image_cache_dir: Option<PathBuf>,
+    /// TMDB requests per second (token bucket, bursts of up to 5).
+    #[arg(long, env = "MAGNETAR_TMDB_RPS", default_value_t = 20)]
+    pub tmdb_rps: u32,
+    /// Background TMDB prefetch of recently matched media per hour; 0 = only on detail views.
+    #[arg(long, env = "MAGNETAR_TMDB_PREFETCH_PER_HOUR", default_value_t = 60)]
+    pub tmdb_prefetch_per_hour: u32,
 }
 
 impl Config {
@@ -169,6 +189,17 @@ impl Config {
         self.dataset_dir
             .clone()
             .unwrap_or_else(|| self.state_dir().join("datasets"))
+    }
+
+    pub fn image_cache_dir(&self) -> PathBuf {
+        self.image_cache_dir.clone().unwrap_or_else(|| {
+            std::env::var_os("XDG_CACHE_HOME")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .unwrap_or_else(|| Self::home().join(".cache"))
+                .join("magnetar")
+                .join("images")
+        })
     }
 
     /// `$XDG_STATE_HOME/magnetar` or `~/.local/state/magnetar`.
