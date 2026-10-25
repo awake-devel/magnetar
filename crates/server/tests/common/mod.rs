@@ -210,3 +210,40 @@ pub fn fixture_events(name: &str) -> Vec<RawEvent> {
         .map(|l| RawEvent::from_json(l).unwrap())
         .collect()
 }
+
+pub const TOKEN: &str = "test-token-123";
+
+/// In-process API server on 127.0.0.1:0. Returns the base URL.
+pub async fn spawn_server(store: &PgStore) -> String {
+    let state = magnetar_server::AppState::new(std::sync::Arc::new(store.clone()), TOKEN);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, magnetar_server::router(state))
+            .await
+            .unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// A real signed event (for paths that verify signatures).
+pub fn signed(keys: &nostr::prelude::Keys, kind: u16, tags: Vec<Vec<String>>, content: &str) -> RawEvent {
+    use nostr::prelude::*;
+    let tags: Vec<Tag> = tags.into_iter().map(|t| Tag::parse(t).unwrap()).collect();
+    let ev = EventBuilder::new(Kind::from(kind), content)
+        .tags(tags)
+        .finalize(keys)
+        .unwrap();
+    RawEvent::from_json(&ev.as_json()).unwrap()
+}
+
+impl TestDb {
+    /// DATABASE_URL for a child process confined to this test's schema.
+    pub fn scoped_url(&self) -> String {
+        let sep = if self.url.contains('?') { '&' } else { '?' };
+        format!(
+            "{}{sep}options%5Bsearch_path%5D={},public&application_name={}",
+            self.url, self.schema, self.schema
+        )
+    }
+}
