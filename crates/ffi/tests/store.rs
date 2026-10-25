@@ -777,6 +777,7 @@ fn reopen_keeps_data_and_schema() {
     {
         let s = SqliteStore::open(&path).unwrap();
         torrent(&ih(1), "persisted", &pk(1), 1).put(&s);
+        assert!(dir.0.join("m.db-wal").exists(), "WAL journal");
     }
     let s = SqliteStore::open(&path).unwrap();
     assert_eq!(titles(&s, &q("persisted")), ["persisted"]);
