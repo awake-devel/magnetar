@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
@@ -118,6 +119,12 @@ class SearchViewModel(application: Application) : BaseViewModel(application) {
     init {
         viewModelScope.launch {
             textInput.drop(1).debounce(400).distinctUntilChanged().collectLatest { search() }
+        }
+        // A new server URL, token or trust threshold changes what a search returns (e.g. the
+        // "offline results (401)" banner after the token is fixed): run it again.
+        viewModelScope.launch {
+            magApp.settings.map { Triple(it.serverUrl, it.apiToken, it.trustThreshold) }
+                .distinctUntilChanged().drop(1).collect { search() }
         }
         viewModelScope.launch {
             magApp.pendingSearch.filterNotNull().collect { q ->
