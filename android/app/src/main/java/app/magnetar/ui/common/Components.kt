@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -24,6 +25,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import app.magnetar.TrustLevel
 import app.magnetar.ffi.FfiCategory
+import app.magnetar.ffi.FfiOrigin
 import app.magnetar.trustLevel
 
 fun categoryEmoji(c: FfiCategory): String = when (c) {
@@ -60,6 +62,48 @@ fun TrustBadge(score: Int, threshold: Int, modifier: Modifier = Modifier, level:
     ) {
         Text("★ $score", color = fg, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
     }
+}
+
+/**
+ * Result badge by source (D51): the trust star for Nostr results, a neutral outlined "DHT" in
+ * its place for DHT-only ones (no publisher, nothing to score: name and files are verified
+ * against the infohash), and the star with a small "DHT" chip when both hold the torrent.
+ */
+@Composable
+fun SourceBadge(origin: FfiOrigin, score: Int, threshold: Int, modifier: Modifier = Modifier) {
+    when (origin) {
+        FfiOrigin.NOSTR -> TrustBadge(score, threshold, modifier)
+        FfiOrigin.DHT -> DhtChip(modifier)
+        FfiOrigin.BOTH -> Column(modifier, horizontalAlignment = Alignment.End) {
+            TrustBadge(score, threshold)
+            Spacer(Modifier.height(2.dp))
+            DhtChip(small = true)
+        }
+    }
+}
+
+/** Neutral outlined "DHT" label (not a score: no colour of the trust scale). */
+@Composable
+fun DhtChip(modifier: Modifier = Modifier, small: Boolean = false) {
+    Box(
+        modifier
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(8.dp))
+            .padding(horizontal = if (small) 6.dp else 8.dp, vertical = if (small) 0.dp else 2.dp),
+    ) {
+        Text(
+            "DHT",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = if (small) MaterialTheme.typography.labelSmall else MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.Bold,
+        )
+    }
+}
+
+/** Where a torrent is known from, for the detail screen (D51). */
+fun sourceLabel(origin: FfiOrigin): String = when (origin) {
+    FfiOrigin.NOSTR -> "Nostr"
+    FfiOrigin.DHT -> "DHT (verified metadata, no publisher)"
+    FfiOrigin.BOTH -> "Nostr and DHT"
 }
 
 @Composable

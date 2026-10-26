@@ -57,6 +57,8 @@ data class SearchFilters(
     val minRating: Float? = null,
     val minYear: Int? = null,
     val maxYear: Int? = null,
+    /** Where results come from (D51): "nostr", "dht"; empty = both. */
+    val origins: Set<String> = emptySet(),
 ) {
     val activeCount: Int
         get() = listOf(
@@ -64,7 +66,7 @@ data class SearchFilters(
             minSeeders != null, hideDead, minTrust != null,
             languages.isNotEmpty(), subtitles.isNotEmpty(), resolutions.isNotEmpty(), sources.isNotEmpty(),
             codecs.isNotEmpty(), hdr.isNotEmpty(), audio.isNotEmpty(), genres.isNotEmpty(), kinds.isNotEmpty(),
-            minRating != null, minYear != null || maxYear != null,
+            minRating != null, minYear != null || maxYear != null, origins.isNotEmpty(),
         ).count { it }
 
     /** The values selected for facet [field] (the names of `FACET_FIELDS`). */
@@ -78,6 +80,7 @@ data class SearchFilters(
         "audio" -> audio
         "genre" -> genres
         "media_kind" -> kinds.mapTo(HashSet()) { it.code() }
+        "origin" -> origins
         else -> emptySet()
     }
 
@@ -93,6 +96,7 @@ data class SearchFilters(
             "hdr" -> copy(hdr = hdr.flip())
             "audio" -> copy(audio = audio.flip())
             "genre" -> copy(genres = genres.flip())
+            "origin" -> copy(origins = origins.flip())
             "media_kind" -> {
                 val k = mediaKindOf(value) ?: return this
                 copy(kinds = if (k in kinds) kinds - k else kinds + k)
@@ -155,6 +159,8 @@ data class SearchUiState(
     val filterMode: FilterMode = FilterMode.LOCAL,
     /** The server can count facets (`facet_set`); still null counts while its index builds. */
     val facetCounts: Boolean = false,
+    /** The server knows result sources (`origin`, D51): the Source chips apply. */
+    val originFilter: Boolean = false,
 )
 
 private const val MB = 1024L * 1024L
@@ -191,6 +197,7 @@ fun SearchUiState.toQuery(offset: UInt = 0u, nowSec: Long = System.currentTimeMi
     minRating = filters.minRating,
     minYear = filters.minYear,
     maxYear = filters.maxYear,
+    origins = filters.origins.sorted(),
 )
 
 /** Inverse of [toQuery], for running a saved search; `since` snaps to the nearest preset. */
@@ -219,6 +226,7 @@ fun FfiSearchQuery.toUiState(nowSec: Long = System.currentTimeMillis() / 1000) =
         minRating = minRating,
         minYear = minYear,
         maxYear = maxYear,
+        origins = origins.toSet(),
     ),
     sort = sort,
     descending = descending,
@@ -287,6 +295,7 @@ class SearchViewModel(application: Application) : BaseViewModel(application) {
                 it.copy(
                     filterMode = filterMode(hasServer, features),
                     facetCounts = features?.contains("facet_set") == true,
+                    originFilter = features?.contains("origin") == true,
                 )
             }
         }
@@ -306,7 +315,8 @@ class SearchViewModel(application: Application) : BaseViewModel(application) {
         }
         val query = s.copy(filters = f).toQuery()
         // 503 while the server builds its index: no counts, the chips still work.
-        _facets.value = ffiCatching { magApp.magnetar().facets(query, FACET_FIELDS + "category") }.getOrNull()
+        val fields = FACET_FIELDS + "category" + if (s.originFilter) listOf("origin") else emptyList()
+        _facets.value = ffiCatching { magApp.magnetar().facets(query, fields) }.getOrNull()
     }
 
     fun setFilters(f: SearchFilters) {

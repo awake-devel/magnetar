@@ -699,6 +699,15 @@ impl SqliteStore {
     }
 
     pub fn search_sync(&self, q: &SearchQuery, now: i64) -> Result<SearchPage> {
+        // The phone caches Nostr events only (D51): a DHT-only source chip matches nothing.
+        if q.origin_filter() == ["dht"] {
+            return Ok(SearchPage {
+                hits: Vec::new(),
+                total: 0,
+                source: "local".into(),
+                total_is_lower_bound: false,
+            });
+        }
         let conn = self.conn();
         let min_trust = match q.min_trust {
             Some(t) => t,

@@ -23,7 +23,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 /** One activity chart the user can pick (D47 metrics). */
-enum class Activity(val metric: String, val label: String, val unit: ValueUnit) {
+enum class Activity(val metric: String, val label: String, val unit: ValueUnit, val dht: Boolean = false) {
     TOTAL("torrents_total", "Torrents over time", ValueUnit.COUNT),
     ADDED("torrents_added", "Added", ValueUnit.COUNT),
     PUBLISHED("torrents_published", "Published", ValueUnit.COUNT),
@@ -31,6 +31,9 @@ enum class Activity(val metric: String, val label: String, val unit: ValueUnit) 
     RELAYS("relays_discovered", "Relays found", ValueUnit.COUNT),
     CHECKS("liveness_checks", "Seed checks", ValueUnit.COUNT),
     DB("db_size", "Database size", ValueUnit.BYTES),
+    // The server's DHT crawler (D58); offered when the server runs one.
+    DHT_ADDED("dht_torrents_added", "DHT torrents added", ValueUnit.COUNT, dht = true),
+    DHT_SEEN("dht_hashes_seen", "DHT hashes found", ValueUnit.COUNT, dht = true),
 }
 
 /** The breakdown charts, in screen order. */
@@ -38,16 +41,22 @@ val BREAKDOWN_FIELDS = listOf(
     "language", "resolution", "category", "source", "codec", "hdr", "audio", "genre", "media_kind", "subcategory",
 )
 
+/** The breakdowns a server with [features] can count: `origin` (Nostr / DHT, D51) is newer. */
+fun breakdownFields(features: List<String>?): List<String> =
+    if (features?.contains("origin") == true) BREAKDOWN_FIELDS + "origin" else BREAKDOWN_FIELDS
+
 /** Chart titles. */
 val FIELD_TITLES = mapOf(
     "language" to "Audio languages", "resolution" to "Resolutions", "category" to "Categories",
     "source" to "Sources", "codec" to "Video codecs", "hdr" to "HDR", "audio" to "Audio formats",
     "genre" to "Genres", "media_kind" to "Movies, series, anime", "subcategory" to "Publisher categories",
-    "year" to "Years",
+    "year" to "Years", "origin" to "Found via (Nostr / DHT)",
 )
 
 /** Fields that can cross-filter (the others only show counts). */
-val FILTERABLE = setOf("language", "resolution", "category", "source", "codec", "hdr", "audio", "genre", "media_kind", "year")
+val FILTERABLE = setOf(
+    "language", "resolution", "category", "source", "codec", "hdr", "audio", "genre", "media_kind", "year", "origin",
+)
 
 data class StatsUiState(
     val hasServer: Boolean = false,
@@ -68,6 +77,8 @@ data class StatsUiState(
 ) {
     val stats: Boolean get() = features?.contains("stats") == true
     val graphs: Boolean get() = features?.contains("graphs") == true
+    /** The server runs the DHT crawler (D58). */
+    val dht: Boolean get() = features?.contains("dht") == true
 }
 
 /** Cross-filter on [value] of [field] switched on or off (categories and years included). */
@@ -120,7 +131,8 @@ class StatsViewModel(application: Application) : BaseViewModel(application) {
         val query = SearchUiState(filters = filters).toQuery()
         breakdownJob = viewModelScope.launch {
             val m = magApp.magnetar()
-            val main = async { ffiCatching { m.statsBreakdown(query, BREAKDOWN_FIELDS, 10u) } }
+            val fields = breakdownFields(_state.value.features)
+            val main = async { ffiCatching { m.statsBreakdown(query, fields, 10u) } }
             // Years as a histogram: many more values.
             val years = async { ffiCatching { m.statsBreakdown(query, listOf("year"), 50u) } }
             main.await()

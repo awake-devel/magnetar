@@ -83,7 +83,7 @@ import app.magnetar.ui.common.Banner
 import app.magnetar.ui.common.CategoryIcon
 import app.magnetar.ui.common.CenteredMessage
 import app.magnetar.ui.common.SaveSearchDialog
-import app.magnetar.ui.common.TrustBadge
+import app.magnetar.ui.common.SourceBadge
 import app.magnetar.ui.common.categoryLabel
 import app.magnetar.ui.detail.mediaHeadline
 import kotlin.math.roundToInt
@@ -177,6 +177,7 @@ fun SearchScreen(onOpen: (String) -> Unit, onOpenMedia: (Long) -> Unit = {}, vm:
             facets = facets,
             onDraft = vm::draftFilters,
             onApply = { vm.setFilters(it); showFilters = false; vm.draftFilters(null) },
+            sourceChips = state.originFilter,
         )
     }
     if (showSave) {
@@ -287,7 +288,7 @@ private fun ResultRow(hit: FfiTorrentSummary, threshold: Int, modifier: Modifier
                 }
             }
         },
-        trailingContent = { TrustBadge(hit.trust.toInt(), threshold) },
+        trailingContent = { SourceBadge(hit.origin, hit.trust.toInt(), threshold) },
     )
 }
 

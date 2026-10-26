@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.viewModelScope
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
+import app.magnetar.ffi.FfiDhtStats
 import app.magnetar.ffi.FfiLivenessStats
 import app.magnetar.ffi.FfiStats
 import app.magnetar.ffiCatching
@@ -24,6 +25,8 @@ data class StatusUiState(
     val serverError: String? = null,
     /** The server's seed-check backlog (D45); null offline or from an older server. */
     val liveness: FfiLivenessStats? = null,
+    /** The server's DHT crawler (D58); null when it runs none. */
+    val dht: FfiDhtStats? = null,
     val checkingServer: Boolean = false,
     val workRunning: Boolean = false,
     val lastRun: List<String> = emptyList(),
@@ -66,7 +69,7 @@ class StatusViewModel(application: Application) : BaseViewModel(application) {
 
     fun checkServer() {
         if (!hasServer) {
-            _state.update { it.copy(serverHealthy = null, serverError = null, liveness = null) }
+            _state.update { it.copy(serverHealthy = null, serverError = null, liveness = null, dht = null) }
             return
         }
         _state.update { it.copy(checkingServer = true) }
@@ -80,6 +83,10 @@ class StatusViewModel(application: Application) : BaseViewModel(application) {
         viewModelScope.launch {
             val live = ffiCatching { magApp.magnetar().serverLiveness() }.getOrNull()
             _state.update { it.copy(liveness = live) }
+        }
+        viewModelScope.launch {
+            val dht = ffiCatching { magApp.magnetar().serverDht() }.getOrNull()
+            _state.update { it.copy(dht = dht) }
         }
     }
 

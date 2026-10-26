@@ -2193,6 +2193,9 @@ pub fn facet_label(facet: &str, value: &str) -> String {
         ("media_kind", "series") => "Series",
         ("media_kind", "anime") => "Anime",
         ("subtitles", "multi") => "Multi-subs",
+        // Result sources (D51).
+        ("origin", "nostr") => "Nostr",
+        ("origin", "dht") => "DHT",
         _ => "",
     };
     if !fixed.is_empty() {

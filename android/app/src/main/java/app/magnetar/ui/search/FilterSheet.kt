@@ -54,6 +54,9 @@ private val FACET_TITLES = mapOf(
     "media_kind" to "Type",
 )
 
+/** Source chips (D51): value sent in `origins`, label. */
+val SOURCE_CHIPS = listOf("nostr" to "Nostr", "dht" to "DHT")
+
 /** Facets the phone cache cannot test well: hidden offline unless a saved search set them. */
 private val SERVER_ONLY = setOf("genre", "media_kind")
 
@@ -82,6 +85,8 @@ fun FilterSheet(
     facets: FfiFacetSet?,
     onDraft: (SearchFilters) -> Unit,
     onApply: (SearchFilters) -> Unit,
+    /** The server knows result sources (feature `origin`, D51). */
+    sourceChips: Boolean = false,
 ) {
     var f by remember { mutableStateOf(initial) }
     var minSize by remember { mutableStateOf(initial.minSizeMb?.toString() ?: "") }
@@ -125,6 +130,26 @@ fun FilterSheet(
                         label = { Text(categoryLabel(c) + (count?.let { " (${formatCount(it)})" } ?: "")) },
                         enabled = c in f.categories || count != 0uL,
                     )
+                }
+            }
+            // Source (D51): Nostr publishers or the server's DHT crawler; a torrent known from
+            // both counts under each. Offered when the server knows sources, kept while set.
+            if (sourceChips || f.origins.isNotEmpty()) {
+                val originCounts = facets?.facets?.firstOrNull { it.field == "origin" }
+                    ?.counts?.associate { it.value to it.count }
+                Spacer(Modifier.height(8.dp))
+                Text("Source", style = MaterialTheme.typography.titleSmall)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    for ((value, label) in SOURCE_CHIPS) {
+                        val on = value in f.origins
+                        val count = originCounts?.let { it[value] ?: 0uL }
+                        FilterChip(
+                            selected = on,
+                            onClick = { f = f.toggle("origin", value) },
+                            label = { Text(label + (count?.let { " (${formatCount(it)})" } ?: "")) },
+                            enabled = on || count != 0uL,
+                        )
+                    }
                 }
             }
             for (field in FACET_FIELDS) {

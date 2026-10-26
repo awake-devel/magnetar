@@ -59,7 +59,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import app.magnetar.ffi.FfiDhtInfo
 import app.magnetar.ffi.FfiLiveness
+import app.magnetar.ffi.FfiOrigin
 import app.magnetar.ffi.FfiTorrentDetail
 import app.magnetar.ffi.FfiTrust
 import app.magnetar.ffi.facetLabel
@@ -72,12 +74,14 @@ import app.magnetar.trustLevel
 import app.magnetar.ui.common.AppIcons
 import app.magnetar.ui.common.CategoryIcon
 import app.magnetar.ui.common.CenteredMessage
+import app.magnetar.ui.common.DhtChip
 import app.magnetar.ui.common.SaveSearchDialog
 import app.magnetar.ui.common.SectionTitle
 import app.magnetar.ui.common.TrustBadge
 import app.magnetar.ui.common.copyToClipboard
 import app.magnetar.ui.common.openMagnetExternally
 import app.magnetar.ui.common.shortKey
+import app.magnetar.ui.common.sourceLabel
 import app.magnetar.ui.search.peersText
 import kotlinx.coroutines.launch
 
@@ -137,10 +141,13 @@ fun DetailScreen(
                                     text = { Text(if (detail.summary.hidden) "Unhide" else "Hide") },
                                     onClick = { menu = false; vm.toggleHidden() },
                                 )
-                                DropdownMenuItem(
-                                    text = { Text("Block publisher…") },
-                                    onClick = { menu = false; confirmBlock = true },
-                                )
+                                // A DHT-only torrent has no publisher to block (D51).
+                                if (detail.summary.pubkey.isNotEmpty()) {
+                                    DropdownMenuItem(
+                                        text = { Text("Block publisher…") },
+                                        onClick = { menu = false; confirmBlock = true },
+                                    )
+                                }
                             }
                             DropdownMenuItem(
                                 text = { Text("Save search…") },
@@ -341,13 +348,21 @@ private fun DetailBody(
         item {
             SectionTitle("Infohash")
             CopyRow(s.infohash, monospace = true) { onCopy("Infohash", s.infohash) }
-            SectionTitle("Publisher")
-            CopyRow(s.npub, monospace = true) { onCopy("npub", s.npub) }
-            if (s.publisherCount > 1u) Text("${s.publisherCount} publishers announced this torrent")
-            if (s.powBits > 0u) Text("Proof of work: ${s.powBits} bits", style = MaterialTheme.typography.bodySmall)
+            SectionTitle("Source")
+            Text(sourceLabel(s.origin), style = MaterialTheme.typography.bodyMedium)
+            if (s.origin != FfiOrigin.DHT) {
+                SectionTitle("Publisher")
+                CopyRow(s.npub, monospace = true) { onCopy("npub", s.npub) }
+                if (s.publisherCount > 1u) Text("${s.publisherCount} publishers announced this torrent")
+                if (s.powBits > 0u) Text("Proof of work: ${s.powBits} bits", style = MaterialTheme.typography.bodySmall)
+            }
         }
 
-        item { TrustCard(detail.trust, threshold, trustOpen) { trustOpen = !trustOpen } }
+        // DHT-only: no publisher, so no trust score to show; the card says why it is listed.
+        detail.dht?.let { d -> item { DhtCard(d, s.title) } }
+        if (s.origin != FfiOrigin.DHT) {
+            item { TrustCard(detail.trust, threshold, trustOpen) { trustOpen = !trustOpen } }
+        }
 
         item { LivenessCard(detail.liveness, checkingLiveness, onCheckLiveness, swarm) }
 
@@ -444,6 +459,30 @@ private fun CopyRow(text: String, monospace: Boolean, onCopy: () -> Unit) {
             style = MaterialTheme.typography.bodySmall,
         )
         IconButton(onClick = onCopy) { Icon(AppIcons.ContentCopy, "Copy") }
+    }
+}
+
+/** What the server's DHT crawler verified (D51). */
+@Composable
+private fun DhtCard(d: FfiDhtInfo, shownTitle: String) {
+    Card(Modifier.fillMaxWidth().padding(top = 12.dp)) {
+        Column(Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Found on the DHT", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+                DhtChip()
+            }
+            Text(
+                "Name and files were downloaded from the swarm and verified against the infohash; " +
+                    "no publisher stands behind them.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            if (d.title != shownTitle) Text("Torrent name: ${d.title}", style = MaterialTheme.typography.bodySmall)
+            Text(
+                "First seen ${formatTimestamp(d.firstSeen)} · ${d.peersSeen} peers then · via ${d.discoveredVia.replace('_', ' ')}",
+                style = MaterialTheme.typography.labelSmall,
+            )
+            d.infohashV2?.let { Text("BitTorrent v2 hash: ${shortKey(it)}", style = MaterialTheme.typography.labelSmall) }
+        }
     }
 }
 

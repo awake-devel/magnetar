@@ -45,6 +45,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import app.magnetar.backlogEta
+import app.magnetar.dhtLines
 import app.magnetar.ffi.FfiBreakdown
 import app.magnetar.ffi.FfiStatsHealth
 import app.magnetar.formatAgo
@@ -269,6 +270,16 @@ private fun HealthCard(h: FfiStatsHealth, colors: ChartColors) {
                     else -> "not yet"
                 } + (h.crawlerLastError?.let { " · error: $it" } ?: ""),
             )
+            // The server's DHT crawler (D58): discovery rate, queue, metadata success.
+            h.dht?.let { d ->
+                Text(
+                    "DHT crawler",
+                    Modifier.padding(top = 8.dp),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = colors.inkMuted,
+                )
+                for ((label, value) in dhtLines(d)) Line(label, value)
+            }
         }
     }
 }
@@ -297,7 +308,7 @@ private fun ActivityCard(state: StatsUiState, colors: ChartColors, vm: StatsView
                 )
             }
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                for (a in Activity.entries) {
+                for (a in Activity.entries.filter { !it.dht || state.dht }) {
                     FilterChip(selected = state.activity == a, onClick = { vm.pickActivity(a) }, label = { Text(a.label) })
                 }
             }

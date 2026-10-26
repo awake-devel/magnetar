@@ -23,6 +23,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.magnetar.backlogEta
+import app.magnetar.dhtLines
+import app.magnetar.ffi.FfiDhtStats
 import app.magnetar.ffi.FfiLivenessStats
 import app.magnetar.ffi.FfiStats
 import app.magnetar.formatAgo
@@ -45,6 +47,7 @@ fun StatusContent(vm: StatusViewModel, modifier: Modifier = Modifier) {
                 state.stats?.let { StatsCard(it) }
                 ServerCard(state, vm.hasServer, vm::checkServer)
                 state.liveness?.let { LivenessCard(it) }
+                state.dht?.let { DhtCard(it) }
                 Row(Modifier.padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = vm::checkSavedSearchesNow, enabled = !state.workRunning && vm.hasServer) {
                         Text("Check saved searches now")
@@ -94,6 +97,17 @@ private fun LivenessCard(l: FfiLivenessStats) {
             l.lastBatchAt?.let {
                 StatLine("Last batch", "${formatCount(l.lastBatchSize)} in ${l.lastBatchMs.toLong() / 1000} s, ${formatAgo(it)}")
             }
+        }
+    }
+}
+
+/** The server's DHT crawler (D58): discovery, queue, metadata, router ports. */
+@Composable
+private fun DhtCard(d: FfiDhtStats) {
+    Card(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+        Column(Modifier.padding(12.dp)) {
+            Text("DHT crawler (server)", style = MaterialTheme.typography.titleSmall)
+            for ((label, value) in dhtLines(d)) StatLine(label, value)
         }
     }
 }
