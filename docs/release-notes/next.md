@@ -72,6 +72,18 @@ must be updated together to get all of it, but each side keeps working with an o
 - Settings: "Get my key from Amber" fills the trust root from a NIP-55 signer (only the
   public key is asked for). A private key (`nsec1…`) pasted into the field is cleared at once.
 
+### DHT crawler: design (stage 0, nothing runs yet; docs/DHT.md, D49–D58)
+
+- The server will find torrents on the BitTorrent DHT itself (BEP 51 sampling, and in
+  "aggressive" mode by listening on open UDP ports mapped with UPnP), download only their
+  metadata from peers and verify it against the infohash. Off by default (`MAGNETAR_DHT`).
+- DHT results will be mixed in with Nostr results on equal terms: they pass the trust threshold
+  and carry a "DHT" badge instead of a trust star.
+- Adult content will be hidden by default everywhere, Nostr torrents in the adult category
+  included, with a switch to show it.
+- A hard blocklist for illegal content will drop such torrents from the DHT and from Nostr
+  alike, keeping only their infohash so they are never fetched again; it cannot be turned off.
+
 ## Older servers and offline mode
 
 - The app asks `GET /health` for `features` and hides what the server lacks: an older server

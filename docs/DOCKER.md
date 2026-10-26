@@ -237,6 +237,22 @@ If the host already runs Tailscale, skip the sidecar and use the host's
 **UNVERIFIED:** the sidecar was checked with `docker compose --profile tailscale config` only;
 it has not been run against a real tailnet.
 
+## DHT crawler ports (planned, not implemented yet)
+
+The DHT crawler (docs/DHT.md, D49–D58) will be off by default and the default `compose.yml`
+will not publish anything new. In aggressive mode it listens on UDP ports (default 6891–6894),
+which an overlay publishes:
+
+```sh
+docker compose -f compose.yml -f docker/compose.dht.yml up -d
+```
+
+UPnP from inside a container needs two variables, because SSDP multicast does not leave
+Docker's bridge network and the container only knows its bridge address:
+`MAGNETAR_DHT_UPNP_GATEWAY=<router LAN address>` and `MAGNETAR_DHT_UPNP_LOCAL_IP=<this host's
+LAN address>`. Only UDP is mapped; the crawler never accepts incoming TCP connections. The
+overlay and these variables arrive with the UPnP stage; until then nothing here is active.
+
 ## Platform notes
 
 ### Synology NAS (DSM 7.2+, x86_64 models)
