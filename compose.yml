@@ -71,6 +71,22 @@ services:
       MAGNETAR_LIVENESS_TRACKER_CONCURRENCY:
       MAGNETAR_LIVENESS_DHT:
       MAGNETAR_LIVENESS_DHT_CONCURRENCY:
+      # DHT crawler (docs/DHT.md, off by default). Its UDP ports are published only by the
+      # overlay docker/compose.dht.yml, which also turns it on.
+      MAGNETAR_DHT:
+      MAGNETAR_DHT_PORT:
+      MAGNETAR_DHT_NODES:
+      MAGNETAR_DHT_QPS:
+      MAGNETAR_DHT_POOL:
+      MAGNETAR_DHT_PEER_LOOKUPS:
+      MAGNETAR_DHT_FETCH_CONCURRENCY:
+      MAGNETAR_DHT_TCP_RATE:
+      MAGNETAR_DHT_TCP_MAX:
+      MAGNETAR_DHT_PROBE:
+      MAGNETAR_DHT_UPNP:
+      MAGNETAR_DHT_UPNP_GATEWAY:
+      MAGNETAR_DHT_UPNP_LOCAL_IP:
+      MAGNETAR_BLOCKLIST_FILE:
       RUST_LOG: ${RUST_LOG:-info}
     # Image default is 10001:10001. Set to your own uid:gid when MAGNETAR_DATA is a host folder.
     user: ${MAGNETAR_UID:-10001}:${MAGNETAR_GID:-10001}

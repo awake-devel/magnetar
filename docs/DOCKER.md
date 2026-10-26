@@ -237,25 +237,43 @@ If the host already runs Tailscale, skip the sidecar and use the host's
 **UNVERIFIED:** the sidecar was checked with `docker compose --profile tailscale config` only;
 it has not been run against a real tailnet.
 
-## DHT crawler ports (overlay planned)
+## DHT crawler
 
-The DHT crawler (docs/DHT.md, D49–D62) exists since stage 1 and is off by default
-(`MAGNETAR_DHT=off`); the default `compose.yml` publishes nothing new. With `MAGNETAR_DHT` set
-and no published UDP ports, it still crawls (answers to its own queries come back through the
-NAT), but unsolicited queries cannot reach it, so passive capture finds almost nothing. In aggressive mode it listens on UDP ports (default 6891–6894),
-which an overlay publishes:
+The DHT crawler (docs/DHT.md) is off by default (`MAGNETAR_DHT=off`) and the default
+`compose.yml` publishes nothing for it; `compose.yml` only passes the `MAGNETAR_DHT*`
+variables through when `.env` sets them. The overlay `docker/compose.dht.yml` turns it on
+(`MAGNETAR_DHT=aggressive` unless `.env` says otherwise) and publishes its UDP ports
+6891–6894:
 
 ```sh
 docker compose -f compose.yml -f docker/compose.dht.yml up -d
 ```
 
-UPnP from inside a container needs two variables, because SSDP multicast does not leave
-Docker's bridge network and the container only knows its bridge address:
-`MAGNETAR_DHT_UPNP_GATEWAY=<router LAN address>` and `MAGNETAR_DHT_UPNP_LOCAL_IP=<this host's
-LAN address>`. Only UDP is mapped; the crawler never accepts incoming TCP connections (the
-metadata fetch of stage 2 only opens **outgoing** TCP connections to peers, which need no
-published port). The
-overlay and these variables arrive with the UPnP stage; until then nothing here is active.
+Crawling shows this host's IP address in BitTorrent swarms: opt in deliberately. With other
+values of `MAGNETAR_DHT_PORT` or `MAGNETAR_DHT_NODES`, change both sides of the overlay's
+port range (`MAGNETAR_DHT_PUBLISH` sets the host side).
+
+**UPnP from inside a container** needs two variables in `.env`, because SSDP multicast does
+not leave Docker's bridge network and the container only knows its bridge address:
+
+```sh
+MAGNETAR_DHT_UPNP_GATEWAY=192.168.1.1     # the router's LAN address
+MAGNETAR_DHT_UPNP_LOCAL_IP=192.168.1.20   # this host's LAN address
+```
+
+The server logs a warning when it runs in a container without them. Otherwise set
+`MAGNETAR_DHT_UPNP=false` and forward UDP 6891–6894 on the router by hand, or not at all: the
+crawler still works, answers to its own queries come back through the NAT, it only captures
+less passively. Only UDP is mapped: the crawler never accepts incoming TCP connections (the
+metadata fetch only opens outgoing ones, which need no published port). Outbound UDP is
+masqueraded by Docker with the source port kept when it is free (the Linux default), so remote
+nodes see the published port. UNVERIFIED on a real router from a container.
+
+**Watching it**: the app's Stats tab (health card) and Status screen show the crawler
+(discovery rate, queue, metadata success, stored and adult counts, router ports);
+`curl -H "Authorization: Bearer $MAGNETAR_API_TOKEN" http://127.0.0.1:8787/api/v1/stats | jq .dht`
+gives the same numbers. Disk use grows without a cap (user decision), roughly 5–6 KB per stored
+DHT torrent (docs/DHT.md §16); the `db_size` chart in Stats follows it.
 
 Extra illegal-content blocklist terms (`MAGNETAR_BLOCKLIST_FILE`, docs/CONFIG.md) are read from
 a file inside the container: mount it read-only (for example `./blocklist.txt:/config/blocklist.txt:ro`

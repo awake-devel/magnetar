@@ -1,0 +1,21 @@
+# DHT crawler overlay (docs/DHT.md §9, docs/DOCKER.md "DHT crawler"): publishes the crawler's
+# UDP ports and turns the crawler on. The default compose.yml publishes nothing for the DHT.
+#
+#   docker compose -f compose.yml -f docker/compose.dht.yml up -d
+#
+# Crawling makes this host's IP address visible in BitTorrent swarms: opt in deliberately.
+# UPnP from a container needs MAGNETAR_DHT_UPNP_GATEWAY (the router's LAN address) and
+# MAGNETAR_DHT_UPNP_LOCAL_IP (this host's LAN address) in .env: SSDP multicast does not leave
+# Docker's bridge network, and the container only knows its bridge address. Without them,
+# set MAGNETAR_DHT_UPNP=false and forward the UDP ports on the router by hand (or not at all:
+# the crawler still works, it only captures less passively).
+# Only UDP: the crawler never accepts TCP connections (it only opens outgoing ones).
+
+services:
+  magnetar:
+    environment:
+      MAGNETAR_DHT: ${MAGNETAR_DHT:-aggressive}
+    ports:
+      # Container ports follow MAGNETAR_DHT_PORT (6891) and MAGNETAR_DHT_NODES (4): change both
+      # sides together. The host side must be free; the router maps the same numbers (D57).
+      - "${MAGNETAR_DHT_PUBLISH:-6891-6894}:6891-6894/udp"

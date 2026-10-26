@@ -101,14 +101,17 @@ The Postgres credentials and volumes are described in docs/DOCKER.md.
 | `liveness.enabled` | bool | |
 | `ntfy.url`, `ntfy.topic` | string | from env |
 
-### DHT crawler (stages 1–3: discovery, metadata fetch, classification and blocklist)
+### DHT crawler (stages 1–4: discovery, metadata fetch, classification and blocklist, search and ops)
 
 Designed in docs/DHT.md (ARCHITECTURE.md D49–D70). Stage 1 implements discovery: BEP 51
 sampling, passive capture, triage into `dht_seen` and peer collection; stage 2 downloads and
 verifies each torrent's metadata from its peers (BEP 9, TCP); stage 3 classifies it (category,
 adult tag) and passes every name through the hard illegal-content blocklist before anything
 is stored (D68, D69). Stored DHT torrents get release attributes, seed checks and IMDb/anime
-links; they reach search with stage 5 (index readers). Rows marked *planned* do nothing so far.
+links. Since stage 4 they are search results mixed equally with Nostr ones (D51, D73: they
+pass any trust threshold, carry `origin` `dht` or `both`, and have a Source filter chip), the
+crawler shows up in `/api/v1/stats`, `/api/v1/stats/health` and `/health` (feature `dht`), and
+`serve` maps its UDP ports with UPnP (D72).
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -124,9 +127,9 @@ links; they reach search with stage 5 (index readers). Rows marked *planned* do 
 | `MAGNETAR_DHT_TCP_MAX` | `350` | TCP connections open at once (1–10000); the same router held ~440 |
 | `MAGNETAR_DHT_PROBE` | `1.1.1.1:443,9.9.9.9:443` | router health probe: one TCP connect every 5 s, alternating targets; when latency triples (or ≥ 40 ms more) or 3 of 6 fail, DHT queries and TCP attempts are halved for 5 min. `off` disables it. ICMP is not used: blocked or rate-limited on that line |
 | `MAGNETAR_DHT_METADATA_MAX` | `16777216` | largest info dictionary accepted, bytes (16384–67108864); larger torrents are marked `oversize` and not retried |
-| `MAGNETAR_DHT_UPNP` | `true` in aggressive | *planned (stage 6)*: map the UDP ports on the router |
-| `MAGNETAR_DHT_UPNP_GATEWAY` | the default gateway | *planned (stage 6)*: router address for a unicast SSDP search; required in Docker |
-| `MAGNETAR_DHT_UPNP_LOCAL_IP` | detected | *planned (stage 6)*: LAN address the router forwards to; required in Docker (the host's address) |
+| `MAGNETAR_DHT_UPNP` | `true` in aggressive (`serve`) | map the crawler's UDP ports on the router with UPnP IGD (external = internal port, 1 h lease renewed every 30 min, removed at a clean stop; D57, D72). Polite mode has nothing to map. The bounded `dht` command maps only with an explicit `true`. Only UDP: the crawler never listens on TCP. Builds without the `upnp` cargo feature ignore it |
+| `MAGNETAR_DHT_UPNP_GATEWAY` | the default gateway (`/proc/net/route`) | `host[:port]` (port 1900) for a unicast SSDP M-SEARCH, tried before the multicast one (the user's MiniUPnPd answers unicast only); required in Docker |
+| `MAGNETAR_DHT_UPNP_LOCAL_IP` | the address the route to the gateway leaves from | LAN address the router forwards to; required in Docker (the host's LAN address) |
 | `MAGNETAR_BLOCKLIST_FILE` | unset | extra illegal-content terms, one per line, 1–3 words each (`context:` prefix = only for adult torrents, `#` comments). Adds to the built-in list, for the DHT crawler and Nostr ingest alike; nothing can disable the list. A file that cannot be read or has a malformed line stops the server at start (the error names the line number, never its text) |
 
 Each option also exists as a flag (`--dht aggressive`, `--dht-nodes 2`, …). Bounded run with a

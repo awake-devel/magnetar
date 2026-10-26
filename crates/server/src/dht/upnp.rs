@@ -130,6 +130,13 @@ pub fn parse_route_table(text: &str) -> Option<Ipv4Addr> {
     None
 }
 
+/// Docker's default bridge networks (172.16/12) are where a container's default gateway
+/// points: no IGD answers there.
+#[cfg(feature = "upnp")]
+fn route_is_bridge(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V4(v) if v.octets()[0] == 172 && (v.octets()[1] & 0xf0) == 16)
+}
+
 /// The local address a UDP "connection" to `to` would leave from (no packet is sent).
 pub fn route_source(to: SocketAddr) -> Option<Ipv4Addr> {
     let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
@@ -315,6 +322,14 @@ pub async fn upnp_loop(
 ) {
     if wanted.is_empty() {
         return;
+    }
+    if std::path::Path::new("/.dockerenv").exists()
+        && (cfg.local_ip.is_none() || cfg.gateway.is_none_or(|g| route_is_bridge(g.ip())))
+    {
+        tracing::warn!(
+            "UPnP inside a container needs MAGNETAR_DHT_UPNP_GATEWAY (the router) and \
+             MAGNETAR_DHT_UPNP_LOCAL_IP (this host's LAN address); see docs/DOCKER.md"
+        );
     }
     set(&status, |s| s.state = "searching".into());
     let mut retry = RETRY_MIN;
