@@ -156,8 +156,14 @@ async fn crawler_samples_captures_and_collects_peers() {
     .await;
     assert!(c.from_source && !c.peers.is_empty(), "{c:?}");
     assert!(c.peers.iter().all(|p| *p.ip() == client_ip));
-    // And through an iterative lookup when no source is known.
-    let c = collect_peers(&crawler, hashes[5], None, None, Duration::from_secs(5), 8).await;
+    // And through an iterative lookup when no source is known. The fake announces went to
+    // arbitrary nodes, not the ones closest to the hash, so a correct Kademlia walk may stop
+    // before reaching them; a hash stored on every node is always found.
+    let everywhere: [u8; 20] = rand::random();
+    for (_, a) in &net {
+        announce(&client, *a, everywhere, false).await;
+    }
+    let c = collect_peers(&crawler, everywhere, None, None, Duration::from_secs(5), 8).await;
     assert!(c.looked_up && !c.peers.is_empty(), "{c:?}");
     // An unknown hash: no peers, nothing invented.
     let c = collect_peers(
