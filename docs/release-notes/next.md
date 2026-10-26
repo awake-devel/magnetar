@@ -137,6 +137,37 @@ mode, no router port opened, 10 minutes, 2026-10-26)
   checks ran; searches use Postgres meanwhile). Both happen whether or not the crawler is on.
   The next start reuses the index (ready in under 1 s).
 
+### App rebuild, stage 1: server (D76–D78)
+
+- **Browse is no longer flooded by unchecked DHT torrents.** The default list (no search text,
+  no Source chip) shows a torrent found only on the DHT once a seed check found peers. Before,
+  the first 50 results on production were all DHT torrents with unknown peers. Searching any
+  text, or tapping the **DHT** chip, still lists every DHT result. Nostr results are unchanged.
+  Adult detection is unchanged too (no stricter rules, by your choice); adult content stays
+  hidden by default and is never deleted.
+- **Everything the app needs is in the REST API** (docs/API.md), so the new app can be a plain
+  Kotlin client: saved searches can be read, edited (`PUT`) and polled for new results from the
+  server (`GET /api/v1/saved-searches/poll?since=…`; the phone keeps its own position, so it
+  never steals the server's ntfy notifications). Results now carry `best_peers` (tracker
+  seeders or DHT peers, whichever is higher), so a DHT torrent with only DHT peers no longer
+  reads as "unknown". "Check now" on a DHT-only torrent works (it answered "not found").
+- **Faster test builds**: each crate's integration tests are one test program instead of one
+  per file (46 test executables → 10, `target/` 24 GB → 9.9 GB). Measured on this laptop with
+  mold, each tree from scratch in its own target directory, `cargo test --workspace`:
+
+  | | before | after |
+  |---|---|---|
+  | Build from scratch (`--no-run`) | 371 s | 422 s |
+  | Run (everything built; doc-tests compile here) | 381 s / 443 s | 223 s / 177 s |
+  | Rebuild after touching `crates/server/src` | 92 s | 38 s |
+  | Rebuild after touching `crates/core/src` | 120 s | 54 s |
+  | Rebuild after touching one server test file | 7.9 s | 16.0 s |
+
+  So an edit-and-test cycle on the code is ~2.5 × faster (server change + run: 535 s → 215 s);
+  a from-scratch build is 14 % slower (one big test crate compiles with less parallelism at
+  the end), and editing only a test file costs 8 s more.
+- Upgrade: no migration and no index rebuild (the browse rule reads existing index fields).
+
 ## Older servers and offline mode
 
 - The app asks `GET /health` for `features` and hides what the server lacks: an older server
