@@ -40,7 +40,7 @@ enums in `snake_case`). Checked for the app rebuild in 2026-10 (D77).
 | Block / trust a publisher | `PUT /api/v1/overrides/{pubkey}` (`{"action": "block"\|"trust"\|null}`) | 204. There is no list endpoint: a client that shows "blocked publishers" keeps its own list. |
 | Publisher trust | `GET /api/v1/trust/{pubkey}` | `TrustScore`. |
 | Relays | `GET` / `PUT /api/v1/relays` (`{"url","enabled"}`) | The server's crawl relays. |
-| Saved searches | `GET /api/v1/saved-searches`, `POST` (create, `id` 0), `GET\|PUT\|DELETE /api/v1/saved-searches/{id}` | Stored on the server (`SavedSearch {id, name, query, notify, last_checked, last_seen_created_at}`). `PUT` takes name, query and notify and keeps the server notifier's watermarks (a changed query resets them). |
+| Saved searches | `GET /api/v1/saved-searches`, `POST` (create, `id` 0), `GET\|PUT\|DELETE /api/v1/saved-searches/{id}` | Stored on the server (`SavedSearch {id, name, query, notify, last_checked, last_seen_created_at}`). `POST {"name","query","notify"}` is enough (every field defaults). `PUT` takes name, query and notify and keeps the server notifier's watermarks (a changed query resets them). |
 | Notifications | `GET /api/v1/saved-searches/poll?since=<watermark>[&adult=1][&all=1][&id=1,2]` | See below. |
 | Server downloads | `GET\|POST /api/v1/downloads`, `POST /api/v1/downloads/{id}/{pause\|resume}`, `DELETE /api/v1/downloads/{id}` | Only when the server runs with downloads; 503 `downloads_unavailable` otherwise. |
 
@@ -64,7 +64,11 @@ enums in `snake_case`). Checked for the app rebuild in 2026-10 (D77).
   next watermark is the newest `created_at` returned, or `since` when nothing matched. An event
   that reaches the server late with an older `created_at` than the watermark is not reported
   (Nostr events are accepted up to 15 min in the future, so a watermark cannot run ahead by
-  more than that).
+  more than that). The same holds for a DHT torrent stored long after it was first sighted
+  (its `created_at` is the first sighting), and for a saved search with no text, where D76
+  lists a DHT-only torrent only after a seed check: such a torrent can predate the watermark by
+  the time it becomes visible. A per-arrival watermark would need an arrival time in the
+  search index; not done.
 - `adult=1` adds the client's adult switch to every query; otherwise each saved query's own
   `include_adult` applies.
 - A periodic poll from Android WorkManager (e.g. 15 min) is enough; each poll is one search per

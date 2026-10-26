@@ -317,7 +317,10 @@ pub enum OverrideAction {
     Trust,
 }
 
+/// Every field has a default when read (D77): a client may POST `{"name", "query",
+/// "notify"}` without `id` (0 = create) or the notifier fields.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct SavedSearch {
     pub id: i64,
     pub name: String,

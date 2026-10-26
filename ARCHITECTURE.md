@@ -650,6 +650,8 @@ Phone crawl is bounded: max 8 relays, `max_seconds` budget, forward cursors firs
   floors (`tests/it/release_sample.rs`, D44).
 - `ffi`: SqliteStore search parity with PgStore on the fixture set; cleanup never deletes unsynced rows;
   sync to a live in-process server; D44 filters, backfill and the offline title page (`tests/it/filters.rs`).
+- Layout (D78): each crate's integration tests are modules of one binary, `tests/it/main.rs`
+  (`tests/it/<former file>.rs`); one module runs with `cargo test -p <crate> --test it <module>::`.
 - Network tests against real relays/trackers are `#[ignore]` (run with `--ignored`).
 - `scripts/test.sh` = fmt check + clippy `-D warnings` + tests (with DB) + Android assembleDebug.
 - CI (`.github/workflows/ci.yml`, D39) runs the same minus Android, against a `postgres:18` service.

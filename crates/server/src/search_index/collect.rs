@@ -229,11 +229,13 @@ impl Columns {
         let Some((col, nostr)) = &self.origin else {
             return false;
         };
-        let dht_only = match nostr {
-            Some(n) => !col.ords().values_for_doc(doc).any(|o| o == *n),
-            None => true,
-        };
-        dht_only && self.best_peers.get_val(doc) <= 0
+        // The fast column first: most documents of a browse were checked with peers or are
+        // never read past this.
+        self.best_peers.get_val(doc) <= 0
+            && match nostr {
+                Some(n) => !col.ords().values_for_doc(doc).any(|o| o == *n),
+                None => true,
+            }
     }
 
     /// Sort key: higher is better. Unknown sizes/peers sort last in both directions; ties go

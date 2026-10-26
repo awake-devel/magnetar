@@ -909,6 +909,17 @@ async fn saved_searches_for_a_thin_client() {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    // A minimal body creates (no id, no notifier fields).
+    let r = http()
+        .post(format!("{base}/api/v1/saved-searches"))
+        .bearer_auth(TOKEN)
+        .json(&json!({"name": "Minimal", "query": {"text": "debian"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let minimal: SavedSearch = r.json().await.unwrap();
+    assert!(minimal.id > fedora.id && !minimal.notify);
     api.delete_saved_search(fedora.id).await.unwrap();
     assert!(api.saved_search(fedora.id).await.is_err());
 }
