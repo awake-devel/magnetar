@@ -117,25 +117,16 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
                 valueRange = 0f..100f,
             )
 
-            SectionTitle("Cache and crawling")
+            SectionTitle("Cache and background")
             Field(
                 "Cache cap (MiB)", form.cacheCapMb, { v -> vm.edit { it.copy(cacheCapMb = v.filter(Char::isDigit)) } },
                 error = state.cacheError,
                 keyboard = KeyboardType.Number,
             )
-            OutlinedTextField(
-                value = form.seedRelays,
-                onValueChange = { v -> vm.edit { it.copy(seedRelays = v) } },
-                label = { Text("Seed relays (one per line)") },
-                supportingText = { Text(state.relaysError ?: "Empty = built-in defaults") },
-                isError = state.relaysError != null,
-                minLines = 3,
-                modifier = Modifier.fillMaxWidth(),
-            )
             Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
-                    Text("Background crawl and sync")
-                    Text("Hourly, on Wi-Fi while charging", style = MaterialTheme.typography.bodySmall)
+                    Text("Saved-search notifications")
+                    Text("Hourly check on the server for new matches", style = MaterialTheme.typography.bodySmall)
                 }
                 Switch(checked = form.backgroundSync, onCheckedChange = { v -> vm.edit { it.copy(backgroundSync = v) } })
             }

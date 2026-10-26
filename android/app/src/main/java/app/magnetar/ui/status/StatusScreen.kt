@@ -32,7 +32,7 @@ import app.magnetar.ui.common.Banner
 import app.magnetar.ui.common.SectionTitle
 
 /**
- * Local cache, server, seed checks and relays: the Status section of the Stats tab (D47). The
+ * Local cache, server and seed checks: the Status section of the Stats tab (D47). The
  * caller owns the top bar (refresh) and the snackbar for [StatusViewModel.messages].
  */
 @Composable
@@ -46,9 +46,8 @@ fun StatusContent(vm: StatusViewModel, modifier: Modifier = Modifier) {
                 ServerCard(state, vm.hasServer, vm::checkServer)
                 state.liveness?.let { LivenessCard(it) }
                 Row(Modifier.padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = vm::crawlNow, enabled = !state.workRunning) { Text("Crawl now") }
-                    OutlinedButton(onClick = vm::syncNow, enabled = !state.workRunning && vm.hasServer) {
-                        Text("Sync now")
+                    Button(onClick = vm::checkSavedSearchesNow, enabled = !state.workRunning && vm.hasServer) {
+                        Text("Check saved searches now")
                     }
                 }
                 if (state.workRunning) {
@@ -59,26 +58,7 @@ fun StatusContent(vm: StatusViewModel, modifier: Modifier = Modifier) {
                 state.lastRunErrors.forEach {
                     Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
                 }
-                SectionTitle("Relays (${state.relays.size})")
             }
-        }
-        items(state.relays, key = { it.url }) { r ->
-            ListItem(
-                headlineContent = { Text(r.url, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                supportingContent = {
-                    Text(
-                        listOfNotNull(
-                            r.source,
-                            "${r.eventsFound} events",
-                            r.lastOk?.let { "ok ${formatAgo(it)}" },
-                            r.lastErr?.let { "error: $it" },
-                        ).joinToString(" · "),
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                },
-                trailingContent = { Switch(checked = r.enabled, onCheckedChange = { vm.setRelayEnabled(r, it) }) },
-            )
         }
     }
 }
@@ -90,13 +70,7 @@ private fun StatsCard(s: FfiStats) {
             Text("Local cache", style = MaterialTheme.typography.titleSmall)
             StatLine("Torrents", s.torrents.toString())
             StatLine("Events", s.events.toString())
-            StatLine("Publishers", s.publishers.toString())
-            StatLine("Comments", s.comments.toString())
-            StatLine("Relays", s.relays.toString())
-            StatLine("Not yet synced", s.unsynced.toString())
             StatLine("Database size", formatBytes(s.dbBytes))
-            StatLine("Last crawl", s.lastCrawl?.let { formatAgo(it) } ?: "never")
-            StatLine("Last sync", s.lastSync?.let { formatAgo(it) } ?: "never")
         }
     }
 }
