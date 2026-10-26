@@ -6,8 +6,9 @@
 #
 # Input: one term per line, `hard <phrase>` or `context <phrase>`; `#` comments. A phrase is
 # 1-3 ASCII words (letters/digits; any other character separates words, as the Rust
-# normaliser does). Non-ASCII terms are refused (the shell cannot reproduce Unicode folding:
-# put them in MAGNETAR_BLOCKLIST_FILE, which the server normalises itself).
+# normaliser does), or one CJK term of 2-4 characters (han, kana, hangul; hashed as is).
+# Other non-ASCII terms are refused (the shell cannot reproduce Unicode folding: put them in
+# MAGNETAR_BLOCKLIST_FILE, which the server normalises itself).
 # Output: `hard|context <sha256 hex>` with sha256("magnetar-blocklist-v1:" + words joined by one
 # space), sorted, after a header. Nothing is echoed to stderr but line numbers.
 set -euo pipefail
@@ -25,14 +26,25 @@ while IFS= read -r line || [ -n "$line" ]; do
     phrase=${line#* }
     case $tier in hard | context) ;; *) echo "line $n: tier must be hard or context" >&2; exit 1 ;; esac
     if LC_ALL=C grep -q '[^ -~]' <<<"$phrase"; then
-        echo "line $n: non-ASCII term (use MAGNETAR_BLOCKLIST_FILE)" >&2
-        exit 1
-    fi
-    norm=$(printf '%s' "$phrase" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' ' ' | tr -s ' ' | sed 's/^ //;s/ $//')
-    words=$(wc -w <<<"$norm")
-    if [ "$words" -lt 1 ] || [ "$words" -gt 3 ]; then
-        echo "line $n: a term has 1-3 words" >&2
-        exit 1
+        # A CJK term (han, kana, hangul): 2-4 characters, no ASCII, hashed as is (the Rust
+        # matcher looks up character 2-4-grams of CJK runs; these scripts have no case).
+        if LC_ALL=C grep -q '[ -~]' <<<"$phrase"; then
+            echo "line $n: mixed ASCII/non-ASCII term (use MAGNETAR_BLOCKLIST_FILE)" >&2
+            exit 1
+        fi
+        chars=$(printf '%s' "$phrase" | LC_ALL=C.UTF-8 wc -m)
+        if [ "$chars" -lt 2 ] || [ "$chars" -gt 4 ]; then
+            echo "line $n: a CJK term has 2-4 characters" >&2
+            exit 1
+        fi
+        norm=$phrase
+    else
+        norm=$(printf '%s' "$phrase" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' ' ' | tr -s ' ' | sed 's/^ //;s/ $//')
+        words=$(wc -w <<<"$norm")
+        if [ "$words" -lt 1 ] || [ "$words" -gt 3 ]; then
+            echo "line $n: a term has 1-3 words" >&2
+            exit 1
+        fi
     fi
     h=$(printf '%s%s' "$prefix" "$norm" | sha256sum | cut -d' ' -f1)
     printf '%s %s\n' "$tier" "$h" >>"$out"
