@@ -193,7 +193,7 @@ The full-index facet pass grows with the number of documents (each document read
 columns), so at the 3.2 M of D43's benchmark it would take roughly 7× longer; that run was not
 repeated here. A first attempt with the index directory on `/tmp` failed with "an index writer
 was killed" (an I/O error in a writer thread): `/tmp` on this laptop is a tmpfs with a user quota
-that other work had nearly filled; the same build on disk succeeded, as did a second disk run.
+that other work had nearly filled; the same build with the index on disk succeeded.
 
 ## Accuracy
 

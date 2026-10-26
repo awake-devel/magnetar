@@ -62,6 +62,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import app.magnetar.ffi.FfiLiveness
 import app.magnetar.ffi.FfiTorrentDetail
 import app.magnetar.ffi.FfiTrust
+import app.magnetar.ffi.facetLabel
 import app.magnetar.formatAge
 import app.magnetar.formatAgo
 import app.magnetar.formatBytes
@@ -281,6 +282,22 @@ private fun DetailBody(
             )
             if (detail.categoryPath.isNotEmpty()) {
                 Text(detail.categoryPath.joinToString(" › "), style = MaterialTheme.typography.bodySmall)
+            }
+            // What the name says about the release (D44): quality, languages, group.
+            s.attrs?.let { a ->
+                val line = a.badges + listOfNotNull(
+                    a.subtitles.takeIf { it.isNotEmpty() }?.let { subs ->
+                        "subs " + subs.joinToString("/") { facetLabel("subtitles", it) }
+                    },
+                    a.group?.let { "group $it" },
+                )
+                if (line.isNotEmpty()) {
+                    Text(
+                        line.joinToString(" · "),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.secondary,
+                    )
+                }
             }
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 8.dp)) {
                 Button(onClick = onOpen) { Text("Open magnet") }
