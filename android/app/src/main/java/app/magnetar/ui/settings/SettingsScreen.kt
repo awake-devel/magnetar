@@ -71,7 +71,7 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
             Field(
                 "Server URL", form.serverUrl, { v -> vm.edit { it.copy(serverUrl = v) } },
                 error = state.serverUrlError,
-                hint = state.serverWarning ?: "Empty = offline only. Example: https://myhost.tailnet.ts.net",
+                hint = state.serverWarning ?: "Your Magnetar server, e.g. https://myhost.tailnet.ts.net",
                 keyboard = KeyboardType.Uri,
             )
             OutlinedTextField(
