@@ -26,7 +26,9 @@ use crate::release;
 
 /// Stored per DHT row (`dht_torrents.classifier_version`): rows below it are re-classified.
 /// 0 = stored before any classifier (stage 2).
-pub const CLASSIFIER_VERSION: i16 = 1;
+/// 1: first version (stage 3). 2: CJK adult words, JAV code shape, game data files and words,
+/// CJK book hints, adult archives (tuned on the stage 3 live sample, docs/DHT.md §15).
+pub const CLASSIFIER_VERSION: i16 = 2;
 
 const ADULT_LIST: &str = include_str!("adult.txt");
 
@@ -83,7 +85,9 @@ pub fn class_of(ext: &str) -> Class {
         | "vsix" => Class::Application,
         "nsp" | "nsz" | "xci" | "xcz" | "wbfs" | "rvz" | "wua" | "gcm" | "cia" | "3ds" | "nds"
         | "gba" | "gbc" | "gb" | "sfc" | "smc" | "n64" | "z64" | "v64" | "nes" | "vpk" | "pbp"
-        | "cso" | "chd" | "xex" => Class::GameImage,
+        | "cso" | "chd" | "xex"
+        // Game data archives (Unreal/id/Blizzard/Bethesda engines).
+        | "pak" | "mpq" | "gpk" | "upk" | "bsa" | "ba2" | "forge" | "vpp" => Class::GameImage,
         "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "heic" | "heif" | "tif" | "tiff"
         | "cr2" | "cr3" | "nef" | "arw" | "dng" | "orf" | "rw2" | "raf" | "psd" | "avif"
         | "jxl" => Class::Picture,
@@ -145,6 +149,9 @@ struct AdultList {
     strong: HashSet<String>,
     weak: HashSet<String>,
     prefixes: Vec<String>,
+    /// CJK words, found as substrings (those scripts have no spaces).
+    cjk: Vec<String>,
+    cjk_weak: Vec<String>,
 }
 
 fn adult_list() -> &'static AdultList {
@@ -154,6 +161,8 @@ fn adult_list() -> &'static AdultList {
             strong: HashSet::new(),
             weak: HashSet::new(),
             prefixes: Vec::new(),
+            cjk: Vec::new(),
+            cjk_weak: Vec::new(),
         };
         for line in ADULT_LIST.lines() {
             let line = line.trim();
@@ -172,6 +181,8 @@ fn adult_list() -> &'static AdultList {
                     l.weak.insert(toks);
                 }
                 "prefix" => l.prefixes.push(toks),
+                "cjk" => l.cjk.push(phrase.trim().to_lowercase()),
+                "cjkweak" => l.cjk_weak.push(phrase.trim().to_lowercase()),
                 _ => {}
             }
         }
@@ -188,6 +199,62 @@ const JAV_LABELS: &[&str] = &[
     "fsdss", "sone", "start", "achj", "roe", "mkmp", "ofje", "huntb", "nacr", "jufd", "mvsd",
     "cjod", "dldss", "fset", "nnpj", "sqte", "tppn", "xvsr", "aukg", "bban", "gvg", "hmpd", "kire",
 ];
+
+/// Console disc serials (`SLUS-21269`) share the JAV shape: never an adult code.
+const SERIAL_PREFIXES: &[&str] = &[
+    "slus", "sles", "scus", "sces", "slps", "slpm", "scps", "ulus", "ules", "ucus", "uces", "npub",
+    "npeb", "npjb", "cusa", "ppsa", "bles", "blus", "bcus", "bces", "bljm", "ntr", "ctr", "rvl",
+];
+
+/// Words that come before a number with a hyphen in ordinary names.
+const CODE_STOP: &[&str] = &[
+    "web", "dl", "cd", "dvd", "bd", "vol", "part", "ep", "no", "op", "ed", "ova", "sp", "the",
+    "aac", "dd", "ac", "nf", "mp", "dts", "dtshd", "ddp", "flac", "sha", "md", "crc", "utf", "iso",
+    "win", "id", "rev", "build", "ver", "covid", "top", "best", "hits", "track", "disc", "page",
+    "chapter", "issue", "case", "file", "pack", "set", "vr", "ps", "gt", "mk", "rx", "fx", "gtx",
+    "rtx", "tx", "sm", "lg", "av", "tv", "tt", "bwv", "kv", "hob",
+];
+
+/// A JAV-style product code in the raw name: 2–6 letters, `-`, 3–5 digits (not a year), as a
+/// whole word: `ABCD-123`, `[FHD]ABCD-123`, `site.com ABCD-123`.
+pub fn jav_shape(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    let b = n.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if !b[i].is_ascii_lowercase() || (i > 0 && b[i - 1].is_ascii_alphanumeric()) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && b[i].is_ascii_lowercase() {
+            i += 1;
+        }
+        let letters = &n[start..i];
+        if !(2..=6).contains(&letters.len()) || i >= b.len() || b[i] != b'-' {
+            continue;
+        }
+        let d0 = i + 1;
+        let mut j = d0;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        let digits = &n[d0..j];
+        let ends = j >= b.len() || !b[j].is_ascii_alphanumeric() || b[j].is_ascii_alphabetic();
+        if (3..=5).contains(&digits.len())
+            && ends
+            && !digits
+                .parse::<u32>()
+                .is_ok_and(|y| (1900..2100).contains(&y))
+            && !CODE_STOP.contains(&letters)
+            && !SERIAL_PREFIXES.contains(&letters)
+        {
+            return true;
+        }
+        i = j.max(i + 1);
+    }
+    false
+}
 
 fn jav_code(toks: &[String]) -> bool {
     let digits = |t: &str| (3..=5).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_digit());
@@ -225,6 +292,23 @@ pub fn adult_signal<S: AsRef<str>>(name: &str, paths: &[S]) -> bool {
     texts.extend(paths.iter().map(|p| strip_ext(p.as_ref())));
     let mut seen: HashSet<String> = HashSet::new();
     for (k, text) in texts.iter().enumerate() {
+        if k == 0 && jav_shape(text) {
+            return true;
+        }
+        if text.chars().any(crate::blocklist::is_cjk) {
+            let low = text.to_lowercase();
+            if l.cjk.iter().any(|w| low.contains(w.as_str())) {
+                return true;
+            }
+            for w in &l.cjk_weak {
+                if low.contains(w.as_str()) {
+                    weak.insert(w.clone());
+                }
+            }
+            if weak.len() >= 2 {
+                return true;
+            }
+        }
         for toks in normalize(text) {
             if jav_code(&toks) {
                 return true;
@@ -310,7 +394,19 @@ const GAME_TAGS: &[&str] = &[
     "wii",
     "wiiu",
     "3ds",
+    "ps2",
+    "ps5",
+    "psx",
+    "slus",
+    "sles",
+    "scus",
+    "sces",
+    "cusa",
 ];
+
+/// "Game" in the name, checked after the video hints (`Game of Thrones S01 … .rar` is video).
+const GAME_WORDS: &[&str] = &["game", "games"];
+const GAME_CJK: &[&str] = &["游戏", "遊戲", "ゲーム"];
 
 /// Words of software releases.
 const APP_HINTS: &[&str] = &[
@@ -393,6 +489,23 @@ const BOOK_HINTS: &[&str] = &[
     "magazines",
     "cbr",
     "cbz",
+    "dl版",
+    "dlraw",
+    "doujinshi",
+];
+
+/// CJK book words, found as substrings: doujinshi translations, manga, comics.
+const BOOK_CJK: &[&str] = &[
+    "中国翻訳",
+    "汉化",
+    "漢化",
+    "翻訳",
+    "同人誌",
+    "漫画",
+    "漫畫",
+    "コミック",
+    "小说",
+    "小說",
 ];
 
 fn has_any(grams: &HashSet<String>, words: &[&str]) -> bool {
@@ -478,6 +591,12 @@ pub fn fansub_group(g: &str) -> bool {
                 | "mp4"
                 | "mkv"
                 | "hd"
+                | "fhd"
+                | "uhd"
+                | "sd"
+                | "vr"
+                | "8k"
+                | "hdr"
                 | "4k"
                 | "1080p"
                 | "720p"
@@ -599,7 +718,10 @@ pub fn classify(name: &str, files: &[TorrentFile]) -> Classification {
 
     let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
     let adult_signal = adult_signal(name, &paths);
-    let visual = share(Class::Video) + share(Class::Picture);
+    // Pictures, videos, or containers that may hold them (archives, disc images): not an
+    // audio, book or software majority, where adult words are titles (`XXX hits`).
+    let visual =
+        share(Class::Video) + share(Class::Picture) + share(Class::Archive) + share(Class::Disc);
     let mk = |category, rule| Classification {
         category,
         adult_signal,
@@ -617,7 +739,11 @@ pub fn classify(name: &str, files: &[TorrentFile]) -> Classification {
         winner,
         Some(Class::Video | Class::Audio | Class::Book | Class::Picture)
     );
-    if not_media && has_any(&grams, GAME_TAGS) {
+    let game_word = has_any(&grams, GAME_WORDS) || GAME_CJK.iter().any(|w| name.contains(w));
+    if not_media
+        && (has_any(&grams, GAME_TAGS)
+            || (game_word && matches!(winner, Some(Class::Application | Class::Disc))))
+    {
         return mk(Category::Game, Rule::GameTag);
     }
     if not_media && installer_set(files) {
@@ -650,10 +776,13 @@ pub fn classify(name: &str, files: &[TorrentFile]) -> Classification {
         }
         return mk(Category::Video, Rule::NameHint);
     }
+    if game_word {
+        return mk(Category::Game, Rule::GameTag);
+    }
     if has_any(&grams, AUDIO_HINTS) && share(Class::Audio) > 0 {
         return mk(Category::Audio, Rule::NameHint);
     }
-    if has_any(&grams, BOOK_HINTS) {
+    if has_any(&grams, BOOK_HINTS) || BOOK_CJK.iter().any(|w| name.contains(w)) {
         return mk(Category::Book, Rule::NameHint);
     }
     if has_any(&grams, APP_HINTS) || winner == Some(Class::Disc) && share(Class::Application) > 0 {
@@ -868,6 +997,53 @@ mod tests {
         assert!(c.adult_signal && c.adult());
         // Name only.
         assert_eq!(cat("Some studio XXX clip", &[]), Category::Porn);
+    }
+
+    #[test]
+    fn version_2_rules() {
+        let clip = [f("clip.mp4", 900 * MB)];
+        // JAV-style codes, not years, serials or release words.
+        assert!(jav_shape("ABCD-123"));
+        assert!(jav_shape("[FHD]ABCD-123"));
+        assert!(jav_shape("site.com 12345.com ABCD-1234 x"));
+        assert!(jav_shape("ABCD-123.[4K]@x"));
+        assert!(!jav_shape("Blade.Runner-2049.1080p"));
+        assert!(!jav_shape("Game [SLUS-21269]"));
+        assert!(!jav_shape("Show.WEB-DL.1080p"));
+        assert!(!jav_shape("Track-12"));
+        assert!(!jav_shape("x264-123"));
+        assert_eq!(cat("ABCD-123", &clip), Category::Porn);
+        assert_eq!(cat("[FHD]ABCD-123", &clip), Category::Porn, "not anime");
+        // CJK words as substrings.
+        assert_eq!(cat("某某性爱视频", &clip), Category::Porn);
+        assert_eq!(cat("某某偷拍美女", &clip), Category::Porn, "two weak");
+        assert_eq!(cat("某某美女风景", &clip), Category::Video, "one weak");
+        // Adult archives.
+        assert_eq!(
+            cat("某某性爱视频.zip", &[f("a.zip", 300 * MB)]),
+            Category::Porn
+        );
+        // Games: data archives and the word "game", after the video hints.
+        assert_eq!(
+            cat(
+                "Some Game-GRP",
+                &[f("data.pak", 9000 * MB), f("x.exe", 90 * MB)]
+            ),
+            Category::Game
+        );
+        assert_eq!(
+            cat("某某游戏 完整版", &[f("a.exe", 900 * MB)]),
+            Category::Game
+        );
+        assert_eq!(
+            cat("Game.of.Thrones.S01.1080p.BluRay", &[f("a.rar", 4000 * MB)]),
+            Category::Video
+        );
+        // Books: translated doujinshi and manga archives.
+        assert_eq!(
+            cat("[作者] 作品 [中国翻訳] [DL版].zip", &[f("a.zip", 90 * MB)]),
+            Category::Book
+        );
     }
 
     #[test]
