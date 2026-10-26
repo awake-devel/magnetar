@@ -236,6 +236,12 @@ pub struct Config {
     /// (default 64 aggressive, 8 polite).
     #[arg(long, env = "MAGNETAR_DHT_PEER_LOOKUPS", value_parser = clap::value_parser!(u32).range(1..=512))]
     pub dht_peer_lookups: Option<u32>,
+    /// BEP 9 metadata fetches in flight (default 128 aggressive, 16 polite).
+    #[arg(long, env = "MAGNETAR_DHT_FETCH_CONCURRENCY", value_parser = clap::value_parser!(u32).range(1..=2048))]
+    pub dht_fetch_concurrency: Option<u32>,
+    /// Largest info dict fetched, in bytes (BEP 9 sets no limit).
+    #[arg(long, env = "MAGNETAR_DHT_METADATA_MAX", default_value_t = 16 * 1024 * 1024, value_parser = clap::value_parser!(u64).range(16_384..=67_108_864))]
+    pub dht_metadata_max: u64,
 }
 
 impl Config {

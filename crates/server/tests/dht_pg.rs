@@ -384,6 +384,9 @@ fn opts(ports: usize) -> DhtOptions {
         dry_run: false,
         bloom_bits: 1 << 20,
         queue_cap: 1000,
+        fetch_concurrency: 8,
+        metadata_max: 1 << 20,
+        screen: None,
     }
 }
 

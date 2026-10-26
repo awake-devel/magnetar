@@ -42,5 +42,6 @@ tantivy.workspace = true
 
 [dev-dependencies]
 tokio-tungstenite.workspace = true
+sha1_smol.workspace = true
 nostr-sdk = "0.45.4"
 nostr-memory = "0.45.2"

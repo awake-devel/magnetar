@@ -2,13 +2,15 @@
 //! infohashes (seen filter → Postgres), the persisted queue (`dht_seen`), peer collection for the
 //! metadata stage, identity/contact persistence and a JSON report.
 //!
-//! Stage 1 ends at peer collection: each queued hash gets its peers (announcer, the node that
-//! sampled it, or an iterative lookup) and is handed to [`PeerSink`]. The BEP 9 fetcher (stage 2)
-//! will consume those jobs; until then the sink only measures them, and the `dht_seen` lease
-//! brings each hash back through the retry loop. A hash with no peer at all is marked `failed`
-//! (`no_peers`) and backs off.
+//! Each queued hash gets its peers (announcer, the node that sampled it, or an iterative
+//! lookup); a hash with no peer at all is marked `failed` (`no_peers`) and backs off. Hashes with
+//! peers go to the BEP 9 fetchers (`core::metainfo`, stage 2), whose results are written in
+//! batches by [`persist`]: verified torrents pass the content [`screen`] first, and without one
+//! nothing named is stored (fail closed until the stage 3 blocklist exists).
 
+pub mod persist;
 pub mod queue;
+pub mod screen;
 pub mod seen;
 pub mod store;
 
@@ -20,6 +22,7 @@ use std::time::Duration;
 
 use magnetar_core::dht::{Dht, EngineConfig, EngineStats, Mode, Sighting, Via, collect_peers};
 use magnetar_core::liveness::dht::BOOTSTRAP;
+use magnetar_core::metainfo::{FetchConfig, FetchStats, Fetcher};
 use serde::Serialize;
 use sqlx::PgPool;
 use tokio::sync::{Notify, mpsc, watch};
@@ -28,7 +31,9 @@ use tokio::time::Instant;
 
 use crate::config::{Config, DhtMode};
 use crate::daemons::stop_requested;
+use persist::{FetchResult, PersistOutcome};
 use queue::{FetchItem, FetchQueue};
+use screen::Screen;
 use seen::SeenFilter;
 
 const BATCH_MAX: usize = 1000;
@@ -47,6 +52,12 @@ const PEER_SAMPLE_CAP: usize = 100_000;
 
 #[derive(Clone, Debug)]
 pub struct DhtOptions {
+    /// Metadata fetches in flight (`MAGNETAR_DHT_FETCH_CONCURRENCY`).
+    pub fetch_concurrency: usize,
+    /// Largest info dict accepted, bytes (`MAGNETAR_DHT_METADATA_MAX`).
+    pub metadata_max: usize,
+    /// The content screen (D53). None: verified metadata is never stored (fail closed).
+    pub screen: Option<Arc<dyn Screen>>,
     pub mode: Mode,
     pub ports: Vec<u16>,
     pub qps: u32,
@@ -98,6 +109,12 @@ impl DhtOptions {
             dry_run: false,
             bloom_bits: seen::DEFAULT_BITS,
             queue_cap: queue::DEFAULT_CAP,
+            fetch_concurrency: cfg
+                .dht_fetch_concurrency
+                .map(|n| n as usize)
+                .unwrap_or(if aggressive { 128 } else { 16 }),
+            metadata_max: cfg.dht_metadata_max as usize,
+            screen: None,
         })
     }
 }
@@ -145,6 +162,7 @@ struct Counters {
     lookup_queries: AtomicU64,
     marked_failed: AtomicU64,
     paused_ms: AtomicU64,
+    persist_errors: AtomicU64,
 }
 
 fn add(a: &AtomicU64, n: u64) {
@@ -155,27 +173,12 @@ fn get(a: &AtomicU64) -> u64 {
     a.load(Ordering::Relaxed)
 }
 
-/// A hash with its peers, ready for the metadata fetcher (stage 2).
+/// A hash with its peers, ready for the metadata fetcher.
 #[derive(Clone, Debug)]
 pub struct FetchJob {
     pub info_hash: [u8; 20],
     pub via: Via,
     pub peers: Vec<SocketAddrV4>,
-}
-
-/// Where collected jobs go. Stage 1: measured, then dropped (the `dht_seen` lease remains).
-#[derive(Default)]
-pub struct PeerSink {
-    counts: Mutex<Vec<u32>>,
-}
-
-impl PeerSink {
-    fn accept(&self, job: FetchJob) {
-        let mut c = self.counts.lock().unwrap();
-        if c.len() < PEER_SAMPLE_CAP {
-            c.push(job.peers.len() as u32);
-        }
-    }
 }
 
 struct Pipeline {
@@ -184,7 +187,10 @@ struct Pipeline {
     queue: Mutex<FetchQueue>,
     notify: Notify,
     c: Counters,
-    sink: PeerSink,
+    /// Peers per collected hash (a sample for the report's percentiles).
+    peer_counts: Mutex<Vec<u32>>,
+    fetcher: Fetcher,
+    persisted: Mutex<PersistOutcome>,
 }
 
 impl Pipeline {
@@ -208,6 +214,17 @@ pub struct PeerStats {
     pub from_sampling_node: u64,
     pub iterative_lookups: u64,
     pub queries_per_hash: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Bandwidth {
+    /// UDP payload bytes (KRPC) and TCP bytes (peer wire), headers not included.
+    pub udp_in: u64,
+    pub udp_out: u64,
+    pub tcp_in: u64,
+    pub tcp_out: u64,
+    pub mbit_per_sec_in: f64,
+    pub mbit_per_sec_out: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -235,6 +252,14 @@ pub struct Report {
     /// Seconds the sampler was paused by backpressure (D62).
     pub sampling_paused_secs: f64,
     pub peers: PeerStats,
+    pub fetch: FetchStats,
+    /// Verified info dicts per minute (stored or not: the screen decides that).
+    pub metadata_per_min: f64,
+    /// Verified share of finished fetches that had at least one peer.
+    pub fetch_success_rate: f64,
+    pub persist: PersistOutcome,
+    pub persist_errors: u64,
+    pub bandwidth: Bandwidth,
     pub engine: EngineStats,
     pub answered_share: f64,
     pub queries_per_sec: f64,
@@ -261,7 +286,7 @@ fn proc_cpu_seconds() -> Option<f64> {
 }
 
 fn peer_stats(p: &Pipeline) -> PeerStats {
-    let mut v = p.sink.counts.lock().unwrap().clone();
+    let mut v = p.peer_counts.lock().unwrap().clone();
     v.sort_unstable();
     let n = get(&p.c.collected);
     let with = get(&p.c.with_peers);
@@ -299,6 +324,17 @@ fn report(p: &Pipeline, dht: &Dht, started: Instant) -> Report {
     let secs = started.elapsed().as_secs_f64().max(0.001);
     let mins = secs / 60.0;
     let engine = dht.stats();
+    let fetch = p.fetcher.stats();
+    let verified = fetch.ok + fetch.private + fetch.v2_only + fetch.invalid;
+    let finished = verified + fetch.failed + fetch.oversize;
+    let bandwidth = Bandwidth {
+        udp_in: engine.udp_bytes_in,
+        udp_out: engine.udp_bytes_out,
+        tcp_in: fetch.tcp_bytes_in,
+        tcp_out: fetch.tcp_bytes_out,
+        mbit_per_sec_in: (engine.udp_bytes_in + fetch.tcp_bytes_in) as f64 * 8.0 / secs / 1e6,
+        mbit_per_sec_out: (engine.udp_bytes_out + fetch.tcp_bytes_out) as f64 * 8.0 / secs / 1e6,
+    };
     let q = p.queue.lock().unwrap();
     Report {
         mode: p.opts.mode,
@@ -323,6 +359,16 @@ fn report(p: &Pipeline, dht: &Dht, started: Instant) -> Report {
         queue_overflow: q.overflow,
         sampling_paused_secs: get(&p.c.paused_ms) as f64 / 1000.0,
         peers: peer_stats(p),
+        metadata_per_min: verified as f64 / mins,
+        fetch_success_rate: if finished > 0 {
+            verified as f64 / finished as f64
+        } else {
+            0.0
+        },
+        fetch,
+        persist: p.persisted.lock().unwrap().clone(),
+        persist_errors: get(&p.c.persist_errors),
+        bandwidth,
         answered_share: if engine.queries_sent > 0 {
             engine.answered as f64 / engine.queries_sent as f64
         } else {
@@ -418,7 +464,12 @@ async fn triage_loop(
     flush(&p, &mut batch).await;
 }
 
-async fn collector(p: Arc<Pipeline>, dht: Dht, mut stop: watch::Receiver<bool>) {
+async fn collector(
+    p: Arc<Pipeline>,
+    dht: Dht,
+    jobs: mpsc::Sender<FetchJob>,
+    mut stop: watch::Receiver<bool>,
+) {
     loop {
         let item = p.queue.lock().unwrap().pop();
         let Some(item) = item else {
@@ -455,11 +506,131 @@ async fn collector(p: Arc<Pipeline>, dht: Dht, mut stop: watch::Receiver<bool>) 
         if c.looked_up {
             add(&p.c.looked_up, 1);
         }
-        p.sink.accept(FetchJob {
+        {
+            let mut counts = p.peer_counts.lock().unwrap();
+            if counts.len() < PEER_SAMPLE_CAP {
+                counts.push(c.peers.len() as u32);
+            }
+        }
+        if c.peers.is_empty() {
+            continue;
+        }
+        let job = FetchJob {
             info_hash: item.info_hash,
             via: item.via,
             peers: c.peers,
-        });
+        };
+        // Blocks while every fetcher is busy: collection never runs far ahead of fetching.
+        tokio::select! {
+            r = jobs.send(job) => if r.is_err() { return },
+            _ = stop_requested(&mut stop) => return,
+        }
+    }
+}
+
+/// One metadata fetch at a time; `fetch_concurrency` of these run.
+async fn fetch_worker(
+    p: Arc<Pipeline>,
+    jobs: Arc<tokio::sync::Mutex<mpsc::Receiver<FetchJob>>>,
+    results: mpsc::Sender<FetchResult>,
+    mut stop: watch::Receiver<bool>,
+) {
+    loop {
+        let job = tokio::select! {
+            j = async { jobs.lock().await.recv().await } => match j {
+                Some(j) => j,
+                None => return,
+            },
+            _ = stop_requested(&mut stop) => return,
+        };
+        // A fetch cut short by the stop keeps its dht_seen lease and comes back later.
+        let result = tokio::select! {
+            r = p.fetcher.fetch(job.info_hash, &job.peers) => r,
+            _ = stop_requested(&mut stop) => return,
+        };
+        let r = FetchResult {
+            sighted: job.info_hash,
+            via: job.via,
+            peers_seen: job.peers.len(),
+            result,
+        };
+        if results.send(r).await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn persist_flush(p: &Pipeline, pool: &PgPool, batch: &mut Vec<FetchResult>) {
+    if batch.is_empty() {
+        return;
+    }
+    let items = std::mem::take(batch);
+    let screen = p.opts.screen.as_deref();
+    match persist::persist_batch(
+        pool,
+        &items,
+        screen,
+        p.opts.fetch_known,
+        magnetar_core::now(),
+    )
+    .await
+    {
+        Ok(o) => {
+            let mut t = p.persisted.lock().unwrap();
+            t.stored += o.stored;
+            t.not_new += o.not_new;
+            t.alias += o.alias;
+            t.blocked += o.blocked;
+            t.unscreened += o.unscreened;
+            t.private += o.private;
+            t.v2_only += o.v2_only;
+            t.invalid += o.invalid;
+            t.oversize += o.oversize;
+            t.failed += o.failed;
+        }
+        Err(e) => {
+            // The hashes keep their dht_seen lease: the retry loop brings them back.
+            if get(&p.c.persist_errors).is_multiple_of(100) {
+                tracing::warn!("DHT persist: {e}");
+            }
+            add(&p.c.persist_errors, 1);
+        }
+    }
+}
+
+/// Batches fetch results into transactions (≤ 500 results or 1 s). Runs until every fetch
+/// worker has dropped its sender, so results finished before a stop are still written.
+async fn persist_loop(p: Arc<Pipeline>, mut rx: mpsc::Receiver<FetchResult>) {
+    let mut batch = Vec::new();
+    let mut flush_at = Instant::now() + persist::BATCH_WAIT;
+    loop {
+        tokio::select! {
+            r = rx.recv() => match r {
+                Some(r) => {
+                    if p.pool.is_none() {
+                        continue; // dry run: the fetcher's own counters are the report
+                    }
+                    if batch.is_empty() {
+                        flush_at = Instant::now() + persist::BATCH_WAIT;
+                    }
+                    batch.push(r);
+                    if batch.len() >= persist::BATCH_MAX
+                        && let Some(pool) = &p.pool
+                    {
+                        persist_flush(&p, pool, &mut batch).await;
+                    }
+                }
+                None => break,
+            },
+            _ = tokio::time::sleep_until(flush_at), if !batch.is_empty() => {
+                if let Some(pool) = &p.pool {
+                    persist_flush(&p, pool, &mut batch).await;
+                }
+            }
+        }
+    }
+    if let Some(pool) = &p.pool {
+        persist_flush(&p, pool, &mut batch).await;
     }
 }
 
@@ -533,7 +704,7 @@ async fn persist(pool: &PgPool, dht: &Dht, ports: &[u16]) {
     }
 }
 
-async fn persist_loop(pool: PgPool, dht: Dht, ports: Vec<u16>, mut stop: watch::Receiver<bool>) {
+async fn identity_loop(pool: PgPool, dht: Dht, ports: Vec<u16>, mut stop: watch::Receiver<bool>) {
     loop {
         tokio::select! {
             _ = tokio::time::sleep(PERSIST_EVERY) => persist(&pool, &dht, &ports).await,
@@ -586,24 +757,52 @@ pub async fn run(
         }
     );
     let started = Instant::now();
+    let fetcher = Fetcher::new(FetchConfig {
+        metadata_max: opts.metadata_max,
+        // The engine's loopback seam (fake networks in tests) opens the fetcher's too.
+        allow_loopback: cfg.allow_loopback,
+        ..FetchConfig::default()
+    });
     let p = Arc::new(Pipeline {
         pool: db.clone(),
         queue: Mutex::new(FetchQueue::new(opts.queue_cap)),
         notify: Notify::new(),
         c: Counters::default(),
-        sink: PeerSink::default(),
+        peer_counts: Mutex::default(),
+        fetcher,
+        persisted: Mutex::default(),
         opts,
     });
     let (int_tx, int_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
     tasks.spawn(triage_loop(p.clone(), rx, int_rx.clone()));
-    for _ in 0..p.opts.peer_lookups.max(1) {
-        tasks.spawn(collector(p.clone(), dht.clone(), int_rx.clone()));
+    let workers = p.opts.fetch_concurrency.max(1);
+    let (jobs_tx, jobs_rx) = mpsc::channel::<FetchJob>(workers);
+    let jobs_rx = Arc::new(tokio::sync::Mutex::new(jobs_rx));
+    let (res_tx, res_rx) = mpsc::channel::<FetchResult>(workers * 2);
+    let persister = tokio::spawn(persist_loop(p.clone(), res_rx));
+    for _ in 0..workers {
+        tasks.spawn(fetch_worker(
+            p.clone(),
+            jobs_rx.clone(),
+            res_tx.clone(),
+            int_rx.clone(),
+        ));
     }
+    drop(res_tx);
+    for _ in 0..p.opts.peer_lookups.max(1) {
+        tasks.spawn(collector(
+            p.clone(),
+            dht.clone(),
+            jobs_tx.clone(),
+            int_rx.clone(),
+        ));
+    }
+    drop(jobs_tx);
     tasks.spawn(backpressure(p.clone(), dht.clone(), int_rx.clone()));
     if let Some(pool) = &db {
         tasks.spawn(retry_loop(p.clone(), pool.clone(), int_rx.clone()));
-        tasks.spawn(persist_loop(
+        tasks.spawn(identity_loop(
             pool.clone(),
             dht.clone(),
             p.opts.ports.clone(),
@@ -621,15 +820,23 @@ pub async fn run(
     let deadline = Instant::now() + Duration::from_secs(4);
     while let Ok(Some(_)) = tokio::time::timeout_at(deadline, tasks.join_next()).await {}
     tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    // Every result sender is gone now: the persister writes what is left and ends.
+    let _ = tokio::time::timeout(Duration::from_secs(3), persister).await;
+    let mut rep = rep;
+    rep.persist = p.persisted.lock().unwrap().clone();
+    rep.persist_errors = get(&p.c.persist_errors);
     if let Some(pool) = &db {
         persist(pool, &dht, &p.opts.ports).await;
     }
     dht.shutdown().await;
     tracing::info!(
-        "DHT crawler stopped: {} unique hashes, {} queued, {} collected",
+        "DHT crawler stopped: {} unique hashes, {} queued, {} collected, {} metadata verified, {} stored",
         rep.unique_hashes,
         rep.queued,
-        rep.peers.hashes
+        rep.peers.hashes,
+        rep.fetch.ok,
+        rep.persist.stored
     );
     Ok(rep)
 }
