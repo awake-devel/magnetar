@@ -19,7 +19,7 @@ use magnetar_core::metainfo::{
     FetchFailure, Fetched, InfoError, Outcome, PeerError, parse_info, wire,
 };
 use magnetar_server::dht::persist::{FetchResult, persist_batch};
-use magnetar_server::dht::screen::{Screen, UNSCREENED_RETRY_SECS, Verdict};
+use magnetar_server::dht::screen::{BlocklistScreen, Screen, UNSCREENED_RETRY_SECS, Verdict};
 use magnetar_server::dht::{self, DhtOptions, store as dstore};
 use sha2::Digest;
 use sqlx::PgPool;
@@ -31,9 +31,9 @@ use tokio::net::{TcpListener, TcpStream};
 struct MarkerScreen;
 
 impl Screen for MarkerScreen {
-    fn verdict(&self, names: &[String]) -> Verdict {
+    fn verdict(&self, names: &[String], _adult: bool) -> Verdict {
         if names.iter().any(|n| n.contains("BLOCKME")) {
-            Verdict::Block
+            Verdict::Block(magnetar_core::blocklist::Tier::Hard)
         } else {
             Verdict::Allow
         }
@@ -170,8 +170,8 @@ async fn verified_torrents_are_stored_and_searchable() {
     assert_eq!(row.2, 1_500_000_000);
     assert_eq!(
         (row.3.as_str(), row.4),
-        ("other", 0),
-        "unclassified until stage 3"
+        ("video", magnetar_core::classify::CLASSIFIER_VERSION),
+        "classified (stage 3)"
     );
     assert_eq!((row.5, row.6), (NOW - 500, NOW), "first_seen from dht_seen");
     assert_eq!((row.7.as_str(), row.8), ("sample", 3));
@@ -627,4 +627,190 @@ async fn pipeline_fetches_and_stores_from_a_fake_seeder() {
         .unwrap();
     assert_eq!(n, 1);
     client.shutdown().await;
+}
+
+/// Log capture for the whole test process (TRACE, every target).
+#[derive(Clone, Default)]
+struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Capture {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+    type Writer = Capture;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Stage 3 (D53, D68, D69): the real `core::blocklist` screen with neutral placeholder terms
+/// (`zorblax` hard, `wibblewob` context), the classifier deciding the context tier, through
+/// the whole pipeline at TRACE: blocked torrents leave only hashes, stored ones carry their
+/// category, and no torrent name or path ever appears in the logs or the report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pipeline_blocklist_classifies_and_never_logs_names() {
+    let Some(db) = test_db().await else { return };
+    let cap = Capture::default();
+    let sub = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(cap.clone())
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::set_global_default(sub).expect("only test setting a subscriber");
+    let pool = db.store.pool().clone();
+    let mut net = Vec::new();
+    let mut boot = Vec::new();
+    for i in 0..6u8 {
+        let ip = Ipv4Addr::new(127, 0, 19, 10 + i);
+        let (d, _rx) = Dht::start(fake_cfg(ip, boot.clone())).await.unwrap();
+        let a = SocketAddrV4::new(ip, d.local_ports()[0]);
+        if boot.len() < 2 {
+            boot.push(a);
+        }
+        net.push((d, a));
+    }
+    // (name, padding path, expected: Some(category) stored, None blocked)
+    let fixtures: Vec<(String, &str, Option<&str>)> = vec![
+        ("Plain.Show.2024.720p".into(), "zorblax", None), // hard, in a padding path
+        ("Studio.MILF.Scene.Wibblewob.1080p".into(), "0", None), // context, adult
+        ("Studio.XXX.Clip.12.yo".into(), "0", None),      // age rule, adult
+        (
+            "Wibblewob.Documentary.2020.1080p".into(),
+            "0",
+            Some("video"),
+        ), // context, not adult
+        ("Studio.XXX.Scene.2024.1080p".into(), "0", Some("porn")),
+        ("[Grp] Some Show - 05 (1080p)".into(), "0", Some("anime")),
+    ];
+    let mut dicts = HashMap::new();
+    let mut expect = HashMap::new();
+    for (name, pad, want) in &fixtures {
+        let raw = info(name, pad);
+        let h = sha1(&raw);
+        expect.insert(hex::encode(h), *want);
+        dicts.insert(h, raw);
+    }
+    for k in 0..6 {
+        let raw = info(&format!("Filler.Torrent.{k}.2024.720p"), "0");
+        let h = sha1(&raw);
+        expect.insert(hex::encode(h), Some("video"));
+        dicts.insert(h, raw);
+    }
+    let hashes: Vec<[u8; 20]> = dicts.keys().copied().collect();
+    let client_ip = Ipv4Addr::new(127, 0, 20, 1);
+    let port = seeder(client_ip, dicts).await;
+    let (client, _crx) = Dht::start(fake_cfg(client_ip, vec![net[0].1]))
+        .await
+        .unwrap();
+    for (k, h) in hashes.iter().enumerate() {
+        announce(&client, net[k % net.len()].1, *h, port).await;
+    }
+    let list = magnetar_core::blocklist::Blocklist::builtin()
+        .unwrap()
+        .with_extra("zorblax\ncontext:wibblewob\n")
+        .unwrap();
+    let opts = DhtOptions {
+        mode: Mode::Aggressive,
+        ports: vec![0],
+        qps: 400,
+        pool_cap: 10_000,
+        fetch_known: false,
+        peer_lookups: 8,
+        dry_run: false,
+        bloom_bits: 1 << 20,
+        queue_cap: 1000,
+        fetch_concurrency: 8,
+        metadata_max: 1 << 20,
+        tcp_rate: 1000,
+        tcp_max: 350,
+        probe: Vec::new(),
+        screen: Some(Arc::new(BlocklistScreen(Arc::new(list)))),
+    };
+    let crawler_ip = Ipv4Addr::new(127, 0, 21, 1);
+    let (_tx, stop) = tokio::sync::watch::channel(false);
+    let rep = dht::run(
+        Some(pool.clone()),
+        opts,
+        stop,
+        Some(Duration::from_secs(8)),
+        move |c: &mut EngineConfig| {
+            c.bind = crawler_ip;
+            c.bootstrap = vec![net[0].1];
+            c.allow_loopback = true;
+            c.query_timeout = Duration::from_millis(500);
+            c.per_ip_qps = 100.0;
+            c.response_per_ip = 1000.0;
+            c.response_rate = 10_000.0;
+            c.vote_responders = 3;
+            c.vote_prefixes = 1;
+        },
+    )
+    .await
+    .unwrap();
+    client.shutdown().await;
+    let report = serde_json::to_string(&rep).unwrap();
+    assert_eq!(rep.persist_errors, 0);
+    assert_eq!(rep.persist.blocked, 3, "{report}");
+    for tier in ["hard", "context", "age"] {
+        assert_eq!(rep.persist.blocked_by_tier.get(tier), Some(&1), "{report}");
+    }
+    let stored: HashMap<String, (String, i16)> = sqlx::query_as::<_, (String, String, i16)>(
+        "SELECT infohash, category, classifier_version FROM dht_torrents",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|(h, c, v)| (h, (c, v)))
+    .collect();
+    let blocked: Vec<String> = sqlx::query_scalar("SELECT infohash FROM blocked_infohashes")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    for (h, want) in &expect {
+        match want {
+            Some(cat) => {
+                let got = stored.get(h).expect("stored");
+                assert_eq!(
+                    (got.0.as_str(), got.1),
+                    (*cat, magnetar_core::classify::CLASSIFIER_VERSION)
+                );
+            }
+            None => {
+                assert!(!stored.contains_key(h));
+                assert!(blocked.contains(h));
+            }
+        }
+    }
+    assert_eq!(rep.persist.categories.get("porn"), Some(&1), "{report}");
+    // Nothing named in the logs (the whole process, TRACE) or the report.
+    let logs = String::from_utf8_lossy(&cap.0.lock().unwrap()).to_lowercase();
+    assert!(
+        logs.len() > 1000,
+        "the capture saw the run ({} bytes)",
+        logs.len()
+    );
+    for needle in [
+        "zorblax",
+        "wibblewob",
+        "studio",
+        "plain.show",
+        "filler",
+        "some show",
+        "documentary",
+        ".mkv",
+    ] {
+        assert!(!logs.contains(needle), "{needle:?} logged");
+        assert!(
+            !report.to_lowercase().contains(needle),
+            "{needle:?} in the report"
+        );
+    }
 }

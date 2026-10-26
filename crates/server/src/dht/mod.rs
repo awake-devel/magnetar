@@ -8,6 +8,7 @@
 //! batches by [`persist`]: verified torrents pass the content [`screen`] first, and without one
 //! nothing named is stored (fail closed until the stage 3 blocklist exists).
 
+pub mod classify;
 pub mod health;
 pub mod persist;
 pub mod queue;
@@ -32,7 +33,7 @@ use tokio::time::Instant;
 
 use crate::config::{Config, DhtMode};
 use crate::daemons::stop_requested;
-use persist::{FetchResult, PersistOutcome};
+use persist::{FetchResult, PersistOutcome, ReclassifyOutcome};
 use queue::{FetchItem, FetchQueue};
 use screen::Screen;
 use seen::SeenFilter;
@@ -121,7 +122,8 @@ impl DhtOptions {
                 .map(|n| n as usize)
                 .unwrap_or(if aggressive { 128 } else { 16 }),
             metadata_max: cfg.dht_metadata_max as usize,
-            screen: None,
+            // The process-wide blocklist (installed at start); None stores nothing.
+            screen: screen::global_screen(),
             tcp_rate: cfg.dht_tcp_rate,
             tcp_max: cfg.dht_tcp_max as usize,
             probe: health::parse_targets(&cfg.dht_probe),
@@ -269,6 +271,8 @@ pub struct Report {
     /// Verified share of finished fetches that had at least one peer.
     pub fetch_success_rate: f64,
     pub persist: PersistOutcome,
+    /// Rows of an older classifier version re-classified (and re-screened) at start (D69).
+    pub reclassified: ReclassifyOutcome,
     pub persist_errors: u64,
     pub bandwidth: Bandwidth,
     /// Router health probe (D66).
@@ -380,6 +384,7 @@ fn report(p: &Pipeline, dht: &Dht, started: Instant) -> Report {
         },
         fetch,
         persist: p.persisted.lock().unwrap().clone(),
+        reclassified: ReclassifyOutcome::default(),
         persist_errors: get(&p.c.persist_errors),
         bandwidth,
         health: p.health.lock().unwrap().clone(),
@@ -595,6 +600,12 @@ async fn persist_flush(p: &Pipeline, pool: &PgPool, batch: &mut Vec<FetchResult>
             t.not_new += o.not_new;
             t.alias += o.alias;
             t.blocked += o.blocked;
+            for (k, v) in o.blocked_by_tier {
+                *t.blocked_by_tier.entry(k).or_default() += v;
+            }
+            for (k, v) in o.categories {
+                *t.categories.entry(k).or_default() += v;
+            }
             t.unscreened += o.unscreened;
             t.private += o.private;
             t.v2_only += o.v2_only;
@@ -747,6 +758,10 @@ pub async fn run(
         cfg.known_nodes = store::load_nodes(pool).await?;
         cfg.identity = store::load_identity(pool, &opts.ports).await?;
     }
+    let reclassified = match (&db, opts.screen.as_deref()) {
+        (Some(pool), Some(screen)) => reclassify_all(pool, screen).await?,
+        _ => ReclassifyOutcome::default(),
+    };
     // Tests replace the bootstrap list (and open the loopback seam) here.
     engine_tweak(&mut cfg);
     if cfg.bootstrap.is_empty() && !cfg.allow_loopback {
@@ -852,6 +867,7 @@ pub async fn run(
     let mut rep = rep;
     rep.persist = p.persisted.lock().unwrap().clone();
     rep.persist_errors = get(&p.c.persist_errors);
+    rep.reclassified = reclassified;
     if let Some(pool) = &db {
         persist(pool, &dht, &p.opts.ports).await;
     }
@@ -865,6 +881,34 @@ pub async fn run(
         rep.persist.stored
     );
     Ok(rep)
+}
+
+/// Re-classify every row of an older classifier version, 500 per transaction (D69).
+pub async fn reclassify_all(
+    pool: &PgPool,
+    screen: &dyn Screen,
+) -> anyhow::Result<ReclassifyOutcome> {
+    let mut total = ReclassifyOutcome::default();
+    loop {
+        let o = persist::reclassify_batch(pool, screen, 500, magnetar_core::now())
+            .await
+            .map_err(|e| anyhow::anyhow!("DHT reclassify: {}", persist::error_class(&e)))?;
+        total.rows += o.rows;
+        total.changed += o.changed;
+        total.blocked += o.blocked;
+        if o.rows < 500 {
+            break;
+        }
+    }
+    if total.rows > 0 {
+        tracing::info!(
+            "DHT: re-classified {} rows ({} with a category, {} blocked)",
+            total.rows,
+            total.changed,
+            total.blocked
+        );
+    }
+    Ok(total)
 }
 
 /// Wait before restarting the crawler after its `n`-th consecutive failure (30 s doubling,

@@ -7,8 +7,10 @@
 //! carries its name; a block writes only hashes; no screen at all → nothing named is written
 //! (fail closed, `screen.rs`). Nothing here logs a name or path.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
+use magnetar_core::classify::{CLASSIFIER_VERSION, Classification};
 use magnetar_core::dht::Via;
 use magnetar_core::metainfo::{FetchFailure, Fetched, Outcome, PeerError};
 use magnetar_core::model::{Category, TorrentFile};
@@ -17,6 +19,7 @@ use serde::Serialize;
 use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, Transaction};
 
+use super::classify::classify;
 use super::screen::{Screen, UNSCREENED_RETRY_SECS, Verdict};
 use super::store::BACKOFF_SECS;
 
@@ -26,8 +29,8 @@ pub const BATCH_WAIT: Duration = Duration::from_secs(1);
 pub const FILES_MAX: usize = 5000;
 /// `dht_torrents.files_text` keeps the first this many bytes of the paths.
 pub const FILES_TEXT_MAX: usize = 64 * 1024;
-/// `classifier_version` of rows stored before `core::classify` exists (stage 3): category
-/// `other`, re-classified by the first classifier version.
+/// `classifier_version` of rows stored before `core::classify` existed (stage 2): category
+/// `other`, re-classified by [`reclassify_batch`].
 pub const UNCLASSIFIED: i16 = 0;
 
 pub const STATUS_INVALID: i16 = 3;
@@ -55,6 +58,10 @@ pub struct PersistOutcome {
     /// Hybrids sighted under their truncated v2 hash (sighted row kept as `alias`).
     pub alias: u64,
     pub blocked: u64,
+    /// Blocked, by rule tier (`hard`, `context`, `age`): counts only, never names (D53).
+    pub blocked_by_tier: BTreeMap<String, u64>,
+    /// New rows by category (D52); `porn` is the adult share.
+    pub categories: BTreeMap<String, u64>,
     /// Verified but dropped: no content screen installed (stage 2, fail closed).
     pub unscreened: u64,
     pub private: u64,
@@ -189,10 +196,24 @@ async fn block(
     Ok(())
 }
 
+/// The display files (padding dropped by the parser), NUL removed.
+fn display_files(f: &Fetched) -> Vec<TorrentFile> {
+    f.info
+        .files
+        .iter()
+        .map(|x| TorrentFile {
+            path: clean(&x.path),
+            size: Some(x.size),
+        })
+        .collect()
+}
+
 /// Insert a screened torrent. Returns whether a new row was written.
+#[allow(clippy::too_many_arguments)]
 async fn store(
     tx: &mut Transaction<'_, Postgres>,
     f: &Fetched,
+    class: &Classification,
     via: Via,
     peers_seen: usize,
     fetch_known: bool,
@@ -200,15 +221,7 @@ async fn store(
 ) -> sqlx::Result<bool> {
     let v1 = hex::encode(f.v1);
     let title = clean(&f.info.name);
-    let files: Vec<TorrentFile> = f
-        .info
-        .files
-        .iter()
-        .map(|x| TorrentFile {
-            path: clean(&x.path),
-            size: Some(x.size),
-        })
-        .collect();
+    let files = display_files(f);
     let kept = &files[..files.len().min(FILES_MAX)];
     let text = files_text(kept);
     // A hybrid sighted by its v2 hash was never triaged under its SHA-1: the same checks as a
@@ -234,14 +247,14 @@ async fn store(
     .bind(i32::try_from(files.len()).unwrap_or(i32::MAX))
     .bind(&text)
     .bind(i64::try_from(f.info.total_size).unwrap_or(i64::MAX))
-    .bind(Category::Other.as_str())
+    .bind(class.category.as_str())
     .bind(i32::try_from(f.metadata_size).unwrap_or(i32::MAX))
     .bind(f.info.piece_length.and_then(|p| i32::try_from(p).ok()))
     .bind(f.sighted.as_slice())
     .bind(now)
     .bind(via_text(via))
     .bind(i32::try_from(peers_seen).unwrap_or(i32::MAX))
-    .bind(UNCLASSIFIED)
+    .bind(CLASSIFIER_VERSION)
     .bind(skip_known_check)
     .execute(&mut **tx)
     .await?
@@ -250,7 +263,7 @@ async fn store(
     if inserted {
         // Release attributes (D44) from the DHT name and files; first writer wins, as for
         // Nostr (a Nostr event stored later keeps these unless the parser version moved).
-        let attrs = release::parse_release(&title, kept, Category::Other);
+        let attrs = release::parse_release(&title, kept, class.category);
         sqlx::query(
             "INSERT INTO torrent_attrs (infohash, parser_version, attrs) VALUES ($1, $2, $3)
              ON CONFLICT (infohash) DO NOTHING",
@@ -307,14 +320,23 @@ pub async fn persist_batch(
                     o.unscreened += 1;
                     continue;
                 };
-                match screen.verdict(&f.info.all_names) {
-                    Verdict::Block => {
+                // Classify (pure, silent) before the screen: the context tier needs the
+                // adult result (docs/DHT.md §7.1 order).
+                let class = classify(&f.info.name, &display_files(f));
+                match screen.verdict(&f.info.all_names, class.adult()) {
+                    Verdict::Block(tier) => {
                         block(&mut tx, f, screen.rule_version(), now).await?;
                         o.blocked += 1;
+                        *o.blocked_by_tier.entry(tier.as_str().into()).or_default() += 1;
                     }
                     Verdict::Allow => {
-                        if store(&mut tx, f, it.via, it.peers_seen, fetch_known, now).await? {
+                        if store(&mut tx, f, &class, it.via, it.peers_seen, fetch_known, now)
+                            .await?
+                        {
                             o.stored += 1;
+                            *o.categories
+                                .entry(class.category.as_str().into())
+                                .or_default() += 1;
                         } else {
                             o.not_new += 1;
                         }
@@ -350,6 +372,83 @@ pub async fn persist_batch(
                 set_failed(&mut tx, &it.sighted, f.code(), now).await?;
                 o.failed += 1;
             }
+        }
+    }
+    tx.commit().await?;
+    Ok(o)
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct ReclassifyOutcome {
+    pub rows: u64,
+    pub changed: u64,
+    pub blocked: u64,
+}
+
+/// Re-classify up to `limit` rows stored by an older classifier (`classifier_version` below
+/// [`CLASSIFIER_VERSION`], stage 2 rows included) and screen them again with the new adult
+/// result (the context tier depends on it). A row that is now blocked is deleted and only its
+/// hash kept (origin `sweep`); the others get the new category and, when no Nostr event
+/// owns the infohash, re-parsed release attributes. One transaction. Never logs a name.
+pub async fn reclassify_batch(
+    pool: &PgPool,
+    screen: &dyn Screen,
+    limit: i64,
+    now: i64,
+) -> sqlx::Result<ReclassifyOutcome> {
+    let rows: Vec<(String, String, Json<Vec<TorrentFile>>)> = sqlx::query_as(
+        "SELECT infohash, title, files FROM dht_torrents WHERE classifier_version < $1
+         ORDER BY infohash LIMIT $2",
+    )
+    .bind(CLASSIFIER_VERSION)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    let mut o = ReclassifyOutcome::default();
+    let mut tx = pool.begin().await?;
+    for (infohash, title, Json(files)) in rows {
+        o.rows += 1;
+        let class = classify(&title, &files);
+        let mut names = Vec::with_capacity(files.len() + 1);
+        names.push(title.clone());
+        names.extend(files.iter().map(|f| f.path.clone()));
+        if let Verdict::Block(_) = screen.verdict(&names, class.adult()) {
+            sqlx::query(
+                "INSERT INTO blocked_infohashes (infohash, blocked_at, rule_version, origin)
+                 VALUES ($1, $2, $3, 'sweep') ON CONFLICT (infohash) DO NOTHING",
+            )
+            .bind(&infohash)
+            .bind(now)
+            .bind(screen.rule_version())
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM dht_torrents WHERE infohash = $1")
+                .bind(&infohash)
+                .execute(&mut *tx)
+                .await?;
+            o.blocked += 1;
+            continue;
+        }
+        sqlx::query(
+            "UPDATE dht_torrents SET category = $2, classifier_version = $3 WHERE infohash = $1",
+        )
+        .bind(&infohash)
+        .bind(class.category.as_str())
+        .bind(CLASSIFIER_VERSION)
+        .execute(&mut *tx)
+        .await?;
+        let attrs = release::parse_release(&title, &files, class.category);
+        sqlx::query(
+            "UPDATE torrent_attrs SET parser_version = $2, attrs = $3
+             WHERE infohash = $1 AND NOT EXISTS (SELECT 1 FROM torrents t WHERE t.infohash = $1)",
+        )
+        .bind(&infohash)
+        .bind(release::PARSER_VERSION)
+        .bind(Json(&attrs))
+        .execute(&mut *tx)
+        .await?;
+        if class.category != Category::Other {
+            o.changed += 1;
         }
     }
     tx.commit().await?;
