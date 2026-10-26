@@ -13,6 +13,12 @@
             <action android:name="android.intent.action.VIEW" />
             <data android:scheme="magnet" />
         </intent>
+        <!-- NIP-55 signers (Amber): only to ask for the public key of the trust root. -->
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="nostrsigner" />
+        </intent>
     </queries>
 
     <application

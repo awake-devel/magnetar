@@ -1,6 +1,8 @@
 package app.magnetar.ui.settings
 
 import android.Manifest
+import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -92,8 +94,22 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
             Field(
                 "Root npub", form.rootNpub, { v -> vm.edit { it.copy(rootNpub = v) } },
                 error = state.npubError,
-                hint = "Your key (npub, hex or nprofile). Trust is computed from its follows.",
+                hint = "Your public key (npub, hex or nprofile), never the nsec. Trust is computed from its follows.",
             )
+            // NIP-55: a signer such as Amber hands over the public key; the private key stays there.
+            val context = LocalContext.current
+            val hasSigner = remember { signerIntent().resolveActivity(context.packageManager) != null }
+            val signer = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+                val data = r.data
+                // `result` per NIP-55 (hex); older Amber versions answered in `signature` (npub).
+                val key = data?.getStringExtra("result") ?: data?.getStringExtra("signature")
+                if (key != null && data?.getBooleanExtra("rejected", false) != true) {
+                    vm.edit { it.copy(rootNpub = key) }
+                }
+            }
+            if (hasSigner) {
+                OutlinedButton(onClick = { signer.launch(signerIntent()) }) { Text("Get my key from Amber") }
+            }
             Text("Trust threshold: ${form.trustThreshold}", style = MaterialTheme.typography.bodyMedium)
             Slider(
                 value = form.trustThreshold.toFloat(),
@@ -174,3 +190,7 @@ private fun Field(
         modifier = Modifier.fillMaxWidth(),
     )
 }
+
+/** NIP-55 get_public_key request to the installed signer app. */
+private fun signerIntent(): Intent =
+    Intent(Intent.ACTION_VIEW, Uri.parse("nostrsigner:")).putExtra("type", "get_public_key")
