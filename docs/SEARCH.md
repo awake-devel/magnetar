@@ -39,6 +39,11 @@ lowest id (D6). Fields:
 - since `SCHEMA_VERSION` 3 (D52, D70), fast `adult` (1 when the canonical category is `porn` or
   a `dht_torrents` row of the infohash is classified `porn`). The version bump rebuilds the
   index once after the upgrade (35 s on the production copy for version 2).
+- since `SCHEMA_VERSION` 4 (D51, D73), DHT torrents: a document per infohash with a
+  `dht_torrents` row and no unblocked event (empty `event_id`/`pubkey`, trust 0), the DHT title
+  and files on mixed documents, stored `origin` and facet `f_origin` (`nostr`, `dht`), and
+  `eligible_trust` lifted to 1000 when a DHT row exists, so DHT results pass any `min_trust`.
+  Filter `SearchQuery.origins` / `origin=nostr,dht`. Rebuild: 48 s on the production copy.
 
 ## Lifecycle
 
@@ -102,7 +107,9 @@ lowest id (D6). Fields:
 - Differences from the SQL search, by design: date, size and category bounds apply to the
   canonical event (what the result shows), not to any event of the infohash; when the canonical
   event is below `min_trust` but another publisher is trusted locally, the result still shows
-  the canonical event. `rank` is the BM25 score (+10 000), not a 0–1 value.
+  the canonical event. `rank` is the BM25 score (+10 000), not a 0–1 value. The fallback's rows
+  include DHT rows (`torrent_rows`, D73): when the Nostr event is below `min_trust` it shows the
+  DHT row's title, and a category filter also matches the DHT row's category.
 
 ## Counts
 

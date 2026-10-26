@@ -160,6 +160,29 @@ must be updated together to get all of it, but each side keeps working with an o
   letters, and words written with dots or spaces between the letters. Very large torrent
   descriptions no longer cost the crawler a lot of memory to check.
 
+### DHT crawler: DHT torrents in search, crawler status, router ports (stage 4; docs/DHT.md §16, D72–D75)
+
+- **DHT torrents are search results**, mixed equally with Nostr ones: they pass any trust
+  threshold (their name and files are verified against the infohash; there is no publisher to
+  score) and show a neutral **DHT** badge in place of the trust star; a torrent known from both
+  shows the star and a small DHT chip. Adult DHT torrents stay hidden by default, illegal ones
+  are never stored.
+- Filter sheet: **Source** chips (Nostr / DHT) with counts. Torrent page: where it was found, and
+  for DHT-only torrents a "Found on the DHT" card (first seen, peers) instead of the trust card.
+- Stats: "Found via (Nostr / DHT)" breakdown, DHT activity charts and the crawler's numbers in
+  the health card (new hashes per minute, queue, metadata success, stored, adult, blocked,
+  router ports); Status: a DHT crawler card. API: `origin` on results, `origin=` filter, `dht`
+  in `/api/v1/stats` and `/stats/health`, features `origin` and `dht`.
+- **Router ports**: in aggressive mode the server maps its UDP ports with UPnP (and removes them
+  when it stops); `MAGNETAR_DHT_UPNP=false` turns that off. Docker: `docker/compose.dht.yml`
+  publishes UDP 6891–6894 and turns the crawler on; set `MAGNETAR_DHT_UPNP_GATEWAY` and
+  `MAGNETAR_DHT_UPNP_LOCAL_IP` for UPnP from a container. Only UDP: nothing listens on TCP.
+- Measured on a copy of production (10.7 min, home connection, no port opened): 837 torrents
+  stored (154 adult), ~6 KB each in the database; search p95 16 ms before, 24 ms after, 30–82 ms
+  while crawling (the 82 ms sample was not reproduced in a second run, 18–23 ms).
+- Upgrade: one quick migration (61 ms on the production copy) and a one-off search index rebuild
+  (48 s) at the first start.
+
 ## Older servers and offline mode
 
 - The app asks `GET /health` for `features` and hides what the server lacks: an older server
@@ -170,7 +193,8 @@ must be updated together to get all of it, but each side keeps working with an o
 - An older app talking to the new server keeps working: all new fields have defaults. It gets
   adult content hidden (the new default) and has no switch to show it.
 - The new app talking to an older server drops adult results itself (that server ignores the
-  setting).
+  setting). It hides the Source chips and DHT charts when the server does not list `origin` /
+  `dht`; offline, the phone's cache holds Nostr torrents only, so DHT results need the server.
 
 ## Upgrade notes
 

@@ -1,4 +1,4 @@
-# DHT crawler (ARCHITECTURE.md D49–D70)
+# DHT crawler (ARCHITECTURE.md D49–D75)
 
 Design document for the native Mainline DHT crawler. Status: **stages 1 (discovery), 2
 (metadata fetch) and 3 (classification and safety) built**: KRPC node, BEP 42 ids, routing,
@@ -7,8 +7,10 @@ the persisted `dht_seen` queue, the `dht` CLI and the `serve` daemon (§13), the
 fetcher, fetch workers and the `dht_torrents` writer behind a fail-closed content screen (§14),
 then `core::classify`, the hard blocklist `core::blocklist` installed as that screen and on
 Nostr ingest, the adult filter on every search path, and the enrichers / attrs backfill on DHT
-rows (§15). DHT torrents are now **stored** (classified and screened) with release attributes,
-seed checks and media links; they reach search results with stage 5 (index readers, §2.5).
+rows (§15), then **product integration and ops** (§16): DHT torrents in the search index,
+facets, SQL fallback, detail and API (`origin`, D73), the crawler's live stats and health
+fields (D74), UPnP port mapping and the Docker overlay (D72), the app's source badge, Source
+chips, Stats and Status (D74), and a 10-minute live run on a production copy (D75).
 Each section says which stage builds it (§12); later stages update this file as they land.
 
 Research behind it: [research/dht-crawling.md](research/dht-crawling.md),
@@ -582,7 +584,7 @@ holding the 256 MiB in-flight budget cannot starve the decodes; an announced has
 order is (§7.1): **screen** (D65) → store or block. Stage 2 has no classifier: rows are stored
 with `category = other`, `classifier_version = 0`, which stage 3 re-classifies.
 
-## 5. Trust treatment and display of DHT results (D51, stage 5)
+## 5. Trust treatment and display of DHT results (D51, as built in stage 4: D73, §16)
 
 **Rule**: an infohash with a `dht_torrents` row **always passes `min_trust`**. In the index,
 `eligible_trust = max(best publisher trust, TRUSTED (1000))` when the document has a DHT row.
@@ -783,7 +785,7 @@ when that is off. `--dry-run`: no database at all (dedupe in memory). `serve` st
 `MAGNETAR_DHT` ≠ `off`, after migrations (the blocklist sweep joins in stage 3); it stops within
 `serve`'s 10 s daemon grace, saving the identity and 1000 contacts.
 
-## 9. UPnP, ports, Docker (D57, stage 6)
+## 9. UPnP, ports, Docker (D57, as built in stage 4: D72, §16)
 
 - Crate: **`igd-next` 0.18.0** (MIT, 2026-10-04, ~5 M recent downloads; deps hyper 1 / xmltree /
   xml-rs / url, all MIT, hyper already in the tree via reqwest), `default-features = false,
@@ -816,7 +818,7 @@ when that is off. `--dry-run`: no database at all (dedupe in memory). `serve` st
 - The laptop's own nftables ruleset (169 lines) may need the published UDP ports allowed; checked
   in stage 8, without changing any router setting before then.
 
-## 10. Stats, health, resources (D58, stage 6)
+## 10. Stats, health, resources (D58, as built in stage 4: D74, §16)
 
 - `/api/v1/stats.dht` (`DhtStats`, serde default): mode, virtual nodes (id prefix, port, mapped),
   external IP class (public / private / CGNAT, never the address itself), routing-table sizes,
@@ -852,10 +854,8 @@ blocked names anywhere; nothing from the DHT is published to Nostr.
 | 1 | `core::dht` KRPC, BEP 42 ids, routing, pool, sampler, limiter, responder, peer store; **pulled forward from stage 4** (swarm plan): migration §2.3, `server::dht` triage, `dht_seen` queue, retry, peer collection, `dht` CLI, config, `serve` daemon | BEP 5/42/51 vectors (BEP 42 over 4 bytes), arbitrary-bytes no-panic decoders, address filter, map caps (§3.8), fake-network tests, Postgres tests, bounded live aggressive runs (§13) |
 | 2 (built, §14) | `core::metainfo` BEP 3/10/9 fetcher, v1/hybrid/v2 verification; **pulled forward from stage 4**: fetch workers, `server::dht::persist` (dht_torrents + attrs batches, alias rows, final statuses), the fail-closed content-screen seam (D65) | fake-peer tests (reject, short piece, wrong hash, hybrid, private, duplicate keys, LAN/loopback peer refused), a real librqbit seed, Postgres storage tests, bounded live fetch of sampled hashes |
 | 3 (built, §15) | `core::classify`, `core::blocklist`, `Rejection::Blocked`, `scripts/blocklist-hash.sh`; **pulled forward from stage 5/7**: `SearchQuery.include_adult` on the index (`SCHEMA_VERSION` 3), SQL fallback and phone, the app's adult switch; enrichers and attrs backfill on `torrent_rows` | accuracy sample, blocklist vectors (hashed, every name/path variant), Nostr ingest rejection (description/hashtags too), no-name-in-logs test at `TRACE` |
-| 4 | `server::dht::persist` (dht_torrents + attrs batches, alias rows), fetch results into `dht_seen` | Postgres tests, hybrid alias, bounded live aggressive run without UPnP |
-| 5 | `torrent_rows` readers (index documents, detail, SQL fallback), index `SCHEMA_VERSION` 4 (origin, eligible_trust), API/ffi types, sweep | search/filters/detail tests on both paths (DHT rows pass `min_trust` in the SQL fallback too, `EXPLAIN` shows no seq scan of `dht_torrents`), `recompute_published` Nostr-only, sweep vacuum + merge |
-| 6 | UPnP, `docker/compose.dht.yml`, stats/health | fake gateway tests, stats API |
-| 7 | app: badge, filter chip, crawler card (the adult switch landed in stage 3) | Gradle build + unit tests |
+| 4 (built, §16; swarm stage "product integration and ops", covers the planned 5–7 except the sweep) | `torrent_rows` readers (index documents, detail, SQL fallback), index `SCHEMA_VERSION` 4 (origin, eligible_trust), API/ffi types, UPnP, `docker/compose.dht.yml`, stats/health, app badge, Source chips, Stats/Status | both search paths, `EXPLAIN`, fake gateway, stats API, Android unit tests, 10-min live run on a production copy |
+| 5 (open) | the Nostr **sweep** of §7.1 (stored events re-screened when the blocklist version moves, vacuum + index merge) | not built yet |
 | 8 | live tuning on the laptop | rates, hit rate, resources, disk per torrent |
 
 ## 13. Stage 1: built and measured (2026-10-26)
@@ -1152,3 +1152,118 @@ was blocked (by the DHT or another event) stays until the stage 5 sweep. Re-clas
 re-screens only the first 5000 stored files of a row (`FILES_MAX`), not every name of the
 original info dict. A hostile 16 MiB info dict costs up to ~9 s of one core to screen.
 
+
+## 16. Stage 4: product integration and ops, built and measured (2026-10-26)
+
+**Code.** Index: `search_index/{load,schema,mod}.rs` (`SCHEMA_VERSION` 4, DHT documents,
+`origin` stored/facet/filter, `eligible_trust`, DHT file matches); SQL fallback
+`search.rs` on `torrent_rows` (+ `search::explain_hits`); `store.rs` DHT-only and mixed
+detail, origin refinement of fallback pages; `stats.rs` (`origin` breakdown, DHT metrics,
+`recompute_published` Nostr-only); `api.rs` (`origin=` parameter, features `origin` / `dht`,
+`StatsResponse.dht`, `StatsHealth.dht`); `dht/status.rs` (`DhtService`, `DhtStats`, the
+per-minute sampler), `dht/upnp.rs` (D72); core types `Origin`, `DhtInfo`, `DhtStats`,
+`UpnpStatus`, `SearchQuery.origins`; ffi `FfiOrigin`, `FfiDhtInfo`, `FfiDhtStats`,
+`Magnetar::server_dht`; app (badge, Source chips, detail card, Stats, Status, `DhtFormat.kt`);
+`docker/compose.dht.yml`, `compose.yml` pass-through, `.env.example`. New dependency:
+`igd-next` 0.18.0 (+ `xml-rs`, `xmltree`, all MIT), server feature `upnp`.
+
+**Trust treatment as built (D51/D73)**: a document with a DHT row passes every `min_trust`
+(index: `eligible_trust` lifted to 1000; fallback: `t.origin = 'dht' OR …`). A Nostr event
+stays canonical when one exists; a DHT-only result has empty `event_id`/`pubkey`/`npub`, trust
+0 and `publisher_count` 0, and the app shows a neutral "DHT" badge instead of the trust star.
+A blocked publisher hides its events, not the DHT row. Adult DHT rows stay hidden by default
+(D52); the Source chip (`origins`) is an optional filter, never a default.
+
+**Tests.** `server/tests/dht_search_pg.rs`: both search paths agree at `min_trust` 0; at 20 and
+100 DHT rows still pass (and only they at 100); blocked publisher + DHT row → DHT-only result
+and detail; Source chips on both paths (`dht`, `nostr`, both, bogus); disjunctive `origin`
+facet; DHT titles and file names searchable, `matched_file` from the DHT files; the index
+follows DHT inserts/deletes through `search_changes`; detail (DHT-only, both, Nostr-only);
+published-per-day counts without the DHT-only hash; the fallback plan reaches `dht_torrents`
+through `dht_torrents_search_tsv` with seq scans disabled (the trigram arm folds away).
+`search_index.rs::adult_hidden_by_default_on_both_paths` now records the accepted fallback
+difference (category filter on any row, DHT rows included). `server/tests/dht_upnp.rs`: an
+in-process fake IGD (SSDP over UDP, device/service XML and SOAP over HTTP on 127.0.0.1, no
+multicast): UDP and TCP mapped through unicast discovery with our LAN address and a 1 h lease;
+725 → lease 0; 718 → `partial` with the error; the loop maps, then removes everything on
+stop; no gateway → `failed`, softly; the crawler (fake DHT, 2 virtual nodes) maps exactly its
+bound UDP ports, shows in `/health` (`dht`, `origin`) and `/api/v1/stats.dht`, and unmaps at
+stop. Android `DhtTest` (chip ↔ query, breakdown fields per feature, labels, crawler lines,
+uptime) with the existing unit tests, `assembleDebug`.
+
+**Live run** (D75; release build, home IP, aggressive, 4 virtual nodes, `MAGNETAR_DHT_UPNP=false`,
+no router port opened). Database `dht_stage4_live` = `pg_dump` of production (`magnetar-db-1`,
+read-only, 1.8 GB custom format, 3 min) restored on the test Postgres (12 min): 501 820
+infohashes, 506 988 events, 8.39 GB. Phase A without crawler: the DHT migration took **61 ms**,
+the `SCHEMA_VERSION` 4 rebuild **48 s** for 501 820 documents (400.6 MB). Phase B: `serve` with
+the crawler for 10.7 min (other daemons as in production except downloads, NIP-66, IMDb and
+anime datasets off; Nostr crawl limited to 2 relays):
+
+| | |
+|---|---|
+| unique hashes / queued / given to peer collection | 11 191 / 10 978 / 4 978 |
+| info dicts verified | 851 (~80/min once running), 25.7 % of finished fetches |
+| stored / adult / blocked | **837** / 154 (18.4 %) / 14 (counted by number only) |
+| categories | video 394, porn 154, audio 98, other 60, book 43, application 36, anime 23, game 19, picture 10 |
+| KRPC | 101–172 q/s, 45–49 % answered; **probe brake on from minute 1 to the end** (D66) |
+| incoming queries without an open port | ~41/min |
+| whole server (index, seed checks, Nostr crawl included) | 73.6 s CPU in 558 s = 13 % of one core; peak RSS 462 MB (index mmap included) |
+| growth | database +8.2 MB: `dht_torrents` 5.05 MB = **6.0 KB per stored torrent** with its indexes, `dht_seen` 1.79 MB for 10 130 rows (~177 B), attrs/schedule/liveness the rest; index +2.6 MB |
+| `stats_series` after the run | `dht_torrents_added` 837, `dht_hashes_seen` 11 179, `dht_fetch_ok` 807, `dht_fetch_fail` 2 324, `dht_blocked` 13 |
+
+Search latency over HTTP (`POST /api/v1/search`, loopback, 48 queries × 5 runs after one warm-up:
+the D43 benchmark set, plus `origins` dht / nostr on five texts, adult shown, `min_trust` 100;
+client-side wall time, so HTTP and JSON included):
+
+| when | p50 | p95 | p99 | max |
+|---|---|---|---|---|
+| before the crawl (0 DHT documents) | 8.9 ms | 16.3 ms | 22.8 ms | 24.5 ms |
+| crawl, minute 5 | 14.0 | 30.4 | 56.6 | 65.2 |
+| crawl, end of minute 10 | 40.4 | **81.6** | 105.1 | 129.8 |
+| after the crawl (837 DHT documents, 683 shown, crawler off) | 11.5 | 24.4 | 34.4 | 36.6 |
+| second crawl (5 min, 1 149 stored at the end), each minute | 9.1–9.3 | 17.5–22.6 | 25.9–29.7 | ≤ 43.2 |
+
+p95 stayed under the 100 ms bound in every measurement. The end-of-run sample is the outlier
+(two queries above 100 ms p95: `game of thrones s01`, whose file match reads paths from Postgres,
+and `french` by date); the second crawl did not reproduce it, and its cause (Postgres load from
+seed-check batches and DHT writes at that moment, other load on the laptop) is **not
+established** (load average and Postgres activity were only recorded in the second crawl: load
+~2, 2 active backends). Facet `origin` on the copy afterwards: nostr 465 030, dht 683 (adult
+hidden); `origin=dht&min_trust=50` returned the 683 DHT documents with trust 0 and no publisher.
+
+### 16.1 Ops
+
+- **Turn it on**: `MAGNETAR_DHT=aggressive` (or `polite`) and restart `serve`; in Docker
+  `docker compose -f compose.yml -f docker/compose.dht.yml up -d` (docs/DOCKER.md). The first
+  start after the upgrade runs the DHT migration (61 ms on the production copy) and rebuilds the
+  search index once (`SCHEMA_VERSION` 4, 48 s).
+- **Ports**: UDP `MAGNETAR_DHT_PORT`…`+NODES-1` (6891–6894). `serve` maps them with UPnP in
+  aggressive mode (`MAGNETAR_DHT_UPNP=false` to forward by hand or not at all); in Docker set
+  `MAGNETAR_DHT_UPNP_GATEWAY` and `MAGNETAR_DHT_UPNP_LOCAL_IP`. No TCP port: the crawler never
+  listens on TCP (D72).
+- **Watch**: `/health` lists `dht`; `/api/v1/stats` and `/api/v1/stats/health` carry `dht`
+  (`running`, `last_error`, `hashes_per_min`, `queue_len`, `metadata_per_min`,
+  `fetch_success_rate`, `stored_total`, `adult_total`, `blocked_total`, `brake`,
+  `incoming_per_min`, `upnp.state` / `mappings` / `last_error`); the app shows them on the Stats
+  health card and the Status screen; the activity chart has "DHT torrents added" and "DHT hashes
+  found". `incoming_per_min` near zero for 10 min with `upnp.state = mapped` means the router or
+  a firewall drops unsolicited UDP. `brake = true` for long stretches means the D66 probe sees a
+  slow or lossy line (it did for the whole stage 4 run).
+- **Stop**: SIGTERM/Ctrl-C; within `serve`'s grace the crawler saves its identity and 1000
+  contacts and removes its UPnP mappings.
+- **Disk**: no cap (user decision). Measured ~6 KB per stored torrent in `dht_torrents`, ~10 KB
+  per stored torrent for the whole database including the `dht_seen` queue of hashes not
+  (yet) fetched, plus ~3 KB of index. At the stage 4 rate (~80 stored/min ≈ 115 k/day) that is
+  roughly 1 GB a day; `db_size` in Stats shows it.
+- **Bounded measurement**: `magnetar-server dht --seconds N` never maps router ports unless
+  `MAGNETAR_DHT_UPNP=true` is set explicitly.
+
+**Not verified in stage 4.** UPnP against the real router (only the fake gateway; the router was
+not touched) and from a container; inbound reachability and passive capture with mapped ports;
+the app on a phone (built and unit-tested only); the SQL fallback's speed at production size
+with DHT rows (only the plan shape, on a test database); `both`-origin torrents at scale (the
+crawler skips hashes known from Nostr, `MAGNETAR_DHT_FETCH_KNOWN=false`, so none appeared in the
+run: they arise only when a Nostr event arrives later for a DHT hash); the cost of the
+`DhtStats` totals query (`count(*)` on `dht_torrents` and `dht_seen`, cached 60 s) at
+millions of rows; the cause of the end-of-run latency outlier; the Nostr sweep of §7.1
+(not built).

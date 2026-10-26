@@ -66,7 +66,10 @@ series 1 min, health 30 s, graphs 5 min, the swarm graph 30 s since a seed check
 
 Fields: `language`, `subtitles`, `resolution`, `source`, `codec`, `hdr`, `audio`, `channels`,
 `category`, `subcategory` (the publisher's `tcat` path), `genre`, `year`, `media_kind`,
-`edition`, `format`, `group`. `top` default 10, max 50.
+`edition`, `format`, `group`, `origin` (Nostr / DHT, D73; a torrent known from both counts
+under each). `top` default 10, max 50. Timeseries metrics also include the DHT crawler's
+`dht_torrents_added`, `dht_hashes_seen`, `dht_fetch_ok`, `dht_fetch_fail`, `dht_blocked`
+(D74); `/api/v1/stats/health` carries `dht` (`DhtStats`) when the crawler runs.
 
 ```json
 {"total": 501522, "computed_at": 1793000000,
