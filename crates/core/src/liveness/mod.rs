@@ -194,6 +194,18 @@ impl Scraper {
         (trackers.len(), backed_off, self.dht_nodes.len())
     }
 
+    /// What this checker knows of one tracker URL (any announce form): None = not scrapable
+    /// or not asked yet, else (failures in a row, backing off now). A slot busy scraping
+    /// counts as healthy.
+    pub fn tracker_state(&self, url: &str) -> Option<(u32, bool)> {
+        let t = normalize_tracker(url)?;
+        let slot = self.trackers.lock().unwrap().get(&t)?.clone();
+        let now = Instant::now();
+        Some(slot.try_lock().map_or((0, false), |s| {
+            (s.failures, s.skip_until.is_some_and(|u| u > now))
+        }))
+    }
+
     fn slot(&self, t: &Tracker) -> Arc<tokio::sync::Mutex<Slot>> {
         let mut trackers = self.trackers.lock().unwrap();
         trackers

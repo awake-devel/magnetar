@@ -83,6 +83,11 @@ impl LivenessService {
         self.scraper.config()
     }
 
+    /// (failures in a row, backing off now) of one tracker, None if never asked (D47 swarm view).
+    pub fn tracker_state(&self, url: &str) -> Option<(u32, bool)> {
+        self.scraper.tracker_state(url)
+    }
+
     /// Ask for these infohashes to be checked sooner (lane `prio`); applied by the loop
     /// before its next batch, so the API never writes for it.
     pub fn boost<'a>(&self, infohashes: impl IntoIterator<Item = &'a str>, prio: i16) {
@@ -145,6 +150,7 @@ impl LivenessService {
         let (results, report) = self.scraper.check(&items, now).await;
         // Scheduled from the batch's start, like the results' `checked_at`.
         write_results(pool, &rows, &results, now, Expiry::Scheduled).await?;
+        crate::stats::bump(pool, crate::stats::LIVENESS_CHECKS, rows.len() as i64).await;
         tracing::info!(
             checked = report.hashes,
             alive = report.alive,

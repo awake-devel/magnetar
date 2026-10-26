@@ -25,8 +25,10 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::liveness::{LivenessService, PRIO_SEARCH, PRIO_VIEWED};
+use crate::stats::StatsService;
 use crate::store::{PgStore, json_u8};
 use crate::tmdb::Tmdb;
+use crate::{graphs, stats};
 
 /// Longest a poster request waits for a first download from TMDB.
 pub const POSTER_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -51,6 +53,8 @@ pub struct AppState {
     pub shutdown: watch::Receiver<bool>,
     /// TMDB decoration (D42); None when `MAGNETAR_TMDB_TOKEN` is unset.
     pub tmdb: Option<Arc<Tmdb>>,
+    /// Cached chart and graph answers (D47).
+    pub stats: Arc<StatsService>,
 }
 
 impl AppState {
@@ -65,6 +69,7 @@ impl AppState {
             liveness: Arc::default(),
             shutdown: rx,
             tmdb: None,
+            stats: Arc::default(),
         }
     }
 
@@ -208,6 +213,16 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/events/batch", post(batch))
         .route("/api/v1/stats", get(stats))
+        .route(
+            "/api/v1/stats/breakdown",
+            get(breakdown_get).post(breakdown_post),
+        )
+        .route("/api/v1/stats/timeseries", get(timeseries))
+        .route("/api/v1/stats/health", get(stats_health))
+        .route("/api/v1/graphs/wot", get(graph_wot))
+        .route("/api/v1/graphs/relays", get(graph_relays))
+        .route("/api/v1/graphs/media/{id}", get(graph_media))
+        .route("/api/v1/graphs/swarm/{infohash}", get(graph_swarm))
         .route("/api/v1/relays", get(relays).put(set_relay))
         .route("/api/v1/trust/{pubkey}", get(trust_of))
         .route(
@@ -659,6 +674,137 @@ async fn stats(State(st): State<AppState>) -> ApiResult<Json<StatsResponse>> {
         search_index,
         liveness,
     }))
+}
+
+/// `GET /api/v1/stats/breakdown?field=language,resolution&top=10&<search parameters>` (D47).
+async fn breakdown_get(
+    State(st): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> ApiResult<Json<BreakdownSet>> {
+    let query = parse_search_query(raw.as_deref())?;
+    let mut r = BreakdownRequest {
+        query,
+        ..Default::default()
+    };
+    for (k, v) in url::form_urlencoded::parse(raw.as_deref().unwrap_or_default().as_bytes()) {
+        match k.as_ref() {
+            "field" => push_list(&mut r.fields, &v),
+            "top" => r.top = parse_num(&k, &v)?,
+            _ => {}
+        }
+    }
+    breakdown(&st, &r).await
+}
+
+/// `POST /api/v1/stats/breakdown` with `BreakdownRequest` (D47).
+async fn breakdown_post(
+    State(st): State<AppState>,
+    body: Result<Json<BreakdownRequest>, JsonRejection>,
+) -> ApiResult<Json<BreakdownSet>> {
+    let Json(r) = body?;
+    breakdown(&st, &r).await
+}
+
+/// Top values per field, each counted under every filter but its own; 503 until the search
+/// index is built.
+async fn breakdown(st: &AppState, r: &BreakdownRequest) -> ApiResult<Json<BreakdownSet>> {
+    stats::breakdown(&st.store, &st.stats, r, magnetar_core::now())
+        .await?
+        .map(|s| Json((*s).clone()))
+        .ok_or_else(index_unavailable)
+}
+
+/// `GET /api/v1/stats/timeseries?metric=a,b&bucket=hour|day&since=<unix>` (D47).
+async fn timeseries(
+    State(st): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> ApiResult<Json<TimeseriesSet>> {
+    let mut metrics = Vec::new();
+    let mut bucket = "day".to_string();
+    let mut since = None;
+    for (k, v) in url::form_urlencoded::parse(raw.as_deref().unwrap_or_default().as_bytes()) {
+        match k.as_ref() {
+            "metric" => push_list(&mut metrics, &v),
+            "bucket" => bucket = v.into_owned(),
+            "since" => since = Some(parse_num(&k, &v)?),
+            _ => {}
+        }
+    }
+    let s = stats::timeseries(
+        st.store.pool(),
+        &st.stats,
+        &metrics,
+        &bucket,
+        since,
+        magnetar_core::now(),
+    )
+    .await?;
+    Ok(Json((*s).clone()))
+}
+
+/// `GET /api/v1/stats/health` (D47): seed checks, index backlog, relays, crawler.
+async fn stats_health(State(st): State<AppState>) -> ApiResult<Json<StatsHealth>> {
+    let h = stats::health(
+        &st.store,
+        &st.stats,
+        &st.liveness,
+        &st.crawler,
+        magnetar_core::now(),
+    )
+    .await?;
+    Ok(Json((*h).clone()))
+}
+
+/// A graph through the shared cache; None (unknown media/infohash) answers 404.
+async fn cached_graph<F, Fut>(st: &AppState, key: String, make: F) -> ApiResult<Json<Graph>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = magnetar_core::Result<Option<Graph>>>,
+{
+    st.stats
+        .graphs
+        .get_or(key, make)
+        .await?
+        .as_ref()
+        .clone()
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("unknown media or infohash"))
+}
+
+async fn graph_wot(State(st): State<AppState>) -> ApiResult<Json<Graph>> {
+    let store = st.store.clone();
+    cached_graph(&st, "wot".into(), || async move {
+        graphs::wot(&store).await.map(Some)
+    })
+    .await
+}
+
+async fn graph_relays(State(st): State<AppState>) -> ApiResult<Json<Graph>> {
+    let store = st.store.clone();
+    cached_graph(&st, "relays".into(), || async move {
+        graphs::relays(&store, magnetar_core::now()).await.map(Some)
+    })
+    .await
+}
+
+async fn graph_media(State(st): State<AppState>, Path(id): Path<i64>) -> ApiResult<Json<Graph>> {
+    let store = st.store.clone();
+    cached_graph(&st, format!("media/{id}"), || async move {
+        graphs::media(&store, id, magnetar_core::now()).await
+    })
+    .await
+}
+
+async fn graph_swarm(
+    State(st): State<AppState>,
+    Path(infohash): Path<String>,
+) -> ApiResult<Json<Graph>> {
+    let ih = infohash_param(&infohash)?;
+    let (store, live) = (st.store.clone(), st.liveness.clone());
+    cached_graph(&st, format!("swarm/{ih}"), || async move {
+        graphs::swarm(&store, &live, &ih, magnetar_core::now()).await
+    })
+    .await
 }
 
 async fn relays(State(st): State<AppState>) -> ApiResult<Json<Vec<RelayInfo>>> {

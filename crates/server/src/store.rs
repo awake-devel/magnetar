@@ -343,6 +343,11 @@ impl PgStore {
         self.search_index.get().filter(|i| i.is_ready())
     }
 
+    /// Searches and facets go through the index (D43).
+    pub fn index_ready(&self) -> bool {
+        self.ready_index().is_some()
+    }
+
     /// Index state for `/api/v1/stats`; None when no index is attached (disabled).
     pub async fn search_index_status(&self) -> Option<SearchIndexStatus> {
         let idx = self.search_index.get()?.clone();
@@ -410,6 +415,27 @@ impl PgStore {
             .facet_set(q, &[field.to_string()], size, now)
             .await?
             .and_then(|mut s| s.facets.pop()))
+    }
+
+    /// Full tallies of index facets `fields` (names as in `schema::FACETS`, each once) for the
+    /// D47 breakdowns. Ok(None) while the index is not ready.
+    pub async fn facet_tallies(
+        &self,
+        q: &SearchQuery,
+        fields: &[String],
+        now: i64,
+    ) -> Result<Option<(u64, Vec<search_index::collect::FacetTally>)>> {
+        let Some(idx) = self.ready_index() else {
+            return Ok(None);
+        };
+        let min_trust = match q.min_trust {
+            Some(t) => t,
+            None => self.threshold().await?,
+        };
+        search_index::facet_tallies(&self.pool, idx, q, fields, min_trust, now)
+            .await?
+            .map(Some)
+            .ok_or_else(|| Error::Invalid("unknown facet".into()))
     }
 
     /// Releases of one media grouped for the per-title view (D44): every linked torrent

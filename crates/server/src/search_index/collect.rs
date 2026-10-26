@@ -368,8 +368,16 @@ pub struct FacetCounts {
     pub fields: Vec<FacetField>,
 }
 
-/// Documents passing every filter, and per facet: documents counted, value → count.
-pub type FacetFruit = (u64, Vec<(u64, HashMap<String, u64>)>);
+/// Per facet: documents counted, of which without any value, and value → count.
+#[derive(Clone, Debug, Default)]
+pub struct FacetTally {
+    pub counted: u64,
+    pub missing: u64,
+    pub values: HashMap<String, u64>,
+}
+
+/// Documents passing every filter, and one tally per facet.
+pub type FacetFruit = (u64, Vec<FacetTally>);
 
 pub struct FacetSegment {
     cols: Columns,
@@ -378,18 +386,24 @@ pub struct FacetSegment {
     columns: Vec<Option<StrColumn>>,
     counts: Vec<Vec<u64>>,
     totals: Vec<u64>,
+    missing: Vec<u64>,
     all: u64,
 }
 
 impl FacetSegment {
     fn count(&mut self, i: usize, doc: DocId) {
         self.totals[i] += 1;
+        let mut any = false;
         if let Some(c) = &self.columns[i] {
             for ord in c.ords().values_for_doc(doc) {
+                any = true;
                 if let Some(n) = self.counts[i].get_mut(ord as usize) {
                     *n += 1;
                 }
             }
+        }
+        if !any {
+            self.missing[i] += 1;
         }
     }
 }
@@ -432,7 +446,11 @@ impl SegmentCollector for FacetSegment {
                     }
                 }
             }
-            out.push((self.totals[i], m));
+            out.push(FacetTally {
+                counted: self.totals[i],
+                missing: self.missing[i],
+                values: m,
+            });
         }
         (self.all, out)
     }
@@ -461,6 +479,7 @@ impl Collector for FacetCounts {
             columns,
             counts,
             totals: vec![0; self.fields.len()],
+            missing: vec![0; self.fields.len()],
             all: 0,
         })
     }
@@ -471,13 +490,14 @@ impl Collector for FacetCounts {
 
     fn merge_fruits(&self, fruits: Vec<Self::Fruit>) -> tantivy::Result<Self::Fruit> {
         let mut all = 0;
-        let mut out = vec![(0, HashMap::new()); self.fields.len()];
+        let mut out = vec![FacetTally::default(); self.fields.len()];
         for (n_all, fruit) in fruits {
             all += n_all;
-            for (i, (n, m)) in fruit.into_iter().enumerate() {
-                out[i].0 += n;
-                for (k, v) in m {
-                    *out[i].1.entry(k).or_default() += v;
+            for (i, t) in fruit.into_iter().enumerate() {
+                out[i].counted += t.counted;
+                out[i].missing += t.missing;
+                for (k, v) in t.values {
+                    *out[i].values.entry(k).or_default() += v;
                 }
             }
         }

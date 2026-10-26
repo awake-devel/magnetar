@@ -124,16 +124,21 @@ pub async fn crawl_pass(
     let mut ccfg = crawl_config(store, cfg, budget).await;
     ccfg.fetch_metadata &= metadata;
     let res = crawler::crawl_once(store, &ccfg).await;
-    let mut st = status.lock().unwrap();
-    st.running = false;
-    st.last_run = Some(magnetar_core::now());
-    st.passes += 1;
-    match &res {
-        Ok(r) => {
-            st.last_report = Some(r.clone());
-            st.last_error = None;
+    {
+        let mut st = status.lock().unwrap();
+        st.running = false;
+        st.last_run = Some(magnetar_core::now());
+        st.passes += 1;
+        match &res {
+            Ok(r) => {
+                st.last_report = Some(r.clone());
+                st.last_error = None;
+            }
+            Err(e) => st.last_error = Some(e.to_string()),
         }
-        Err(e) => st.last_error = Some(e.to_string()),
+    }
+    if let Ok(r) = &res {
+        crate::stats::bump(store.pool(), crate::stats::CRAWL_EVENTS, r.inserted as i64).await;
     }
     res
 }

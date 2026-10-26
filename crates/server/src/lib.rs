@@ -8,6 +8,7 @@ pub mod discovery;
 pub mod enrich;
 pub mod enrich_anime;
 pub mod filter;
+pub mod graphs;
 pub mod liveness;
 pub mod media_lock;
 pub mod relay;
@@ -15,6 +16,7 @@ mod search;
 pub mod search_index;
 pub mod selftest;
 pub mod server;
+pub mod stats;
 pub mod store;
 pub mod tmdb;
 

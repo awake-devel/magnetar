@@ -39,7 +39,7 @@ use tantivy::schema::{Field, Value};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
 use tokio::sync::watch;
 
-use self::collect::{AttrFilter, FacetCounts, FacetField, Filter, SortBy, TopFiltered};
+use self::collect::{AttrFilter, FacetCounts, FacetField, FacetTally, Filter, SortBy, TopFiltered};
 use self::schema::{Fields, IndexDoc, NONE, SCHEMA_VERSION, TOKENIZER, analyzer};
 use crate::daemons::stop_requested;
 
@@ -507,14 +507,14 @@ impl SearchIndex {
         Ok(IndexResult { hits, total })
     }
 
-    /// Value counts of facets `names` over the hits of `q` (limit/offset/sort ignored), each
-    /// without its own filter (D44). Ok(None) when a name is unknown. Blocking.
-    pub fn facet_set(
+    /// Full tallies of facets `names` over the hits of `q` (limit/offset/sort ignored), each
+    /// without its own filter (D44): (hits with every filter, one tally per name). Ok(None)
+    /// when a name is unknown. Blocking.
+    pub fn facet_tallies(
         &self,
         q: &IndexQuery,
         names: &[String],
-        size: usize,
-    ) -> Result<Option<FacetSet>> {
+    ) -> Result<Option<(u64, Vec<FacetTally>)>> {
         let mut fields = Vec::with_capacity(names.len());
         for name in names {
             let Some(field) = self.fields.facet(name) else {
@@ -530,22 +530,28 @@ impl SearchIndex {
             filter: q.filter.clone(),
             fields,
         };
-        let (total, per_facet) = searcher.search(&*query, &collector).map_err(ix)?;
+        Ok(Some(searcher.search(&*query, &collector).map_err(ix)?))
+    }
+
+    /// Value counts of facets `names` (`facet_tallies`, most frequent `size` values). Blocking.
+    pub fn facet_set(
+        &self,
+        q: &IndexQuery,
+        names: &[String],
+        size: usize,
+    ) -> Result<Option<FacetSet>> {
+        let Some((total, tallies)) = self.facet_tallies(q, names)? else {
+            return Ok(None);
+        };
         let facets = names
             .iter()
-            .zip(per_facet)
-            .map(|(name, (n, counts))| {
-                let mut counts: Vec<FacetCount> = counts
-                    .into_iter()
-                    .map(|(value, count)| FacetCount { value, count })
-                    .collect();
-                counts.sort_unstable_by(|a, b| {
-                    b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value))
-                });
+            .zip(tallies)
+            .map(|(name, t)| {
+                let mut counts = sorted_counts(t.values);
                 counts.truncate(size.clamp(1, MAX_FACET_VALUES));
                 FacetsResponse {
                     field: name.clone(),
-                    total: n,
+                    total: t.counted,
                     counts,
                 }
             })
@@ -652,6 +658,16 @@ impl SearchIndex {
             error: pr.error.clone(),
         }
     }
+}
+
+/// Most frequent first, ties by value.
+pub fn sorted_counts(values: HashMap<String, u64>) -> Vec<FacetCount> {
+    let mut counts: Vec<FacetCount> = values
+        .into_iter()
+        .map(|(value, count)| FacetCount { value, count })
+        .collect();
+    counts.sort_unstable_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
+    counts
 }
 
 fn join_err(e: tokio::task::JoinError) -> Error {
@@ -805,6 +821,27 @@ pub async fn facet_set(
     let idx = idx.clone();
     let names = names.to_vec();
     tokio::task::spawn_blocking(move || idx.facet_set(&iq, &names, size))
+        .await
+        .map_err(join_err)?
+}
+
+/// Full facet tallies through the index (D47 breakdowns: top values, the rest, results without
+/// a value); Ok(None) for an unknown facet name.
+pub async fn facet_tallies(
+    pool: &PgPool,
+    idx: &Arc<SearchIndex>,
+    q: &SearchQuery,
+    names: &[String],
+    min_trust: u8,
+    now: i64,
+) -> Result<Option<(u64, Vec<FacetTally>)>> {
+    let Some((text, media_id)) = media_filter(pool, &q.text).await? else {
+        return Ok(Some((0, vec![FacetTally::default(); names.len()])));
+    };
+    let iq = index_query(q, &text, min_trust, media_id, now);
+    let idx = idx.clone();
+    let names = names.to_vec();
+    tokio::task::spawn_blocking(move || idx.facet_tallies(&iq, &names))
         .await
         .map_err(join_err)?
 }

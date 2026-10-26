@@ -29,7 +29,19 @@ pub mod features {
     pub const MEDIA_RELEASES: &str = "media_releases";
     /// `GET /api/v1/torrents/{infohash}/liveness-history` (D45).
     pub const LIVENESS_HISTORY: &str = "liveness_history";
-    pub const ALL: &[&str] = &[FILTERS, FACET_SET, MEDIA_RELEASES, LIVENESS_HISTORY];
+    /// `/api/v1/stats/breakdown`, `/stats/timeseries`, `/stats/health` (D47). Breakdowns are
+    /// still 503 while the search index builds.
+    pub const STATS: &str = "stats";
+    /// `/api/v1/graphs/{wot,relays,media/{id},swarm/{infohash}}` (D47).
+    pub const GRAPHS: &str = "graphs";
+    pub const ALL: &[&str] = &[
+        FILTERS,
+        FACET_SET,
+        MEDIA_RELEASES,
+        LIVENESS_HISTORY,
+        STATS,
+        GRAPHS,
+    ];
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -208,6 +220,156 @@ pub struct MediaReleases {
     pub truncated: bool,
     pub groups: Vec<crate::release::ReleaseGroup>,
 }
+
+/// `POST /api/v1/stats/breakdown` body (D47): top values of several fields over one search.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct BreakdownRequest {
+    /// The current filters (cross-filtering): each field is counted with every filter but its
+    /// own, like the facets of D44.
+    pub query: SearchQuery,
+    /// `language`, `resolution`, `source`, `codec`, `hdr`, `audio`, `category`, `subcategory`,
+    /// `genre`, `year`, `media_kind`, … (docs/STATS.md).
+    pub fields: Vec<String>,
+    /// Values shown per field, default 10, at most 50; the rest is summed into `other`.
+    pub top: u32,
+}
+
+/// Top values of one field and what is left.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Breakdown {
+    pub field: String,
+    /// Results counted for this field (every filter but its own).
+    pub total: u64,
+    /// Most frequent first. Multi-valued fields (languages, HDR, audio, genres) count a result
+    /// once per value, so the counts can add up to more than `total`.
+    pub counts: Vec<FacetCount>,
+    /// Sum of the counts of the values after the top ones, and how many such values there are.
+    pub other: u64,
+    pub other_values: u64,
+    /// Results without any value for this field (unknown language, no media link, …).
+    pub missing: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct BreakdownSet {
+    /// Results of the query with every filter.
+    pub total: u64,
+    pub breakdowns: Vec<Breakdown>,
+    /// Unix time the counts were taken (answers are cached for a minute or two).
+    pub computed_at: i64,
+}
+
+/// One bucket of a time series: its start (unix time) and value.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct TimeseriesPoint {
+    pub at: i64,
+    pub value: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Timeseries {
+    pub metric: String,
+    /// "counter" (events per bucket, empty buckets are 0) | "gauge" (last sample of the
+    /// bucket; buckets without a sample are left out).
+    pub kind: String,
+    /// "hour" | "day": a metric kept per day only (`torrents_published`) says "day" even when
+    /// hours were asked for.
+    pub bucket: String,
+    /// Oldest first.
+    pub points: Vec<TimeseriesPoint>,
+}
+
+/// `GET /api/v1/stats/timeseries?metric=…&bucket=hour|day&since=…` (D47).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TimeseriesSet {
+    pub since: i64,
+    pub until: i64,
+    pub series: Vec<Timeseries>,
+}
+
+/// Relays the server crawls, by state.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RelayHealth {
+    pub total: u64,
+    pub enabled: u64,
+    /// Answered in the last 24 h.
+    pub ok_24h: u64,
+    /// Failing now (backing off).
+    pub failing: u64,
+    /// Ever delivered a torrent.
+    pub productive: u64,
+}
+
+/// `GET /api/v1/stats/health` (D47): how complete and how fresh the index is.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct StatsHealth {
+    pub torrents: u64,
+    /// Seed checks: alive / dead / unknown and the backlog (D45).
+    pub liveness: Option<LivenessStats>,
+    /// Index backlog (`pending`, `lag_secs`) and state (D43).
+    pub search_index: Option<SearchIndexStatus>,
+    pub relays: RelayHealth,
+    pub crawler: CrawlerStatus,
+    /// Infohashes linked to a movie/series/anime (D40/D41), shown or not.
+    pub media_linked: u64,
+    /// Infohashes whose release attributes (D44) are still to be parsed.
+    pub attrs_missing: u64,
+    pub computed_at: i64,
+}
+
+/// A node of a network graph (D47). What `id` is depends on `kind`: a pubkey (hex) for
+/// `root`/`follow`/`publisher`, a URL for `relay`/`tracker`, an infohash for
+/// `torrent`/`release`, a media id for `media`, the facet value for `quality`/`language`/
+/// `group`/`season` (docs/STATS.md), `dht` for the DHT.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct GraphNode {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    /// Size: torrents, seeders, publishers… (≥ 0; the app scales it).
+    pub weight: f64,
+    /// Trust score of a publisher (0–100), when known.
+    pub score: Option<u8>,
+    /// Lines shown when the node is tapped ("followed by you", "+25 first seen 400 days ago").
+    pub detail: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct GraphEdge {
+    /// Indexes into `Graph::nodes`.
+    pub source: u32,
+    pub target: u32,
+    pub weight: f64,
+    /// `follows`, `writes_to`, `quality`, `language`, `group`, `season`, `tracker`, `dht`,
+    /// `published`.
+    pub kind: String,
+}
+
+/// `GET /api/v1/graphs/…` (D47): at most [`MAX_GRAPH_NODES`] nodes.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Graph {
+    /// `wot` | `relays` | `media` | `swarm`.
+    pub kind: String,
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+    /// Nodes were left out to stay under the cap.
+    pub truncated: bool,
+    /// What the graph cannot show (no trust root set, no relay lists known, …).
+    pub note: Option<String>,
+}
+
+/// Node cap of every graph endpoint: what a phone lays out and draws smoothly.
+pub const MAX_GRAPH_NODES: usize = 200;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct TrustSettings {
@@ -436,6 +598,54 @@ impl ApiClient {
     ) -> crate::Result<MediaReleases> {
         let path = format!("/api/v1/media/{media_id}/releases");
         self.json(self.req(Method::POST, &path).json(q)).await
+    }
+    /// Top values of several fields under the current filters (D47, `features::STATS`).
+    /// 503 while the server's search index builds, 404 from older servers.
+    pub async fn stats_breakdown(&self, r: &BreakdownRequest) -> crate::Result<BreakdownSet> {
+        self.json(self.req(Method::POST, "/api/v1/stats/breakdown").json(r))
+            .await
+    }
+    /// Activity per hour or day (D47); `since` None = the server's default window.
+    pub async fn stats_timeseries(
+        &self,
+        metrics: &[String],
+        bucket: &str,
+        since: Option<i64>,
+    ) -> crate::Result<TimeseriesSet> {
+        let mut query = vec![
+            ("metric", metrics.join(",")),
+            ("bucket", bucket.to_string()),
+        ];
+        if let Some(s) = since {
+            query.push(("since", s.to_string()));
+        }
+        self.json(
+            self.req(Method::GET, "/api/v1/stats/timeseries")
+                .query(&query),
+        )
+        .await
+    }
+    pub async fn stats_health(&self) -> crate::Result<StatsHealth> {
+        self.json(self.req(Method::GET, "/api/v1/stats/health"))
+            .await
+    }
+    /// A network graph (D47): `wot`, `relays`, `media/{id}` or `swarm/{infohash}`. None on
+    /// 404 (unknown media/infohash, or a server older than D47).
+    pub async fn graph(&self, path: &str) -> crate::Result<Option<Graph>> {
+        let ok = match path.split_once('/') {
+            None => matches!(path, "wot" | "relays"),
+            Some(("media", id)) => id.parse::<i64>().is_ok(),
+            Some(("swarm", ih)) => ih.len() == 40 && ih.bytes().all(|b| b.is_ascii_hexdigit()),
+            Some(_) => false,
+        };
+        if !ok {
+            return Err(crate::Error::Invalid(format!("unknown graph {path:?}")));
+        }
+        let path = format!("/api/v1/graphs/{path}");
+        match self.json(self.req(Method::GET, &path)).await {
+            Err(crate::Error::Server { status: 404, .. }) => Ok(None),
+            r => r.map(Some),
+        }
     }
     pub async fn relays(&self) -> crate::Result<Vec<RelayInfo>> {
         self.json(self.req(Method::GET, "/api/v1/relays")).await
