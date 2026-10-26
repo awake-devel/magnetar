@@ -50,6 +50,12 @@ data class SettingsUiState(
     val coreVersion: String? = null,
 )
 
+const val PRIVATE_KEY_ERROR =
+    "That is your private key (nsec): never paste it into an app. Use your public key (npub1…). The field was cleared."
+
+/** True for a Nostr private key (bech32 nsec or ncryptsec), which the trust root must never hold. */
+fun isPrivateKey(key: String): Boolean = key.trim().lowercase().let { it.startsWith("nsec1") || it.startsWith("ncryptsec1") }
+
 /** Pure checks; npub decoding goes through the ffi in [SettingsViewModel.save]. */
 fun validateServerUrl(url: String): Pair<String?, String?> {
     val u = url.trim()
@@ -124,6 +130,10 @@ class SettingsViewModel(application: Application) : BaseViewModel(application) {
     fun edit(f: (SettingsForm) -> SettingsForm) {
         _state.update {
             val form = f(it.form)
+            if (isPrivateKey(form.rootNpub)) {
+                // Cleared as soon as it is pasted, before anything could store it.
+                return@update it.copy(form = form.copy(rootNpub = ""), npubError = PRIVATE_KEY_ERROR)
+            }
             it.copy(form = form, dirty = true, serverWarning = validateServerUrl(form.serverUrl).second)
         }
     }
@@ -136,6 +146,11 @@ class SettingsViewModel(application: Application) : BaseViewModel(application) {
         val cacheError = if (cache == null || cache < 16) "At least 16 MiB" else null
         val badRelays = invalidRelays(form.seedRelays)
         val relaysError = if (badRelays.isNotEmpty()) "Not a ws:// or wss:// URL: ${badRelays.first()}" else null
+        // A private key is never kept, not even in the form: clear it and say what to paste instead.
+        if (isPrivateKey(form.rootNpub)) {
+            _state.update { it.copy(form = it.form.copy(rootNpub = ""), npubError = PRIVATE_KEY_ERROR) }
+            return false
+        }
         val npubError = form.rootNpub.trim().takeIf { it.isNotEmpty() }?.let { npub ->
             ffiCatching { io { pubkeyDecode(npub) } }.exceptionOrNull()?.let { "Invalid key: ${it.userMessage()}" }
         }

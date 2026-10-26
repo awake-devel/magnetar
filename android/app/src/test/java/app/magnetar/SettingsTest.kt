@@ -72,4 +72,12 @@ class SettingsTest {
     fun relayValidation() {
         assertEquals(listOf("https://x"), invalidRelays("wss://relay.damus.io\n\n https://x \nws://127.0.0.1:7777"))
     }
+
+    @Test
+    fun privateKeysAreRecognised() {
+        org.junit.Assert.assertTrue(app.magnetar.ui.settings.isPrivateKey(" nsec1qqqq"))
+        org.junit.Assert.assertTrue(app.magnetar.ui.settings.isPrivateKey("NCRYPTSEC1abc"))
+        org.junit.Assert.assertFalse(app.magnetar.ui.settings.isPrivateKey("npub1abc"))
+        org.junit.Assert.assertFalse(app.magnetar.ui.settings.isPrivateKey(""))
+    }
 }
