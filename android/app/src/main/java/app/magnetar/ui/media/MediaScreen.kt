@@ -3,6 +3,7 @@ package app.magnetar.ui.media
 import android.graphics.BitmapFactory
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -206,7 +207,7 @@ private fun MediaHeader(m: FfiMediaInfo, posterPath: String?) {
                 bitmap = it,
                 contentDescription = "Poster",
                 contentScale = ContentScale.Crop,
-                modifier = Modifier.width(96.dp).clip(RoundedCornerShape(6.dp)),
+                modifier = Modifier.width(96.dp).aspectRatio(2f / 3f).clip(RoundedCornerShape(6.dp)),
             )
             Spacer(Modifier.width(12.dp))
         }

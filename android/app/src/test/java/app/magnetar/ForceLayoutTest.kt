@@ -40,4 +40,16 @@ class ForceLayoutTest {
         l.run()
         assertEquals(0f, l.x[0], 0f)
     }
+
+    @Test
+    fun detachedPartsStayNearTheMainCluster() {
+        // A 60-node star and a separate 4-node star (the relays graph's shape).
+        val edges = (1 until 60).map { 0 to it } + (61..63).map { 60 to it }
+        val l = ForceLayout(64, edges).apply { run() }
+        val cx = (0 until 60).map { l.x[it] }.average()
+        val cy = (0 until 60).map { l.y[it] }.average()
+        val radius = (0 until 60).maxOf { hypot(l.x[it] - cx, l.y[it] - cy) }
+        val apart = hypot(l.x[60] - cx, l.y[60] - cy)
+        assertTrue("detached hub within 3 cluster radii: $apart vs $radius", apart < 3 * radius)
+    }
 }

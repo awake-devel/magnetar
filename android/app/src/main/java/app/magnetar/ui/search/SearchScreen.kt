@@ -176,7 +176,6 @@ fun SearchScreen(onOpen: (String) -> Unit, onOpenMedia: (Long) -> Unit = {}, vm:
             mode = state.filterMode,
             facets = facets,
             onDraft = vm::draftFilters,
-            onDismiss = { showFilters = false; vm.draftFilters(null) },
             onApply = { vm.setFilters(it); showFilters = false; vm.draftFilters(null) },
         )
     }

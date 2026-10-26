@@ -26,6 +26,7 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -80,7 +81,6 @@ fun FilterSheet(
     mode: FilterMode,
     facets: FfiFacetSet?,
     onDraft: (SearchFilters) -> Unit,
-    onDismiss: () -> Unit,
     onApply: (SearchFilters) -> Unit,
 ) {
     var f by remember { mutableStateOf(initial) }
@@ -98,16 +98,32 @@ fun FilterSheet(
     )
     // Live counts follow the draft (the view model debounces).
     LaunchedEffect(f, minSize, maxSize, minSeeders, minYear, maxYear) { onDraft(current()) }
+    // Chip order per facet, fixed by the first counts seen: picking a chip must not move the
+    // others under the finger. Values nothing would match stay in place, disabled.
+    val order = remember { mutableStateMapOf<String, List<String>>() }
+    fun stable(field: String, chips: List<FacetChip>): List<FacetChip> {
+        if (facets == null) return chips
+        val known = order[field] ?: chips.map { it.value }.also { order[field] = it }
+        val byValue = chips.associateBy { it.value }
+        val fresh = chips.filter { it.value !in known }
+        if (fresh.isNotEmpty()) order[field] = known + fresh.map { it.value }
+        return known.map { v -> byValue[v] ?: FacetChip(v, facetLabel(field, v), 0uL) } + fresh
+    }
+    val categoryCounts = facets?.facets?.firstOrNull { it.field == "category" }
+        ?.counts?.associate { it.value to it.count }
 
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
+    // Swiping the sheet away or pressing Back keeps the picks, like the Show button.
+    ModalBottomSheet(onDismissRequest = { onApply(current()) }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Column(Modifier.padding(horizontal = 16.dp).verticalScroll(rememberScrollState())) {
             Text("Categories", style = MaterialTheme.typography.titleSmall)
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 for (c in FfiCategory.entries) {
+                    val count = categoryCounts?.let { it[c.name.lowercase()] ?: 0uL }
                     FilterChip(
                         selected = c in f.categories,
                         onClick = { f = f.copy(categories = if (c in f.categories) f.categories - c else f.categories + c) },
-                        label = { Text(categoryLabel(c)) },
+                        label = { Text(categoryLabel(c) + (count?.let { " (${formatCount(it)})" } ?: "")) },
+                        enabled = c in f.categories || count != 0uL,
                     )
                 }
             }
@@ -120,19 +136,19 @@ fun FilterSheet(
                 }
                 // A filter the current server cannot apply stays visible while set, so it can be cleared.
                 if (!supported && selected.isEmpty()) continue
-                val chips = facetChips(field, selected, facets)
+                val chips = stable(field, facetChips(field, selected, facets))
                 if (chips.isEmpty()) continue
                 Spacer(Modifier.height(8.dp))
                 Text(FACET_TITLES[field] ?: field, style = MaterialTheme.typography.titleSmall)
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     for (chip in chips) {
                         val on = chip.value in selected
-                        // With counts, values nothing would match are left out unless selected.
-                        if (!on && chip.count == 0uL) continue
                         FilterChip(
                             selected = on,
                             onClick = { f = f.toggle(field, chip.value) },
                             label = { Text(chip.label + (chip.count?.let { " (${formatCount(it)})" } ?: "")) },
+                            // With counts, values nothing would match stay in place but disabled.
+                            enabled = on || chip.count != 0uL,
                         )
                     }
                 }

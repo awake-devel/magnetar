@@ -305,7 +305,7 @@ class SearchViewModel(application: Application) : BaseViewModel(application) {
         }
         val query = s.copy(filters = f).toQuery()
         // 503 while the server builds its index: no counts, the chips still work.
-        _facets.value = ffiCatching { magApp.magnetar().facets(query, FACET_FIELDS) }.getOrNull()
+        _facets.value = ffiCatching { magApp.magnetar().facets(query, FACET_FIELDS + "category") }.getOrNull()
     }
 
     fun setFilters(f: SearchFilters) {

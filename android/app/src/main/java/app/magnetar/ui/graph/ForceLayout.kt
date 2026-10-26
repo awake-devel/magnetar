@@ -27,6 +27,13 @@ class ForceLayout(
 
     /** Ideal edge length (layout units; the view scales to fit). */
     private val k = 40f
+
+    /**
+     * Repulsion stops beyond this distance. Without a cutoff, parts with no edge between them
+     * push each other until gravity balances it, several cluster radii away, and fitting the
+     * view to them shrinks the main cluster to a corner.
+     */
+    private val cutoff2 = (6 * k) * (6 * k)
     private var temperature = k * 3
     var steps = 0
         private set
@@ -60,6 +67,7 @@ class ForceLayout(
                     ddy = ((i * 17 + j) % 5 - 2).toFloat() * 0.1f + 0.05f
                     d2 = ddx * ddx + ddy * ddy
                 }
+                if (d2 > cutoff2) continue
                 val f = k2 / d2
                 dx[i] += ddx * f
                 dy[i] += ddy * f

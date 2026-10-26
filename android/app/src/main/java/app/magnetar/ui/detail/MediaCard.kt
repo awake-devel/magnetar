@@ -6,6 +6,7 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -80,7 +81,7 @@ private fun Poster(path: String?, modifier: Modifier = Modifier) {
             bitmap = it,
             contentDescription = "Poster",
             contentScale = ContentScale.Crop,
-            modifier = modifier.width(100.dp).clip(RoundedCornerShape(6.dp)),
+            modifier = modifier.width(100.dp).aspectRatio(2f / 3f).clip(RoundedCornerShape(6.dp)),
         )
     }
 }

@@ -240,7 +240,8 @@ private fun HealthCard(h: FfiStatsHealth, colors: ChartColors) {
                     listOf(
                         Triple("Seeded", l.alive, colors.good),
                         Triple("Dead", l.dead, colors.critical),
-                        Triple("No answer", l.unknown + l.neverChecked, colors.unknown),
+                        Triple("No answer", l.unknown, colors.unknown),
+                        Triple("Not checked yet", l.neverChecked, colors.grid),
                     ),
                     colors,
                 )
