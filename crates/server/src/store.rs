@@ -13,7 +13,7 @@ use magnetar_core::model::*;
 use magnetar_core::query::{SearchPage, SearchQuery, Sort};
 use magnetar_core::store::{DEFAULT_TRUST_THRESHOLD, Store, keys};
 use magnetar_core::{magnet, release, trust, wot};
-use sqlx::postgres::{PgConnection, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
 use sqlx::types::Json;
 use sqlx::{FromRow, PgPool, Postgres, QueryBuilder};
 use tokio::sync::broadcast;
@@ -302,11 +302,19 @@ enum Derived {
 
 impl PgStore {
     /// Connect with at most `max_connections` pooled connections (`MAGNETAR_DB_POOL`).
+    ///
+    /// Sessions run with `client_min_messages = warning`: Postgres NOTICEs (thousands of "word
+    /// is too long to be indexed" from `to_tsvector` on long file names, which sqlx logs at
+    /// INFO) are not sent at all, while WARNINGs and errors still reach the log.
     pub async fn connect(url: &str, max_connections: u32) -> Result<Self> {
+        let opts = url
+            .parse::<PgConnectOptions>()
+            .map_err(db)?
+            .options([("client_min_messages", "warning")]);
         let pool = PgPoolOptions::new()
             .max_connections(max_connections.max(1))
             .acquire_timeout(Duration::from_secs(5))
-            .connect(url)
+            .connect_with(opts)
             .await
             .map_err(db)?;
         Ok(Self::from_pool(pool))
