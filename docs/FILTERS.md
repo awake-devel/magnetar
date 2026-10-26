@@ -142,6 +142,7 @@ the phone's local notifications apply the filters too.
 | media_kinds | `kind` | `media_kind` |
 | min_rating, min_year, max_year | `min_rating`, `min_year`, `max_year` | `year` |
 | sort | `sort=rating` | |
+| include_adult (D52) | `adult=1` | |
 
 Further facets (counted, not filterable yet): `channels`, `edition`, `format`, `group`,
 plus D43's `category`, `category_path`.
@@ -161,8 +162,16 @@ episode (series and anime: complete packs first, then season packs, then episode
 resolution (best first), then language key; each group's releases sorted by seeders (unknown
 last), then date.
 
+**Adult content (D52, D70).** `include_adult` (default false) hides adult torrents from search,
+browse, facet and Stats counts and saved-search notifications: canonical category `porn`, or a
+DHT row the classifier tagged `porn`. Selecting the `porn` category shows them (choosing it is
+consent). Older apps send nothing and get the default. The app's Settings → "Show adult
+content" (`FfiConfig.show_adult`) sets it on every query the phone makes; the phone's own
+SQLite search hides an infohash when any of its events is filed under `porn`.
+
 **Capabilities.** `GET /health` now lists `features`: `filters`, `facet_set`,
-`media_releases`. The app shows the filters a server cannot apply only while they are set
+`media_releases`, and since D70 `adult_filter` (a server without it ignores `include_adult`;
+the app then drops `porn` hits itself). The app shows the filters a server cannot apply only while they are set
 (so they can be cleared), never offers rating sort to a server without `filters`, and falls
 back to the local cache's grouping for the title page.
 

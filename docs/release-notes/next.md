@@ -132,6 +132,30 @@ must be updated together to get all of it, but each side keeps working with an o
   other floods; the content screen now sees every whole file path of v2 file trees; database
   errors in the crawler log only their error code, never a message that could quote a name.
 
+### DHT crawler: classification, adult filter, illegal-content blocklist (stage 3; docs/DHT.md §15, D68–D70)
+
+- **Adult content is hidden by default, everywhere**: search, browse, filter and Stats counts,
+  saved-search notifications, on the server and on the phone. Settings → "Show adult content"
+  turns it back on; picking the adult category in the filter sheet shows it for that search.
+  This also hides the Nostr torrents publishers filed as adult (36 809 infohashes on
+  production). API: `adult=1` / `include_adult`. Older apps get the default (hidden).
+- The crawler now **stores** what it finds: each torrent is classified from its name and files
+  (video, anime, audio, book, application, game, picture, adult, other) and gets release
+  attributes, seed checks and IMDb/anime title links like Nostr torrents. Hand-checked on 100
+  fresh names: 83 % in the right category; adult tagging made no false positive and caught 2
+  of 3 adult torrents (names with only performer names or Chinese voyeur words are missed).
+  DHT torrents appear in search results with the next stage.
+- **Hard illegal-content blocklist**, always on, for the DHT and for Nostr events (title, file
+  names, description, hashtags): a match keeps only the infohash (and the event id), never a
+  name, so it is never fetched or accepted again; relays get `blocked: content policy`. Names in
+  Chinese/Japanese/Korean are checked too, and a name labelled with a child's age is blocked
+  whatever else it says. The list ships as hashes only; `MAGNETAR_BLOCKLIST_FILE` can add terms
+  (never remove), and a file that does not load stops the server.
+- Live measurement (2 × 7 min, home connection, no port opened): 96–117 torrents verified per
+  minute, 1 477 stored, 16 blocked by the list (counted, never looked at), 2–3 % of a core,
+  ≤ 107 MB RAM. One stored picture set labelled with a child's age slipped through the first
+  version; it was removed by hand and is why such labels now block on their own.
+
 ## Older servers and offline mode
 
 - The app asks `GET /health` for `features` and hides what the server lacks: an older server
@@ -139,7 +163,10 @@ must be updated together to get all of it, but each side keeps working with an o
 - Offline (phone cache only) the app still filters by the parsed attributes it can compute
   locally (language, resolution, source, codecs…), not by genre, kind or rating; the Stats tab
   shows counts of the phone's own cache without cross-filtering.
-- An older app talking to the new server keeps working: all new fields have defaults.
+- An older app talking to the new server keeps working: all new fields have defaults. It gets
+  adult content hidden (the new default) and has no switch to show it.
+- The new app talking to an older server drops adult results itself (that server ignores the
+  setting).
 
 ## Upgrade notes
 
@@ -153,6 +180,7 @@ Measured on a full copy of the production database (501 528 infohashes, 506 171 
 | Parsed release attributes backfill | background, at the same time | 117 s |
 | Activity history backfill (`torrents_added`) | background | 2 s |
 | Next start | | index reused, ready in 0.6 s |
+| Search index rebuild for the adult flag (`SCHEMA_VERSION` 3, stage 3) | background, once | not measured; the version 2 build took 35 s on the same copy |
 
 - The API answers during the build: searches use Postgres until the index is ready (slow on
   big queries, as before; title pages too), and the filter counts and Stats breakdowns return

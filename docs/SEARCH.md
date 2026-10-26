@@ -35,7 +35,10 @@ lowest id (D6). Fields:
   year in the name), and since `SCHEMA_VERSION` 2 the release attributes of `torrent_attrs`
   (D44, docs/FILTERS.md): `f_language`, `f_subtitles`, `f_resolution`, `f_source`, `f_codec`,
   `f_hdr`, `f_audio`, `f_channels`, `f_edition`, `f_format`, `f_group`; plus fast `year` and the
-  stored `attrs` JSON returned in every hit.
+  stored `attrs` JSON returned in every hit;
+- since `SCHEMA_VERSION` 3 (D52, D70), fast `adult` (1 when the canonical category is `porn` or
+  a `dht_torrents` row of the infohash is classified `porn`). The version bump rebuilds the
+  index once after the upgrade (35 s on the production copy for version 2).
 
 ## Lifecycle
 
@@ -85,6 +88,9 @@ lowest id (D6). Fields:
   one, so a title holding the typo itself ranks first.
 - Documents whose title holds every word get a flat +10 000, so title hits always rank above
   file-only and description-only hits; ties go to the newest.
+- Adult documents are left out unless `include_adult` is set or `categories` selects `porn`
+  (D52; query string `adult=1`; the SQL fallback tests the canonical category plus an `EXISTS`
+  on `dht_torrents`, so both paths agree, tested in `tests/search_index.rs`).
 - Filters (`categories`, size range, `since`/`until`, `min_trust` incl. local trust overrides,
   `hide_dead`, `min_seeders`, media tokens such as `imdb:tt…` resolved to a media id through
   Postgres) and sorts (relevance, date, size, seeders, both directions, unknown last) run in one

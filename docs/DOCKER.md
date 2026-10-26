@@ -257,6 +257,11 @@ metadata fetch of stage 2 only opens **outgoing** TCP connections to peers, whic
 published port). The
 overlay and these variables arrive with the UPnP stage; until then nothing here is active.
 
+Extra illegal-content blocklist terms (`MAGNETAR_BLOCKLIST_FILE`, docs/CONFIG.md) are read from
+a file inside the container: mount it read-only (for example `./blocklist.txt:/config/blocklist.txt:ro`
+under `volumes:` and `MAGNETAR_BLOCKLIST_FILE=/config/blocklist.txt`). A missing or malformed
+file stops the server at start, by design (fail closed).
+
 ## Platform notes
 
 ### Synology NAS (DSM 7.2+, x86_64 models)

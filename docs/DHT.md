@@ -1,13 +1,15 @@
-# DHT crawler (ARCHITECTURE.md D49–D58)
+# DHT crawler (ARCHITECTURE.md D49–D70)
 
-Design document for the native Mainline DHT crawler. Status: **stages 1 (discovery) and 2
-(metadata fetch) built**: KRPC node, BEP 42 ids, routing, crawl pool, BEP 51 sampler, passive
-capture, peer collection, the migration of §2.3, triage, the persisted `dht_seen` queue, the
-`dht` CLI and the `serve` daemon (§13), then the BEP 3/10/9 fetcher, fetch workers and the
-`dht_torrents` writer behind a fail-closed content screen (§14). **Until the stage 3 blocklist
-is installed as that screen, nothing named is stored** (D65): fetched metadata is verified,
-counted and dropped, so `dht_torrents` stays empty in a real deployment. Each section says
-which stage builds it (§12); later stages update this file as they land.
+Design document for the native Mainline DHT crawler. Status: **stages 1 (discovery), 2
+(metadata fetch) and 3 (classification and safety) built**: KRPC node, BEP 42 ids, routing,
+crawl pool, BEP 51 sampler, passive capture, peer collection, the migration of §2.3, triage,
+the persisted `dht_seen` queue, the `dht` CLI and the `serve` daemon (§13), the BEP 3/10/9
+fetcher, fetch workers and the `dht_torrents` writer behind a fail-closed content screen (§14),
+then `core::classify`, the hard blocklist `core::blocklist` installed as that screen and on
+Nostr ingest, the adult filter on every search path, and the enrichers / attrs backfill on DHT
+rows (§15). DHT torrents are now **stored** (classified and screened) with release attributes,
+seed checks and media links; they reach search results with stage 5 (index readers, §2.5).
+Each section says which stage builds it (§12); later stages update this file as they land.
 
 Research behind it: [research/dht-crawling.md](research/dht-crawling.md),
 [research/bitmagnet.md](research/bitmagnet.md), [research/bittorrent.md](research/bittorrent.md),
@@ -257,9 +259,9 @@ built; a blocked hash never reaches this code path.
 | `search_index/load.rs::load_docs` | documents: DHT-only infohashes get a document, mixed ones gain `origin` (§5) |
 | `store.rs` `torrent_detail` (`:1239` area) | DHT-only detail (§5.3) |
 | `search.rs` SQL fallback | DHT rows searchable while the index builds |
-| `enrich/mod.rs` `due`, `load_groups`, `coverage` | IMDb/TMDB matching by name works on DHT names (D40 already uses the largest video file) |
-| `enrich_anime.rs` pending query | anime by name (`category = 'anime'`, §6) |
-| `attrs.rs` backfill | re-parse DHT names when `PARSER_VERSION` moves |
+| `enrich/mod.rs` `due`, `load_groups`, `coverage` | IMDb/TMDB matching by name works on DHT names (D40 already uses the largest video file). **Done in stage 3** (D70): `due` walks `torrent_infohashes` |
+| `enrich_anime.rs` pending query | anime by name (`category = 'anime'`, §6). **Done in stage 3** |
+| `attrs.rs` backfill | re-parse DHT names when `PARSER_VERSION` moves. **Done in stage 3** (Nostr event first, else the DHT row) |
 | `stats.rs::recompute_published` | not a switch but a fix: it counts `liveness_schedule.born` per day, which DHT rows now also fill. It must join `torrent_infohashes` and keep `events > 0`, or every DHT discovery shows up as a "published" torrent on its `first_seen` day (D47's chart means Nostr publications). For a hash known from both sources, `born` can be the DHT `first_seen` when that is earlier (the schedule trigger keeps the minimum); accepted |
 
 Readers that look a row up **by `event_id`** stay on `torrents`: DHT rows have `event_id = ''` in
@@ -612,7 +614,7 @@ user's "mixed equally, not hidden by min_trust".
   there (stage 5 checks this with `EXPLAIN` on a test database). One accepted difference: the
   fallback filters rows before picking the canonical one, so when every Nostr event is below
   `min_trust` it shows the DHT row, where the index shows the Nostr event.
-- **Index** (`SCHEMA_VERSION` 3): facet `f_origin` (`nostr`, `dht`, both values when both), stored
+- **Index** (`SCHEMA_VERSION` 4; version 3 is the stage 3 `adult` flag, D70): facet `f_origin` (`nostr`, `dht`, both values when both), stored
   `origin`. `SearchQuery.origins: Vec<String>` (serde default, any-of; empty = all) — an optional
   filter chip, not a default.
 - **API types** (all `#[serde(default)]`, so old apps and old servers interoperate):
@@ -630,7 +632,7 @@ user's "mixed equally, not hidden by min_trust".
   origin breakdown and a crawler card (§10). Old apps see DHT-only results with an empty npub and a
   grey (unknown) trust badge — readable, not broken.
 
-## 6. Classification and adult tagging (D52, stage 3)
+## 6. Classification and adult tagging (D52, stage 3; as built: D69, D70, §15)
 
 `core::classify` (pure, no dependencies; `CLASSIFIER_VERSION` stored per row so a new version
 re-classifies; the anime refinement of step 2 runs in the server, which already has
@@ -665,7 +667,7 @@ words, and a "Show adult content" switch that only half worked would be confusin
 send no `include_adult`, so they get the new default too (documented in the release notes).
 App: Settings → "Show adult content" (off), stored with the app's search preferences.
 
-## 7. Hard illegal-content blocklist (D53, stage 3)
+## 7. Hard illegal-content blocklist (D53, stage 3; as built: D68, §15)
 
 **Binding user rule (2026-10-26):** NO agent and no code path may ever view, print, log, sample, export or "verify" the names, files or descriptions of anything the illegal-content blocklist matches — not even to check for false positives, not in tests, not in reviews, not in live runs. Count matches only by rule id / category, as stage 0 did. False positives are accepted: a blocked torrent stays blocked.
 
@@ -727,9 +729,16 @@ application 1), all from two short terms (3 and 8 letters; read-only count by ru
 names were not and will never be viewed, per the rule above). Those terms go to the context
 tier; whatever they still match stays blocked (false positives are accepted).
 
+**As built (D68)**: CJK runs are also looked up as character 2–4-grams (those scripts have no
+spaces; a token-only matcher missed them in the live sample), the age rule covers ages 1–17
+and an **explicit** annotation (`12 yo`, `12 years old`) blocks any torrent while ordinary-word
+markers (`ans`, `aged`, …) need an adult torrent, and "adult" for the context tier is the
+classifier's category `porn` **or** its adult signal whatever the file types.
+
 **Where the list lives**: `crates/core/src/blocklist/terms.v1`, one line per entry
 `hard|context <sha256 hex>`, generated by `scripts/blocklist-hash.sh` from a plain-text source
-that is **not committed** (the repo carries no readable list of such terms). Initial source:
+that is **not committed** (the repo carries no readable list of such terms; 52 hard and 27
+context entries in version 1, ASCII words and CJK terms). Initial source:
 bitmagnet's `keywords.banned` (credited in the file header), its regex entries rewritten as token
 sequences, the two short terms moved to the context tier. Limits (documented, UNVERIFIED recall):
 hashed n-grams cannot match words glued together without separators; context terms only
@@ -741,7 +750,8 @@ is checked against the hard tier only; public CSAM hash lists
 
 Server variables. **Built in stage 1**: `MAGNETAR_DHT`, `_PORT`, `_NODES`, `_QPS`, `_POOL`,
 `_FETCH_KNOWN`, `_PEER_LOOKUPS`; **stage 2**: `_FETCH_CONCURRENCY` (1–2048), `_METADATA_MAX`
-(16 KiB–64 MiB), `_TCP_RATE`, `_TCP_MAX`, `_PROBE`; the others are still planned (their stage in brackets).
+(16 KiB–64 MiB), `_TCP_RATE`, `_TCP_MAX`, `_PROBE`; **stage 3**: `MAGNETAR_BLOCKLIST_FILE`; the
+others are still planned (their stage in brackets).
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -760,7 +770,7 @@ Server variables. **Built in stage 1**: `MAGNETAR_DHT`, `_PORT`, `_NODES`, `_QPS
 | `MAGNETAR_DHT_UPNP` | `true` in aggressive | map the UDP ports on the router (§9) (stage 6) |
 | `MAGNETAR_DHT_UPNP_GATEWAY` | default gateway from `/proc/net/route` | `host[:port]` for a unicast SSDP M-SEARCH (needed in Docker, §9) |
 | `MAGNETAR_DHT_UPNP_LOCAL_IP` | the address the SOAP connection leaves from | LAN address to map to; **required in Docker** (the container sees its bridge address) |
-| `MAGNETAR_BLOCKLIST_FILE` | unset | extra plain-text terms, one per line, `context:` prefix for the context tier; additive only (stage 3) |
+| `MAGNETAR_BLOCKLIST_FILE` | unset | extra plain-text terms, one per line (1–3 words, or one 2–4-character CJK term), `context:` prefix for the context tier; additive only; read at the start of every command, a file that does not load stops it (stage 3) |
 
 CLI (built in stage 1): `magnetar-server dht [--seconds N] [--mode polite|aggressive] [--dry-run]`
 runs the crawler for a bounded time (default 300 s; Ctrl-C/SIGTERM stop it early, cleanly) and
@@ -838,11 +848,11 @@ blocked names anywhere; nothing from the DHT is published to Nostr.
 | 0 | this document, D49–D58 | production counts, librqbit-dht API, BEP texts, router UPnP (read-only) |
 | 1 | `core::dht` KRPC, BEP 42 ids, routing, pool, sampler, limiter, responder, peer store; **pulled forward from stage 4** (swarm plan): migration §2.3, `server::dht` triage, `dht_seen` queue, retry, peer collection, `dht` CLI, config, `serve` daemon | BEP 5/42/51 vectors (BEP 42 over 4 bytes), arbitrary-bytes no-panic decoders, address filter, map caps (§3.8), fake-network tests, Postgres tests, bounded live aggressive runs (§13) |
 | 2 (built, §14) | `core::metainfo` BEP 3/10/9 fetcher, v1/hybrid/v2 verification; **pulled forward from stage 4**: fetch workers, `server::dht::persist` (dht_torrents + attrs batches, alias rows, final statuses), the fail-closed content-screen seam (D65) | fake-peer tests (reject, short piece, wrong hash, hybrid, private, duplicate keys, LAN/loopback peer refused), a real librqbit seed, Postgres storage tests, bounded live fetch of sampled hashes |
-| 3 | `core::classify`, `core::blocklist`, `Rejection::Blocked`, `scripts/blocklist-hash.sh` | accuracy sample, blocklist vectors (hashed, every name/path variant), Nostr ingest rejection (description/hashtags too), no-name-in-logs test at `TRACE` |
+| 3 (built, §15) | `core::classify`, `core::blocklist`, `Rejection::Blocked`, `scripts/blocklist-hash.sh`; **pulled forward from stage 5/7**: `SearchQuery.include_adult` on the index (`SCHEMA_VERSION` 3), SQL fallback and phone, the app's adult switch; enrichers and attrs backfill on `torrent_rows` | accuracy sample, blocklist vectors (hashed, every name/path variant), Nostr ingest rejection (description/hashtags too), no-name-in-logs test at `TRACE` |
 | 4 | `server::dht::persist` (dht_torrents + attrs batches, alias rows), fetch results into `dht_seen` | Postgres tests, hybrid alias, bounded live aggressive run without UPnP |
-| 5 | `torrent_rows` readers, index `SCHEMA_VERSION` 3 (origin, eligible_trust, include_adult), API/ffi types, sweep | search/filters/detail tests on both paths (DHT rows pass `min_trust` in the SQL fallback too, `EXPLAIN` shows no seq scan of `dht_torrents`), `recompute_published` Nostr-only, sweep vacuum + merge |
+| 5 | `torrent_rows` readers (index documents, detail, SQL fallback), index `SCHEMA_VERSION` 4 (origin, eligible_trust), API/ffi types, sweep | search/filters/detail tests on both paths (DHT rows pass `min_trust` in the SQL fallback too, `EXPLAIN` shows no seq scan of `dht_torrents`), `recompute_published` Nostr-only, sweep vacuum + merge |
 | 6 | UPnP, `docker/compose.dht.yml`, stats/health | fake gateway tests, stats API |
-| 7 | app: badge, filter chip, adult switch, crawler card | Gradle build + unit tests |
+| 7 | app: badge, filter chip, crawler card (the adult switch landed in stage 3) | Gradle build + unit tests |
 | 8 | live tuning on the laptop | rates, hit rate, resources, disk per torrent |
 
 ## 13. Stage 1: built and measured (2026-10-26)
@@ -1017,3 +1027,97 @@ the Tantivy index and app-side visibility of DHT rows (stage 5 readers); uTP-onl
 24 h backoffs on real failures); memory with 16 MiB info dicts under load (the largest seen
 live is not recorded; only the 48 KB mean); passive capture with an open port (announcer path
 exercised only in the fake-network tests); IPv6 peers (dropped, BEP 32 later).
+
+## 15. Stage 3: built and measured (2026-10-26)
+
+**Code.** `crates/core/src/blocklist/` (matcher, `terms.v1` hashes; D68),
+`crates/core/src/classify/` (classifier, `adult.txt`; D69), `scripts/blocklist-hash.sh`,
+`crates/server/src/dht/classify.rs` (anitomy-ng anime refinement), the real screen in
+`server::dht::screen` (`BlocklistScreen`, `install_from_config`), classification before the
+screen and `reclassify_batch` in `server::dht::persist`, `Rejection::Blocked` and
+`Store::{is_blocked, put_blocked}` on Nostr ingest, `SearchQuery.include_adult` through the
+index (`SCHEMA_VERSION` 3), the SQL fallback, the API (`adult=1`), the phone
+(`FfiConfig.show_adult`) and Android Settings (D70), and the IMDb/anime enrichers and attrs
+backfill on `torrent_rows`. No new dependency.
+
+**Order on the DHT path** (§7.1, as built): verify → parse → `classify` (pure, silent) →
+`Screen::verdict(all_names, adult)` → block (hashes only) or store with `category` and
+`classifier_version`, release attributes parsed with that category. At crawler start, rows of an
+older classifier version are re-classified and re-screened (500 per transaction).
+
+**Tests** (neutral placeholder terms only: `zorblax` hard, `wibblewob` context, `甲乙` / `丙丁`
+for CJK). Unit: hashes equal to `sha256sum` of the script's input (ASCII and CJK), every
+variant (diacritics, substitutions, separators, bigrams, padding paths), context tier only
+for adult, hard-only texts, explicit vs ordinary age markers, strict loading that never echoes
+a line, `Debug` without terms; classifier byte classes, games, anime, adult (weak pairs, the
+film *xXx*, `.ass` subtitles, adult words with audio bytes), version 2 rules (JAV codes vs
+years/serials/`WEB-DL`, CJK words, adult archives, `Game of Thrones … .rar`, doujinshi).
+Postgres (`server/tests/dht_classify_pg.rs`): Nostr ingest blocks on title, file name
+(substitution variant), description and hashtag; the context tier only for a `porn` category or
+an adult name; a later harmless event for a blocked hash is rejected; 6 hashes + 6 event ids
+kept and no text in `events`; a Nostr block deletes a DHT row of the hash; stage 2 rows
+re-classified (one now blocked, origin `sweep`); DHT rows in the seed-check schedule with no
+trackers; a malformed or missing `MAGNETAR_BLOCKLIST_FILE` fails without echoing the line.
+`dht_fetch_pg.rs::pipeline_blocklist_classifies_and_never_logs_names`: 12 torrents through fake
+DHT → fake seeder → Postgres with the real screen, the whole process logging at `TRACE` into a
+buffer: one block per tier (hard in a padding path, context, age), stored rows with `video`,
+`porn`, `anime`, and none of the names or paths in the logs or the JSON report.
+`search_index.rs::adult_hidden_by_default_on_both_paths` (index = SQL fallback; a Nostr `video`
+event whose DHT row is `porn` is hidden too), `enrich_pg.rs::dht_only_torrents_are_enriched_and_parsed`
+(a DHT-only name matched to IMDb by title, attributes re-parsed by the backfill), Android
+`SettingsTest` (switch off by default, mapped to `FfiConfig`).
+
+**Live runs** (release build, home IP, aggressive, 4 virtual nodes, no UPnP, no router port
+opened; scratch database `dht_stage3_live`, 420 s each; run 1 with classifier v1, run 2 with
+v2 after re-classifying run 1's rows at start):
+
+| | run 1 (v1) | run 2 (v2) |
+|---|---|---|
+| unique infohashes | 10 789 | 10 851 |
+| verified info dicts (per min) | 672 (96) | 815 (117) |
+| stored / blocked (by tier) | 669 / 3 (hard 1, context 2) | 808 / 7 (hard 1, context 6) |
+| re-classified at start (now blocked) | — | 669 (6) |
+| fetch success rate | 26.5 % | 29.3 % |
+| CPU / peak RSS | 7.8 s (1.8 % of a core) / 74 MB | 11.2 s (2.7 %) / 107 MB |
+| bandwidth in | 0.98 Mbit/s | 1.49 Mbit/s |
+
+Blocked torrents were counted by tier only; their names were never printed or viewed (D53).
+
+**Category distribution** after both runs (1 470 stored rows, classifier v2): video 644
+(43.8 %), **porn 261 (17.8 %)**, audio 147 (10.0 %), other 102 (6.9 %), book 96 (6.5 %),
+application 75 (5.1 %), anime 75 (5.1 %), game 56 (3.8 %), picture 14 (1.0 %). Storage:
+`dht_torrents` ≈ 5.2 KB per row with its indexes, `torrent_attrs` ≈ 0.44 KB; every row got
+attributes and a seed-check schedule row.
+
+**Accuracy, hand-checked** (name, file count, size and byte share of the top extensions; an
+"x" for names nobody could place, excluded):
+
+| | sample A (100 from run 1) | sample B (100 fresh from run 2) |
+|---|---|---|
+| classifier v1 | 61 / 91 (67 %), adult recall 7 / 24, no false adult | — |
+| classifier v2 | 85 / 91 (93 %; **tuned on this sample**), adult 22 / 24, no false adult | **78 / 94 (83 %)**, adult recall 19 / 29 (66 %), precision 19 / 19 |
+
+Sample A drove v2 (CJK adult words, JAV-style codes, game data archives, CJK book hints,
+adult archives), so its v2 figure is optimistic; sample B was drawn afterwards and not tuned
+on. Sample B's 16 errors: 10 adult torrents not tagged (performer or site names only, Chinese
+voyeur vocabulary, Korean words, adult doujinshi/comic magazines filed as book or other), 2
+anime without the fansub shape filed as video, a PS4 `.pkg` game as application, a Unity game
+and a doujinshi zip as other, a Bach box set ISO as application. Adult doujinshi count as
+adult in both samples (hiding them by default is the point). Two sample A rows were blocked
+by the v2 re-screen (counted, not identified).
+
+**Found in the live sample**: one stored picture set in sample B was labelled with a child's
+age (an explicit `NNyo` annotation) and carried no adult word, so neither the hard terms nor
+the adult-only age rule caught it. It was deleted from the scratch database by hand (hash kept
+as `sweep`, name not recorded anywhere), and the age rule changed: explicit age annotations
+next to an age below 18 now block any torrent (D68). The same pass added CJK character n-grams
+to the matcher, because names in Chinese and Japanese are single tokens.
+
+**Not verified in stage 3.** Blocklist recall (only the vectors and the live counts; the
+binding rule forbids checking what it matched); the Nostr sweep of already stored data (stage
+5) — production Nostr data has not been screened by this list; the phone keeps events it
+cached before the update (it only rejects new ones); classification of names in scripts and
+languages beyond the samples; DHT rows in search results (stage 5 readers); the app switch on a
+phone (built and unit-tested only); TMDB decoration of DHT rows (follows the IMDb/anime links,
+not tested with DHT rows); the duration of the re-classification on a large table (669 rows
+here, not timed).

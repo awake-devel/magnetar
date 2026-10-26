@@ -101,13 +101,14 @@ The Postgres credentials and volumes are described in docs/DOCKER.md.
 | `liveness.enabled` | bool | |
 | `ntfy.url`, `ntfy.topic` | string | from env |
 
-### DHT crawler (stages 1–2: discovery and metadata fetch)
+### DHT crawler (stages 1–3: discovery, metadata fetch, classification and blocklist)
 
-Designed in docs/DHT.md (ARCHITECTURE.md D49–D65). Stage 1 implements discovery: BEP 51
+Designed in docs/DHT.md (ARCHITECTURE.md D49–D70). Stage 1 implements discovery: BEP 51
 sampling, passive capture, triage into `dht_seen` and peer collection; stage 2 downloads and
-verifies each torrent's metadata from its peers (BEP 9, TCP). Nothing named is stored until the
-illegal-content blocklist (stage 3) exists: fetched metadata is counted and dropped (D65), so
-nothing reaches search yet. Rows marked *planned* do nothing so far.
+verifies each torrent's metadata from its peers (BEP 9, TCP); stage 3 classifies it (category,
+adult tag) and passes every name through the hard illegal-content blocklist before anything
+is stored (D68, D69). Stored DHT torrents get release attributes, seed checks and IMDb/anime
+links; they reach search with stage 5 (index readers). Rows marked *planned* do nothing so far.
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -126,7 +127,7 @@ nothing reaches search yet. Rows marked *planned* do nothing so far.
 | `MAGNETAR_DHT_UPNP` | `true` in aggressive | *planned (stage 6)*: map the UDP ports on the router |
 | `MAGNETAR_DHT_UPNP_GATEWAY` | the default gateway | *planned (stage 6)*: router address for a unicast SSDP search; required in Docker |
 | `MAGNETAR_DHT_UPNP_LOCAL_IP` | detected | *planned (stage 6)*: LAN address the router forwards to; required in Docker (the host's address) |
-| `MAGNETAR_BLOCKLIST_FILE` | unset | *planned (stage 3)*: extra illegal-content terms, one per line (`context:` prefix = only for adult torrents). Adds to the built-in list; nothing can disable it |
+| `MAGNETAR_BLOCKLIST_FILE` | unset | extra illegal-content terms, one per line, 1–3 words each (`context:` prefix = only for adult torrents, `#` comments). Adds to the built-in list, for the DHT crawler and Nostr ingest alike; nothing can disable the list. A file that cannot be read or has a malformed line stops the server at start (the error names the line number, never its text) |
 
 Each option also exists as a flag (`--dht aggressive`, `--dht-nodes 2`, …). Bounded run with a
 JSON report: `magnetar-server dht --seconds 270 [--mode aggressive] [--dry-run]`. Measured on
