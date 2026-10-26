@@ -1,8 +1,11 @@
 # DHT crawler (ARCHITECTURE.md D49–D58)
 
-Design document for the native Mainline DHT crawler. Status: **stage 0 (design)**. Nothing
-described here is implemented yet; each section says which stage builds it (§12). Later stages
-update this file as they land and replace "planned" with what was built and measured.
+Design document for the native Mainline DHT crawler. Status: **stage 1 (discovery) built**:
+KRPC node, BEP 42 ids, routing, crawl pool, BEP 51 sampler, passive capture, peer collection,
+the migration of §2.3, triage, the persisted `dht_seen` queue, the `dht` CLI and the `serve`
+daemon (§13 has what was built and measured). No metadata is fetched yet (stage 2), so
+`dht_torrents` stays empty. Each section says which stage builds it (§12); later stages update
+this file as they land.
 
 Research behind it: [research/dht-crawling.md](research/dht-crawling.md),
 [research/bitmagnet.md](research/bitmagnet.md), [research/bittorrent.md](research/bittorrent.md),
@@ -288,7 +291,7 @@ request enum and a pre-release ed25519; `fx-torrent` has BEP 51 but is a 56 k-LO
 `core::dht` (feature `dht-crawl`, server-only, no new dependency except `crc32c` 0.6.8,
 MIT/Apache-2.0, for BEP 42), reusing the lenient bencode of `core::liveness::bencode`.
 
-Planned modules (stage 1 unless noted):
+Modules (stage 1 built; the planned `node.rs` and `sampler.rs` became `engine.rs`):
 
 ```
 core/src/dht/          (feature "dht-crawl")
@@ -309,7 +312,8 @@ core/src/metainfo/     (feature "dht-crawl", stage 2)
   info.rs        info dict → name, files, size, private, meta version, v2 hash
 core/src/classify.rs   category + adult tagging from name and files (stage 3, no feature: pure)
 core/src/blocklist/    hard illegal-content matcher (stage 3, no feature: Nostr ingest uses it too)
-server/src/dht/        daemon: triage, queue, persist, upnp, stats (stage 4, 6)
+server/src/dht/        daemon: mod.rs (pipeline, report), seen.rs (Bloom), queue.rs (fetch queue),
+                       store.rs (triage, leases, identity) — stage 1; persist, upnp, stats (4, 6)
 ```
 
 ### 3.2 Modes (D49)
@@ -406,6 +410,15 @@ Both modes honour every rule of §3.4 (interval, per-IP rate, honest ids, no fak
   one RPC per node). Returned `nodes` enter the pool as due now. When the due queue is empty,
   `find_node` to random targets grows the pool. Each answer yields up to 20 samples
   (libtorrent's max, `dht_storage.cpp:183`).
+- **Backpressure (D62, stage 1)**: the sampler only uses a *share* of the QPS budget, set by the
+  server: 0 (paused) while ≥ 10 000 hashes (or half the queue cap) wait for peer collection,
+  back to 1 at half of that. Measured reason (§13): unthrottled, sampling found 62 k new
+  hashes/min while peer collection managed ~2 hashes/s; the budget is worth more on lookups.
+- **Lookup seeds (D61, stage 1)**: the routing tables plus the crawl pool's closest entries,
+  through a 16-bit id-prefix index on the pool (exact top-k: buckets sharing the longest prefix
+  are scanned first). Seeding from the routing tables alone (~100 contacts, nearly all far from
+  a random infohash) sent every concurrent lookup to the same few nodes and into the per-IP
+  limit.
 
 ### 3.6 Passive capture (aggressive only)
 
@@ -438,11 +451,18 @@ samples / announces / get_peers ──► seen filter (2 × Bloom) ──► bat
   recover: a `queued` row whose fetch never ran comes due again in the retry loop. A
   `queued` row with `next_attempt_at = NULL` would be dropped by triage forever.
 - **Fetch queue**: in memory, bounded 100 k, three priorities (2 announce-with-peer, 1 sampled,
-  0 incoming get_peers and retries); overflow drops the lowest-priority oldest entry (the hash
-  stays `queued` in `dht_seen` and is retried by the slow retry loop).
+  0 incoming get_peers and retries), each lane served **newest first** (D60: a fresh sample's
+  swarm and sampling node are the likeliest to still be there); overflow drops the
+  lowest-priority oldest entry (the hash stays `queued` in `dht_seen` and is retried by the slow
+  retry loop).
+- **Stage 1 consumer**: peer collection (64 workers aggressive, 8 polite,
+  `MAGNETAR_DHT_PEER_LOOKUPS`): announcer, else `get_peers` to the sampling node, else an
+  iterative lookup (≤ 10 s, stops at 12 peers). No peer at all → `failed` / `no_peers` with the
+  backoff below. Hashes with peers keep their lease until stage 2's fetcher consumes them.
 - **Retry loop**: every minute, ≤ 1000 `dht_seen` rows with `next_attempt_at <= now` re-enter at
   priority 0. Backoff after a failed fetch: 1 h, 6 h, 24 h, then `next_attempt_at = NULL` (4
-  attempts). `invalid`, `private`, `v2_only`, `oversize`, `alias` are final.
+  attempts). `invalid`, `private`, `v2_only`, `oversize`, `alias` are final. Measured size:
+  ~160 B per `dht_seen` row with its indexes (§13), not the ~70 B estimated in §10.
 
 ### 3.8 Hostile input and memory bounds (review, 2026-10-26)
 
@@ -685,7 +705,8 @@ is checked against the hard tier only; public CSAM hash lists
 
 ## 8. Ops: configuration (D58)
 
-Planned server variables (stage 4 unless noted; not implemented yet):
+Server variables. **Built in stage 1**: `MAGNETAR_DHT`, `_PORT`, `_NODES`, `_QPS`, `_POOL`,
+`_FETCH_KNOWN`, `_PEER_LOOKUPS`; the others are still planned (their stage in brackets).
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -694,17 +715,22 @@ Planned server variables (stage 4 unless noted; not implemented yet):
 | `MAGNETAR_DHT_NODES` | `4` (aggressive), `1` (polite) | 1–8 (BEP 42 allows 8 ids per IP) |
 | `MAGNETAR_DHT_QPS` | `200` / `50` | global outbound KRPC queries per second |
 | `MAGNETAR_DHT_POOL` | `1000000` / `200000` | crawl pool size (nodes) |
-| `MAGNETAR_DHT_FETCH_CONCURRENCY` | `128` / `16` | metadata fetches in flight |
-| `MAGNETAR_DHT_METADATA_MAX` | `16777216` | bytes, per info dict |
+| `MAGNETAR_DHT_PEER_LOOKUPS` | `64` / `8` | peer collections (sampling node, then lookup) at once (D62) |
+| `MAGNETAR_DHT_FETCH_CONCURRENCY` | `128` / `16` | metadata fetches in flight (stage 2) |
+| `MAGNETAR_DHT_METADATA_MAX` | `16777216` | bytes, per info dict (stage 2) |
 | `MAGNETAR_DHT_FETCH_KNOWN` | `false` | also fetch metadata of Nostr-only infohashes |
 | `MAGNETAR_DHT_UPNP` | `true` in aggressive | map the UDP ports on the router (§9) (stage 6) |
 | `MAGNETAR_DHT_UPNP_GATEWAY` | default gateway from `/proc/net/route` | `host[:port]` for a unicast SSDP M-SEARCH (needed in Docker, §9) |
 | `MAGNETAR_DHT_UPNP_LOCAL_IP` | the address the SOAP connection leaves from | LAN address to map to; **required in Docker** (the container sees its bridge address) |
-| `MAGNETAR_BLOCKLIST_FILE` | unset | extra plain-text terms, one per line, `context:` prefix for the context tier; additive only |
+| `MAGNETAR_BLOCKLIST_FILE` | unset | extra plain-text terms, one per line, `context:` prefix for the context tier; additive only (stage 3) |
 
-CLI (stage 4): `magnetar-server dht [--seconds N] [--mode polite|aggressive] [--dry-run]` runs the
-crawler for a bounded time and prints a JSON report (`--dry-run`: no database writes, for live
-tests). `serve` starts it when `MAGNETAR_DHT` ≠ `off`, after migrations and the blocklist sweep.
+CLI (built in stage 1): `magnetar-server dht [--seconds N] [--mode polite|aggressive] [--dry-run]`
+runs the crawler for a bounded time (default 300 s; Ctrl-C/SIGTERM stop it early, cleanly) and
+prints a JSON report on stdout: sightings, unique hashes/min, triage outcome, queue, peers per
+hash, the engine counters, CPU seconds and RSS. `--mode` defaults to `MAGNETAR_DHT`, or polite
+when that is off. `--dry-run`: no database at all (dedupe in memory). `serve` starts it when
+`MAGNETAR_DHT` ≠ `off`, after migrations (the blocklist sweep joins in stage 3); it stops within
+`serve`'s 10 s daemon grace, saving the identity and 1000 contacts.
 
 ## 9. UPnP, ports, Docker (D57, stage 6)
 
@@ -772,11 +798,70 @@ blocked names anywhere; nothing from the DHT is published to Nostr.
 | Stage | Builds | Verifies |
 |---|---|---|
 | 0 | this document, D49–D58 | production counts, librqbit-dht API, BEP texts, router UPnP (read-only) |
-| 1 | `core::dht` KRPC, BEP 42 ids, routing, pool, sampler, limiter, responder, peer store | BEP 5/42/51 vectors (BEP 42 over 4 bytes), arbitrary-bytes no-panic decoders, address filter, map caps (§3.8), fake-socket sampler, a bounded live polite run |
+| 1 | `core::dht` KRPC, BEP 42 ids, routing, pool, sampler, limiter, responder, peer store; **pulled forward from stage 4** (swarm plan): migration §2.3, `server::dht` triage, `dht_seen` queue, retry, peer collection, `dht` CLI, config, `serve` daemon | BEP 5/42/51 vectors (BEP 42 over 4 bytes), arbitrary-bytes no-panic decoders, address filter, map caps (§3.8), fake-network tests, Postgres tests, bounded live aggressive runs (§13) |
 | 2 | `core::metainfo` BEP 3/10/9 fetcher, v1/hybrid/v2 verification | fake-peer tests (reject, short piece, wrong hash, hybrid, private, duplicate keys, LAN/loopback peer refused), bounded live fetch of sampled hashes |
 | 3 | `core::classify`, `core::blocklist`, `Rejection::Blocked`, `scripts/blocklist-hash.sh` | accuracy sample, blocklist vectors (hashed, every name/path variant), Nostr ingest rejection (description/hashtags too), no-name-in-logs test at `TRACE` |
-| 4 | migration §2.3, `server::dht` daemon (triage, queue, persist, retry), `dht` CLI, config | Postgres tests, triggers, counts, queued lease, hybrid alias, bounded live aggressive run without UPnP |
+| 4 | `server::dht::persist` (dht_torrents + attrs batches, alias rows), fetch results into `dht_seen` | Postgres tests, hybrid alias, bounded live aggressive run without UPnP |
 | 5 | `torrent_rows` readers, index `SCHEMA_VERSION` 3 (origin, eligible_trust, include_adult), API/ffi types, sweep | search/filters/detail tests on both paths (DHT rows pass `min_trust` in the SQL fallback too, `EXPLAIN` shows no seq scan of `dht_torrents`), `recompute_published` Nostr-only, sweep vacuum + merge |
 | 6 | UPnP, `docker/compose.dht.yml`, stats/health | fake gateway tests, stats API |
 | 7 | app: badge, filter chip, adult switch, crawler card | Gradle build + unit tests |
 | 8 | live tuning on the laptop | rates, hit rate, resources, disk per torrent |
+
+## 13. Stage 1: built and measured (2026-10-26)
+
+**Code.** `crates/core/src/dht/` (krpc, id, addr, routing, pool, limiter, peerstore, engine,
+lookup), `crates/server/src/dht/` (mod, seen, queue, store), migration
+`20261101000000_dht.sql`, `magnetar-server dht`, `MAGNETAR_DHT*` options in `config.rs`.
+New dependency: `proptest` 1.12.0 (MIT/Apache-2.0), dev only. CRC32C is in-house (D59).
+
+**Tests.** KRPC codec against the BEP 5 example packets, BEP 51 round trip, BEP 42 `ip` and
+BEP 43 `ro`, the five BEP 42 vectors (4-byte CRC) and the 8-byte prose counter-check, strict
+lengths/caps; three proptest suites (arbitrary bytes, KRPC-shaped garbage, mutated valid
+messages) never panic; address filter; limiter, pool (prefix index exact top-k), routing,
+peer store caps. Fake DHT (`core/tests/dht_fake_network.rs`, 1–12 in-process nodes on distinct
+127.0.x.y addresses): sampling of every announced hash, BEP 42 vote, peers from the sampling
+node and through a lookup, passive capture, honest peer store, forged token refused, polite
+read-only, 207 hostile datagrams, cancelled queries release their transactions, sampler pause
+and throttle. Postgres (`server/tests/dht_pg.rs`): triggers (counts, schedule, search_changes),
+the view, the Nostr delete keeping DHT-held hashes, triage (blocked/known/duplicates/lease),
+backoff 1 h/6 h/24 h/final and the announce exception, the retry loop settling known and
+blocked rows, identity/contacts round trip, and the whole pipeline against a 10-node fake DHT
+(40 hashes: all persisted but the known one, peers for every collected hash, identity saved, a
+second run queues nothing again, a stop request returns in < 8 s).
+
+**Live runs** from the laptop (home IP, aggressive, 4 virtual nodes on UDP 6891–6894, **no
+UPnP and no router port opened**, so almost no unsolicited inbound traffic), release build,
+scratch database `dht_stage1_live`, 270 s each:
+
+| | run 1 (before fixes) | run 2 (leak + seeds fixed) | run 3 (with backpressure, current) |
+|---|---|---|---|
+| queries/s (answered share) | 170 (54 %) | 200 (52 %) | 164 (52 %) |
+| sample_infohashes / get_peers sent | 33 371 / 12 404 | 42 869 / 10 985 | 1 764 / 42 322 |
+| unique infohashes (per min) | 211 950 (47 100) | 280 986 (62 441) | 11 350 (2 522 over 270 s; sampling paused 210 s by backpressure) |
+| hashes given peers (per min) | 7 810 (1 736) | 630 (140) | 2 404 (534) |
+| share with ≥ 1 peer | 6.7 % | 84 % | 77 % |
+| peers per hash: mean / median / p90 / max | 0.7 / 0 / 0 / 63 | 8.9 / 3 / 26 / 64 | 7.9 / 2 / 22 / 60 |
+| peers from the sampling node / via lookup | 113 / 7 694 | 119 / 511 | 130 / 2 273 |
+| queries per collected hash | 17.9 | 18.8 | 21.3 |
+| `busy` (transaction map full) / per-IP refusals | 19 324 / 116 431 | 0 / 1 123 | 0 / 9 779 |
+| CPU (whole process) | 6.0 s (2.2 % of a core) | 5.0 s (1.9 %) | 4.2 s (1.6 %) |
+| peak RSS | 68 MB | 75 MB | 47 MB |
+| crawl pool at the end (BEP 51 yes / no / unknown) | 129 k (11 k / 6 k / 111 k) | 149 k (15 k / 8 k / 126 k) | 60 k (0.6 k / 0.5 k / 59 k) |
+
+Run 1 exposed two bugs (fixed, D61): leaked transactions filled the pending map (`busy`), and
+lookups seeded only from the routing tables hit the per-IP limit, so most hashes got no peers.
+Run 2 showed discovery outrunning collection ~450:1, hence D62. Run 3: the queue reaches
+10 000 in about a minute, then the budget goes to lookups. Incoming queries without an open
+port: 11 ping, 264 find_node, 109 get_peers, 4 announce_peer in 270 s (conntrack-allowed flows
+only). `dht_seen` after run 3: 10 798 `queued`, 552 `failed` (`no_peers`), 1.8 MB ≈ 160 B per
+row. A 60 s restart on the same database loaded 1000 saved contacts and the saved identity, and
+76 of 10 706 sighted hashes were already in `dht_seen` (not queued again). SIGINT after 10 s:
+report printed at 9.9 s, ports released.
+
+**Not verified in stage 1.** Inbound reachability and passive capture at scale (needs the UPnP
+stage or an opened port; the user's router was not touched); polite mode live; behaviour past
+5 minutes (pool growth to 1 M, Bloom rotation at 6 h, memory at that size, the retry loop on
+real expired leases, the brake on a real conntrack limit); why only ~5 % of hashes get peers
+from the node that sampled them (a node behind NAT that stopped answering, or a lookup ran
+first because the per-IP bucket was spent — not measured); whether 64 collectors use the full
+budget (run 3 averaged 164 of 200 q/s, waiting on 4 s timeouts).

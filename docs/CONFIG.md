@@ -101,10 +101,11 @@ The Postgres credentials and volumes are described in docs/DOCKER.md.
 | `liveness.enabled` | bool | |
 | `ntfy.url`, `ntfy.topic` | string | from env |
 
-### DHT crawler (planned, not implemented yet)
+### DHT crawler (stage 1: discovery only)
 
-Designed in docs/DHT.md (ARCHITECTURE.md D49–D58); these variables do nothing until the
-crawler stages land, and this table is updated as they do.
+Designed in docs/DHT.md (ARCHITECTURE.md D49–D62). Stage 1 implements discovery: BEP 51
+sampling, passive capture, triage into `dht_seen` and peer collection. No metadata is fetched
+and nothing reaches search yet. Rows marked *planned* do nothing so far.
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -112,14 +113,20 @@ crawler stages land, and this table is updated as they do.
 | `MAGNETAR_DHT_PORT` | `6891` | first UDP port (aggressive); virtual node *i* uses `PORT + i` |
 | `MAGNETAR_DHT_NODES` | `4` aggressive, `1` polite | 1–8 (BEP 42 gives 8 valid node-id prefixes per IPv4 address) |
 | `MAGNETAR_DHT_QPS` | `200` / `50` | outbound DHT queries per second, all kinds |
-| `MAGNETAR_DHT_POOL` | `1000000` / `200000` | nodes kept for sampling (~100 B each) |
-| `MAGNETAR_DHT_FETCH_CONCURRENCY` | `128` / `16` | metadata fetches in flight |
-| `MAGNETAR_DHT_METADATA_MAX` | `16777216` | largest info dictionary accepted, bytes |
-| `MAGNETAR_DHT_FETCH_KNOWN` | `false` | also fetch metadata of infohashes already known from Nostr |
-| `MAGNETAR_DHT_UPNP` | `true` in aggressive | map the UDP ports on the router |
-| `MAGNETAR_DHT_UPNP_GATEWAY` | the default gateway | router address for a unicast SSDP search; required in Docker |
-| `MAGNETAR_DHT_UPNP_LOCAL_IP` | detected | LAN address the router forwards to; required in Docker (the host's address) |
-| `MAGNETAR_BLOCKLIST_FILE` | unset | extra illegal-content terms, one per line (`context:` prefix = only for adult torrents). Adds to the built-in list; nothing can disable it |
+| `MAGNETAR_DHT_POOL` | `1000000` / `200000` | nodes kept for sampling (1000–20000000) |
+| `MAGNETAR_DHT_FETCH_KNOWN` | `false` | also queue infohashes already known from Nostr |
+| `MAGNETAR_DHT_PEER_LOOKUPS` | `64` / `8` | peer collections running at once (1–512) |
+| `MAGNETAR_DHT_FETCH_CONCURRENCY` | `128` / `16` | *planned (stage 2)*: metadata fetches in flight |
+| `MAGNETAR_DHT_METADATA_MAX` | `16777216` | *planned (stage 2)*: largest info dictionary accepted, bytes |
+| `MAGNETAR_DHT_UPNP` | `true` in aggressive | *planned (stage 6)*: map the UDP ports on the router |
+| `MAGNETAR_DHT_UPNP_GATEWAY` | the default gateway | *planned (stage 6)*: router address for a unicast SSDP search; required in Docker |
+| `MAGNETAR_DHT_UPNP_LOCAL_IP` | detected | *planned (stage 6)*: LAN address the router forwards to; required in Docker (the host's address) |
+| `MAGNETAR_BLOCKLIST_FILE` | unset | *planned (stage 3)*: extra illegal-content terms, one per line (`context:` prefix = only for adult torrents). Adds to the built-in list; nothing can disable it |
+
+Each option also exists as a flag (`--dht aggressive`, `--dht-nodes 2`, …). Bounded run with a
+JSON report: `magnetar-server dht --seconds 270 [--mode aggressive] [--dry-run]`. Measured on
+the laptop (aggressive, no port opened, 270 s): ~1.6 % of one core, 47 MB RSS; see
+docs/DHT.md §13.
 
 ### Built-in seed relays (ARCHITECTURE.md §9)
 

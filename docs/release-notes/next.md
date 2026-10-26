@@ -88,6 +88,21 @@ must be updated together to get all of it, but each side keeps working with an o
   torrents whose metadata repeats a field are refused. Adult content is hidden when either the
   publisher or the DHT classifier says so.
 
+### DHT crawler: discovery (stage 1; docs/DHT.md §13, D59–D62)
+
+- New `magnetar-server dht [--seconds N] [--mode polite|aggressive] [--dry-run]`: runs the DHT
+  crawler for a bounded time and prints a JSON report (hashes found per minute, peers per hash,
+  CPU, memory). With `MAGNETAR_DHT=polite|aggressive`, `serve` runs it in the background.
+  Default stays off.
+- Stage 1 finds infohashes (BEP 51 sampling and incoming DHT queries), skips those already known
+  or blocked, keeps a persistent queue (`dht_seen`) and looks up peers for each. It does not yet
+  download metadata, so nothing new appears in search.
+- Database migration `20261101000000_dht.sql` adds the DHT tables and the `torrent_rows` view.
+  It briefly locks `torrent_infohashes` (`lock_timeout` 10 s: a start fails loudly instead of
+  hanging behind another session).
+- Live measurement from the home connection (270 s, no port opened): 534 hashes/min given peers,
+  77 % of them with at least one peer, 1.6 % of a core, 47 MB RAM.
+
 ## Older servers and offline mode
 
 - The app asks `GET /health` for `features` and hides what the server lacks: an older server

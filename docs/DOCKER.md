@@ -237,10 +237,12 @@ If the host already runs Tailscale, skip the sidecar and use the host's
 **UNVERIFIED:** the sidecar was checked with `docker compose --profile tailscale config` only;
 it has not been run against a real tailnet.
 
-## DHT crawler ports (planned, not implemented yet)
+## DHT crawler ports (overlay planned)
 
-The DHT crawler (docs/DHT.md, D49–D58) will be off by default and the default `compose.yml`
-will not publish anything new. In aggressive mode it listens on UDP ports (default 6891–6894),
+The DHT crawler (docs/DHT.md, D49–D62) exists since stage 1 and is off by default
+(`MAGNETAR_DHT=off`); the default `compose.yml` publishes nothing new. With `MAGNETAR_DHT` set
+and no published UDP ports, it still crawls (answers to its own queries come back through the
+NAT), but unsolicited queries cannot reach it, so passive capture finds almost nothing. In aggressive mode it listens on UDP ports (default 6891–6894),
 which an overlay publishes:
 
 ```sh
