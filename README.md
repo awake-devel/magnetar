@@ -64,6 +64,7 @@ of the app on an Android 17 (API 37) x86_64 emulator against a live server crawl
 | Detail: files, trackers, infohash, npub, open/copy magnet, pin, hide, block publisher | app | Tested |
 | Web-of-trust score 0-100 with explanation (follows, mutes, reports, PoW bonus) | core | Tested |
 | Swarm liveness: UDP (BEP 15), HTTP scrape (BEP 48), DHT scrape (BEP 33), TTL cache | core | Tested against real trackers and the DHT |
+| Seed checks at scale on the server: every torrent re-checked by age, viewed/searched ones first, per-tracker rate limits and backoff, seeders history, backlog on the Status screen | server, app | New (D45, docs/LIVENESS.md): ~29 k torrents/h measured on real trackers and the DHT (0.5 M backlog ≈ 17 h, 3 % of a core); Status card built (its ETA helper unit-tested), **UNVERIFIED** on a device or emulator |
 | Phone cache: background crawl (Wi-Fi + charging), sync, LRU/size-cap cleanup that never deletes unsynced rows | app, ffi | Tested |
 | Phone to server sync: NIP-77 negentropy, batch POST fallback | core, server | Tested (also interop with nostr-sdk) |
 | Saved searches with ntfy push (server) and local notifications (phone) | server, app | Tested (local notifications; ntfy against a fake server only) |

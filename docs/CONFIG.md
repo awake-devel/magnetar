@@ -11,6 +11,7 @@ magnetar-server migrate               # apply sqlx migrations (idempotent)
 magnetar-server crawl-once [--seconds N]
 magnetar-server selftest              # DB, DNS, TLS (NIP-11 of a seed relay), UDP
 magnetar-server enrich [--reimport] [--rematch]   # refresh IMDb datasets, link all pending torrents, JSON report
+magnetar-server liveness [--limit N]  # seed-check batches now (configured rates), one JSON line per batch
 magnetar-server attrs [--force]       # parse release attributes (language, quality, …) of torrents without current ones, JSON report
 magnetar-server --version
 ```
@@ -37,6 +38,12 @@ magnetar-server --version
 | `MAGNETAR_NIP66_TRUSTED` | built-in list of 12 monitor pubkeys (`nip66::DEFAULT_TRUSTED_MONITORS`) | comma-separated hex pubkeys of trusted NIP-66 monitors. They get their own request and page budget, and only relays they report escape the cap of 100 new relays per run from other announced monitors (ARCHITECTURE.md D36) |
 | `MAGNETAR_SEARCH_INDEX` | `true` | Embedded Tantivy search index (ARCHITECTURE.md D43, docs/SEARCH.md). Built in the background at the first start (~465 k infohashes: about 35 s on a laptop; searches use Postgres meanwhile), then kept current within ~1–2 s through a change log written by database triggers. `false` = every search runs in Postgres (slow on large indexes) and the change log is emptied hourly; an existing index directory is removed, since it would go stale |
 | `MAGNETAR_SEARCH_INDEX_DIR` | `<state dir>/search-index` (`$XDG_STATE_HOME/magnetar/search-index` or `~/.local/state/magnetar/search-index`; image: `/data/state/magnetar/search-index`) | Index files (derived data: delete the directory to force a rebuild). About 0.7 KiB per infohash on disk (~320 MB for 465 k); the server needs exclusive use of it (one `serve` per directory, and one `serve` with the index per database: two would consume each other's change log). A non-empty directory without Tantivy files is never deleted: the index then stays off (searches use Postgres) |
+| `MAGNETAR_LIVENESS_BATCH` | `2000` | Seed checks (docs/LIVENESS.md, ARCHITECTURE.md D45): infohashes per batch (1–50 000). Batches run back to back while a full batch is due |
+| `MAGNETAR_LIVENESS_INTERVAL_SECS` | `60` | Pause after a batch that emptied the queue (at least 5) |
+| `MAGNETAR_LIVENESS_TRACKER_RPS` | `1` | Scrape requests per second per tracker; one request carries 74 infohashes (UDP) or 50 (HTTP). A failing tracker is skipped for 2 min, doubling up to 6 h |
+| `MAGNETAR_LIVENESS_TRACKER_CONCURRENCY` | `16` | Trackers scraped at the same time |
+| `MAGNETAR_LIVENESS_DHT` | `true` | DHT (BEP 33) for infohashes no tracker answered. `false` leaves them unknown |
+| `MAGNETAR_LIVENESS_DHT_CONCURRENCY` | `32` | DHT walks at the same time (~25–50 nodes asked per walk). 32 cleared ~29 k torrents an hour on a home line in the measurement; lower it on a weak connection |
 | `RUST_LOG` | `info` | tracing `EnvFilter` syntax, e.g. `info,magnetar_core=debug` |
 | `MAGNETAR_IMDB` | `true` | Offline IMDb identification (D40, docs/ENRICHMENT.md): downloads the IMDb non-commercial datasets (~293 MB: title.basics, title.ratings, title.episode) and imports them (~585 MB in Postgres). `false` keeps strong-ID linking (i tags, description links) and skips all downloads |
 | `MAGNETAR_IMDB_AKAS` | `false` | Also import `title.akas` (+519 MB download, +~300 MB in Postgres, import ~4.5 min instead of ~1.5): localised titles, +2.8 points correct on French YGG releases |
@@ -55,13 +62,18 @@ magnetar-server --version
 the last pass), `last_report`, `passes` since start, `last_error` and `next_run` (while pausing),
 and the search index under `search_index` (null when disabled): `state` (`building` | `ready` |
 `error`), `docs`, `build_done`/`build_total`, `build_secs`, `last_commit`, `pending` changes,
-`lag_secs` (age of the oldest pending change), `bytes` on disk, `error`.
+`lag_secs` (age of the oldest pending change), `bytes` on disk, `error`, and the seed checks
+under `liveness` (null from servers older than D45): `enabled`, `torrents`, `never_checked`,
+`due_now`, `checked_24h`, `checks_per_hour`, `alive`/`dead`/`unknown`, `trackers`,
+`trackers_backed_off`, `dht_nodes`, `last_batch` (a `BatchReport`) and `last_batch_at`
+(docs/LIVENESS.md).
 
 Release attributes (ARCHITECTURE.md D44, docs/FILTERS.md) need no configuration: `serve` parses
 new torrents as they arrive and, at startup, any torrent stored before D44 or by an older parser
 (`release::PARSER_VERSION`), in chunks of 2000 off the async runtime; `magnetar-server attrs`
 does the same once (`--force`: every torrent again). `GET /health` lists `features`
-(`filters`, `facet_set`, `media_releases`); the app hides what a server does not list.
+(`filters`, `facet_set`, `media_releases`, `liveness_history`); the app hides what a server
+does not list.
 
 librqbit keeps its session and DHT state in `<state dir>/downloads`, where the state dir is
 `$XDG_STATE_HOME/magnetar` (default `~/.local/state/magnetar`). The image keeps it under

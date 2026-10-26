@@ -50,8 +50,16 @@ real hardware are marked **UNVERIFIED**.
   DHT is used only when no tracker answered, and it fills `dht_peers_est`, never
   `seeders`. [bittorrent.md §4]
 - **Unknown is not dead.** No answer means unknown. "Hide dead" drops a torrent only when it
-  has a *fresh* liveness result with 0 peers. The TTLs are 6 h for alive, 24 h for dead and
-  1 h for errors. [D16, D17]
+  has a *fresh* liveness result with 0 peers. On the phone the TTLs are 6 h for alive, 24 h
+  for dead and 1 h for errors [D16, D17]; the server re-checks by age (6 h for a week-old
+  torrent, up to 4 days for old ones, 7 days after 3 dead checks in a row), so an old
+  torrent's seeders can be days old (docs/LIVENESS.md, D45).
+- **The DHT is polluted.** Node farms answer every lookup with made-up peers; Magnetar ignores
+  nodes on an IP seen with 3+ ports in one walk and ids made for the target. A farm that
+  spreads over many IPs would still make a dead torrent look alive. [D45]
+- **Fallback trackers only prove life.** Torrents without trackers are scraped on the magnet
+  default trackers; zero there means "not registered", so the DHT decides between dead and
+  unknown. [D45]
 - UDP scrape batches are 74 infohashes, and a truncated reply counts as unanswered.
   [bittorrent.md §1]
 

@@ -26,6 +26,9 @@ services:
       timeout: 5s
       retries: 6
       start_period: 30s
+    # Optional resource limits (none by default; docs/DOCKER.md "Resource limits"):
+    # cpus: "2.0"
+    # mem_limit: 1g
     # No published port: only the magnetar service talks to Postgres, over the compose network.
 
   magnetar:
@@ -62,6 +65,12 @@ services:
       MAGNETAR_TMDB_LANGS:
       MAGNETAR_TMDB_RPS:
       MAGNETAR_TMDB_PREFETCH_PER_HOUR:
+      MAGNETAR_LIVENESS_BATCH:
+      MAGNETAR_LIVENESS_INTERVAL_SECS:
+      MAGNETAR_LIVENESS_TRACKER_RPS:
+      MAGNETAR_LIVENESS_TRACKER_CONCURRENCY:
+      MAGNETAR_LIVENESS_DHT:
+      MAGNETAR_LIVENESS_DHT_CONCURRENCY:
       RUST_LOG: ${RUST_LOG:-info}
     # Image default is 10001:10001. Set to your own uid:gid when MAGNETAR_DATA is a host folder.
     user: ${MAGNETAR_UID:-10001}:${MAGNETAR_GID:-10001}
@@ -69,6 +78,10 @@ services:
       # A named volume by default; set MAGNETAR_DATA to a host path (e.g. /volume1/magnetar on
       # Synology) to keep downloads in a share. It holds downloads/ and state/.
       - ${MAGNETAR_DATA:-magnetar-data}:/data
+    # Optional resource limits (none by default; docs/DOCKER.md "Resource limits"). The server
+    # averages well under one core; index builds and dataset imports use more for minutes.
+    # cpus: "2.0"
+    # mem_limit: 2g
     ports:
       # 127.0.0.1 only by default: the API is token protected but plain HTTP. Use 0.0.0.0:8787
       # (or a LAN address) only on a trusted network, or put HTTPS (Tailscale, a proxy) in front.

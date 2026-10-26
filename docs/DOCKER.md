@@ -107,7 +107,32 @@ start and upgrades need no separate `migrate` step.
 Heavy features can be switched off in `.env`: `MAGNETAR_DOWNLOADS=false` (no librqbit
 engine), `MAGNETAR_NIP66=false`, a longer `MAGNETAR_CRAWL_INTERVAL_SECS` or a lower
 `MAGNETAR_CRAWL_MAX_RELAYS` for small hardware. `MAGNETAR_CRAWL_INTERVAL_SECS=0` (continuous)
-is fine on an always-on box.
+is fine on an always-on box. Seed checks (docs/LIVENESS.md) can be slowed with a lower
+`MAGNETAR_LIVENESS_DHT_CONCURRENCY` or `MAGNETAR_LIVENESS_TRACKER_RPS`.
+
+### Resource limits
+
+None are set by default. `compose.yml` has commented examples for both services; uncomment
+and adjust them (or put them in `compose.override.yml`) to keep Magnetar from competing with
+other services on a NAS or Pi:
+
+```yaml
+services:
+  magnetar:
+    cpus: "2.0"      # at most two cores
+    mem_limit: 2g    # killed and restarted (restart: unless-stopped) above this
+  db:
+    cpus: "2.0"
+    mem_limit: 1g
+```
+
+Rough needs measured on a production-sized copy (~0.5 M infohashes): the server averages well
+under one core (seed checks ~3 % of a core while clearing a backlog, crawling and enrichment
+in bursts); the first search-index build and IMDb dataset imports use several cores for a few
+minutes, and a CPU limit only makes them take longer. Memory: about 0.5 GB for the server in
+steady state (production, 2026-10-26), more during the index build and dataset imports, so
+leave headroom above `mem_limit: 1g`. Postgres also used about 0.5 GB; it caches what it is
+allowed to, and `mem_limit` there mostly bounds the page cache it gets.
 
 ## Updates
 
