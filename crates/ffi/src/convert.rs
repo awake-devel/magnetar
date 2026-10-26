@@ -1,7 +1,10 @@
 //! core <-> Ffi type conversions and error mapping.
 
 use magnetar_core::Error;
-use magnetar_core::api::{FacetSet, LivenessHistory, LivenessStats, MediaReleases};
+use magnetar_core::api::{
+    BreakdownSet, FacetSet, Graph, LivenessHistory, LivenessStats, MediaReleases, StatsHealth,
+    TimeseriesSet,
+};
 use magnetar_core::model::*;
 use magnetar_core::query::{SearchPage, SearchQuery, Sort};
 use magnetar_core::release::{self, ReleaseAttrs};
@@ -610,6 +613,125 @@ impl From<LivenessHistory> for FfiLivenessHistory {
                 })
                 .collect(),
             keep_days: h.keep_days,
+        }
+    }
+}
+
+/// Chart counts with display labels (`release::facet_label` of the field's facet).
+pub fn breakdowns(s: BreakdownSet, source: &str, server_error: Option<String>) -> FfiBreakdownSet {
+    FfiBreakdownSet {
+        total: s.total,
+        breakdowns: s
+            .breakdowns
+            .into_iter()
+            .map(|b| {
+                let facet = if b.field == "subcategory" {
+                    "category_path"
+                } else {
+                    b.field.as_str()
+                };
+                FfiBreakdown {
+                    counts: b
+                        .counts
+                        .into_iter()
+                        .map(|c| FfiFacetCount {
+                            label: release::facet_label(facet, &c.value),
+                            value: c.value,
+                            count: c.count,
+                        })
+                        .collect(),
+                    field: b.field,
+                    total: b.total,
+                    other: b.other,
+                    other_values: b.other_values,
+                    missing: b.missing,
+                }
+            })
+            .collect(),
+        computed_at: s.computed_at,
+        source: source.into(),
+        server_error,
+    }
+}
+
+impl From<TimeseriesSet> for FfiTimeseriesSet {
+    fn from(s: TimeseriesSet) -> Self {
+        Self {
+            since: s.since,
+            until: s.until,
+            series: s
+                .series
+                .into_iter()
+                .map(|t| FfiTimeseries {
+                    metric: t.metric,
+                    kind: t.kind,
+                    bucket: t.bucket,
+                    points: t
+                        .points
+                        .into_iter()
+                        .map(|p| FfiTimeseriesPoint {
+                            at: p.at,
+                            value: p.value,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<StatsHealth> for FfiStatsHealth {
+    fn from(h: StatsHealth) -> Self {
+        let idx = h.search_index.as_ref();
+        Self {
+            torrents: h.torrents,
+            liveness: h.liveness.map(Into::into),
+            index_state: idx.map(|i| i.state.clone()),
+            index_pending: idx.map_or(0, |i| i.pending),
+            index_lag_secs: idx.and_then(|i| i.lag_secs),
+            relays_total: h.relays.total,
+            relays_enabled: h.relays.enabled,
+            relays_ok_24h: h.relays.ok_24h,
+            relays_failing: h.relays.failing,
+            relays_productive: h.relays.productive,
+            crawler_running: h.crawler.running,
+            crawler_last_run: h.crawler.last_run,
+            crawler_last_error: h.crawler.last_error,
+            media_linked: h.media_linked,
+            attrs_missing: h.attrs_missing,
+            computed_at: h.computed_at,
+        }
+    }
+}
+
+impl From<Graph> for FfiGraph {
+    fn from(g: Graph) -> Self {
+        Self {
+            kind: g.kind,
+            nodes: g
+                .nodes
+                .into_iter()
+                .map(|n| FfiGraphNode {
+                    id: n.id,
+                    kind: n.kind,
+                    label: n.label,
+                    weight: n.weight,
+                    score: n.score,
+                    detail: n.detail,
+                })
+                .collect(),
+            edges: g
+                .edges
+                .into_iter()
+                .map(|e| FfiGraphEdge {
+                    source: e.source,
+                    target: e.target,
+                    weight: e.weight,
+                    kind: e.kind,
+                })
+                .collect(),
+            truncated: g.truncated,
+            note: g.note,
         }
     }
 }

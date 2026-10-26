@@ -464,6 +464,105 @@ pub struct FfiLivenessHistory {
     pub keep_days: u32,
 }
 
+/// Top values of one field (D47 charts); labels as in the filter sheet.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiBreakdown {
+    pub field: String,
+    /// Results counted for this field (every filter but its own).
+    pub total: u64,
+    pub counts: Vec<FfiFacetCount>,
+    /// Sum of the values after the top ones, and how many such values there are.
+    pub other: u64,
+    pub other_values: u64,
+    /// Results without a value (unknown language, …).
+    pub missing: u64,
+}
+
+/// `Magnetar::stats_breakdown`: from the server, else the local cache's counts.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiBreakdownSet {
+    pub total: u64,
+    pub breakdowns: Vec<FfiBreakdown>,
+    pub computed_at: i64,
+    /// "server" | "local" (fewer fields, no cross-filtering).
+    pub source: String,
+    /// Set when the server was asked and failed (or is still building its index).
+    pub server_error: Option<String>,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiTimeseriesPoint {
+    pub at: i64,
+    pub value: i64,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiTimeseries {
+    pub metric: String,
+    /// "counter" | "gauge"
+    pub kind: String,
+    /// "hour" | "day"
+    pub bucket: String,
+    pub points: Vec<FfiTimeseriesPoint>,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiTimeseriesSet {
+    pub since: i64,
+    pub until: i64,
+    pub series: Vec<FfiTimeseries>,
+}
+
+/// `Magnetar::stats_health` (D47): what the server has and how far behind it is.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiStatsHealth {
+    pub torrents: u64,
+    pub liveness: Option<FfiLivenessStats>,
+    /// "building" | "ready" | "error"; None: the index is off.
+    pub index_state: Option<String>,
+    pub index_pending: u64,
+    pub index_lag_secs: Option<i64>,
+    pub relays_total: u64,
+    pub relays_enabled: u64,
+    pub relays_ok_24h: u64,
+    pub relays_failing: u64,
+    pub relays_productive: u64,
+    pub crawler_running: bool,
+    pub crawler_last_run: Option<i64>,
+    pub crawler_last_error: Option<String>,
+    pub media_linked: u64,
+    pub attrs_missing: u64,
+    pub computed_at: i64,
+}
+
+/// A graph node (D47, `core::api::GraphNode` for what `id` is per `kind`).
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiGraphNode {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub weight: f64,
+    pub score: Option<u8>,
+    pub detail: Vec<String>,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiGraphEdge {
+    pub source: u32,
+    pub target: u32,
+    pub weight: f64,
+    pub kind: String,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiGraph {
+    pub kind: String,
+    pub nodes: Vec<FfiGraphNode>,
+    pub edges: Vec<FfiGraphEdge>,
+    pub truncated: bool,
+    pub note: Option<String>,
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiRelay {
     pub url: String,
@@ -1025,6 +1124,71 @@ impl Magnetar {
             return Ok(None);
         };
         self.run(move |_| async move { Ok(api.liveness_history(&ih, days).await?.map(Into::into)) })
+            .await
+    }
+
+    /// Chart counts (D47): the top `top` values of each of `fields` ("language", "resolution",
+    /// "source", "codec", "hdr", "audio", "category", "subcategory", "genre", "year",
+    /// "media_kind", …) under `query`'s filters, each field without its own filter. From the
+    /// server; without one, or when it fails or still builds its index, the local cache's
+    /// unfiltered counts of the fields it can answer (`source` "local", `server_error` set if
+    /// the server was asked).
+    pub async fn stats_breakdown(
+        &self,
+        query: FfiSearchQuery,
+        fields: Vec<String>,
+        top: u32,
+    ) -> Result<FfiBreakdownSet, FfiError> {
+        let q = self.inner.query(query);
+        self.run(move |inner| async move {
+            let mut server_error = None;
+            if let Some(api) = inner.api() {
+                let r = magnetar_core::api::BreakdownRequest {
+                    query: q,
+                    fields: fields.clone(),
+                    top,
+                };
+                match api.stats_breakdown(&r).await {
+                    Ok(set) => return Ok(convert::breakdowns(set, "server", None)),
+                    Err(e) => server_error = Some(e.to_string()),
+                }
+            }
+            let top = if top == 0 { 10 } else { top.min(50) } as usize;
+            let set = inner.store.local_breakdown(&fields, top)?;
+            Ok(convert::breakdowns(set, "local", server_error))
+        })
+        .await
+    }
+
+    /// Activity series (D47): `metrics` among "torrents_added", "torrents_total",
+    /// "torrents_published", "relays_discovered", "crawl_events", "liveness_checks",
+    /// "db_size"; `bucket` "hour" | "day"; `since` None = the server's default window.
+    /// Server only: `Invalid` offline, `Server{404}` from servers older than D47.
+    pub async fn stats_timeseries(
+        &self,
+        metrics: Vec<String>,
+        bucket: String,
+        since: Option<i64>,
+    ) -> Result<FfiTimeseriesSet, FfiError> {
+        let api = self.inner.require_api()?;
+        self.run(move |_| async move {
+            Ok(api.stats_timeseries(&metrics, &bucket, since).await?.into())
+        })
+        .await
+    }
+
+    /// The server's health summary (D47). Server only, like `stats_timeseries`.
+    pub async fn stats_health(&self) -> Result<FfiStatsHealth, FfiError> {
+        let api = self.inner.require_api()?;
+        self.run(move |_| async move { Ok(api.stats_health().await?.into()) })
+            .await
+    }
+
+    /// A network graph (D47): `path` is "wot", "relays", "media/{id}" or "swarm/{infohash}".
+    /// None: unknown media/infohash or a server older than D47. Server only.
+    pub async fn graph(&self, path: String) -> Result<Option<FfiGraph>, FfiError> {
+        let api = self.inner.require_api()?;
+        self.run(move |_| async move { Ok(api.graph(&path).await?.map(Into::into)) })
             .await
     }
 

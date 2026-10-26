@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
+use magnetar_core::api::{Breakdown, BreakdownSet, FacetCount};
 use magnetar_core::error::{Error, Result};
 use magnetar_core::model::*;
 use magnetar_core::query::{SearchPage, SearchQuery, Sort, fts5_match};
@@ -24,6 +25,18 @@ pub const MAX_BACKOFF_SECS: i64 = 24 * 3600;
 const BACKOFF_BASE_SECS: i64 = 60;
 /// Infohashes parsed per `backfill_attrs` call (one lock for the read, one for the write).
 pub const ATTRS_CHUNK: usize = 500;
+/// Breakdown fields the cache answers offline (D47): (field, `ReleaseAttrs` JSON key, list).
+pub const LOCAL_FIELDS: &[(&str, &str, bool)] = &[
+    ("category", "category", false),
+    ("language", "languages", true),
+    ("subtitles", "subtitles", true),
+    ("resolution", "resolution", false),
+    ("source", "source", false),
+    ("codec", "video_codec", false),
+    ("hdr", "hdr", true),
+    ("audio", "audio", true),
+    ("channels", "channels", false),
+];
 const REPLACEABLE_KINDS: &[u16] = &[
     KIND_PROFILE,
     KIND_CONTACTS,
@@ -1519,6 +1532,78 @@ impl SqliteStore {
             relays: count("SELECT COUNT(*) FROM relays")?,
             unsynced: count("SELECT COUNT(*) FROM sync_ids WHERE synced = 0")?,
             db_bytes: db_bytes(&conn)?,
+        })
+    }
+
+    /// Offline charts (D47): counts of the cached torrents for the fields the cache can answer
+    /// without the server (category, and the release attributes parsed on the phone); other
+    /// fields are left out. No filters: cross-filtering needs the server.
+    pub fn local_breakdown(&self, fields: &[String], top: usize) -> Result<BreakdownSet> {
+        let conn = self.conn();
+        let total: i64 = conn
+            .query_row("SELECT COUNT(DISTINCT infohash) FROM torrents", [], |r| {
+                r.get(0)
+            })
+            .db()?;
+        let total = total.max(0) as u64;
+        let mut out = Vec::new();
+        for field in fields {
+            // The value counts, and how many torrents have a value at all.
+            let (values, with) = match LOCAL_FIELDS.iter().find(|(f, _, _)| f == field) {
+                Some((_, "category", _)) => (
+                    "SELECT category, COUNT(DISTINCT infohash) FROM torrents GROUP BY 1"
+                        .to_string(),
+                    "SELECT COUNT(DISTINCT infohash) FROM torrents".to_string(),
+                ),
+                Some((_, key, false)) => (
+                    format!(
+                        "SELECT json_extract(attrs, '$.{key}') AS v, COUNT(*) FROM torrent_attrs
+                         WHERE v IS NOT NULL GROUP BY 1"
+                    ),
+                    format!(
+                        "SELECT COUNT(*) FROM torrent_attrs
+                         WHERE json_extract(attrs, '$.{key}') IS NOT NULL"
+                    ),
+                ),
+                Some((_, key, true)) => (
+                    format!(
+                        "SELECT j.value, COUNT(*)
+                         FROM torrent_attrs, json_each(torrent_attrs.attrs, '$.{key}') j GROUP BY 1"
+                    ),
+                    format!(
+                        "SELECT COUNT(*) FROM torrent_attrs
+                         WHERE json_array_length(attrs, '$.{key}') > 0"
+                    ),
+                ),
+                None => continue,
+            };
+            let mut st = conn.prepare(&values).db()?;
+            let mut counts: Vec<FacetCount> = st
+                .query_map([], |r| {
+                    Ok(FacetCount {
+                        value: r.get::<_, String>(0)?,
+                        count: r.get::<_, i64>(1)?.max(0) as u64,
+                    })
+                })
+                .db()?
+                .collect::<rusqlite::Result<_>>()
+                .db()?;
+            counts.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
+            let with: i64 = conn.query_row(&with, [], |r| r.get(0)).db()?;
+            let rest = counts.split_off(top.min(counts.len()));
+            out.push(Breakdown {
+                field: field.clone(),
+                total,
+                counts,
+                other: rest.iter().map(|c| c.count).sum(),
+                other_values: rest.len() as u64,
+                missing: total.saturating_sub(with.max(0) as u64),
+            });
+        }
+        Ok(BreakdownSet {
+            total,
+            breakdowns: out,
+            computed_at: magnetar_core::now(),
         })
     }
 
