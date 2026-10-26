@@ -10,7 +10,8 @@ Nostr ingest, the adult filter on every search path, and the enrichers / attrs b
 rows (§15), then **product integration and ops** (§16): DHT torrents in the search index,
 facets, SQL fallback, detail and API (`origin`, D73), the crawler's live stats and health
 fields (D74), UPnP port mapping and the Docker overlay (D72), the app's source badge, Source
-chips, Stats and Status (D74), and a 10-minute live run on a production copy (D75).
+chips, Stats and Status (D74), and a 10-minute live run on a production copy (D75). The final
+integration check (§17) found nothing to fix.
 Each section says which stage builds it (§12); later stages update this file as they land.
 
 Research behind it: [research/dht-crawling.md](research/dht-crawling.md),
@@ -857,6 +858,7 @@ blocked names anywhere; nothing from the DHT is published to Nostr.
 | 2 (built, §14) | `core::metainfo` BEP 3/10/9 fetcher, v1/hybrid/v2 verification; **pulled forward from stage 4**: fetch workers, `server::dht::persist` (dht_torrents + attrs batches, alias rows, final statuses), the fail-closed content-screen seam (D65) | fake-peer tests (reject, short piece, wrong hash, hybrid, private, duplicate keys, LAN/loopback peer refused), a real librqbit seed, Postgres storage tests, bounded live fetch of sampled hashes |
 | 3 (built, §15) | `core::classify`, `core::blocklist`, `Rejection::Blocked`, `scripts/blocklist-hash.sh`; **pulled forward from stage 5/7**: `SearchQuery.include_adult` on the index (`SCHEMA_VERSION` 3), SQL fallback and phone, the app's adult switch; enrichers and attrs backfill on `torrent_rows` | accuracy sample, blocklist vectors (hashed, every name/path variant), Nostr ingest rejection (description/hashtags too), no-name-in-logs test at `TRACE` |
 | 4 (built, §16; swarm stage "product integration and ops", covers the planned 5–7 except the sweep) | `torrent_rows` readers (index documents, detail, SQL fallback), index `SCHEMA_VERSION` 4 (origin, eligible_trust), API/ffi types, UPnP, `docker/compose.dht.yml`, stats/health, app badge, Source chips, Stats/Status | both search paths, `EXPLAIN`, fake gateway, stats API, Android unit tests, 10-min live run on a production copy |
+| final (§17) | no new features | merge onto `main`, migrations from scratch and on a production copy, gates, debug APK + app unit tests, Docker image, 10-min live run on a production copy with every DHT API surface smoke-tested |
 | 5 (open) | the Nostr **sweep** of §7.1 (stored events re-screened when the blocklist version moves, vacuum + index merge) | not built yet |
 | 8 | live tuning on the laptop | rates, hit rate, resources, disk per torrent |
 
@@ -1271,3 +1273,64 @@ run: they arise only when a Nostr event arrives later for a DHT hash); the cost 
 `DhtStats` totals query (`count(*)` on `dht_torrents` and `dht_seen`, cached 60 s, one refresh
 at a time, 5 s statement timeout after which the last value is kept) at millions of rows; the cause of the end-of-run latency outlier; the Nostr sweep of §7.1
 (not built).
+
+## 17. Final integration check (2026-10-26, no new features)
+
+- **Merge**: `main` (`cb5dd61`) is an ancestor of `dht/crawler`; `git merge-tree` is clean (the
+  merge is a fast-forward).
+- **Migrations from scratch** (empty database, release build): all 11 applied, 624 ms of
+  migration time in total (38–81 ms each, `20261101000000_dht` 70 ms); a second `migrate` is a
+  no-op.
+- **Production copy**: `pg_dump -Fc` from `magnetar-db-1` (read-only, 230 s, 1.80 GB), restored
+  with `pg_restore -j 4` into `dht_final_prod` on the test Postgres (~9 min): 501 854
+  infohashes, 507 022 events, 8.40 GB, migrated to `20261031000000`. The DHT migration took
+  **47.8 ms** (114 ms for the whole `migrate` process).
+- **Gates**: `cargo fmt --check`, `clippy --workspace --all-targets --all-features -D warnings`,
+  `cargo test --workspace --all-features` (480 passed, 0 failed, 23 ignored network tests);
+  `scripts/build-android.sh` with `assembleDebug testDebugUnitTest --rerun`: debug APK built,
+  37 app unit tests passed. Docker: `docker build` 354 s, image 167 MB, `--version` →
+  `magnetar-server 0.2.0`, runs as uid 10001; image removed afterwards.
+- **Live run** (release build, home IP, aggressive, 4 virtual nodes on UDP 16891–16894,
+  `MAGNETAR_DHT_UPNP=false`, no router port opened; daemons as in §16 (downloads, NIP-66, IMDb,
+  anime datasets off; Nostr crawl 2 relays); fresh index directory, so the `SCHEMA_VERSION` 4
+  index was built from nothing while crawling). 614 s from start to exit:
+
+| | |
+|---|---|
+| index build (502 k documents, crawler and seed checks running) | **132 s**, 405 MB |
+| unique hashes / queued / given to peer collection | 11 855 / 11 653 / 5 114 |
+| metadata verified / stored | 1 152 / **1 146** (~113/min once running), 31.3 % of finished fetches |
+| adult / blocked | 193 (16.8 %) / 6 (counted by number only) |
+| categories | video 537, porn 193, audio 131, book 96, other 64, application 55, game 39, anime 24, picture 7 |
+| KRPC | 196 q/s in the first 15 s, then 151 → 99 q/s with the **probe brake on from second 55 to the end** (D66); 58–62 % answered; 43–73 incoming queries/min without an open port |
+| whole server | 224.9 s CPU in 613 s = 37 % of a core (index build included); peak RSS 852 MB |
+| database growth | +10.98 MB = 9.6 KB per stored torrent; `dht_torrents` 6.50 MB (5.7 KB each), `dht_seen` 1.88 MB for 10 504 rows |
+| stop | SIGINT → exit in < 1 s; `dht.identity` and `dht.nodes` (1000 contacts) saved; UDP and TCP ports released |
+| log | 0 errors; 161 warnings: 43 probe-brake notices, 118 sqlx slow-statement (104) / slow-acquire (14) notices, 114 of them during the index build and 4 at shutdown |
+
+Search latency (`POST /api/v1/search`, loopback, the §16 set of 48 queries × 5 runs):
+
+| when | p50 | p95 | p99 | max |
+|---|---|---|---|---|
+| index just ready (crawl, minute 2.5) | 11.3 ms | 20.6 ms | 26.4 ms | 28.5 ms |
+| crawl, minute 5 | 9.6 | 23.0 | 31.5 | 39.2 |
+| crawl, minute 9 | 10.8 | 23.1 | 32.7 | 35.1 |
+| restart with `MAGNETAR_DHT=off` (index reused, ready in 840 ms; 953 DHT documents shown) | 9.4 | 18.3 | 22.2 | 24.0 |
+
+The §16 end-of-run outlier (p95 81.6 ms) was not reproduced. Slowest query in every sample:
+`game of thrones s01` (file match, 24–39 ms p95).
+
+**Smoke test** (all passed, during the crawl): `/health` features `origin` and `dht` (and
+without the crawler: `origin` only, `stats.dht` null); `GET /api/v1/search?origin=dht&min_trust=100`
+→ DHT-only hits with empty publisher and no adult category; `adult=1` adds the adult ones
+(270 → 317 at that moment); `origin=bogus` → 400; `POST` search with `origins` and
+`include_adult`; `GET` / `POST /api/v1/facets` with `origin`; `/api/v1/stats/breakdown?field=origin`;
+torrent detail of a DHT-only hash (`summary.origin = dht`, `dht` block, trust factor `dht`, empty
+pubkey); swarm graph of a DHT hash; `/api/v1/stats.dht`; `/api/v1/stats/health.dht`;
+`/api/v1/stats/timeseries?metric=dht_torrents_added,dht_hashes_seen`.
+
+**Not verified here**: UPnP against the real router or from a container, inbound reachability
+with mapped ports, the app on a phone, the Docker image running the crawler (only `--version`),
+the Nostr ingest `blocked` rejection over HTTP (covered by the Postgres tests only: building a
+live blocked event would mean looking at the list), and a latency baseline on this copy before
+any DHT row (the index was built during the crawl; §16 measured 16.3 ms p95 before).

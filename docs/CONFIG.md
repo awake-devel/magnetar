@@ -103,7 +103,7 @@ The Postgres credentials and volumes are described in docs/DOCKER.md.
 
 ### DHT crawler (stages 1–4: discovery, metadata fetch, classification and blocklist, search and ops)
 
-Designed in docs/DHT.md (ARCHITECTURE.md D49–D70). Stage 1 implements discovery: BEP 51
+Designed in docs/DHT.md (ARCHITECTURE.md D49–D75). Stage 1 implements discovery: BEP 51
 sampling, passive capture, triage into `dht_seen` and peer collection; stage 2 downloads and
 verifies each torrent's metadata from its peers (BEP 9, TCP); stage 3 classifies it (category,
 adult tag) and passes every name through the hard illegal-content blocklist before anything
