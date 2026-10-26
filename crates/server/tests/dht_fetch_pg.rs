@@ -580,6 +580,9 @@ async fn pipeline_fetches_and_stores_from_a_fake_seeder() {
         queue_cap: 1000,
         fetch_concurrency: 8,
         metadata_max: 1 << 20,
+        tcp_rate: 1000,
+        tcp_max: 350,
+        probe: Vec::new(),
         screen: Some(Arc::new(MarkerScreen)),
     };
     let (_tx, stop) = tokio::sync::watch::channel(false);

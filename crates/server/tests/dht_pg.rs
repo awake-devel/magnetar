@@ -386,6 +386,9 @@ fn opts(ports: usize) -> DhtOptions {
         queue_cap: 1000,
         fetch_concurrency: 8,
         metadata_max: 1 << 20,
+        tcp_rate: 1000,
+        tcp_max: 350,
+        probe: Vec::new(),
         screen: None,
     }
 }

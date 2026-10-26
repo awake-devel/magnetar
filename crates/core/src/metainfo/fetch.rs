@@ -3,7 +3,8 @@
 //! Per peer: connect (3 s) → BEP 3 handshake with the BEP 10 bit → the peer's handshake (it must
 //! set the bit too) → our extended handshake → the peer's (5 s from the connect) →
 //! every 16 KiB block requested at once → blocks checked and assembled → hash of the raw bytes
-//! (whole peer 10 s). Per hash: ≤ 12 peers, ≤ 4 at once, 30 s. Global: ≤ 25 new connections/s,
+//! (whole peer 10 s). Per hash: ≤ 12 peers, ≤ 4 at once, 30 s. Global: ≤ 150 connection attempts/s and ≤ 350 open
+//! connections (router benchmark, D66),
 //! 256 MiB of metadata in flight, 4 decodes at once (each reserving 3 × its size more from a
 //! decode budget of its own).
 //!
@@ -59,7 +60,10 @@ pub struct FetchConfig {
     pub metadata_max: usize,
     /// Global bytes of metadata buffered at once.
     pub inflight_max: usize,
+    /// New TCP connection attempts per second, all fetches (each SYN is a router NAT entry).
     pub connects_per_sec: u32,
+    /// TCP connections open at once, all fetches.
+    pub max_connections: usize,
     pub decode_parallel: usize,
     /// `v` in our extended handshake.
     pub client: String,
@@ -78,7 +82,10 @@ impl Default for FetchConfig {
             parallel: 4,
             metadata_max: 16 * 1024 * 1024,
             inflight_max: 256 * 1024 * 1024,
-            connects_per_sec: 25,
+            // Router benchmark on the user's neufbox (docs/research/router-bench.md): 200
+            // attempts/s safe, 400 breaks; ~440 open connections held. ~30 % under the knees.
+            connects_per_sec: 150,
+            max_connections: 350,
             decode_parallel: 4,
             client: format!("Magnetar {}", env!("CARGO_PKG_VERSION")),
             allow_loopback: false,
@@ -279,6 +286,10 @@ struct Inner {
     /// release it.
     decode_budget: Semaphore,
     connects: Mutex<Pace>,
+    /// Open TCP connections.
+    conns: Semaphore,
+    /// While in the future, connection attempts are paced at half the rate (D66).
+    braked_until: Mutex<Option<Instant>>,
     c: Counters,
 }
 
@@ -353,9 +364,19 @@ impl Fetcher {
                 decode: Semaphore::new(cfg.decode_parallel.max(1)),
                 decode_budget: Semaphore::new(decode_units),
                 connects: Mutex::new(Pace::new(cfg.connects_per_sec.max(1), now)),
+                conns: Semaphore::new(cfg.max_connections.clamp(1, Semaphore::MAX_PERMITS)),
+                braked_until: Mutex::new(None),
                 c: Counters::default(),
                 cfg,
             }),
+        }
+    }
+
+    /// Halve the connection-attempt rate until `until` (router health probe, D66).
+    pub fn brake_until(&self, until: Instant) {
+        let mut b = self.inner.braked_until.lock().unwrap();
+        if b.is_none_or(|u| u < until) {
+            *b = Some(until);
         }
     }
 
@@ -519,13 +540,22 @@ impl Fetcher {
             return Err(PeerError::Filtered);
         }
         let cfg = &self.inner.cfg;
-        // Global new-connection pace (home router conntrack, docs/DHT.md §4 step 7).
-        let at = self
+        // Global bounds (home router NAT, docs/DHT.md §4 step 7): open connections, then the
+        // attempt pace (halved while the health probe brakes, D66).
+        let _conn = self
             .inner
-            .connects
+            .conns
+            .acquire()
+            .await
+            .map_err(|_| PeerError::Closed)?;
+        let now = Instant::now();
+        let braked = self
+            .inner
+            .braked_until
             .lock()
             .unwrap()
-            .reserve(Instant::now(), false);
+            .is_some_and(|u| now < u);
+        let at = self.inner.connects.lock().unwrap().reserve(now, braked);
         tokio::time::sleep_until(at).await;
         let stream = tokio::time::timeout(cfg.connect_timeout, TcpStream::connect(addr))
             .await

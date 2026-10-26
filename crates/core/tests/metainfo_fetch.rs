@@ -494,3 +494,54 @@ async fn no_peers_and_the_peer_cap() {
     assert_eq!(err.peers_tried, 12);
     assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
 }
+
+#[tokio::test]
+async fn open_connections_are_capped() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // A peer that holds every connection silently and records the peak of open ones.
+    let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let addr = match l.local_addr().unwrap() {
+        std::net::SocketAddr::V4(a) => a,
+        _ => unreachable!(),
+    };
+    let open = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let (o, pk) = (open.clone(), peak.clone());
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            let (o, pk) = (o.clone(), pk.clone());
+            tokio::spawn(async move {
+                let n = o.fetch_add(1, Ordering::SeqCst) + 1;
+                pk.fetch_max(n, Ordering::SeqCst);
+                let mut buf = [0u8; 256];
+                while let Ok(k) = s.read(&mut buf).await {
+                    if k == 0 {
+                        break;
+                    }
+                }
+                o.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+    });
+    let f = Fetcher::new(FetchConfig {
+        allow_loopback: true,
+        connects_per_sec: 1000,
+        max_connections: 3,
+        peer_timeout: Duration::from_millis(400),
+        handshake_timeout: Duration::from_millis(300),
+        ..FetchConfig::default()
+    });
+    // 6 hashes × 4 parallel peers would open 24 at once without the cap.
+    let jobs: Vec<_> = (0..6u8)
+        .map(|i| {
+            let f = f.clone();
+            tokio::spawn(async move { f.fetch([i; 20], &[addr; 4]).await })
+        })
+        .collect();
+    for j in jobs {
+        assert!(j.await.unwrap().is_err());
+    }
+    assert!(peak.load(Ordering::SeqCst) <= 3, "{peak:?}");
+    assert!(peak.load(Ordering::SeqCst) >= 1);
+}

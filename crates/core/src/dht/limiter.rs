@@ -140,6 +140,16 @@ impl Brake {
         self.until.is_some_and(|u| now < u)
     }
 
+    /// Engage (or extend) the brake from outside, e.g. the router health probe (D66).
+    pub fn engage_until(&mut self, until: Instant) {
+        if self.until.is_none_or(|u| u < until) {
+            if !self.until.is_some_and(|u| Instant::now() < u) {
+                self.engaged += 1;
+            }
+            self.until = Some(until);
+        }
+    }
+
     fn share(&self, last: usize) -> Option<(f64, f64)> {
         let n = self.seconds.len().min(last);
         let (s, a) = self

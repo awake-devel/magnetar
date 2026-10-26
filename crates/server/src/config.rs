@@ -242,6 +242,20 @@ pub struct Config {
     /// Largest info dict fetched, in bytes (BEP 9 sets no limit).
     #[arg(long, env = "MAGNETAR_DHT_METADATA_MAX", default_value_t = 16 * 1024 * 1024, value_parser = clap::value_parser!(u64).range(16_384..=67_108_864))]
     pub dht_metadata_max: u64,
+    /// New TCP connection attempts per second for metadata fetches (router benchmark: 200
+    /// safe, 400 breaks the user's router; docs/research/router-bench.md).
+    #[arg(long, env = "MAGNETAR_DHT_TCP_RATE", default_value_t = 150, value_parser = clap::value_parser!(u32).range(1..=2000))]
+    pub dht_tcp_rate: u32,
+    /// TCP connections open at once for metadata fetches (benchmark: ~440 held).
+    #[arg(long, env = "MAGNETAR_DHT_TCP_MAX", default_value_t = 350, value_parser = clap::value_parser!(u32).range(1..=10_000))]
+    pub dht_tcp_max: u32,
+    /// Router health probe: TCP-connect targets, comma-separated, or `off`.
+    #[arg(
+        long,
+        env = "MAGNETAR_DHT_PROBE",
+        default_value = "1.1.1.1:443,9.9.9.9:443"
+    )]
+    pub dht_probe: String,
 }
 
 impl Config {

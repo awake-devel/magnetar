@@ -101,23 +101,28 @@ The Postgres credentials and volumes are described in docs/DOCKER.md.
 | `liveness.enabled` | bool | |
 | `ntfy.url`, `ntfy.topic` | string | from env |
 
-### DHT crawler (stage 1: discovery only)
+### DHT crawler (stages 1–2: discovery and metadata fetch)
 
-Designed in docs/DHT.md (ARCHITECTURE.md D49–D62). Stage 1 implements discovery: BEP 51
-sampling, passive capture, triage into `dht_seen` and peer collection. No metadata is fetched
-and nothing reaches search yet. Rows marked *planned* do nothing so far.
+Designed in docs/DHT.md (ARCHITECTURE.md D49–D65). Stage 1 implements discovery: BEP 51
+sampling, passive capture, triage into `dht_seen` and peer collection; stage 2 downloads and
+verifies each torrent's metadata from its peers (BEP 9, TCP). Nothing named is stored until the
+illegal-content blocklist (stage 3) exists: fetched metadata is counted and dropped (D65), so
+nothing reaches search yet. Rows marked *planned* do nothing so far.
 
 | Variable | Default | Notes |
 |---|---|---|
 | `MAGNETAR_DHT` | `off` | `off`, `polite` (BEP 51 sampling only, read-only node) or `aggressive` (sampling + passive listening on open UDP ports, UPnP). Crawling shows the host's IP in swarms: opt in deliberately |
 | `MAGNETAR_DHT_PORT` | `6891` | first UDP port (aggressive); virtual node *i* uses `PORT + i` |
 | `MAGNETAR_DHT_NODES` | `4` aggressive, `1` polite | 1–8 (BEP 42 gives 8 valid node-id prefixes per IPv4 address) |
-| `MAGNETAR_DHT_QPS` | `200` / `50` | outbound DHT queries per second, all kinds |
+| `MAGNETAR_DHT_QPS` | `200` / `50` | outbound DHT queries per second, all kinds (router benchmark: 300 safe, 400 breaks the neufbox) |
 | `MAGNETAR_DHT_POOL` | `1000000` / `200000` | nodes kept for sampling (1000–20000000) |
 | `MAGNETAR_DHT_FETCH_KNOWN` | `false` | also queue infohashes already known from Nostr |
 | `MAGNETAR_DHT_PEER_LOOKUPS` | `64` / `8` | peer collections running at once (1–512) |
-| `MAGNETAR_DHT_FETCH_CONCURRENCY` | `128` / `16` | *planned (stage 2)*: metadata fetches in flight |
-| `MAGNETAR_DHT_METADATA_MAX` | `16777216` | *planned (stage 2)*: largest info dictionary accepted, bytes |
+| `MAGNETAR_DHT_FETCH_CONCURRENCY` | `128` / `16` | metadata fetches in flight (1–2048); each opens ≤ 4 TCP connections at once, within the two limits below |
+| `MAGNETAR_DHT_TCP_RATE` | `150` | new TCP connection attempts per second, all fetches (1–2000). Each attempt is a NAT entry on the router: on the user's SFR neufbox 200/s was safe and 400/s cut the line (docs/research/router-bench.md) |
+| `MAGNETAR_DHT_TCP_MAX` | `350` | TCP connections open at once (1–10000); the same router held ~440 |
+| `MAGNETAR_DHT_PROBE` | `1.1.1.1:443,9.9.9.9:443` | router health probe: one TCP connect every 5 s, alternating targets; when latency triples (or ≥ 40 ms more) or 3 of 6 fail, DHT queries and TCP attempts are halved for 5 min. `off` disables it. ICMP is not used: blocked or rate-limited on that line |
+| `MAGNETAR_DHT_METADATA_MAX` | `16777216` | largest info dictionary accepted, bytes (16384–67108864); larger torrents are marked `oversize` and not retried |
 | `MAGNETAR_DHT_UPNP` | `true` in aggressive | *planned (stage 6)*: map the UDP ports on the router |
 | `MAGNETAR_DHT_UPNP_GATEWAY` | the default gateway | *planned (stage 6)*: router address for a unicast SSDP search; required in Docker |
 | `MAGNETAR_DHT_UPNP_LOCAL_IP` | detected | *planned (stage 6)*: LAN address the router forwards to; required in Docker (the host's address) |

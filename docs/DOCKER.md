@@ -252,7 +252,9 @@ docker compose -f compose.yml -f docker/compose.dht.yml up -d
 UPnP from inside a container needs two variables, because SSDP multicast does not leave
 Docker's bridge network and the container only knows its bridge address:
 `MAGNETAR_DHT_UPNP_GATEWAY=<router LAN address>` and `MAGNETAR_DHT_UPNP_LOCAL_IP=<this host's
-LAN address>`. Only UDP is mapped; the crawler never accepts incoming TCP connections. The
+LAN address>`. Only UDP is mapped; the crawler never accepts incoming TCP connections (the
+metadata fetch of stage 2 only opens **outgoing** TCP connections to peers, which need no
+published port). The
 overlay and these variables arrive with the UPnP stage; until then nothing here is active.
 
 ## Platform notes

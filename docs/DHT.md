@@ -1,11 +1,13 @@
 # DHT crawler (ARCHITECTURE.md D49–D58)
 
-Design document for the native Mainline DHT crawler. Status: **stage 1 (discovery) built**:
-KRPC node, BEP 42 ids, routing, crawl pool, BEP 51 sampler, passive capture, peer collection,
-the migration of §2.3, triage, the persisted `dht_seen` queue, the `dht` CLI and the `serve`
-daemon (§13 has what was built and measured). No metadata is fetched yet (stage 2), so
-`dht_torrents` stays empty. Each section says which stage builds it (§12); later stages update
-this file as they land.
+Design document for the native Mainline DHT crawler. Status: **stages 1 (discovery) and 2
+(metadata fetch) built**: KRPC node, BEP 42 ids, routing, crawl pool, BEP 51 sampler, passive
+capture, peer collection, the migration of §2.3, triage, the persisted `dht_seen` queue, the
+`dht` CLI and the `serve` daemon (§13), then the BEP 3/10/9 fetcher, fetch workers and the
+`dht_torrents` writer behind a fail-closed content screen (§14). **Until the stage 3 blocklist
+is installed as that screen, nothing named is stored** (D65): fetched metadata is verified,
+counted and dropped, so `dht_torrents` stays empty in a real deployment. Each section says
+which stage builds it (§12); later stages update this file as they land.
 
 Research behind it: [research/dht-crawling.md](research/dht-crawling.md),
 [research/bitmagnet.md](research/bitmagnet.md), [research/bittorrent.md](research/bittorrent.md),
@@ -313,7 +315,8 @@ core/src/metainfo/     (feature "dht-crawl", stage 2)
 core/src/classify.rs   category + adult tagging from name and files (stage 3, no feature: pure)
 core/src/blocklist/    hard illegal-content matcher (stage 3, no feature: Nostr ingest uses it too)
 server/src/dht/        daemon: mod.rs (pipeline, report), seen.rs (Bloom), queue.rs (fetch queue),
-                       store.rs (triage, leases, identity) — stage 1; persist, upnp, stats (4, 6)
+                       store.rs (triage, leases, identity) — stage 1; persist.rs (results →
+                       Postgres), screen.rs (content screen seam, D65) — stage 2; upnp, stats (6)
 ```
 
 ### 3.2 Modes (D49)
@@ -382,6 +385,12 @@ Both modes honour every rule of §3.4 (interval, per-IP rate, honest ids, no fak
 5. **Adaptive brake**: if the answered share over the last 60 s falls below half of its 10-min
    average while > 50 q/s, halve the rate for 5 min (a full router conntrack table or an ISP
    limiter shows up as silence, not errors). Logged and counted in stats.
+   **Second trigger, the router health probe (D66)**: a TCP connect every 5 s to
+   `MAGNETAR_DHT_PROBE` (1.1.1.1:443, 9.9.9.9:443; ICMP is blocked on the user's line and
+   rate-limited by the gateway). Saturated when 3 of the last 6 probes fail or their median
+   exceeds `max(3 × baseline, baseline + 40 ms)` (baseline = 10th percentile of the last 10 min);
+   then KRPC queries **and** TCP connection attempts are halved for 5 min, extended while it
+   lasts. Benchmark: safe rates kept 17–19 ms, saturation gave 122 ms or 100 % loss.
 6. Responses matched on `(transaction id, source address)` (bitmagnet only checks the tid,
    bitmagnet.md §2.6). Transaction ids 2 random bytes per query.
 7. No forged ids, no neighbour trick, no fake `values` or `nodes` (dht-crawling.md §2).
@@ -457,13 +466,13 @@ samples / announces / get_peers ──► seen filter (2 × Bloom) ──► bat
   swarm and sampling node are the likeliest to still be there); overflow drops the
   lowest-priority oldest entry (the hash stays `queued` in `dht_seen` and is retried by the slow
   retry loop).
-- **Stage 1 consumer**: peer collection (64 workers aggressive, 8 polite,
+- **Consumers**: peer collection (64 workers aggressive, 8 polite,
   `MAGNETAR_DHT_PEER_LOOKUPS`): announcer, else `get_peers` to the sampling node, else an
   iterative lookup (≤ 10 s, stops at 12 peers). No peer at all → `failed` / `no_peers` with the
-  backoff below. Hashes with peers keep their lease until stage 2's fetcher consumes them: in
-  stage 1 alone that lease expires every hour and the retry loop collects their peers again
-  (≤ 1000 rows a minute, lowest priority), indefinitely — harmless while the stage 1 build is
-  only run for measurements, wasteful if `serve` ran it for days.
+  backoff below. Hashes with peers go through a bounded channel (capacity = fetch workers, so
+  collection blocks while every fetcher is busy) to `MAGNETAR_DHT_FETCH_CONCURRENCY` fetch
+  workers (stage 2); results are written by one persister in batches (§2.4, §14). A fetch cut
+  short by a stop keeps its lease and comes back through the retry loop.
 - **Retry loop**: every minute, ≤ 1000 `dht_seen` rows with `next_attempt_at <= now` re-enter at
   priority 0. Backoff after a failed fetch: 1 h, 6 h, 24 h, then `next_attempt_at = NULL` (4
   attempts). `invalid`, `private`, `v2_only`, `oversize`, `alias` are final. Measured size:
@@ -551,11 +560,23 @@ mapping is UNVERIFIED (dht-crawling.md §6.2), and the wire format is ~150 LOC).
    `name.utf-8`) is not dropped from the blocklist input (§7.2).
 7. **Bounds**: connect 3 s, handshake + extended handshake 5 s, whole peer 10 s; global
    in-flight bytes budget 256 MiB (a fetch reserves `metadata_size` before requesting); global
-   new-TCP-connection rate ≤ 25/s (home router conntrack, dht-crawling.md §5); TCP only for now.
+   new-TCP-connection **attempts ≤ 150/s** and **≤ 350 connections open** (D66, measured on the
+   user's router: [research/router-bench.md](research/router-bench.md) — 200 attempts/s safe,
+   400 breaks; ~440 open held; the 25/s first planned here was ~6× too low and starved the
+   fetcher, §14); TCP only for now.
    **uTP later**: the share of uTP-only peers is unmeasured (UNVERIFIED); `librqbit-utp` 0.7.0
    is already in the lockfile and is the first candidate when a live run shows misses from it.
 
 We never accept inbound TCP: we never announce, so no peer has a reason to connect to us.
+
+**As built (stage 2, D64)**, refinements of the steps above: our extended handshake is sent
+only after the peer's handshake showed the BEP 10 bit; a `request` from the peer is answered
+with `reject` (BEP 9 MUST, ≤ 64 per session); other messages are skipped within 4 MiB per peer
+and an `extended` message above 64 KiB ends the peer; decode memory (3 × size per decode)
+comes from a budget of its own, so downloads holding the 256 MiB in-flight budget cannot
+starve the decodes; an announced hash is fetched from the announcer only. After step 6 the
+order is (§7.1): **screen** (D65) → store or block. Stage 2 has no classifier: rows are stored
+with `category = other`, `classifier_version = 0`, which stage 3 re-classifies.
 
 ## 5. Trust treatment and display of DHT results (D51, stage 5)
 
@@ -715,7 +736,8 @@ is checked against the hard tier only; public CSAM hash lists
 ## 8. Ops: configuration (D58)
 
 Server variables. **Built in stage 1**: `MAGNETAR_DHT`, `_PORT`, `_NODES`, `_QPS`, `_POOL`,
-`_FETCH_KNOWN`, `_PEER_LOOKUPS`; the others are still planned (their stage in brackets).
+`_FETCH_KNOWN`, `_PEER_LOOKUPS`; **stage 2**: `_FETCH_CONCURRENCY` (1–2048), `_METADATA_MAX`
+(16 KiB–64 MiB), `_TCP_RATE`, `_TCP_MAX`, `_PROBE`; the others are still planned (their stage in brackets).
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -725,8 +747,11 @@ Server variables. **Built in stage 1**: `MAGNETAR_DHT`, `_PORT`, `_NODES`, `_QPS
 | `MAGNETAR_DHT_QPS` | `200` / `50` | global outbound KRPC queries per second |
 | `MAGNETAR_DHT_POOL` | `1000000` / `200000` | crawl pool size (nodes) |
 | `MAGNETAR_DHT_PEER_LOOKUPS` | `64` / `8` | peer collections (sampling node, then lookup) at once (D62) |
-| `MAGNETAR_DHT_FETCH_CONCURRENCY` | `128` / `16` | metadata fetches in flight (stage 2) |
-| `MAGNETAR_DHT_METADATA_MAX` | `16777216` | bytes, per info dict (stage 2) |
+| `MAGNETAR_DHT_FETCH_CONCURRENCY` | `128` / `16` | metadata fetches in flight |
+| `MAGNETAR_DHT_METADATA_MAX` | `16777216` | bytes, per info dict |
+| `MAGNETAR_DHT_TCP_RATE` | `150` | new TCP connection attempts/s, all fetches (D66) |
+| `MAGNETAR_DHT_TCP_MAX` | `350` | TCP connections open at once (D66) |
+| `MAGNETAR_DHT_PROBE` | `1.1.1.1:443,9.9.9.9:443` | health probe targets, or `off` (D66) |
 | `MAGNETAR_DHT_FETCH_KNOWN` | `false` | also fetch metadata of Nostr-only infohashes |
 | `MAGNETAR_DHT_UPNP` | `true` in aggressive | map the UDP ports on the router (§9) (stage 6) |
 | `MAGNETAR_DHT_UPNP_GATEWAY` | default gateway from `/proc/net/route` | `host[:port]` for a unicast SSDP M-SEARCH (needed in Docker, §9) |
@@ -785,7 +810,7 @@ when that is off. `--dry-run`: no database at all (dedupe in memory). `serve` st
 - `stats_series` metrics: `dht_torrents_added`, `dht_hashes_seen`, `dht_fetch_ok`,
   `dht_fetch_fail`, `dht_blocked`; breakdown field `origin`.
 - Targets on the laptop (to be measured in stage 8): ≤ 25 % of one core, ≤ 400 MB RSS for the
-  crawler, ≤ 8 Mbit/s down, ≤ 25 new TCP connections/s, ~10 k UDP conntrack entries at
+  crawler, ≤ 8 Mbit/s down, ≤ 150 new TCP connections/s (D66), ~10 k UDP conntrack entries at
   200 q/s (30 s unreplied timeout × rate + flows to answering nodes).
 - **Disk, no cap** (user decision): a DHT torrent costs about 4 KB (heap + `search_tsv` GIN +
   attrs + schedule + infohash row ≈ 3 KB, index ≈ 0.7 KB; DHT rows have no description, which is

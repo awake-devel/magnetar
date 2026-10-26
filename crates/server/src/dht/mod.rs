@@ -8,6 +8,7 @@
 //! batches by [`persist`]: verified torrents pass the content [`screen`] first, and without one
 //! nothing named is stored (fail closed until the stage 3 blocklist exists).
 
+pub mod health;
 pub mod persist;
 pub mod queue;
 pub mod screen;
@@ -58,6 +59,12 @@ pub struct DhtOptions {
     pub metadata_max: usize,
     /// The content screen (D53). None: verified metadata is never stored (fail closed).
     pub screen: Option<Arc<dyn Screen>>,
+    /// New TCP connection attempts per second (`MAGNETAR_DHT_TCP_RATE`, D66).
+    pub tcp_rate: u32,
+    /// TCP connections open at once (`MAGNETAR_DHT_TCP_MAX`, D66).
+    pub tcp_max: usize,
+    /// Router health probe targets (`MAGNETAR_DHT_PROBE`; empty = off, D66).
+    pub probe: Vec<SocketAddr>,
     pub mode: Mode,
     pub ports: Vec<u16>,
     pub qps: u32,
@@ -115,6 +122,9 @@ impl DhtOptions {
                 .unwrap_or(if aggressive { 128 } else { 16 }),
             metadata_max: cfg.dht_metadata_max as usize,
             screen: None,
+            tcp_rate: cfg.dht_tcp_rate,
+            tcp_max: cfg.dht_tcp_max as usize,
+            probe: health::parse_targets(&cfg.dht_probe),
         })
     }
 }
@@ -191,6 +201,7 @@ struct Pipeline {
     peer_counts: Mutex<Vec<u32>>,
     fetcher: Fetcher,
     persisted: Mutex<PersistOutcome>,
+    health: Arc<Mutex<health::HealthStats>>,
 }
 
 impl Pipeline {
@@ -260,6 +271,8 @@ pub struct Report {
     pub persist: PersistOutcome,
     pub persist_errors: u64,
     pub bandwidth: Bandwidth,
+    /// Router health probe (D66).
+    pub health: health::HealthStats,
     pub engine: EngineStats,
     pub answered_share: f64,
     pub queries_per_sec: f64,
@@ -369,6 +382,7 @@ fn report(p: &Pipeline, dht: &Dht, started: Instant) -> Report {
         persist: p.persisted.lock().unwrap().clone(),
         persist_errors: get(&p.c.persist_errors),
         bandwidth,
+        health: p.health.lock().unwrap().clone(),
         answered_share: if engine.queries_sent > 0 {
             engine.answered as f64 / engine.queries_sent as f64
         } else {
@@ -759,6 +773,8 @@ pub async fn run(
     let started = Instant::now();
     let fetcher = Fetcher::new(FetchConfig {
         metadata_max: opts.metadata_max,
+        connects_per_sec: opts.tcp_rate,
+        max_connections: opts.tcp_max,
         // The engine's loopback seam (fake networks in tests) opens the fetcher's too.
         allow_loopback: cfg.allow_loopback,
         ..FetchConfig::default()
@@ -771,6 +787,7 @@ pub async fn run(
         peer_counts: Mutex::default(),
         fetcher,
         persisted: Mutex::default(),
+        health: Arc::default(),
         opts,
     });
     let (int_tx, int_rx) = watch::channel(false);
@@ -799,6 +816,13 @@ pub async fn run(
         ));
     }
     drop(jobs_tx);
+    tasks.spawn(health::health_loop(
+        p.opts.probe.clone(),
+        dht.clone(),
+        p.fetcher.clone(),
+        p.health.clone(),
+        int_rx.clone(),
+    ));
     tasks.spawn(backpressure(p.clone(), dht.clone(), int_rx.clone()));
     if let Some(pool) = &db {
         tasks.spawn(retry_loop(p.clone(), pool.clone(), int_rx.clone()));
