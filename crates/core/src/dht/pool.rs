@@ -8,6 +8,9 @@
 //! - A node silent 3 times in a row is dropped; at most 2 entries per IP.
 //! - When full, a new node replaces the worst of 8 random entries (most failures, then
 //!   non-supporters), never one with a query in flight.
+//! - A 16-bit id-prefix index gives lookups seeds close to any target (D61): the routing tables
+//!   hold ~100 contacts per virtual node, nearly all far from a random infohash, so lookups seeded
+//!   from them alone all start at the same few nodes and hit the per-IP limit.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -71,8 +74,14 @@ pub struct Pool {
     index: HashMap<SocketAddrV4, usize>,
     per_ip: HashMap<Ipv4Addr, u8>,
     due: BinaryHeap<Reverse<(Instant, SocketAddrV4)>>,
+    /// Addresses by the first 16 bits of their id (65 536 buckets, ~8 B per entry).
+    by_prefix: Vec<Vec<SocketAddrV4>>,
     evicted: u64,
     dropped_silent: u64,
+}
+
+fn prefix16(id: &NodeId) -> usize {
+    usize::from(u16::from_be_bytes([id[0], id[1]]))
 }
 
 impl Pool {
@@ -83,6 +92,7 @@ impl Pool {
             index: HashMap::new(),
             per_ip: HashMap::new(),
             due: BinaryHeap::new(),
+            by_prefix: vec![Vec::new(); 1 << 16],
             evicted: 0,
             dropped_silent: 0,
         }
@@ -135,6 +145,7 @@ impl Pool {
     fn remove_at(&mut self, i: usize) -> PoolEntry {
         let e = self.slots.swap_remove(i);
         self.index.remove(&e.node.addr);
+        self.unindex(&e.node);
         if let Some(moved) = self.slots.get(i) {
             self.index.insert(moved.node.addr, i);
         }
@@ -151,7 +162,7 @@ impl Pool {
     /// Add a node (the caller has checked the address). Returns true when it is new.
     pub fn add(&mut self, node: CompactNode, now: Instant) -> bool {
         if let Some(&i) = self.index.get(&node.addr) {
-            self.slots[i].node.id = node.id;
+            self.set_id(i, node.id);
             return false;
         }
         if self.per_ip.get(node.addr.ip()).copied().unwrap_or(0) >= PER_IP {
@@ -170,6 +181,7 @@ impl Pool {
             in_flight: false,
         });
         self.index.insert(node.addr, i);
+        self.by_prefix[prefix16(&node.id)].push(node.addr);
         *self.per_ip.entry(*node.addr.ip()).or_default() += 1;
         self.schedule(i, now);
         true
@@ -231,11 +243,11 @@ impl Pool {
         let Some(&i) = self.index.get(addr) else {
             return;
         };
+        self.set_id(i, id);
         let e = &mut self.slots[i];
         e.in_flight = false;
         e.failures = 0;
         e.last_answer = Some(now);
-        e.node.id = id;
         let next = if samples {
             e.bep51 = Bep51::Yes;
             now + clamp_interval(interval)
@@ -288,6 +300,47 @@ impl Pool {
         if let Some(&i) = self.index.get(addr) {
             self.remove_at(i);
         }
+    }
+
+    fn unindex(&mut self, node: &CompactNode) {
+        let b = &mut self.by_prefix[prefix16(&node.id)];
+        if let Some(k) = b.iter().position(|a| *a == node.addr) {
+            b.swap_remove(k);
+        }
+    }
+
+    fn set_id(&mut self, i: usize, id: NodeId) {
+        let old = self.slots[i].node;
+        if old.id != id {
+            self.unindex(&old);
+            self.slots[i].node.id = id;
+            self.by_prefix[prefix16(&id)].push(old.addr);
+        }
+    }
+
+    /// Up to `k` entries closest to `target` (XOR), from the buckets sharing the longest prefix
+    /// with it: scans the target's 16-bit bucket, then the 2, 4, … buckets around it until `k`
+    /// candidates are found.
+    pub fn closest(&self, target: &NodeId, k: usize) -> Vec<CompactNode> {
+        let p = prefix16(target);
+        let mut out: Vec<CompactNode> = Vec::new();
+        for shift in 0..=16 {
+            out.clear();
+            let lo = (p >> shift) << shift;
+            for b in &self.by_prefix[lo..lo + (1 << shift)] {
+                for a in b {
+                    if let Some(&i) = self.index.get(a) {
+                        out.push(self.slots[i].node);
+                    }
+                }
+            }
+            if out.len() >= k {
+                break;
+            }
+        }
+        out.sort_by_key(|n| super::id::distance(&n.id, target));
+        out.truncate(k);
+        out
     }
 
     /// `n` random entries (to grow the pool with `find_node` when nothing is due).
@@ -395,6 +448,38 @@ mod tests {
         for (addr, &i) in &p.index {
             assert_eq!(p.slots[i].node.addr, *addr);
         }
+    }
+
+    #[test]
+    fn closest_uses_the_prefix_index() {
+        let now = Instant::now();
+        let mut p = Pool::new(10_000);
+        let mut all = Vec::new();
+        for i in 0..5000 {
+            let node = n(i, 1);
+            p.add(node, now);
+            all.push(node);
+        }
+        // Ids change on answers; the index follows.
+        let moved = all[7];
+        let mut new_id = moved.id;
+        new_id[0] ^= 0x80;
+        p.answered(&moved.addr, new_id, true, None, now);
+        all[7].id = new_id;
+        // Evictions/removals leave no stale entries.
+        p.remove(&all[8].addr);
+        all.remove(8);
+        for _ in 0..50 {
+            let t: NodeId = rand::random();
+            let got = p.closest(&t, 8);
+            let mut want = all.clone();
+            want.sort_by_key(|n| super::super::id::distance(&n.id, &t));
+            assert_eq!(got.len(), 8);
+            assert_eq!(got[..], want[..8]);
+        }
+        let total: usize = p.by_prefix.iter().map(Vec::len).sum();
+        assert_eq!(total, p.len());
+        assert!(Pool::new(10).closest(&[0; 20], 8).is_empty());
     }
 
     #[test]

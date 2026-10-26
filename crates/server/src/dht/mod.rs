@@ -37,7 +37,12 @@ const RETRY_EVERY: Duration = Duration::from_secs(60);
 const PERSIST_EVERY: Duration = Duration::from_secs(600);
 /// Budget of one iterative peer lookup (docs/DHT.md §4 step 1).
 const LOOKUP_BUDGET: Duration = Duration::from_secs(10);
-const WANT_PEERS: usize = 16;
+/// Stop a lookup once this many peers are known: the metadata stage tries ≤ 12 per hash (D56).
+const WANT_PEERS: usize = 12;
+/// Backpressure (D62): sampling pauses while this many hashes wait for peer collection and
+/// resumes below half of it, so discovery does not outrun consumption.
+const QUEUE_HIGH: usize = 10_000;
+const BACKPRESSURE_EVERY: Duration = Duration::from_millis(500);
 const PEER_SAMPLE_CAP: usize = 100_000;
 
 #[derive(Clone, Debug)]
@@ -89,7 +94,7 @@ impl DhtOptions {
             peer_lookups: cfg
                 .dht_peer_lookups
                 .map(|n| n as usize)
-                .unwrap_or(if aggressive { 16 } else { 4 }),
+                .unwrap_or(if aggressive { 64 } else { 8 }),
             dry_run: false,
             bloom_bits: seen::DEFAULT_BITS,
             queue_cap: queue::DEFAULT_CAP,
@@ -139,6 +144,7 @@ struct Counters {
     looked_up: AtomicU64,
     lookup_queries: AtomicU64,
     marked_failed: AtomicU64,
+    paused_ms: AtomicU64,
 }
 
 fn add(a: &AtomicU64, n: u64) {
@@ -226,6 +232,8 @@ pub struct Report {
     pub queue_len: usize,
     pub queue_lanes: [usize; 3],
     pub queue_overflow: u64,
+    /// Seconds the sampler was paused by backpressure (D62).
+    pub sampling_paused_secs: f64,
     pub peers: PeerStats,
     pub engine: EngineStats,
     pub answered_share: f64,
@@ -313,6 +321,7 @@ fn report(p: &Pipeline, dht: &Dht, started: Instant) -> Report {
         queue_len: q.len(),
         queue_lanes: q.lane_lens(),
         queue_overflow: q.overflow,
+        sampling_paused_secs: get(&p.c.paused_ms) as f64 / 1000.0,
         peers: peer_stats(p),
         answered_share: if engine.queries_sent > 0 {
             engine.answered as f64 / engine.queries_sent as f64
@@ -454,6 +463,35 @@ async fn collector(p: Arc<Pipeline>, dht: Dht, mut stop: watch::Receiver<bool>) 
     }
 }
 
+/// Pause sampling above the high-water mark, resume below half of it (hysteresis).
+async fn backpressure(p: Arc<Pipeline>, dht: Dht, mut stop: watch::Receiver<bool>) {
+    let high = (p.opts.queue_cap / 2).clamp(1, QUEUE_HIGH);
+    let low = high / 2;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(BACKPRESSURE_EVERY) => {}
+            _ = stop_requested(&mut stop) => return,
+        }
+        let len = p.queue.lock().unwrap().len();
+        let paused = dht.sample_share() <= 0.0;
+        if paused {
+            add(&p.c.paused_ms, BACKPRESSURE_EVERY.as_millis() as u64);
+        }
+        if let Some(share) = next_share(paused, len, high, low) {
+            dht.set_sample_share(share);
+        }
+    }
+}
+
+/// The sampler share to switch to, if any: pause at `high` queued hashes, resume at `low`.
+fn next_share(paused: bool, len: usize, high: usize, low: usize) -> Option<f64> {
+    match (paused, len) {
+        (false, l) if l >= high => Some(0.0),
+        (true, l) if l <= low => Some(1.0),
+        _ => None,
+    }
+}
+
 async fn retry_loop(p: Arc<Pipeline>, pool: PgPool, mut stop: watch::Receiver<bool>) {
     loop {
         tokio::select! {
@@ -562,6 +600,7 @@ pub async fn run(
     for _ in 0..p.opts.peer_lookups.max(1) {
         tasks.spawn(collector(p.clone(), dht.clone(), int_rx.clone()));
     }
+    tasks.spawn(backpressure(p.clone(), dht.clone(), int_rx.clone()));
     if let Some(pool) = &db {
         tasks.spawn(retry_loop(p.clone(), pool.clone(), int_rx.clone()));
         tasks.spawn(persist_loop(
@@ -602,5 +641,23 @@ pub async fn dht_loop(pool: PgPool, cfg: Arc<Config>, stop: watch::Receiver<bool
     };
     if let Err(e) = run(Some(pool), opts, stop, None, |_| {}).await {
         tracing::error!("DHT crawler stopped: {e:#}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_share;
+
+    #[test]
+    fn backpressure_hysteresis() {
+        assert_eq!(next_share(false, 9_999, 10_000, 5_000), None);
+        assert_eq!(next_share(false, 10_000, 10_000, 5_000), Some(0.0));
+        assert_eq!(
+            next_share(true, 7_000, 10_000, 5_000),
+            None,
+            "stays paused in between"
+        );
+        assert_eq!(next_share(true, 5_000, 10_000, 5_000), Some(1.0));
+        assert_eq!(next_share(false, 7_000, 10_000, 5_000), None);
     }
 }

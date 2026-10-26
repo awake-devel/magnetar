@@ -242,6 +242,8 @@ pub struct EngineStats {
     pub external_ip_known: bool,
     pub external_ip_changes: u64,
     pub brake_active: bool,
+    /// Sampler's share of the QPS budget (D62).
+    pub sample_share: f64,
     pub brake_engaged: u64,
     pub pending: usize,
     pub routing: Vec<usize>,
@@ -288,7 +290,7 @@ struct State {
     nodes: Vec<VNode>,
     pool: Pool,
     peers: PeerStore,
-    pending: HashMap<(usize, [u8; 2], SocketAddrV4), oneshot::Sender<Reply>>,
+    pending: HashMap<PendingKey, oneshot::Sender<Reply>>,
     pending_cap: usize,
     pace: Pace,
     per_ip: PerIp,
@@ -300,6 +302,10 @@ struct State {
     votes: HashMap<Ipv4Addr, Vote>,
     secrets: [[u8; 16]; 2],
     rr: usize,
+    /// Share of the QPS budget the sampler may use, 0–1 (D62: the server lowers it while the
+    /// fetch queue is backlogged, so discovery does not outrun what peer collection consumes).
+    sample_share: f64,
+    sample_next: Instant,
 }
 
 struct Inner {
@@ -337,6 +343,26 @@ fn ids_for(ip: Ipv4Addr, n: usize) -> Vec<NodeId> {
             bep42_id(ip, rand_byte, rng.random())
         })
         .collect()
+}
+
+type PendingKey = (usize, [u8; 2], SocketAddrV4);
+
+/// Owns a query's receiver; on drop removes the transaction unless it already belongs to a newer
+/// query with the same key (its sender is then still open).
+struct PendingGuard<'a> {
+    dht: &'a Dht,
+    key: PendingKey,
+    rx: Option<oneshot::Receiver<Reply>>,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.rx.take());
+        let mut s = self.dht.inner.state.lock().unwrap();
+        if s.pending.get(&self.key).is_some_and(|tx| tx.is_closed()) {
+            s.pending.remove(&self.key);
+        }
+    }
 }
 
 impl Dht {
@@ -390,6 +416,8 @@ impl Dht {
             votes: HashMap::new(),
             secrets: [rand::random(), rand::random()],
             rr: 0,
+            sample_share: 1.0,
+            sample_next: now,
         };
         let (tx, rx) = mpsc::channel(cfg.sighting_capacity.max(1));
         let (stop_tx, stop) = watch::channel(false);
@@ -506,6 +534,43 @@ impl Dht {
         all
     }
 
+    /// Lookup seeds: the `k` closest contacts of the routing tables **and** the crawl pool
+    /// (D61), nearest first, one per address.
+    pub fn closest_known(&self, target: &Id, k: usize) -> Vec<CompactNode> {
+        let s = self.inner.state.lock().unwrap();
+        let mut all: Vec<CompactNode> = s
+            .nodes
+            .iter()
+            .flat_map(|v| v.routing.closest(target, k))
+            .chain(s.pool.closest(target, k))
+            .collect();
+        drop(s);
+        all.sort_by_key(|c| (super::id::distance(&c.id, target), c.addr));
+        let mut seen = std::collections::HashSet::new();
+        all.retain(|c| seen.insert(c.addr));
+        all.truncate(k);
+        all
+    }
+
+    /// Set the sampler's share of the QPS budget (clamped to 0–1; 0 pauses sampling, the
+    /// rest of the node keeps running).
+    pub fn set_sample_share(&self, share: f64) {
+        let mut s = self.inner.state.lock().unwrap();
+        let share = if share.is_nan() {
+            1.0
+        } else {
+            share.clamp(0.0, 1.0)
+        };
+        if share != s.sample_share {
+            s.sample_share = share;
+            s.sample_next = Instant::now();
+        }
+    }
+
+    pub fn sample_share(&self) -> f64 {
+        self.inner.state.lock().unwrap().sample_share
+    }
+
     pub fn bootstrap_addrs(&self) -> &[SocketAddrV4] {
         &self.inner.cfg.bootstrap
     }
@@ -558,6 +623,7 @@ impl Dht {
             external_ip_known: s.external_ip.is_some(),
             external_ip_changes: g(&c.ip_changes),
             brake_active: s.brake.active(now),
+            sample_share: s.sample_share,
             brake_engaged: s.brake.engaged,
             pending: s.pending.len(),
             routing: s.nodes.iter().map(|n| n.routing.len()).collect(),
@@ -639,14 +705,19 @@ impl Dht {
             });
             ((node, tid, to), rx, at, wire)
         };
-        let unregister = || {
-            self.inner.state.lock().unwrap().pending.remove(&key);
+        // Removes the transaction however this future ends, cancellation included (a lookup
+        // that stops early drops its in-flight queries; without this they leaked until the
+        // map's cap turned every later query into `Busy`).
+        let mut guard = PendingGuard {
+            dht: self,
+            key,
+            rx: Some(rx),
         };
         if at > Instant::now() {
             let mut stop = self.inner.stop.clone();
             tokio::select! {
                 _ = tokio::time::sleep_until(at) => {}
-                _ = stop.wait_for(|s| *s) => { unregister(); return Err(QueryError::Stopped); }
+                _ = stop.wait_for(|s| *s) => return Err(QueryError::Stopped),
             }
         }
         if self.inner.sockets[key.0]
@@ -654,17 +725,17 @@ impl Dht {
             .await
             .is_err()
         {
-            unregister();
             return Err(QueryError::Io);
         }
         bump(&c.sent[kind.min(4)]);
         self.inner.state.lock().unwrap().brake.sent();
+        let rx = guard.rx.as_mut().expect("receiver until drop");
         match tokio::time::timeout(self.inner.cfg.query_timeout, rx).await {
             Ok(Ok(Reply::Response(r))) => Ok(r),
             Ok(Ok(Reply::Error(code))) => Err(QueryError::Remote(code)),
             Ok(Err(_)) => Err(QueryError::Stopped),
             Err(_) => {
-                unregister();
+                drop(guard);
                 bump(&c.timeouts);
                 let mut s = self.inner.state.lock().unwrap();
                 s.nodes[key.0].routing.failed(&to);
@@ -915,8 +986,36 @@ impl Dht {
     async fn sampler_loop(&self) {
         let mut stop = self.inner.stop.clone();
         let mut inflight: JoinSet<()> = JoinSet::new();
+        let qps = f64::from(self.inner.cfg.qps.max(1));
         loop {
             while inflight.try_join_next().is_some() {}
+            // The sampler's own share of the budget (paused at 0), then a global pace slot.
+            let own = {
+                let mut s = self.inner.state.lock().unwrap();
+                let now = Instant::now();
+                if s.sample_share <= 0.0 {
+                    None
+                } else {
+                    let at = s.sample_next.max(now);
+                    if s.sample_share < 1.0 {
+                        s.sample_next = at + Duration::from_secs_f64(1.0 / (qps * s.sample_share));
+                    }
+                    Some(at)
+                }
+            };
+            let Some(own) = own else {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                    _ = stop.wait_for(|s| *s) => break,
+                }
+                continue;
+            };
+            if own > Instant::now() {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(own) => {}
+                    _ = stop.wait_for(|s| *s) => break,
+                }
+            }
             let at = {
                 let mut s = self.inner.state.lock().unwrap();
                 let now = Instant::now();

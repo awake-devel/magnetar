@@ -250,7 +250,7 @@ pub async fn collect_peers(
     }
     if out.peers.is_empty() && budget > Duration::ZERO {
         out.looked_up = true;
-        let seeds = dht.closest(&info_hash, WIDTH);
+        let seeds = dht.closest_known(&info_hash, WIDTH);
         let extra = if seeds.len() < DONE {
             dht.bootstrap_addrs().to_vec()
         } else {

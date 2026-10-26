@@ -301,3 +301,64 @@ async fn hostile_datagrams_do_not_stop_the_node() {
         d.shutdown().await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_queries_release_their_transactions() {
+    let net = fake_network(1).await;
+    let d = &net[0].0;
+    // A socket that never answers.
+    let silent = tokio::net::UdpSocket::bind("127.0.0.77:0").await.unwrap();
+    let to = match silent.local_addr().unwrap() {
+        std::net::SocketAddr::V4(a) => a,
+        _ => unreachable!(),
+    };
+    for _ in 0..20 {
+        // Dropped mid-flight, the way an early-stopping lookup drops its queries.
+        let _ = tokio::time::timeout(Duration::from_millis(20), d.query(0, to, Query::Ping)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(d.stats().pending, 0, "{:?}", d.stats());
+    // And a completed query leaves nothing either.
+    let r = d.query(0, net[0].1, Query::Ping).await;
+    assert_eq!(
+        r.unwrap_err(),
+        magnetar_core::dht::QueryError::Filtered,
+        "own port"
+    );
+    assert_eq!(d.stats().pending, 0);
+    for (d, _) in net {
+        d.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sampling_can_be_paused_and_throttled() {
+    let net = fake_network(4).await;
+    let ip = Ipv4Addr::new(127, 0, 9, 1);
+    let (d, _rx) = Dht::start(cfg(Mode::Aggressive, ip, 1, vec![net[0].1]))
+        .await
+        .unwrap();
+    d.set_sample_share(0.0);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let st = d.stats();
+    assert_eq!(st.sent_sample_infohashes, 0, "{st:?}");
+    assert_eq!(st.sample_share, 0.0);
+    // Lookups still work while sampling is paused.
+    assert!(d.query(0, net[1].1, Query::Ping).await.is_ok());
+    // A 1 % share of 400 q/s is one sampler send every 250 ms (a sample_infohashes to a due
+    // node, or a find_node growing the pool when none is due).
+    let sampler =
+        |st: &magnetar_core::dht::EngineStats| st.sent_sample_infohashes + st.sent_find_node;
+    let before = sampler(&d.stats());
+    d.set_sample_share(0.01);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let n = sampler(&d.stats()) - before;
+    assert!((2..=8).contains(&n), "{n}");
+    d.set_sample_share(1.0);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(sampler(&d.stats()) - before > n + 20);
+    d.shutdown().await;
+    for (d, _) in net {
+        d.shutdown().await;
+    }
+}

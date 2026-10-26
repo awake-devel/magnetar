@@ -516,25 +516,45 @@ async fn pipeline_against_a_fake_dht() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dry_run_touches_no_database() {
     // No database at all: the pipeline dedupes in memory and still reports.
-    let ip = Ipv4Addr::new(127, 0, 8, 10);
-    let (node, _rx) = Dht::start(fake_cfg(ip, vec![])).await.unwrap();
-    let boot = SocketAddrV4::new(ip, node.local_ports()[0]);
+    let mut net = Vec::new();
+    let mut boot = Vec::new();
+    for i in 0..4u8 {
+        let ip = Ipv4Addr::new(127, 0, 8, 10 + i);
+        let (d, _rx) = Dht::start(fake_cfg(ip, boot.clone())).await.unwrap();
+        let a = SocketAddrV4::new(ip, d.local_ports()[0]);
+        boot.push(a);
+        net.push((d, a));
+    }
+    let (client, _crx) = Dht::start(fake_cfg(Ipv4Addr::new(127, 0, 8, 1), vec![net[0].1]))
+        .await
+        .unwrap();
+    for k in 0..40usize {
+        announce(&client, net[k % 4].1, rand::random()).await;
+    }
+    // A tiny queue: the burst of 40 overflows it (in a dry run nothing keeps a lease).
     let mut o = opts(1);
     o.dry_run = true;
+    o.queue_cap = 8;
+    o.peer_lookups = 1;
     let (_tx, stop) = tokio::sync::watch::channel(false);
     let rep = dht::run(
         None,
         o,
         stop,
-        Some(Duration::from_secs(2)),
-        tweak(Ipv4Addr::new(127, 0, 8, 1), boot),
+        Some(Duration::from_secs(4)),
+        tweak(Ipv4Addr::new(127, 0, 8, 2), net[0].1),
     )
     .await
     .unwrap();
     assert!(rep.dry_run);
-    assert!(rep.engine.queries_sent > 0, "{rep:?}");
-    node.shutdown().await;
+    assert!(rep.unique_hashes >= 8, "{rep:?}");
+    assert!(rep.queue_overflow > 0, "{rep:?}");
+    assert!(rep.peers.hashes >= 1, "{rep:?}");
+    client.shutdown().await;
+    for (d, _) in net {
+        d.shutdown().await;
+    }
 }
