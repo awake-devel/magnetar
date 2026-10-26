@@ -1,0 +1,109 @@
+Everything new since v0.1.0 + the metadata enrichment merge (`main` at `8444084`). Server and app
+must be updated together to get all of it, but each side keeps working with an older other side
+(details under "Older servers and offline mode").
+
+## What's new
+
+### Instant search (ARCHITECTURE.md D43, docs/SEARCH.md)
+
+- The server answers searches from an embedded Tantivy index instead of Postgres. On the
+  production copy (~500 k infohashes) a search takes 4–35 ms, the empty query and one-letter
+  queries included (Postgres took seconds). Typos in titles are forgiven ("interstelar"), the
+  last word matches as a prefix from 3 letters, and hits whose title has every word come first.
+- New torrents, seed checks and matched titles show up in search 1–2 s after they are stored.
+- The app searches as you type (250 ms pause), shows the phone's cached results while the
+  server answers, and shows "1,000+" when the count is only a lower bound.
+- Postgres stays the source of truth: the index can be deleted at any time and is rebuilt.
+
+### Filters: language, quality and more (D44, docs/FILTERS.md)
+
+- Every release name is read for resolution, source (Remux, BluRay, WEB-DL…), video codec, HDR /
+  Dolby Vision, bit depth, audio codecs and channels, audio and subtitle languages, the French
+  tags (VFF, VFQ, VF2, TRUEFRENCH, MULTi, VOSTFR…), group, season/episode, year and editions.
+  Hand-checked on 320 production names: languages 97.5 %, French tags 99.2 %, quality 98.1 %.
+- Filter sheet in Search with a live count next to every choice (counts ignore the filter of
+  their own field, so picking "French" still shows how many English releases there are). Also
+  genre, movie/series/anime, minimum rating, year range and a "rating" sort.
+- Title page: every release of one movie or series, grouped by season/episode, quality and
+  language. The detail screen shows the parsed attributes.
+- Saved searches keep the filters, and their notifications (server and phone) respect them.
+
+### Seed checks at scale (D45, docs/LIVENESS.md)
+
+- The server keeps seeders/leechers current for every torrent: newest first, then re-checks by
+  age (6 h for recent torrents, up to 4 days for old ones, 7 days after three dead checks).
+  What you open, save or see in results is checked first.
+- About 29 k torrents an hour on a home line at 3 % of a core, polite to trackers (1 request
+  per second per tracker, backoff on failures). DHT answers from node farms that invent peers
+  are ignored, so fewer dead torrents look alive.
+- Seeders/leechers history (90 days) on the detail page; a seed-check card on the Status
+  screen (backlog, checks per hour, alive/dead). `magnetar-server liveness` runs batches by hand.
+- Fix: the IMDb and anime enrichers no longer deadlock each other (D46), and the flood of
+  "word is too long to be indexed" notices is gone from the logs.
+
+### Stats, charts and graphs (D47, docs/STATS.md)
+
+- New **Stats** tab (replaces Status; the old Status screen is its third section): breakdowns
+  of audio languages, resolutions, sources, codecs, HDR, audio, genres, kinds, categories and
+  years. Tap a value to filter every other chart by it, long-press to search it.
+- Activity charts (torrents added/published, relays discovered, crawl events, seed checks,
+  database size), per hour or day.
+- Health card: index, crawler, relays, seed checks, enrichment coverage.
+- Interactive network graphs: web of trust, relays and publishers, a title's releases, and a
+  torrent's swarm (from its detail page).
+
+## Older servers and offline mode
+
+- The app asks `GET /health` for `features` and hides what the server lacks: an older server
+  still works, without filters, title pages, history, Stats or graphs.
+- Offline (phone cache only) the app still filters by the parsed attributes it can compute
+  locally (language, resolution, source, codecs…), not by genre, kind or rating; the Stats tab
+  shows counts of the phone's own cache without cross-filtering.
+- An older app talking to the new server keeps working: all new fields have defaults.
+
+## Upgrade notes
+
+Measured on a full copy of the production database (501 528 infohashes, 506 171 events,
+7.3 GB) on this laptop, 2026-10-26:
+
+| Step | When | Duration |
+|---|---|---|
+| Five new database migrations | before the server listens | 13.5 s in total (11.9 s for the seed-check schedule, 1.4 s for the search counters) |
+| Search index build | background, after the server listens | 35 s, 389 MB on disk |
+| Parsed release attributes backfill | background, at the same time | 117 s |
+| Activity history backfill (`torrents_added`) | background | 2 s |
+| Next start | | index reused, ready in 0.6 s |
+
+- The API answers during the build: searches use Postgres until the index is ready (slow on
+  big queries, as before; title pages too), and the filter counts and Stats breakdowns return
+  503 until then. Filters on release attributes give incomplete results until the backfill ends.
+- Seed-check backlog: ~450 k torrents were never checked; at ~29 k/h that is about 16 h after
+  the upgrade, newest first. Lower `MAGNETAR_LIVENESS_DHT_CONCURRENCY` or
+  `MAGNETAR_LIVENESS_TRACKER_RPS` on a weak connection.
+- Docker: the index lives in the existing data volume (`/data/state/magnetar/search-index`);
+  nothing to add. New optional settings are listed in docs/CONFIG.md (`MAGNETAR_SEARCH_INDEX*`,
+  `MAGNETAR_LIVENESS_*`); the defaults are fine. `compose.yml` has commented CPU/memory limits.
+- The phone's cache gets a new table and parses its torrents in the background after the app
+  update; nothing to do.
+- Run one server per database and per index directory (two would consume each other's index
+  change log).
+
+## Known limitations
+
+- The new app screens (filter sheet, title page, Stats tab, graphs, history chart) were built
+  and unit-tested, but not tried on a phone or an emulator in this cycle.
+- Activity history before the upgrade only exists for "torrents added", and dates are when the
+  crawler first saw a torrent: the first crawl shows as one huge day. Seed checks, relays,
+  crawl events and database size start empty.
+- Seeder counts of an old torrent can be up to 4 days old (7 days if dead). DHT peer counts
+  are still estimates, and node farms spread over many IPs can still fool them.
+- The swarm graph shows which trackers answered, not seeders per tracker (not stored). The
+  relays graph shows the relays publishers say they write to, not the relay that delivered
+  each torrent.
+- The release parser reads names only (plus the largest video file); a mislabelled release is
+  filtered by its label. A title page lists at most 1000 releases (best seeded first); for the
+  biggest titles that answer is about 900 KB.
+- In the server log, the first start prints two migration statements in full as "slow
+  statement" warnings, and the first index build logged three Tantivy "couldn't find segment"
+  warnings while the attribute backfill re-indexed documents; the finished index was complete
+  (501 528 documents, nothing pending).
