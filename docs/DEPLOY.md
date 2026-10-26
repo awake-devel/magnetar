@@ -131,7 +131,7 @@ phone, and outside the tunnel the same range is carrier-grade NAT. Use the `*.ts
    empty to stay offline.
 3. API token: the `MAGNETAR_API_TOKEN` from the server's `.env`.
 4. Root npub (optional): your own npub, so the web of trust starts from your follows.
-5. Tap **Test connection**. The Status screen then shows the server as reachable.
+5. Tap **Test connection**. **Stats → Status** then shows the server as reachable.
 
 The app syncs what it crawls up to the server once an hour while the phone is on Wi-Fi and
 charging, or when you tap Sync now.

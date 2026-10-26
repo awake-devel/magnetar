@@ -105,7 +105,7 @@ hour), `alive` / `dead` / `unknown` (latest result: seeded / answered with nobod
 no answer), `trackers` known to the scraper, `trackers_backed_off`, `dht_nodes` cached,
 `last_batch` (a `BatchReport`: hashes, trackers, requests, failures, DHT walks, alive, dead,
 unknown, ms) and `last_batch_at`. The counts are cached for 30 s (two scans of narrow
-tables). The app's Status screen shows them, with the time the backlog needs at the current
+tables). The app's Stats → Status section shows them, with the time the backlog needs at the current
 pace, when the server sends them.
 
 `magnetar-server liveness --limit N` runs batches now (configured rates) and prints one JSON
