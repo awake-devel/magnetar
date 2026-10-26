@@ -18,6 +18,31 @@ fun formatBytes(bytes: ULong?): String {
 
 fun formatRate(bps: ULong): String = formatBytes(bps) + "/s"
 
+/** "1,234" or, when the server only knows a lower bound (D43), "1,000+". */
+fun formatCount(n: ULong, lowerBound: Boolean = false): String =
+    String.format(Locale.ROOT, "%,d", n.toLong()) + if (lowerBound) "+" else ""
+
+/** Last path component of a file inside a torrent ("Season 1/E01.mkv" -> "E01.mkv"). */
+fun fileName(path: String): String = path.trimEnd('/').substringAfterLast('/')
+
+enum class TrustLevel { OK, LOW, NEGATIVE }
+
+/** Trust factor codes that pin a publisher to "do not show". */
+val BLOCKING_TRUST_CODES = setOf("BLOCKED", "ROOT_MUTED")
+
+/**
+ * How a trust badge is tinted: OK at or above the threshold; NEGATIVE (red) only when the score
+ * is explained by a block, a root mute or a negative factor; otherwise LOW, a neutral grey
+ * (an unknown publisher simply has no score yet, which is not a warning).
+ */
+fun trustLevel(score: Int, threshold: Int, factorCodes: Collection<String> = emptyList(), negativeFactor: Boolean = false): TrustLevel =
+    when {
+        factorCodes.any { it in BLOCKING_TRUST_CODES } -> TrustLevel.NEGATIVE
+        score >= threshold -> TrustLevel.OK
+        negativeFactor -> TrustLevel.NEGATIVE
+        else -> TrustLevel.LOW
+    }
+
 /** "3m", "5h", "12d", "2y" relative to [nowSec]. */
 fun formatAge(epochSec: Long, nowSec: Long = System.currentTimeMillis() / 1000): String {
     val d = (nowSec - epochSec).coerceAtLeast(0)

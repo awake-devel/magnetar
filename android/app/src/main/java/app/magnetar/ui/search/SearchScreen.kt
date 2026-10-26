@@ -74,8 +74,10 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import app.magnetar.ffi.FfiCategory
 import app.magnetar.ffi.FfiSort
 import app.magnetar.ffi.FfiTorrentSummary
+import app.magnetar.fileName
 import app.magnetar.formatAge
 import app.magnetar.formatBytes
+import app.magnetar.formatCount
 import app.magnetar.ui.common.AppIcons
 import app.magnetar.ui.common.Banner
 import app.magnetar.ui.common.CategoryIcon
@@ -206,7 +208,9 @@ private fun ResultList(state: SearchUiState, threshold: Int, onOpen: (String) ->
     LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
         item {
             Text(
-                "${state.total} results" + if (state.source != null) " · ${state.source}" else "",
+                "${formatCount(state.total, state.totalIsLowerBound)} results" +
+                    (if (state.source != null) " · ${state.source}" else "") +
+                    (if (state.loading && state.source == "local") " · asking the server…" else ""),
                 style = MaterialTheme.typography.labelMedium,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
             )
@@ -240,7 +244,18 @@ private fun ResultRow(hit: FfiTorrentSummary, threshold: Int, modifier: Modifier
         supportingContent = {
             val dead = if (hit.dead == true) " · dead" else ""
             val pinned = if (hit.pinned) "📌 " else ""
-            Text("$pinned${formatBytes(hit.totalSize)} · ${peersText(hit.seeders, hit.leechers)}$dead · ${formatAge(hit.createdAt)}")
+            Column {
+                Text("$pinned${formatBytes(hit.totalSize)} · ${peersText(hit.seeders, hit.leechers)}$dead · ${formatAge(hit.createdAt)}")
+                hit.matchedFile?.let { f ->
+                    Text(
+                        "matched in file: ${fileName(f)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
         },
         trailingContent = { TrustBadge(hit.trust.toInt(), threshold) },
     )

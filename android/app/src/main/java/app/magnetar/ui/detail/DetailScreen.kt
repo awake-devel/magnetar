@@ -67,6 +67,7 @@ import app.magnetar.formatAgo
 import app.magnetar.formatBytes
 import app.magnetar.formatTimestamp
 import app.magnetar.stripHtml
+import app.magnetar.trustLevel
 import app.magnetar.ui.common.AppIcons
 import app.magnetar.ui.common.CategoryIcon
 import app.magnetar.ui.common.CenteredMessage
@@ -424,7 +425,16 @@ private fun TrustCard(trust: FfiTrust, threshold: Int, open: Boolean, onToggle: 
         Column(Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Trust", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
-                TrustBadge(trust.score.toInt(), threshold)
+                TrustBadge(
+                    trust.score.toInt(),
+                    threshold,
+                    level = trustLevel(
+                        trust.score.toInt(),
+                        threshold,
+                        trust.factors.map { it.code },
+                        negativeFactor = trust.factors.any { it.delta < 0 },
+                    ),
+                )
                 Icon(if (open) Icons.Filled.KeyboardArrowDown else Icons.AutoMirrored.Filled.KeyboardArrowRight, null)
             }
             if (open) {

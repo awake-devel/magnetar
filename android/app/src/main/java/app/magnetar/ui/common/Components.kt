@@ -22,7 +22,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import app.magnetar.TrustLevel
 import app.magnetar.ffi.FfiCategory
+import app.magnetar.trustLevel
 
 fun categoryEmoji(c: FfiCategory): String = when (c) {
     FfiCategory.VIDEO -> "🎬" // clapper board
@@ -43,12 +45,14 @@ fun CategoryIcon(c: FfiCategory, modifier: Modifier = Modifier) {
     Text(categoryEmoji(c), style = MaterialTheme.typography.titleLarge, modifier = modifier)
 }
 
-/** Score badge; tinted as a warning when under the user's threshold. */
+/** Score badge: primary at or above the threshold, neutral grey below it, red only for [TrustLevel.NEGATIVE]. */
 @Composable
-fun TrustBadge(score: Int, threshold: Int, modifier: Modifier = Modifier) {
-    val ok = score >= threshold
-    val bg = if (ok) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.errorContainer
-    val fg = if (ok) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onErrorContainer
+fun TrustBadge(score: Int, threshold: Int, modifier: Modifier = Modifier, level: TrustLevel = trustLevel(score, threshold)) {
+    val (bg, fg) = when (level) {
+        TrustLevel.OK -> MaterialTheme.colorScheme.primaryContainer to MaterialTheme.colorScheme.onPrimaryContainer
+        TrustLevel.LOW -> MaterialTheme.colorScheme.surfaceVariant to MaterialTheme.colorScheme.onSurfaceVariant
+        TrustLevel.NEGATIVE -> MaterialTheme.colorScheme.errorContainer to MaterialTheme.colorScheme.onErrorContainer
+    }
     Box(
         modifier
             .background(bg, RoundedCornerShape(8.dp))

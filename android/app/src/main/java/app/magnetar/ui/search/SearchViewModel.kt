@@ -56,6 +56,8 @@ data class SearchUiState(
     val descending: Boolean = true,
     val hits: List<FfiTorrentSummary> = emptyList(),
     val total: ULong = 0u,
+    /** [total] is a lower bound ("1,000+"). */
+    val totalIsLowerBound: Boolean = false,
     val loading: Boolean = false,
     val loadingMore: Boolean = false,
     val endReached: Boolean = false,
@@ -69,6 +71,8 @@ data class SearchUiState(
 
 private const val MB = 1024L * 1024L
 private const val PAGE = 50u
+/** Typing pause before a search runs; the server index answers in well under this. */
+const val SEARCH_DEBOUNCE_MS = 250L
 
 fun SearchUiState.toQuery(offset: UInt = 0u, nowSec: Long = System.currentTimeMillis() / 1000) = FfiSearchQuery(
     text = text.trim(),
@@ -115,10 +119,12 @@ class SearchViewModel(application: Application) : BaseViewModel(application) {
 
     private val textInput = MutableStateFlow("")
     private var searchJob: Job? = null
+    /** Bumped by every new search: a result applies only while its search is still the newest. */
+    private var searchSeq = 0
 
     init {
         viewModelScope.launch {
-            textInput.drop(1).debounce(400).distinctUntilChanged().collectLatest { search() }
+            textInput.drop(1).debounce(SEARCH_DEBOUNCE_MS).distinctUntilChanged().collectLatest { search() }
         }
         // A new server URL, token or trust threshold changes what a search returns (e.g. the
         // "offline results (401)" banner after the token is fixed): run it again.
@@ -161,22 +167,52 @@ class SearchViewModel(application: Application) : BaseViewModel(application) {
     }
 
     private fun search() {
+        // The newest query wins: the previous request is cancelled and its late answer dropped.
         searchJob?.cancel()
+        val seq = ++searchSeq
         val query = _state.value.toQuery()
+        val server = magApp.settings.value.hasServer
         magApp.lastQuery = query
         _state.update { it.copy(loading = true, error = null, endReached = false) }
         searchJob = viewModelScope.launch {
-            ffiCatching { magApp.magnetar().search(query, magApp.settings.value.hasServer) }
-                .onSuccess { page ->
+            if (server) {
+                // The local cache answers in milliseconds: show it while the server works.
+                ffiCatching { magApp.magnetar().search(query, false) }.onSuccess { page ->
                     _state.update {
-                        it.copy(
-                            hits = page.hits, total = page.total, loading = false, source = page.source,
-                            serverError = page.serverError, endReached = page.hits.size.toUInt() < PAGE,
-                            generation = it.generation + 1,
-                        )
+                        if (seq != searchSeq || !it.loading) {
+                            it
+                        } else {
+                            it.copy(
+                                hits = page.hits, total = page.total, totalIsLowerBound = page.totalIsLowerBound,
+                                source = page.source, serverError = null, endReached = true,
+                                generation = it.generation + 1,
+                            )
+                        }
                     }
                 }
-                .onFailure { e -> _state.update { it.copy(loading = false, hits = emptyList(), error = e.userMessage()) } }
+            }
+            ffiCatching { magApp.magnetar().search(query, server) }
+                .onSuccess { page ->
+                    _state.update {
+                        if (seq != searchSeq) {
+                            it
+                        } else {
+                            // Same first hit as the cached preview: keep the scroll position.
+                            val sameTop = it.hits.firstOrNull()?.infohash == page.hits.firstOrNull()?.infohash
+                            it.copy(
+                                hits = page.hits, total = page.total, totalIsLowerBound = page.totalIsLowerBound,
+                                loading = false, source = page.source, serverError = page.serverError,
+                                endReached = page.hits.size.toUInt() < PAGE,
+                                generation = if (sameTop && it.hits.isNotEmpty()) it.generation else it.generation + 1,
+                            )
+                        }
+                    }
+                }
+                .onFailure { e ->
+                    _state.update {
+                        if (seq != searchSeq) it else it.copy(loading = false, hits = emptyList(), error = e.userMessage())
+                    }
+                }
         }
     }
 
@@ -184,23 +220,26 @@ class SearchViewModel(application: Application) : BaseViewModel(application) {
         val s = _state.value
         if (s.loading || s.loadingMore || s.endReached || s.hits.isEmpty()) return
         val query = s.toQuery(offset = s.hits.size.toUInt())
+        val seq = searchSeq
         _state.update { it.copy(loadingMore = true) }
         searchJob = viewModelScope.launch {
             ffiCatching { magApp.magnetar().search(query, magApp.settings.value.hasServer) }
                 .onSuccess { page ->
                     _state.update {
+                        if (seq != searchSeq) return@update it
                         val known = it.hits.mapTo(HashSet()) { h -> h.infohash }
                         val merged = it.hits + page.hits.filter { h -> h.infohash !in known }
                         it.copy(
-                            hits = merged, total = page.total, loadingMore = false, source = page.source,
-                            serverError = page.serverError,
-                            endReached = page.hits.size.toUInt() < PAGE || merged.size.toULong() >= page.total,
+                            hits = merged, total = page.total, totalIsLowerBound = page.totalIsLowerBound,
+                            loadingMore = false, source = page.source, serverError = page.serverError,
+                            endReached = page.hits.size.toUInt() < PAGE ||
+                                (!page.totalIsLowerBound && merged.size.toULong() >= page.total),
                         )
                     }
                 }
                 .onFailure { e ->
                     _state.update { it.copy(loadingMore = false) }
-                    message(e.userMessage())
+                    if (seq == searchSeq) message(e.userMessage())
                 }
         }
     }

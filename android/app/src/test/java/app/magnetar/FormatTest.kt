@@ -18,6 +18,32 @@ class FormatTest {
     }
 
     @Test
+    fun counts() {
+        assertEquals("0", formatCount(0u))
+        assertEquals("999", formatCount(999u))
+        assertEquals("1,000+", formatCount(1000u, lowerBound = true))
+        assertEquals("3,214,567", formatCount(3_214_567u))
+    }
+
+    @Test
+    fun fileNames() {
+        assertEquals("E01.mkv", fileName("Season 1/E01.mkv"))
+        assertEquals("E01.mkv", fileName("E01.mkv"))
+        assertEquals("Season 1", fileName("Season 1/"))
+    }
+
+    @Test
+    fun trustLevels() {
+        // Unknown publisher (score 0, no factors): neutral, not a warning.
+        assertEquals(TrustLevel.LOW, trustLevel(0, 20))
+        assertEquals(TrustLevel.OK, trustLevel(20, 20))
+        assertEquals(TrustLevel.OK, trustLevel(60, 20, listOf("BURST"), negativeFactor = true))
+        assertEquals(TrustLevel.NEGATIVE, trustLevel(5, 20, listOf("BURST"), negativeFactor = true))
+        assertEquals(TrustLevel.NEGATIVE, trustLevel(0, 20, listOf("BLOCKED")))
+        assertEquals(TrustLevel.NEGATIVE, trustLevel(100, 20, listOf("ROOT_MUTED")))
+    }
+
+    @Test
     fun age() {
         val now = 1_000_000_000L
         assertEquals("now", formatAge(now - 5, now))
