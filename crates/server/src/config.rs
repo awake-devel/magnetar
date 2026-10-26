@@ -256,6 +256,19 @@ pub struct Config {
         default_value = "1.1.1.1:443,9.9.9.9:443"
     )]
     pub dht_probe: String,
+    /// Map the crawler's UDP ports on the router with UPnP IGD (D57, D72). Default: on in
+    /// aggressive mode, off in polite mode (ephemeral port, nothing to map).
+    #[arg(long, env = "MAGNETAR_DHT_UPNP", action = clap::ArgAction::Set)]
+    pub dht_upnp: Option<bool>,
+    /// Gateway for a unicast SSDP M-SEARCH, `host[:port]` (port 1900 by default). Default: the
+    /// default gateway of /proc/net/route. Needed in Docker (the container's gateway is the
+    /// bridge).
+    #[arg(long, env = "MAGNETAR_DHT_UPNP_GATEWAY")]
+    pub dht_upnp_gateway: Option<String>,
+    /// LAN address the router maps the ports to. Default: the address the connection to the
+    /// gateway leaves from. Required in Docker (the container only sees its bridge address).
+    #[arg(long, env = "MAGNETAR_DHT_UPNP_LOCAL_IP")]
+    pub dht_upnp_local_ip: Option<std::net::Ipv4Addr>,
     /// Extra hard-blocklist terms (D53): plain text, one per line, `context:` prefix for the
     /// context tier. Additive only; a file that does not load stops the server.
     #[arg(long, env = "MAGNETAR_BLOCKLIST_FILE")]

@@ -26,7 +26,7 @@ use futures::StreamExt;
 use magnetar_core::api::{FacetCount, FacetSet, FacetsResponse, SearchIndexStatus};
 use magnetar_core::enrich::ids::split_media_token;
 use magnetar_core::error::{Error, Result};
-use magnetar_core::model::{MediaKind, TorrentSummary, npub};
+use magnetar_core::model::{MediaKind, Origin, TorrentSummary, npub};
 use magnetar_core::query::{SearchPage, SearchQuery, Sort};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -596,6 +596,11 @@ impl SearchIndex {
         let best = int(f.best_peers);
         let expires = int(f.expires_at);
         let dead = (best != NONE && now < expires).then_some(best == 0);
+        let origin = match text(f.origin).as_deref() {
+            Some("dht") => Origin::Dht,
+            Some("both") => Origin::Both,
+            _ => Origin::Nostr,
+        };
         let summary = TorrentSummary {
             infohash: text(f.infohash).unwrap_or_default(),
             event_id: text(f.event_id).unwrap_or_default(),
@@ -611,13 +616,17 @@ impl SearchIndex {
             dead,
             trust: int(f.trust).clamp(0, 100) as u8,
             pow_bits: int(f.pow_bits).clamp(0, 255) as u8,
-            // Publishers with an event passing the threshold, as the Postgres search counts.
-            publisher_count: doc
-                .get_all(f.publisher_trust)
-                .filter_map(|v| v.as_i64())
-                .filter(|t| *t >= filter.min_trust)
-                .count()
-                .max(1) as u32,
+            // Publishers with an event passing the threshold, as the Postgres search counts;
+            // a DHT-only document has none (D51).
+            publisher_count: if origin == Origin::Dht {
+                0
+            } else {
+                doc.get_all(f.publisher_trust)
+                    .filter_map(|v| v.as_i64())
+                    .filter(|t| *t >= filter.min_trust)
+                    .count()
+                    .max(1) as u32
+            },
             source_url: text(f.source_url),
             rank,
             pinned: false,
@@ -631,6 +640,7 @@ impl SearchIndex {
                 .filter(|r| *r != NONE)
                 .map(|r| r as f32 / 10.0),
             attrs: text(f.attrs).and_then(|j| serde_json::from_str(&j).ok()),
+            origin,
         };
         (summary, titles.join(" "))
     }
@@ -712,6 +722,11 @@ pub fn index_query(
             attrs: q
                 .attr_filters()
                 .into_iter()
+                .chain(
+                    // The source chip (D51) is one more any-of keyword filter, so the `origin`
+                    // facet is counted disjunctively like the D44 ones.
+                    Some(("origin", q.origin_filter())).filter(|(_, v)| !v.is_empty()),
+                )
                 .map(|(name, values)| AttrFilter {
                     field: schema::facet_field_name(name),
                     values,
@@ -764,13 +779,20 @@ pub async fn search(
             .await
             .map_err(join_err)??
     };
-    let need: Vec<String> = res
+    // Matched file names: from the canonical event, or the DHT row of a DHT-only hit (keyed by
+    // infohash; event ids and infohashes never collide, 64 vs 40 characters).
+    let (need_dht, need): (Vec<&IndexHit>, Vec<&IndexHit>) = res
         .hits
         .iter()
         .filter(|h| h.file_matched)
-        .map(|h| h.summary.event_id.clone())
+        .partition(|h| h.summary.event_id.is_empty());
+    let need: Vec<String> = need.iter().map(|h| h.summary.event_id.clone()).collect();
+    let need_dht: Vec<String> = need_dht
+        .iter()
+        .map(|h| h.summary.infohash.clone())
         .collect();
-    let files = load::event_files(pool, &need).await?;
+    let mut files = load::event_files(pool, &need).await?;
+    files.extend(load::dht_files(pool, &need_dht).await?);
     let total = res.total;
     // Tokenising up to MATCHED_FILE_PATHS paths per hit is CPU work: off the runtime.
     let hits = tokio::task::spawn_blocking(move || {
@@ -779,8 +801,13 @@ pub async fn search(
             .map(|h| {
                 let mut s = h.summary;
                 if h.file_matched {
+                    let key = if s.event_id.is_empty() {
+                        &s.infohash
+                    } else {
+                        &s.event_id
+                    };
                     s.matched_file = files
-                        .get(&s.event_id)
+                        .get(key)
                         .and_then(|f| query::best_file(&words, f.iter().map(String::as_str)));
                 }
                 s

@@ -390,6 +390,8 @@ fn opts(ports: usize) -> DhtOptions {
         tcp_max: 350,
         probe: Vec::new(),
         screen: None,
+        upnp: None,
+        service: None,
     }
 }
 

@@ -126,7 +126,16 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
         .with_tmdb(tmdb.clone())
         .with_liveness(Arc::new(LivenessService::new(liveness::liveness_config(
             &cfg,
-        ))));
+        ))))
+        .with_dht(match cfg.dht {
+            crate::config::DhtMode::Off => None,
+            crate::config::DhtMode::Polite => Some(crate::dht::status::DhtService::new(
+                magnetar_core::dht::Mode::Polite,
+            )),
+            crate::config::DhtMode::Aggressive => Some(crate::dht::status::DhtService::new(
+                magnetar_core::dht::Mode::Aggressive,
+            )),
+        });
     let cfg = Arc::new(cfg);
     let mut daemons = vec![
         tokio::spawn(daemons::crawler_loop(
@@ -161,10 +170,11 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
             stop_rx.clone(),
         )),
     ];
-    if cfg.dht != crate::config::DhtMode::Off {
+    if let Some(svc) = &state.dht {
         daemons.push(tokio::spawn(crate::dht::dht_loop(
             store.pool().clone(),
             cfg.clone(),
+            svc.clone(),
             stop_rx.clone(),
         )));
     }

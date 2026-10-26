@@ -24,6 +24,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
+use crate::dht::status::DhtService;
 use crate::liveness::{LivenessService, PRIO_SEARCH, PRIO_VIEWED};
 use crate::stats::StatsService;
 use crate::store::{PgStore, json_u8};
@@ -55,6 +56,8 @@ pub struct AppState {
     pub tmdb: Option<Arc<Tmdb>>,
     /// Cached chart and graph answers (D47).
     pub stats: Arc<StatsService>,
+    /// The DHT crawler's live state (D58); None when `MAGNETAR_DHT` is off.
+    pub dht: Option<Arc<DhtService>>,
 }
 
 impl AppState {
@@ -70,7 +73,13 @@ impl AppState {
             shutdown: rx,
             tmdb: None,
             stats: Arc::default(),
+            dht: None,
         }
+    }
+
+    pub fn with_dht(mut self, d: Option<Arc<DhtService>>) -> Self {
+        self.dht = d;
+        self
     }
 
     pub fn with_shutdown(mut self, rx: watch::Receiver<bool>) -> Self {
@@ -261,7 +270,13 @@ async fn health(State(st): State<AppState>) -> Json<Health> {
         db: st.store.ping().await,
         features: magnetar_core::api::features::ALL
             .iter()
-            .map(|f| f.to_string())
+            .copied()
+            .chain(
+                st.dht
+                    .is_some()
+                    .then_some(magnetar_core::api::features::DHT),
+            )
+            .map(str::to_string)
             .collect(),
     })
 }
@@ -338,6 +353,19 @@ pub fn parse_search_query(raw: Option<&str>) -> ApiResult<SearchQuery> {
             "hdr" => push_list(&mut q.hdr, &v),
             "audio" => push_list(&mut q.audio, &v),
             "genre" => push_list(&mut q.genres, &v),
+            // D51 source chip (`source` already means the release source, D44).
+            "origin" => {
+                push_list(&mut q.origins, &v);
+                if let Some(bad) = q
+                    .origins
+                    .iter()
+                    .find(|o| !matches!(o.as_str(), "nostr" | "dht"))
+                {
+                    return Err(ApiError::bad_request(format!(
+                        "bad origin {bad:?} (nostr, dht)"
+                    )));
+                }
+            }
             "kind" => {
                 for k in v.split(',').map(str::trim).filter(|k| !k.is_empty()) {
                     let k: MediaKind = k
@@ -669,11 +697,16 @@ async fn stats(State(st): State<AppState>) -> ApiResult<Json<StatsResponse>> {
             None
         }
     };
+    let dht = match &st.dht {
+        Some(d) => Some(d.stats(st.store.pool()).await),
+        None => None,
+    };
     Ok(Json(StatsResponse {
         store,
         crawler,
         search_index,
         liveness,
+        dht,
     }))
 }
 
@@ -753,7 +786,12 @@ async fn stats_health(State(st): State<AppState>) -> ApiResult<Json<StatsHealth>
         magnetar_core::now(),
     )
     .await?;
-    Ok(Json((*h).clone()))
+    let mut h = (*h).clone();
+    // Live (the health answer is cached for a minute; the crawler's totals have their own).
+    if let Some(d) = &st.dht {
+        h.dht = Some(d.stats(st.store.pool()).await);
+    }
+    Ok(Json(h))
 }
 
 /// A graph through the shared cache; None (unknown media/infohash) answers 404.

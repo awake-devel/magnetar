@@ -36,6 +36,11 @@ pub const TORRENTS_TOTAL: &str = "torrents_total";
 
 pub const METRICS: &[&str] = &[
     TORRENTS_ADDED,
+    crate::dht::status::DHT_TORRENTS_ADDED,
+    crate::dht::status::DHT_HASHES_SEEN,
+    crate::dht::status::DHT_FETCH_OK,
+    crate::dht::status::DHT_FETCH_FAIL,
+    crate::dht::status::DHT_BLOCKED,
     TORRENTS_TOTAL,
     TORRENTS_PUBLISHED,
     RELAYS_DISCOVERED,
@@ -62,6 +67,8 @@ pub const BREAKDOWN_FIELDS: &[(&str, &str)] = &[
     ("edition", "edition"),
     ("format", "format"),
     ("group", "group"),
+    // Nostr / DHT (D51): a torrent known from both counts once under each.
+    ("origin", "origin"),
 ];
 pub const DEFAULT_TOP: u32 = 10;
 pub const MAX_TOP: u32 = 50;
@@ -533,6 +540,7 @@ pub async fn health(
                 media_linked: u(c.media_linked),
                 attrs_missing: u(c.torrents - c.attrs),
                 computed_at: now,
+                dht: None,
             })
         })
         .await
@@ -586,9 +594,12 @@ pub async fn recompute_published(pool: &PgPool) -> Result<()> {
         .execute(&mut *tx)
         .await
         .map_err(db)?;
+    // Nostr publications only: DHT rows fill `liveness_schedule` too (D50), and counting them
+    // would show every DHT discovery as a torrent published on its first-seen day.
     sqlx::query(
         "INSERT INTO stats_series (metric, bucket, value)
-         SELECT $1, (born / 86400) * 86400, count(*) FROM liveness_schedule GROUP BY 2",
+         SELECT $1, (s.born / 86400) * 86400, count(*) FROM liveness_schedule s
+         JOIN torrent_infohashes ti ON ti.infohash = s.infohash AND ti.events > 0 GROUP BY 2",
     )
     .bind(TORRENTS_PUBLISHED)
     .execute(&mut *tx)

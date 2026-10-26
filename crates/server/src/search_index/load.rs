@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use magnetar_core::enrich::MIN_DISPLAY_CONFIDENCE;
 use magnetar_core::enrich::ids::MediaRef;
 use magnetar_core::error::Result;
-use magnetar_core::model::Category;
+use magnetar_core::model::{Category, Origin};
 use magnetar_core::release::ReleaseAttrs;
 use sqlx::types::Json;
 use sqlx::{FromRow, PgPool};
@@ -31,6 +31,18 @@ struct EventRow {
     pow_bits: i16,
     source_url: Option<String>,
     trusted: bool,
+}
+
+/// A DHT crawler row (D50): verified name and files, no publisher.
+#[derive(FromRow)]
+struct DhtRow {
+    infohash: String,
+    title: String,
+    files_text: String,
+    file_count: i32,
+    total_size: i64,
+    category: String,
+    first_seen: i64,
 }
 
 #[derive(FromRow)]
@@ -61,8 +73,9 @@ fn u32_of(v: Option<i32>) -> Option<u32> {
     v.and_then(|v| u32::try_from(v).ok())
 }
 
-/// One document per infohash that still has a non-blocked event; the others are absent (the
-/// caller deletes them from the index).
+/// One document per infohash that still has a non-blocked event or a DHT row (D51); the
+/// others are absent (the caller deletes them from the index). The canonical display stays a
+/// Nostr event when there is one; a DHT-only document has no event id, publisher or trust.
 pub async fn load_docs(pool: &PgPool, infohashes: &[String]) -> Result<Vec<IndexDoc>> {
     if infohashes.is_empty() {
         return Ok(Vec::new());
@@ -107,16 +120,18 @@ pub async fn load_docs(pool: &PgPool, infohashes: &[String]) -> Result<Vec<Index
             .fetch_all(pool)
             .await
             .map_err(db)?;
-    // D52: a DHT row the classifier tagged `porn` makes the document adult whatever the
-    // Nostr publisher filed it under.
-    let dht_adult: Vec<String> = sqlx::query_scalar(
-        "SELECT infohash FROM dht_torrents WHERE infohash = ANY($1) AND category = 'porn'",
+    let dht: Vec<DhtRow> = sqlx::query_as(
+        "SELECT infohash, title, left(files_text, $2) AS files_text, file_count, total_size,
+                category, first_seen
+         FROM dht_torrents WHERE infohash = ANY($1) ORDER BY infohash",
     )
     .bind(infohashes)
+    .bind(FILES_CHARS)
     .fetch_all(pool)
     .await
     .map_err(db)?;
-    let dht_adult: std::collections::HashSet<String> = dht_adult.into_iter().collect();
+    let mut dht: HashMap<String, DhtRow> =
+        dht.into_iter().map(|d| (d.infohash.clone(), d)).collect();
     let mut attrs: HashMap<String, ReleaseAttrs> =
         attrs.into_iter().map(|(ih, a)| (ih, a.0)).collect();
     let mut live: HashMap<String, LiveRow> =
@@ -124,6 +139,18 @@ pub async fn load_docs(pool: &PgPool, infohashes: &[String]) -> Result<Vec<Index
     let mut media: HashMap<String, MediaRow> =
         media.into_iter().map(|m| (m.infohash.clone(), m)).collect();
 
+    let mut docs_media = |ih: &str| {
+        media.remove(ih).and_then(|m| {
+            Some(DocMedia {
+                id: m.id,
+                kind: m.kind.parse().ok()?,
+                title: m.title,
+                year: m.year,
+                rating: m.rating,
+                genres: m.genres,
+            })
+        })
+    };
     let mut out: Vec<IndexDoc> = Vec::new();
     for r in rows {
         if let Some(d) = out.last_mut()
@@ -141,20 +168,8 @@ pub async fn load_docs(pool: &PgPool, infohashes: &[String]) -> Result<Vec<Index
             continue;
         }
         let l = live.remove(&r.infohash);
-        let best_peers = l.as_ref().and_then(|l| match (l.seeders, l.dht_peers_est) {
-            (None, None) => None,
-            (s, d) => u32_of(Some(s.unwrap_or(0).max(d.unwrap_or(0)))),
-        });
-        let m = media.remove(&r.infohash).and_then(|m| {
-            Some(DocMedia {
-                id: m.id,
-                kind: m.kind.parse().ok()?,
-                title: m.title,
-                year: m.year,
-                rating: m.rating,
-                genres: m.genres,
-            })
-        });
+        let best_peers = best_peers(l.as_ref());
+        let m = docs_media(&r.infohash);
         out.push(IndexDoc {
             event_id: r.event_id,
             publishers: vec![r.pubkey.clone()],
@@ -177,11 +192,67 @@ pub async fn load_docs(pool: &PgPool, infohashes: &[String]) -> Result<Vec<Index
             expires_at: l.map(|l| l.expires_at),
             media: m,
             attrs: attrs.remove(&r.infohash),
-            dht_adult: dht_adult.contains(&r.infohash),
+            dht_adult: false,
+            origin: Origin::Nostr,
             infohash: r.infohash,
         });
     }
+    // The DHT side (D51): Nostr documents gain it, infohashes without an unblocked event get
+    // a DHT-only document.
+    for d in out.iter_mut() {
+        if let Some(row) = dht.remove(&d.infohash) {
+            d.origin = Origin::Both;
+            // D52: a DHT row the classifier tagged `porn` makes the document adult whatever
+            // the Nostr publisher filed it under.
+            d.dht_adult = row.category == Category::Porn.as_str();
+            if !d.titles.contains(&row.title) {
+                d.titles.push(row.title);
+            }
+            if d.files_text.is_empty() {
+                d.files_text = row.files_text;
+            }
+        }
+    }
+    let mut dht: Vec<DhtRow> = dht.into_values().collect();
+    dht.sort_unstable_by(|a, b| a.infohash.cmp(&b.infohash));
+    for row in dht {
+        let l = live.remove(&row.infohash);
+        let category: Category = row.category.parse().unwrap_or(Category::Other);
+        out.push(IndexDoc {
+            event_id: String::new(),
+            pubkey: String::new(),
+            publishers: Vec::new(),
+            publisher_trust: Vec::new(),
+            titles: vec![row.title],
+            files_text: row.files_text,
+            description: String::new(),
+            category,
+            category_path: Vec::new(),
+            created_at: row.first_seen,
+            total_size: u64::try_from(row.total_size).ok(),
+            file_count: u32::try_from(row.file_count).unwrap_or(0),
+            trust: 0,
+            pow_bits: 0,
+            source_url: None,
+            seeders: l.as_ref().and_then(|l| u32_of(l.seeders)),
+            leechers: l.as_ref().and_then(|l| u32_of(l.leechers)),
+            best_peers: best_peers(l.as_ref()),
+            expires_at: l.map(|l| l.expires_at),
+            media: docs_media(&row.infohash),
+            attrs: attrs.remove(&row.infohash),
+            dht_adult: category == Category::Porn,
+            origin: Origin::Dht,
+            infohash: row.infohash,
+        });
+    }
     Ok(out)
+}
+
+fn best_peers(l: Option<&LiveRow>) -> Option<u32> {
+    l.and_then(|l| match (l.seeders, l.dht_peers_est) {
+        (None, None) => None,
+        (s, d) => u32_of(Some(s.unwrap_or(0).max(d.unwrap_or(0)))),
+    })
 }
 
 /// Infohashes after `cursor` in byte order (the full build's keyset walk).
@@ -352,4 +423,24 @@ pub async fn event_files(
     .await
     .map_err(db)?;
     Ok(rows.into_iter().map(|(id, f)| (id, f.0)).collect())
+}
+
+/// The first `MATCHED_FILE_PATHS` file paths of DHT rows, by infohash (DHT-only hits, D51).
+pub async fn dht_files(
+    pool: &PgPool,
+    infohashes: &[String],
+) -> Result<HashMap<String, Vec<String>>> {
+    if infohashes.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<(String, Json<Vec<String>>)> = sqlx::query_as(
+        "SELECT infohash, jsonb_path_query_array(files, ('$[0 to ' || $2 || '].path')::jsonpath)
+         FROM dht_torrents WHERE infohash = ANY($1)",
+    )
+    .bind(infohashes)
+    .bind(MATCHED_FILE_PATHS - 1)
+    .fetch_all(pool)
+    .await
+    .map_err(db)?;
+    Ok(rows.into_iter().map(|(ih, f)| (ih, f.0)).collect())
 }

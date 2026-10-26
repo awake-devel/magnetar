@@ -14,7 +14,9 @@ pub mod persist;
 pub mod queue;
 pub mod screen;
 pub mod seen;
+pub mod status;
 pub mod store;
+pub mod upnp;
 
 use std::collections::HashSet;
 use std::net::{SocketAddr, SocketAddrV4};
@@ -76,6 +78,10 @@ pub struct DhtOptions {
     pub dry_run: bool,
     pub bloom_bits: u64,
     pub queue_cap: usize,
+    /// Router port mappings for the UDP ports (D57, D72); None = no UPnP.
+    pub upnp: Option<upnp::UpnpConfig>,
+    /// Live state for the API (`serve`); None for the bounded `dht` command.
+    pub service: Option<Arc<status::DhtService>>,
 }
 
 impl DhtOptions {
@@ -127,6 +133,15 @@ impl DhtOptions {
             tcp_rate: cfg.dht_tcp_rate,
             tcp_max: cfg.dht_tcp_max as usize,
             probe: health::parse_targets(&cfg.dht_probe),
+            // Polite mode uses an ephemeral port: nothing to map. `serve` maps by default in
+            // aggressive mode; the bounded `dht` command clears this unless asked (D72).
+            upnp: (aggressive && cfg.dht_upnp.unwrap_or(true)).then(|| {
+                upnp::UpnpConfig::from_settings(
+                    cfg.dht_upnp_gateway.as_deref(),
+                    cfg.dht_upnp_local_ip,
+                )
+            }),
+            service: None,
         })
     }
 }
@@ -841,6 +856,26 @@ pub async fn run(
         int_rx.clone(),
     ));
     tasks.spawn(backpressure(p.clone(), dht.clone(), int_rx.clone()));
+    if let Some(svc) = &p.opts.service {
+        svc.attach(p.clone(), dht.clone(), started);
+        tasks.spawn(status::sampler(svc.clone(), db.clone(), int_rx.clone()));
+    }
+    // UPnP outlives the task grace below: it removes its mappings after the stop.
+    let mapper = p.opts.upnp.clone().map(|cfg| {
+        let wanted: Vec<(upnp::Protocol, u16)> = dht
+            .local_ports()
+            .into_iter()
+            .filter(|port| *port != 0)
+            .map(|port| (upnp::Protocol::Udp, port))
+            .collect();
+        let status = p
+            .opts
+            .service
+            .as_ref()
+            .map(|s| s.upnp.clone())
+            .unwrap_or_default();
+        tokio::spawn(upnp::upnp_loop(cfg, wanted, status, int_rx.clone()))
+    });
     if let Some(pool) = &db {
         tasks.spawn(retry_loop(p.clone(), pool.clone(), int_rx.clone()));
         tasks.spawn(identity_loop(
@@ -864,6 +899,13 @@ pub async fn run(
     while tasks.join_next().await.is_some() {}
     // Every result sender is gone now: the persister writes what is left and ends.
     let _ = tokio::time::timeout(Duration::from_secs(3), persister).await;
+    if let Some(m) = mapper {
+        // ≤ 2 s per mapping removal; the stop already reached it.
+        let _ = tokio::time::timeout(Duration::from_secs(3), m).await;
+    }
+    if let Some(svc) = &p.opts.service {
+        svc.detach();
+    }
     let mut rep = rep;
     rep.persist = p.persisted.lock().unwrap().clone();
     rep.persist_errors = get(&p.c.persist_errors);
@@ -922,10 +964,16 @@ fn restart_delay(n: u32) -> Duration {
 /// `serve` daemon: runs while `MAGNETAR_DHT` ≠ off; errors are logged, never fatal to `serve`.
 /// A start that fails (no bootstrap router resolved yet, a UDP port still taken, a database
 /// error) is retried with a backoff instead of leaving the crawler off until the next restart.
-pub async fn dht_loop(pool: PgPool, cfg: Arc<Config>, mut stop: watch::Receiver<bool>) {
-    let Some(opts) = DhtOptions::from_config(&cfg, cfg.dht) else {
+pub async fn dht_loop(
+    pool: PgPool,
+    cfg: Arc<Config>,
+    svc: Arc<status::DhtService>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let Some(mut opts) = DhtOptions::from_config(&cfg, cfg.dht) else {
         return;
     };
+    opts.service = Some(svc.clone());
     let mut failures = 0u32;
     loop {
         let started = Instant::now();
@@ -937,6 +985,7 @@ pub async fn dht_loop(pool: PgPool, cfg: Arc<Config>, mut stop: watch::Receiver<
                 }
                 let wait = restart_delay(failures);
                 failures = failures.saturating_add(1);
+                svc.set_error(&format!("{e:#}"));
                 tracing::error!(
                     "DHT crawler stopped: {e:#}; restarting in {} s",
                     wait.as_secs()

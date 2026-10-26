@@ -6,7 +6,7 @@
 //! release/media filters of D44 test; adding one means a new entry here and a `SCHEMA_VERSION`
 //! bump, which rebuilds the index on the next start.
 
-use magnetar_core::model::{Category, MediaKind};
+use magnetar_core::model::{Category, MediaKind, Origin};
 use magnetar_core::release::ReleaseAttrs;
 use tantivy::schema::{
     FAST, Field, IndexRecordOption, NumericOptions, STORED, STRING, Schema, TextFieldIndexing,
@@ -21,7 +21,9 @@ use tantivy::{TantivyDocument, Term};
 /// 2: release attributes (D44): `attrs`, `year`, the attribute facets, `year` facet = media
 /// year else parsed year.
 /// 3: `adult` (D52): canonical category `porn` or a DHT row classified `porn`.
-pub const SCHEMA_VERSION: u32 = 3;
+/// 4: DHT documents (D51): stored `origin`, facet `origin` (`nostr` / `dht`), DHT titles and
+/// file names searchable, `eligible_trust` lifted to `TRUSTED` when a DHT row exists.
+pub const SCHEMA_VERSION: u32 = 4;
 pub const TOKENIZER: &str = "magnetar";
 /// Descriptions are indexed up to this many characters (lower weight, mostly boilerplate).
 pub const DESCRIPTION_CHARS: i32 = 2000;
@@ -129,6 +131,11 @@ pub const FACETS: &[FacetDef] = &[
         name: "group",
         values: |d| attr_one(d, |a| &a.group),
     },
+    // Where the torrent is known from (D51): `nostr`, `dht`, or both values.
+    FacetDef {
+        name: "origin",
+        values: |d| d.origin.sources().into_iter().map(str::to_string).collect(),
+    },
 ];
 
 fn attr_list(d: &IndexDoc, f: fn(&ReleaseAttrs) -> &Vec<String>) -> Vec<String> {
@@ -205,6 +212,9 @@ pub struct IndexDoc {
     pub attrs: Option<ReleaseAttrs>,
     /// A DHT row of this infohash is classified `porn` (D52).
     pub dht_adult: bool,
+    /// Nostr events, a DHT row, or both (D51). A DHT-only document has no event, publisher or
+    /// trust (`event_id`, `pubkey` empty).
+    pub origin: Origin,
 }
 
 impl IndexDoc {
@@ -219,6 +229,23 @@ impl IndexDoc {
     /// Hidden unless the query asks for adult content (D52).
     pub fn adult(&self) -> bool {
         self.category == Category::Porn || self.dht_adult
+    }
+
+    /// The trust a `min_trust` threshold is compared with: the best publisher's, and
+    /// `TRUSTED` when the DHT holds the infohash (D51: its name and files are bound to the
+    /// infohash, no publisher's claim is involved, so DHT results mix in equally).
+    pub fn eligible_trust(&self) -> i64 {
+        let best = self
+            .publisher_trust
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(i64::from(self.trust));
+        if self.origin.has_dht() {
+            best.max(TRUSTED)
+        } else {
+            best
+        }
     }
 }
 
@@ -259,6 +286,8 @@ pub struct Fields {
     pub attrs: Field,
     /// 1 = adult (D52), fast.
     pub adult: Field,
+    /// `nostr` | `dht` | `both` (D51), stored.
+    pub origin: Field,
     /// One keyword field per `FACETS` entry, same order.
     pub facets: Vec<Field>,
 }
@@ -309,6 +338,7 @@ impl Fields {
         let year = b.add_i64_field("year", num);
         let attrs = b.add_text_field("attrs", STORED);
         let adult = b.add_u64_field("adult", NumericOptions::default().set_fast());
+        let origin = b.add_text_field("origin", STORED);
         let facets = FACETS
             .iter()
             .map(|f| b.add_text_field(&facet_field_name(f.name), STRING | FAST))
@@ -343,6 +373,7 @@ impl Fields {
             year,
             attrs,
             adult,
+            origin,
             facets,
         }
     }
@@ -389,14 +420,8 @@ impl Fields {
         );
         doc.add_i64(self.file_count, i64::from(d.file_count));
         doc.add_i64(self.trust, i64::from(d.trust));
-        doc.add_i64(
-            self.eligible_trust,
-            d.publisher_trust
-                .iter()
-                .copied()
-                .max()
-                .unwrap_or(i64::from(d.trust)),
-        );
+        doc.add_i64(self.eligible_trust, d.eligible_trust());
+        doc.add_text(self.origin, d.origin.as_str());
         for t in &d.publisher_trust {
             doc.add_i64(self.publisher_trust, *t);
         }

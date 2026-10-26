@@ -327,6 +327,75 @@ pub struct SavedSearch {
     pub last_seen_created_at: Option<i64>,
 }
 
+/// Where an infohash is known from (D51, docs/DHT.md §5): Nostr events, the DHT crawler's
+/// verified metadata, or both. Older servers send none (`Nostr`).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    #[default]
+    Nostr,
+    Dht,
+    Both,
+}
+
+impl Origin {
+    pub fn from_sources(nostr: bool, dht: bool) -> Origin {
+        match (nostr, dht) {
+            (true, true) => Origin::Both,
+            (false, true) => Origin::Dht,
+            _ => Origin::Nostr,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Origin::Nostr => "nostr",
+            Origin::Dht => "dht",
+            Origin::Both => "both",
+        }
+    }
+
+    pub fn has_nostr(&self) -> bool {
+        matches!(self, Origin::Nostr | Origin::Both)
+    }
+
+    pub fn has_dht(&self) -> bool {
+        matches!(self, Origin::Dht | Origin::Both)
+    }
+
+    /// The source values a document carries in the `origin` facet and filter: `nostr`,
+    /// `dht`, or both of them.
+    pub fn sources(&self) -> Vec<&'static str> {
+        match self {
+            Origin::Nostr => vec!["nostr"],
+            Origin::Dht => vec!["dht"],
+            Origin::Both => vec!["nostr", "dht"],
+        }
+    }
+}
+
+/// What the DHT crawler verified for an infohash (D50/D51): name and files come from the
+/// info dictionary whose SHA-1 is the infohash, so no publisher stands behind them.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DhtInfo {
+    /// First time the crawler saw the hash, and when its metadata was fetched (unix seconds).
+    pub first_seen: i64,
+    pub fetched_at: i64,
+    /// `info.name` (the DHT title; a Nostr event may show another one).
+    pub title: String,
+    pub file_count: u32,
+    pub total_size: u64,
+    /// Classifier category (D69), independent of what a Nostr publisher filed it under.
+    pub category: Option<Category>,
+    /// Peers known when the metadata was fetched.
+    pub peers_seen: u32,
+    /// "sample" (BEP 51), "announce" or "get_peers" (passive capture).
+    pub discovered_via: String,
+    /// Hybrid torrents (BEP 52): the full v2 infohash, 64 hex.
+    pub infohash_v2: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TorrentSummary {
     pub infohash: InfoHash,
@@ -367,6 +436,10 @@ pub struct TorrentSummary {
     /// Release attributes parsed from the name and files (D44); None from older servers.
     #[serde(default)]
     pub attrs: Option<ReleaseAttrs>,
+    /// Nostr, DHT or both (D51). A DHT-only result has empty `event_id`, `pubkey` and `npub`,
+    /// trust 0 and `publisher_count` 0; older servers send none (`Nostr`).
+    #[serde(default)]
+    pub origin: Origin,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -396,6 +469,9 @@ pub struct TorrentDetail {
     /// Identified film/series/anime (D40); None when unknown or below the display threshold.
     #[serde(default)]
     pub media: Option<MediaInfo>,
+    /// The DHT crawler's verified metadata (D51); None when the DHT does not hold it.
+    #[serde(default)]
+    pub dht: Option<DhtInfo>,
 }
 
 /// What a `media` row describes (D40).

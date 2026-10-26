@@ -2,8 +2,8 @@
 
 use magnetar_core::Error;
 use magnetar_core::api::{
-    BreakdownSet, FacetSet, Graph, LivenessHistory, LivenessStats, MediaReleases, StatsHealth,
-    TimeseriesSet,
+    BreakdownSet, DhtStats, FacetSet, Graph, LivenessHistory, LivenessStats, MediaReleases,
+    StatsHealth, TimeseriesSet,
 };
 use magnetar_core::model::*;
 use magnetar_core::query::{SearchPage, SearchQuery, Sort};
@@ -116,6 +116,7 @@ impl From<FfiSearchQuery> for SearchQuery {
             min_year: q.min_year,
             max_year: q.max_year,
             include_adult: q.include_adult,
+            origins: q.origins,
         }
     }
 }
@@ -150,6 +151,75 @@ impl From<SearchQuery> for FfiSearchQuery {
             min_year: q.min_year,
             max_year: q.max_year,
             include_adult: q.include_adult,
+            origins: q.origins,
+        }
+    }
+}
+
+impl From<Origin> for FfiOrigin {
+    fn from(o: Origin) -> Self {
+        match o {
+            Origin::Nostr => FfiOrigin::Nostr,
+            Origin::Dht => FfiOrigin::Dht,
+            Origin::Both => FfiOrigin::Both,
+        }
+    }
+}
+
+impl From<DhtInfo> for FfiDhtInfo {
+    fn from(d: DhtInfo) -> Self {
+        Self {
+            first_seen: d.first_seen,
+            fetched_at: d.fetched_at,
+            title: d.title,
+            file_count: d.file_count,
+            total_size: d.total_size,
+            category: d.category.map(Into::into),
+            peers_seen: d.peers_seen,
+            discovered_via: d.discovered_via,
+            infohash_v2: d.infohash_v2,
+        }
+    }
+}
+
+impl From<DhtStats> for FfiDhtStats {
+    fn from(d: DhtStats) -> Self {
+        let upnp = d.upnp.unwrap_or_default();
+        Self {
+            mode: d.mode,
+            running: d.running,
+            uptime_secs: d.uptime_secs,
+            virtual_nodes: d.virtual_nodes,
+            external_ip: d.external_ip,
+            routing_nodes: d.routing_nodes,
+            pool_nodes: d.pool_nodes,
+            queries_per_sec: d.queries_per_sec,
+            answered_share: d.answered_share,
+            brake: d.brake,
+            incoming_per_min: d.incoming_per_min,
+            hashes_per_min: d.hashes_per_min,
+            hashes_seen: d.hashes_seen,
+            queue_len: d.queue_len,
+            sampling_paused: d.sampling_paused,
+            metadata_per_min: d.metadata_per_min,
+            fetch_success_rate: d.fetch_success_rate,
+            fetch_ok: d.fetch_ok,
+            fetch_failed: d.fetch_failed,
+            stored: d.stored,
+            blocked: d.blocked,
+            stored_total: d.stored_total,
+            adult_total: d.adult_total,
+            blocked_total: d.blocked_total,
+            seen_queued: d.seen_queued,
+            seen_failed: d.seen_failed,
+            upnp_state: Some(upnp.state).filter(|s| !s.is_empty()),
+            upnp_mappings: upnp
+                .mappings
+                .iter()
+                .map(|m| format!("{} {}", m.protocol, m.port))
+                .collect(),
+            upnp_error: upnp.last_error,
+            last_error: d.last_error,
         }
     }
 }
@@ -183,6 +253,7 @@ impl From<TorrentSummary> for FfiTorrentSummary {
             media_id: t.media_id,
             media_rating: t.media_rating,
             attrs: t.attrs.map(Into::into),
+            origin: t.origin.into(),
         }
     }
 }
@@ -463,6 +534,7 @@ pub fn detail(d: TorrentDetail, source: &str) -> FfiTorrentDetail {
             .collect(),
         source: source.into(),
         media: d.media.map(Into::into),
+        dht: d.dht.map(Into::into),
     }
 }
 
@@ -704,6 +776,7 @@ impl From<StatsHealth> for FfiStatsHealth {
             media_linked: h.media_linked,
             attrs_missing: h.attrs_missing,
             computed_at: h.computed_at,
+            dht: h.dht.map(Into::into),
         }
     }
 }

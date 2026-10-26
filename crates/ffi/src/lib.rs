@@ -124,6 +124,74 @@ pub struct FfiSearchQuery {
     /// Show adult content in this query (D52); `FfiConfig::show_adult` turns it on for all.
     #[uniffi(default)]
     pub include_adult: bool,
+    /// Source chip (D51): "nostr", "dht"; any of them, empty = all. Only for servers listing
+    /// the `origin` feature (older ones ignore it).
+    #[uniffi(default)]
+    pub origins: Vec<String>,
+}
+
+/// Where a result is known from (D51): Nostr events, the server's DHT crawler, or both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiOrigin {
+    Nostr,
+    Dht,
+    Both,
+}
+
+/// What the server's DHT crawler verified for a torrent (D51).
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiDhtInfo {
+    pub first_seen: i64,
+    pub fetched_at: i64,
+    /// The torrent's own name (`info.name`); a Nostr event may show another title.
+    pub title: String,
+    pub file_count: u32,
+    pub total_size: u64,
+    pub category: Option<FfiCategory>,
+    pub peers_seen: u32,
+    /// "sample" | "announce" | "get_peers".
+    pub discovered_via: String,
+    pub infohash_v2: Option<String>,
+}
+
+/// The server's DHT crawler (D58), for the Stats and Status screens. Rates cover the last ~10
+/// minutes; `*_total` come from the server's database.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiDhtStats {
+    /// "polite" | "aggressive".
+    pub mode: String,
+    pub running: bool,
+    pub uptime_secs: u64,
+    pub virtual_nodes: u32,
+    /// "public" | "private" | "cgnat" | "unknown".
+    pub external_ip: String,
+    pub routing_nodes: u64,
+    pub pool_nodes: u64,
+    pub queries_per_sec: f64,
+    pub answered_share: f64,
+    pub brake: bool,
+    pub incoming_per_min: f64,
+    pub hashes_per_min: f64,
+    pub hashes_seen: u64,
+    pub queue_len: u64,
+    pub sampling_paused: bool,
+    pub metadata_per_min: f64,
+    pub fetch_success_rate: f64,
+    pub fetch_ok: u64,
+    pub fetch_failed: u64,
+    pub stored: u64,
+    pub blocked: u64,
+    pub stored_total: u64,
+    pub adult_total: u64,
+    pub blocked_total: u64,
+    pub seen_queued: u64,
+    pub seen_failed: u64,
+    /// "off" | "searching" | "mapped" | "partial" | "failed"; None from older servers.
+    pub upnp_state: Option<String>,
+    /// Mapped ports as "udp 6891".
+    pub upnp_mappings: Vec<String>,
+    pub upnp_error: Option<String>,
+    pub last_error: Option<String>,
 }
 
 /// `core::release::ReleaseAttrs` (D44): what the name and files say about a release.
@@ -191,6 +259,8 @@ pub struct FfiTorrentSummary {
     pub media_id: Option<i64>,
     pub media_rating: Option<f32>,
     pub attrs: Option<FfiReleaseAttrs>,
+    /// Nostr, DHT or both (D51); DHT-only results have no publisher (empty pubkey/npub).
+    pub origin: FfiOrigin,
 }
 
 /// One facet value with its count (D44) and display label.
@@ -371,6 +441,8 @@ pub struct FfiTorrentDetail {
     pub source: String,
     /// Identified media; offline it comes from the phone's copy of the last server answer.
     pub media: Option<FfiMediaInfo>,
+    /// The server's DHT crawler verified this torrent (D51).
+    pub dht: Option<FfiDhtInfo>,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -540,6 +612,8 @@ pub struct FfiStatsHealth {
     pub media_linked: u64,
     pub attrs_missing: u64,
     pub computed_at: i64,
+    /// The DHT crawler; None when the server runs none.
+    pub dht: Option<FfiDhtStats>,
 }
 
 /// A graph node (D47, `core::api::GraphNode` for what `id` is per `kind`).
@@ -1113,6 +1187,17 @@ impl Magnetar {
     pub async fn server_liveness(&self) -> Option<FfiLivenessStats> {
         let api = self.inner.api()?;
         self.run(move |_| async move { Ok(api.stats().await?.liveness) })
+            .await
+            .ok()
+            .flatten()
+            .map(Into::into)
+    }
+
+    /// The server's DHT crawler (D58, Status screen). None: no server, the crawler is off, or
+    /// the server predates it.
+    pub async fn server_dht(&self) -> Option<FfiDhtStats> {
+        let api = self.inner.api()?;
+        self.run(move |_| async move { Ok(api.stats().await?.dht) })
             .await
             .ok()
             .flatten()

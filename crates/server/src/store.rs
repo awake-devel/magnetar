@@ -249,6 +249,37 @@ struct DetailRow {
     trust: i16,
 }
 
+/// `dht_torrents` as the detail view reads it (D50).
+#[derive(FromRow)]
+struct DhtDetailRow {
+    title: String,
+    files: Json<Vec<TorrentFile>>,
+    file_count: i32,
+    total_size: i64,
+    category: String,
+    first_seen: i64,
+    fetched_at: i64,
+    discovered_via: String,
+    peers_seen: i32,
+    infohash_v2: Option<String>,
+}
+
+impl DhtDetailRow {
+    fn info(self) -> DhtInfo {
+        DhtInfo {
+            first_seen: self.first_seen,
+            fetched_at: self.fetched_at,
+            title: self.title,
+            file_count: u32::try_from(self.file_count).unwrap_or(0),
+            total_size: u64::try_from(self.total_size).unwrap_or(0),
+            category: self.category.parse().ok(),
+            peers_seen: u32::try_from(self.peers_seen).unwrap_or(0),
+            discovered_via: self.discovered_via,
+            infohash_v2: self.infohash_v2,
+        }
+    }
+}
+
 #[derive(FromRow)]
 struct CommentRow {
     event_id: String,
@@ -567,6 +598,122 @@ impl PgStore {
             }
         }
         Ok(Some(out))
+    }
+
+    /// The DHT row of an infohash (D50), if the crawler stored one.
+    async fn dht_row(&self, infohash: &str) -> Result<Option<DhtDetailRow>> {
+        sqlx::query_as(
+            "SELECT title, files, file_count, total_size, category, first_seen, fetched_at,
+                    discovered_via, peers_seen, infohash_v2
+             FROM dht_torrents WHERE infohash = $1",
+        )
+        .bind(infohash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)
+    }
+
+    /// Detail of an infohash only the DHT holds (D51, docs/DHT.md §5): no event, publisher,
+    /// description or comments; the magnet gets the default trackers (as a tracker-less Nostr
+    /// torrent does).
+    async fn dht_detail(&self, infohash: &str, d: DhtDetailRow, now: i64) -> Result<TorrentDetail> {
+        let liveness = self.get_liveness(infohash).await?;
+        let media = crate::enrich::media_for_infohash(&self.pool, infohash).await?;
+        let attrs: Option<Json<release::ReleaseAttrs>> =
+            sqlx::query_scalar("SELECT attrs FROM torrent_attrs WHERE infohash = $1")
+                .bind(infohash)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db)?;
+        let total_size = u64::try_from(d.total_size).ok();
+        let summary = TorrentSummary {
+            infohash: infohash.to_string(),
+            event_id: String::new(),
+            title: d.title.clone(),
+            category: category(&d.category),
+            total_size,
+            file_count: to_u32(d.file_count),
+            created_at: d.first_seen,
+            pubkey: String::new(),
+            npub: String::new(),
+            seeders: liveness.as_ref().and_then(|l| l.seeders),
+            leechers: liveness.as_ref().and_then(|l| l.leechers),
+            dead: liveness.as_ref().and_then(|l| search::dead(l, now)),
+            trust: 0,
+            pow_bits: 0,
+            publisher_count: 0,
+            source_url: None,
+            rank: 0.0,
+            pinned: false,
+            hidden: false,
+            media_title: media.as_ref().map(|m| m.title.clone()),
+            media_year: media.as_ref().and_then(|m| m.year),
+            media_kind: media.as_ref().map(|m| m.kind),
+            matched_file: None,
+            media_id: media.as_ref().map(|m| m.media_id),
+            media_rating: media.as_ref().and_then(|m| m.rating),
+            attrs: attrs.map(|a| a.0),
+            origin: Origin::Dht,
+        };
+        let magnet = magnet::build_magnet(infohash, Some(&d.title), &[], total_size);
+        let files = d.files.0.clone();
+        Ok(TorrentDetail {
+            summary,
+            description: String::new(),
+            files,
+            trackers: Vec::new(),
+            hashtags: Vec::new(),
+            category_path: Vec::new(),
+            external_ids: Vec::new(),
+            magnet,
+            liveness,
+            trust: TrustScore {
+                pubkey: String::new(),
+                score: 0,
+                factors: vec![TrustFactor {
+                    code: "dht".into(),
+                    delta: 0,
+                    detail: "Found on the DHT: name and files verified against the infohash; \
+                             no publisher"
+                        .into(),
+                    evidence: Vec::new(),
+                }],
+                root: None,
+                computed_at: 0,
+                graph_version: 0,
+            },
+            events: Vec::new(),
+            comments: Vec::new(),
+            media,
+            dht: Some(d.info()),
+        })
+    }
+
+    /// The SQL fallback knows each hit's canonical row only: mark hits known from both sources
+    /// (an unblocked Nostr event and a DHT row) as `Both`, as the index does (D51).
+    async fn refine_origins(&self, hits: &mut [TorrentSummary]) -> Result<()> {
+        if hits.is_empty() {
+            return Ok(());
+        }
+        let ihs: Vec<String> = hits.iter().map(|h| h.infohash.clone()).collect();
+        let dht: Vec<String> =
+            sqlx::query_scalar("SELECT infohash FROM dht_torrents WHERE infohash = ANY($1)")
+                .bind(&ihs)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(db)?;
+        let nostr: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT infohash FROM torrents t WHERE infohash = ANY($1) AND NOT EXISTS (
+                 SELECT 1 FROM local_overrides o WHERE o.pubkey = t.pubkey AND o.action = 'block')",
+        )
+        .bind(&ihs)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        for h in hits {
+            h.origin = Origin::from_sources(nostr.contains(&h.infohash), dht.contains(&h.infohash));
+        }
+        Ok(())
     }
 
     async fn threshold(&self) -> Result<u8> {
@@ -1276,8 +1423,10 @@ impl Store for PgStore {
             .fetch_all(&self.pool)
             .await
             .map_err(db)?;
+        let mut hits: Vec<TorrentSummary> = hits.into_iter().map(|h| h.into_summary(now)).collect();
+        self.refine_origins(&mut hits).await?;
         Ok(SearchPage {
-            hits: hits.into_iter().map(|h| h.into_summary(now)).collect(),
+            hits,
             total: u64::try_from(total).unwrap_or(0),
             source: "server".into(),
             total_is_lower_bound: lower_bound,
@@ -1285,6 +1434,7 @@ impl Store for PgStore {
     }
 
     async fn torrent_detail(&self, infohash: &str, now: i64) -> Result<Option<TorrentDetail>> {
+        let dht = self.dht_row(infohash).await?;
         let rows: Vec<DetailRow> = sqlx::query_as(
             "SELECT event_id, pubkey, created_at, title, description, files, file_count, total_size,
                     trackers, category, category_path, hashtags, external_ids, source_url,
@@ -1299,7 +1449,11 @@ impl Store for PgStore {
         .await
         .map_err(db)?;
         let Some(canon) = rows.first() else {
-            return Ok(None);
+            // No unblocked Nostr event: the DHT row alone, when there is one (D51).
+            return match dht {
+                Some(d) => self.dht_detail(infohash, d, now).await.map(Some),
+                None => Ok(None),
+            };
         };
         let ids: Vec<String> = rows.iter().map(|r| r.event_id.clone()).collect();
         let comments: Vec<CommentRow> = sqlx::query_as(
@@ -1368,6 +1522,7 @@ impl Store for PgStore {
             media_id: media.as_ref().map(|m| m.media_id),
             media_rating: media.as_ref().and_then(|m| m.rating),
             attrs: attrs.map(|a| a.0),
+            origin: Origin::from_sources(true, dht.is_some()),
         };
         let events = rows
             .iter()
@@ -1395,6 +1550,7 @@ impl Store for PgStore {
             events,
             comments: comments.into_iter().map(Into::into).collect(),
             media,
+            dht: dht.map(DhtDetailRow::info),
         }))
     }
 

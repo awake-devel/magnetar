@@ -13,7 +13,7 @@ pub mod graphs;
 pub mod liveness;
 pub mod media_lock;
 pub mod relay;
-mod search;
+pub mod search;
 pub mod search_index;
 pub mod selftest;
 pub mod server;

@@ -57,6 +57,11 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("--mode off: nothing to run");
             };
             opts.dry_run = dry_run;
+            // A bounded run maps router ports only when asked explicitly (D72): measurement
+            // runs must not open the router by default.
+            if cli.config.dht_upnp != Some(true) {
+                opts.upnp = None;
+            }
             let pool = if dry_run {
                 None
             } else {

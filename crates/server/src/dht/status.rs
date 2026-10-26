@@ -1,0 +1,297 @@
+//! Live state of the `serve` crawler for `/api/v1/stats`, `/api/v1/stats/health` and
+//! `/health` (D58, docs/DHT.md §10): the running pipeline's counters, rates over the last ~10
+//! minutes, the UPnP state, and database totals cached for a minute.
+//!
+//! Every minute the sampler also adds the counters' growth to `stats_series` (`dht_hashes_seen`,
+//! `dht_fetch_ok`, `dht_fetch_fail`, `dht_blocked`; `dht_torrents_added` comes from the insert
+//! trigger), so the app's activity chart shows the crawler.
+
+use std::collections::VecDeque;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use magnetar_core::api::{DhtStats, UpnpStatus};
+use magnetar_core::dht::{Dht, Mode};
+use sqlx::{FromRow, PgPool};
+use tokio::sync::watch;
+use tokio::time::Instant;
+
+use super::{Pipeline, get};
+use crate::daemons::stop_requested;
+use crate::stats;
+
+/// Rates are computed over at most this many one-minute samples (10 minutes).
+const WINDOW: usize = 11;
+pub const SAMPLE_EVERY: Duration = Duration::from_secs(60);
+const TOTALS_TTL: Duration = Duration::from_secs(60);
+
+pub const DHT_HASHES_SEEN: &str = "dht_hashes_seen";
+pub const DHT_FETCH_OK: &str = "dht_fetch_ok";
+pub const DHT_FETCH_FAIL: &str = "dht_fetch_fail";
+pub const DHT_BLOCKED: &str = "dht_blocked";
+pub const DHT_TORRENTS_ADDED: &str = "dht_torrents_added";
+
+/// Counters the rates are computed from.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Snap {
+    unique: u64,
+    verified: u64,
+    failed: u64,
+    blocked: u64,
+    incoming: u64,
+    queries: u64,
+    answered: u64,
+}
+
+struct Running {
+    p: Arc<Pipeline>,
+    dht: Dht,
+    started: Instant,
+    window: VecDeque<(Instant, Snap)>,
+    /// What the last `stats_series` bump covered.
+    bumped: Snap,
+}
+
+#[derive(Clone, Debug, Default, FromRow)]
+struct Totals {
+    stored: i64,
+    adult: i64,
+    blocked: i64,
+    queued: i64,
+    failed: i64,
+}
+
+#[derive(Default)]
+struct Inner {
+    running: Option<Running>,
+    last_error: Option<String>,
+    totals: Option<(Instant, Totals)>,
+}
+
+/// Shared between the crawler (`run` attaches its pipeline) and the API.
+pub struct DhtService {
+    mode: Mode,
+    pub upnp: super::upnp::Status,
+    inner: Mutex<Inner>,
+}
+
+fn snap(p: &Pipeline, dht: &Dht) -> Snap {
+    let e = dht.stats();
+    let f = p.fetcher.stats();
+    let persisted = p.persisted.lock().unwrap();
+    Snap {
+        unique: get(&p.c.unique),
+        verified: f.ok + f.private + f.v2_only + f.invalid,
+        failed: f.failed + f.oversize,
+        blocked: persisted.blocked,
+        incoming: e.incoming_ping
+            + e.incoming_find_node
+            + e.incoming_get_peers
+            + e.incoming_announce_peer
+            + e.incoming_sample_infohashes
+            + e.incoming_unknown,
+        queries: e.queries_sent,
+        answered: e.answered,
+    }
+}
+
+impl std::fmt::Debug for DhtService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DhtService")
+            .field("mode", &self.mode)
+            .finish()
+    }
+}
+
+impl DhtService {
+    pub fn new(mode: Mode) -> Arc<Self> {
+        Arc::new(Self {
+            mode,
+            upnp: Arc::new(Mutex::new(UpnpStatus {
+                state: "off".into(),
+                ..Default::default()
+            })),
+            inner: Mutex::default(),
+        })
+    }
+
+    pub(super) fn attach(&self, p: Arc<Pipeline>, dht: Dht, started: Instant) {
+        let s = snap(&p, &dht);
+        let mut i = self.inner.lock().unwrap();
+        i.running = Some(Running {
+            p,
+            dht,
+            started,
+            window: VecDeque::from([(started, s)]),
+            bumped: Snap::default(),
+        });
+        i.last_error = None;
+    }
+
+    pub(super) fn detach(&self) {
+        self.inner.lock().unwrap().running = None;
+    }
+
+    pub(super) fn set_error(&self, e: &str) {
+        self.inner.lock().unwrap().last_error = Some(e.to_string());
+    }
+
+    /// Record a sample; returns the growth since the last bump (for `stats_series`).
+    fn sample(&self) -> Option<Snap> {
+        let mut i = self.inner.lock().unwrap();
+        let r = i.running.as_mut()?;
+        let s = snap(&r.p, &r.dht);
+        r.window.push_back((Instant::now(), s));
+        while r.window.len() > WINDOW {
+            r.window.pop_front();
+        }
+        let d = Snap {
+            unique: s.unique.saturating_sub(r.bumped.unique),
+            verified: s.verified.saturating_sub(r.bumped.verified),
+            failed: s.failed.saturating_sub(r.bumped.failed),
+            blocked: s.blocked.saturating_sub(r.bumped.blocked),
+            ..Snap::default()
+        };
+        r.bumped = s;
+        Some(d)
+    }
+
+    /// The live part of `DhtStats` (no database).
+    pub fn live(&self) -> DhtStats {
+        let i = self.inner.lock().unwrap();
+        let mut out = DhtStats {
+            mode: match self.mode {
+                Mode::Polite => "polite",
+                Mode::Aggressive => "aggressive",
+            }
+            .into(),
+            last_error: i.last_error.clone(),
+            upnp: Some(self.upnp.lock().unwrap().clone()),
+            ..Default::default()
+        };
+        let Some(r) = &i.running else {
+            return out;
+        };
+        let now = Instant::now();
+        let cur = snap(&r.p, &r.dht);
+        let (t0, old) = r.window.front().copied().unwrap_or((r.started, cur));
+        let mins = now.duration_since(t0).as_secs_f64().max(1.0) / 60.0;
+        let per_min = |a: u64, b: u64| a.saturating_sub(b) as f64 / mins;
+        let e = r.dht.stats();
+        let f = r.p.fetcher.stats();
+        let q = r.p.queue.lock().unwrap();
+        let persisted = r.p.persisted.lock().unwrap();
+        let queries = cur.queries.saturating_sub(old.queries);
+        let finished =
+            cur.verified.saturating_sub(old.verified) + cur.failed.saturating_sub(old.failed);
+        out.running = true;
+        out.uptime_secs = now.duration_since(r.started).as_secs();
+        out.virtual_nodes = r.dht.virtual_nodes() as u32;
+        out.ports = r.dht.local_ports();
+        out.external_ip = match r.dht.identity().map(|id| IpAddr::V4(id.external_ip)) {
+            Some(ip) => super::upnp::ip_class(ip).into(),
+            None => "unknown".into(),
+        };
+        out.routing_nodes = e.routing.iter().sum::<usize>() as u64;
+        out.pool_nodes = e.pool.size as u64;
+        out.pool_bep51 = e.pool.bep51_yes as u64;
+        out.queries_per_sec = queries as f64 / (mins * 60.0);
+        out.answered_share = if queries > 0 {
+            cur.answered.saturating_sub(old.answered) as f64 / queries as f64
+        } else {
+            0.0
+        };
+        out.brake = e.brake_active;
+        out.incoming_per_min = per_min(cur.incoming, old.incoming);
+        out.hashes_per_min = per_min(cur.unique, old.unique);
+        out.hashes_seen = cur.unique;
+        out.queue_len = q.len() as u64;
+        out.queue_lanes = q.lane_lens().iter().map(|n| *n as u64).collect();
+        out.sampling_paused = e.sample_share <= 0.0;
+        out.metadata_per_min = per_min(cur.verified, old.verified);
+        out.fetch_success_rate = if finished > 0 {
+            cur.verified.saturating_sub(old.verified) as f64 / finished as f64
+        } else {
+            0.0
+        };
+        out.fetch_ok = f.ok;
+        out.fetch_failed = f.failed + f.oversize;
+        out.stored = persisted.stored;
+        out.blocked = persisted.blocked;
+        out
+    }
+
+    /// `live()` plus the database totals (cached for a minute: `dht_seen` can be large).
+    pub async fn stats(&self, pool: &PgPool) -> DhtStats {
+        let mut out = self.live();
+        let cached = {
+            let i = self.inner.lock().unwrap();
+            i.totals
+                .as_ref()
+                .filter(|(at, _)| at.elapsed() < TOTALS_TTL)
+                .map(|(_, t)| t.clone())
+        };
+        let totals = match cached {
+            Some(t) => Some(t),
+            None => match totals(pool).await {
+                Ok(t) => {
+                    self.inner.lock().unwrap().totals = Some((Instant::now(), t.clone()));
+                    Some(t)
+                }
+                Err(e) => {
+                    tracing::warn!("DHT stats: {e}");
+                    None
+                }
+            },
+        };
+        if let Some(t) = totals {
+            let u = |v: i64| u64::try_from(v).unwrap_or(0);
+            out.stored_total = u(t.stored);
+            out.adult_total = u(t.adult);
+            out.blocked_total = u(t.blocked);
+            out.seen_queued = u(t.queued);
+            out.seen_failed = u(t.failed);
+        }
+        out
+    }
+}
+
+async fn totals(pool: &PgPool) -> Result<Totals, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM dht_torrents) AS stored,
+                (SELECT count(*) FROM dht_torrents WHERE category = 'porn') AS adult,
+                (SELECT count(*) FROM blocked_infohashes) AS blocked,
+                (SELECT count(*) FROM dht_seen WHERE status = 0) AS queued,
+                (SELECT count(*) FROM dht_seen WHERE status = 2) AS failed",
+    )
+    .fetch_one(pool)
+    .await
+}
+
+/// Every minute: one rate sample, and the growth of the counters into `stats_series`.
+pub(super) async fn sampler(
+    svc: Arc<DhtService>,
+    pool: Option<PgPool>,
+    mut stop: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(SAMPLE_EVERY) => {}
+            _ = stop_requested(&mut stop) => return,
+        }
+        let Some(d) = svc.sample() else { continue };
+        if let Some(pool) = &pool {
+            for (metric, n) in [
+                (DHT_HASHES_SEEN, d.unique),
+                (DHT_FETCH_OK, d.verified),
+                (DHT_FETCH_FAIL, d.failed),
+                (DHT_BLOCKED, d.blocked),
+            ] {
+                if n > 0 {
+                    stats::bump(pool, metric, i64::try_from(n).unwrap_or(i64::MAX)).await;
+                }
+            }
+        }
+    }
+}

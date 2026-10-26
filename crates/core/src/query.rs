@@ -55,6 +55,10 @@ pub struct SearchQuery {
     /// Year range: the linked media's year, else the year in the name.
     pub min_year: Option<i32>,
     pub max_year: Option<i32>,
+    /// Sources (D51): `nostr`, `dht`; any of them (a torrent known from both matches either).
+    /// Empty = every source. Older servers ignore it, so the app offers the chip only when
+    /// the server lists `api::features::ORIGIN`.
+    pub origins: Vec<String>,
 }
 
 impl SearchQuery {
@@ -104,6 +108,22 @@ impl SearchQuery {
 }
 
 impl SearchQuery {
+    /// The source filter (D51), lowercased, known values only (`nostr`, `dht`), deduplicated;
+    /// empty = every source. Both values together select everything, so that is empty too.
+    pub fn origin_filter(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for o in &self.origins {
+            let o = o.trim().to_lowercase();
+            if matches!(o.as_str(), "nostr" | "dht") && !out.contains(&o) {
+                out.push(o);
+            }
+        }
+        if out.len() == 2 {
+            out.clear();
+        }
+        out
+    }
+
     /// Adult documents are left out of this query (D52).
     pub fn hides_adult(&self) -> bool {
         !self.include_adult && !self.categories.contains(&Category::Porn)

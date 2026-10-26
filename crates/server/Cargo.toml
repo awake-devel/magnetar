@@ -8,6 +8,12 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = ["upnp"]
+# Router port mappings for the DHT crawler (D57, D72). Without it MAGNETAR_DHT_UPNP is ignored
+# (logged) and the ports must be forwarded by hand.
+upnp = ["dep:igd-next"]
+
 [[bin]]
 name = "magnetar-server"
 path = "src/main.rs"
@@ -39,6 +45,7 @@ parse-torrent-title.workspace = true
 anitomy-ng.workspace = true
 ruzstd.workspace = true
 tantivy.workspace = true
+igd-next = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio-tungstenite.workspace = true

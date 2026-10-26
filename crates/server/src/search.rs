@@ -1,10 +1,14 @@
 //! Search SQL (ARCHITECTURE.md §5, rust-crates.md §9): eligible events are filtered first, then
 //! grouped by infohash with one canonical event (highest trust, then earliest). Since D43 this is
 //! the fallback while the Tantivy index (`search_index`) is disabled or still building.
+//!
+//! Rows come from the `torrent_rows` view (D50/D51): Nostr events and DHT rows. A DHT row
+//! always passes `min_trust` (its `trust` is -1 so a Nostr event stays canonical), is not a
+//! publisher, and is left out of the trigram typo arm (`dht_torrents` has no trigram index).
 
 use magnetar_core::enrich::MIN_DISPLAY_CONFIDENCE;
 use magnetar_core::enrich::ids::split_media_token;
-use magnetar_core::model::{Liveness, TorrentSummary, npub};
+use magnetar_core::model::{Liveness, Origin, TorrentSummary, npub};
 use magnetar_core::query::{MIN_PREFIX_CHARS, SearchQuery, Sort, pg_tsquery};
 use magnetar_core::release::ReleaseAttrs;
 use sqlx::types::Json;
@@ -35,6 +39,8 @@ pub(crate) struct HitRow {
     media_id: Option<i64>,
     media_rating: Option<f32>,
     attrs: Option<Json<ReleaseAttrs>>,
+    /// The canonical row's source; `store` refines it to `Both` from the page's infohashes.
+    origin: String,
 }
 
 impl HitRow {
@@ -73,6 +79,11 @@ impl HitRow {
             media_id: self.media_id,
             media_rating: self.media_rating,
             attrs: self.attrs.map(|a| a.0),
+            origin: if self.origin == "dht" {
+                Origin::Dht
+            } else {
+                Origin::Nostr
+            },
         }
     }
 }
@@ -107,11 +118,14 @@ fn push_hits_cte(qb: &mut QueryBuilder<Postgres>, q: &SearchQuery, min_trust: u8
             qb.push("0::float4 AS rank");
         }
     }
-    qb.push(" FROM torrents t WHERE NOT EXISTS (SELECT 1 FROM local_overrides o ");
-    qb.push("WHERE o.pubkey = t.pubkey AND o.action = 'block') AND (t.trust >= ")
-        .push_bind(i16::from(min_trust))
-        .push(" OR EXISTS (SELECT 1 FROM local_overrides o WHERE o.pubkey = t.pubkey ")
-        .push("AND o.action = 'trust'))");
+    qb.push(", t.origin FROM torrent_rows t WHERE NOT EXISTS (SELECT 1 FROM local_overrides o ");
+    // D51: a DHT row always passes the threshold (its trust is -1, below any threshold).
+    qb.push(
+        "WHERE o.pubkey = t.pubkey AND o.action = 'block') AND (t.origin = 'dht' OR t.trust >= ",
+    )
+    .push_bind(i16::from(min_trust))
+    .push(" OR EXISTS (SELECT 1 FROM local_overrides o WHERE o.pubkey = t.pubkey ")
+    .push("AND o.action = 'trust'))");
     if !q.categories.is_empty() {
         let cats: Vec<String> = q
             .categories
@@ -144,21 +158,23 @@ fn push_hits_cte(qb: &mut QueryBuilder<Postgres>, q: &SearchQuery, min_trust: u8
             .push(")");
         // Fuzzy title matching needs a few characters: below that pg_trgm cannot use its
         // index and `<%` scans every title.
+        // Nostr rows only: `dht_torrents` has no trigram index, and the constant `origin` of
+        // each UNION ALL branch folds this arm away in the DHT branch.
         if text.chars().count() >= MIN_PREFIX_CHARS {
-            qb.push(" OR ")
+            qb.push(" OR (t.origin = 'nostr' AND ")
                 .push_bind(text.clone())
-                .push(" <% lower(t.title)");
+                .push(" <% lower(t.title))");
         }
         qb.push(")");
     }
     qb.push(
-        "), grp AS (SELECT infohash, count(DISTINCT pubkey) AS publisher_count, max(rank) AS rank \
-         FROM elig GROUP BY infohash), \
+        "), grp AS (SELECT infohash, count(DISTINCT pubkey) FILTER (WHERE origin = 'nostr') \
+         AS publisher_count, max(rank) AS rank FROM elig GROUP BY infohash), \
          canon AS (SELECT DISTINCT ON (infohash) * FROM elig \
          ORDER BY infohash, trust DESC, created_at ASC, event_id ASC), \
          hits AS (SELECT c.event_id, c.infohash, c.pubkey, c.created_at, c.trust, c.title, \
          c.category, c.total_size, c.file_count, c.pow_bits, c.source_url, g.publisher_count, \
-         g.rank, l.seeders, l.leechers, l.expires_at, \
+         g.rank, c.origin, l.seeders, l.leechers, l.expires_at, \
          CASE WHEN l.seeders IS NULL AND l.dht_peers_est IS NULL THEN NULL \
          ELSE greatest(coalesce(l.seeders, 0), coalesce(l.dht_peers_est, 0)) END AS best_peers \
          FROM canon c JOIN grp g ON g.infohash = c.infohash \
@@ -237,6 +253,20 @@ fn push_hit_filters(qb: &mut QueryBuilder<Postgres>, q: &SearchQuery, now: i64) 
              WHERE d.infohash = h.infohash AND d.category = 'porn')",
         );
     }
+    // D51 source chip: a torrent known from both sources matches either value.
+    match q.origin_filter().as_slice() {
+        [o] if o == "dht" => {
+            qb.push(" AND EXISTS (SELECT 1 FROM dht_torrents d WHERE d.infohash = h.infohash)");
+        }
+        [o] if o == "nostr" => {
+            qb.push(
+                " AND EXISTS (SELECT 1 FROM torrents t WHERE t.infohash = h.infohash \
+                 AND NOT EXISTS (SELECT 1 FROM local_overrides o WHERE o.pubkey = t.pubkey \
+                 AND o.action = 'block'))",
+            );
+        }
+        _ => {}
+    }
     if q.hide_dead {
         qb.push(" AND NOT coalesce(expires_at > ")
             .push_bind(now)
@@ -262,7 +292,16 @@ pub(crate) fn count_query(q: &SearchQuery, now: i64, min_trust: u8) -> QueryBuil
 }
 
 pub(crate) fn hits_query(q: &SearchQuery, now: i64, min_trust: u8) -> QueryBuilder<Postgres> {
-    let mut qb = QueryBuilder::new("");
+    hits_query_with("", q, now, min_trust)
+}
+
+fn hits_query_with(
+    prefix: &str,
+    q: &SearchQuery,
+    now: i64,
+    min_trust: u8,
+) -> QueryBuilder<Postgres> {
+    let mut qb = QueryBuilder::new(prefix);
     push_hits_cte(&mut qb, q, min_trust);
     qb.push(
         "SELECT h.*, m.title AS media_title, m.year AS media_year, m.kind AS media_kind, \
@@ -290,4 +329,19 @@ pub(crate) fn hits_query(q: &SearchQuery, now: i64, min_trust: u8) -> QueryBuild
     qb.push_bind(i64::from(q.effective_limit()));
     qb.push(" OFFSET ").push_bind(i64::from(q.offset));
     qb
+}
+
+/// `EXPLAIN` of the fallback's page query (tests and ops checks: the DHT branch of
+/// `torrent_rows` must reach `dht_torrents` through its GIN index, never a full scan, D51).
+pub async fn explain_hits(
+    conn: &mut sqlx::PgConnection,
+    q: &SearchQuery,
+    now: i64,
+    min_trust: u8,
+) -> magnetar_core::error::Result<Vec<String>> {
+    let mut qb = hits_query_with("EXPLAIN ", q, now, min_trust);
+    qb.build_query_scalar()
+        .fetch_all(conn)
+        .await
+        .map_err(crate::store::db)
 }

@@ -919,6 +919,12 @@ fn synthetic_docs(n: u64) -> Vec<IndexDoc> {
                 media: None,
                 attrs: Some(magnetar_core::release::parse_release(&title, &[], cat)),
                 dht_adult: false,
+                // About one in five documents is known from the DHT as well (D51).
+                origin: match next() % 10 {
+                    0 => Origin::Dht,
+                    1 => Origin::Both,
+                    _ => Origin::Nostr,
+                },
             }
         })
         .collect()
@@ -1010,11 +1016,16 @@ async fn adult_hidden_by_default_on_both_paths() {
     assert_eq!(run(all).await, vec!["clip one", "clip three", "clip two"]);
     let mut porn = q("clip");
     porn.categories = vec![Category::Porn];
+    // Choosing porn is consent. The index filters on the canonical category; the fallback on
+    // any row (D43), and since D51 its rows include the DHT row classified `porn`.
     assert_eq!(
-        run(porn).await,
+        titles(&s.search(&porn, NOW).await.unwrap()),
         vec!["clip two"],
         "choosing porn is consent"
     );
+    let mut fallback = titles(&pg.search(&porn, NOW).await.unwrap());
+    fallback.sort();
+    assert_eq!(fallback, vec!["clip three dht", "clip two"]);
     // The API's query string: `adult=1`.
     let parsed = magnetar_server::api::parse_search_query(Some("q=clip&adult=1")).unwrap();
     assert!(parsed.include_adult);

@@ -41,6 +41,7 @@ fn summary() -> TorrentSummary {
         media_id: None,
         media_rating: None,
         attrs: None,
+        origin: Origin::Both,
     }
 }
 
@@ -143,6 +144,17 @@ fn detail() -> TorrentDetail {
             poster: Some("/api/v1/media/7/poster".into()),
             episode_title: None,
         }),
+        dht: Some(DhtInfo {
+            first_seen: 1_789_000_000,
+            fetched_at: 1_789_000_030,
+            title: "Big.Buck.Bunny.2008".into(),
+            file_count: 3,
+            total_size: 276_134_947,
+            category: Some(Category::Video),
+            peers_seen: 9,
+            discovered_via: "sample".into(),
+            infohash_v2: None,
+        }),
     }
 }
 
@@ -239,6 +251,11 @@ async fn server() -> api_support::FakeHttp {
                 search_index: None,
                 liveness: Some(LivenessStats {
                     never_checked: 7,
+                    ..Default::default()
+                }),
+                dht: Some(DhtStats {
+                    mode: "aggressive".into(),
+                    hashes_per_min: 2.5,
                     ..Default::default()
                 }),
             }),

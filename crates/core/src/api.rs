@@ -37,6 +37,13 @@ pub mod features {
     /// `SearchQuery.include_adult` (D52): adult documents are left out unless it is set or
     /// `porn` is selected. Older servers ignore it; the app then drops `porn` hits itself.
     pub const ADULT_FILTER: &str = "adult_filter";
+    /// `SearchQuery.origins`, `TorrentSummary.origin`, `TorrentDetail.dht` and the `origin`
+    /// facet / breakdown (D51): results carry their source (Nostr, DHT or both).
+    pub const ORIGIN: &str = "origin";
+    /// The DHT crawler runs on this server (`MAGNETAR_DHT` ≠ off): DHT results can appear and
+    /// `StatsHealth.dht` / `StatsResponse.dht` are filled. Not in `ALL` (it depends on the
+    /// configuration).
+    pub const DHT: &str = "dht";
     pub const ALL: &[&str] = &[
         FILTERS,
         FACET_SET,
@@ -45,6 +52,7 @@ pub mod features {
         STATS,
         GRAPHS,
         ADULT_FILTER,
+        ORIGIN,
     ];
 }
 
@@ -101,6 +109,87 @@ pub struct StatsResponse {
     /// The seed-check backlog (D45); None from older servers.
     #[serde(default)]
     pub liveness: Option<LivenessStats>,
+    /// The DHT crawler (D58); None when it is off or the server is older.
+    #[serde(default)]
+    pub dht: Option<DhtStats>,
+}
+
+/// The DHT crawler on the server (D58, docs/DHT.md §10). Rates are over the last ~10 minutes
+/// of the running crawler; `*_total` counts come from the database. The external address is
+/// reported as a class only, never the address itself.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DhtStats {
+    /// "polite" | "aggressive".
+    pub mode: String,
+    /// False while it waits to restart after an error (`last_error`).
+    pub running: bool,
+    pub uptime_secs: u64,
+    pub virtual_nodes: u32,
+    pub ports: Vec<u16>,
+    /// "public" | "private" | "cgnat" | "unknown" (BEP 42 vote or UPnP).
+    pub external_ip: String,
+    /// Contacts in the routing tables (all virtual nodes) and in the crawl pool.
+    pub routing_nodes: u64,
+    pub pool_nodes: u64,
+    /// Pool nodes known to answer `sample_infohashes` (BEP 51).
+    pub pool_bep51: u64,
+    pub queries_per_sec: f64,
+    /// Share of our queries that got an answer.
+    pub answered_share: f64,
+    /// The adaptive brake (D54/D66) halves the rates.
+    pub brake: bool,
+    /// Queries other nodes sent us per minute (aggressive: reachability shows here).
+    pub incoming_per_min: f64,
+    /// Discovery: new unique infohashes per minute, and since the start.
+    pub hashes_per_min: f64,
+    pub hashes_seen: u64,
+    /// Hashes waiting for peer collection (in memory), by lane: announce, sample, retry.
+    pub queue_len: u64,
+    pub queue_lanes: Vec<u64>,
+    /// Sampling paused by backpressure (D62).
+    pub sampling_paused: bool,
+    /// Metadata (BEP 9) verified per minute, and success share of finished fetches.
+    pub metadata_per_min: f64,
+    pub fetch_success_rate: f64,
+    /// Since the start: verified, failed, stored, blocked (D53, counted only).
+    pub fetch_ok: u64,
+    pub fetch_failed: u64,
+    pub stored: u64,
+    pub blocked: u64,
+    /// Database totals: DHT torrents stored, of which adult (D52), hashes blocked (any
+    /// origin), hashes waiting in `dht_seen` (queued) and given up / failed.
+    pub stored_total: u64,
+    pub adult_total: u64,
+    pub blocked_total: u64,
+    pub seen_queued: u64,
+    pub seen_failed: u64,
+    pub upnp: Option<UpnpStatus>,
+    pub last_error: Option<String>,
+}
+
+/// Router port mappings for the crawler (D57, D72).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct UpnpStatus {
+    /// "off" | "searching" | "mapped" | "partial" | "failed".
+    pub state: String,
+    /// The gateway's LAN address that answered (`host:port` of its description).
+    pub gateway: Option<String>,
+    pub mappings: Vec<UpnpMapping>,
+    /// Unix time of the last successful (re)mapping.
+    pub renewed_at: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct UpnpMapping {
+    /// "udp" | "tcp".
+    pub protocol: String,
+    pub port: u16,
+    /// 0 = permanent (the router refused a lease).
+    pub lease_secs: u32,
 }
 
 /// Seed checks (liveness) on the server (D45). Counts are distinct infohashes.
@@ -326,6 +415,8 @@ pub struct StatsHealth {
     /// Infohashes whose release attributes (D44) are still to be parsed.
     pub attrs_missing: u64,
     pub computed_at: i64,
+    /// The DHT crawler (D58); None when it is off.
+    pub dht: Option<DhtStats>,
 }
 
 /// A node of a network graph (D47). What `id` is depends on `kind`: a pubkey (hex) for

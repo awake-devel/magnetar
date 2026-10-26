@@ -896,6 +896,8 @@ impl SqliteStore {
                         .and_then(|j| serde_json::from_str(&j).ok()),
                     media_id: r.get(30)?,
                     media_rating: r.get::<_, Option<f64>>(31)?.map(|r| r as f32),
+                    // The phone's cache holds Nostr events only (D51).
+                    origin: Origin::Nostr,
                 })
             })
             .db()?
@@ -1060,6 +1062,7 @@ impl SqliteStore {
             media_id: media.as_ref().map(|m| m.media_id),
             media_rating: media.as_ref().and_then(|m| m.rating),
             attrs,
+            origin: Origin::Nostr,
         };
         let events = rows
             .iter()
@@ -1087,6 +1090,7 @@ impl SqliteStore {
             events,
             comments,
             media,
+            dht: None,
         }))
     }
 
