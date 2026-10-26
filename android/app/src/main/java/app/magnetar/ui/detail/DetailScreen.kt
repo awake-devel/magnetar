@@ -84,7 +84,12 @@ private const val MAX_FILE_ROWS = 300
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DetailScreen(onBack: () -> Unit, onOpenTorrent: (String) -> Unit = {}, vm: DetailViewModel = viewModel()) {
+fun DetailScreen(
+    onBack: () -> Unit,
+    onOpenTorrent: (String) -> Unit = {},
+    onOpenMedia: (Long) -> Unit = {},
+    vm: DetailViewModel = viewModel(),
+) {
     val state by vm.state.collectAsStateWithLifecycle()
     val settings by vm.settings.collectAsStateWithLifecycle()
     val context = LocalContext.current
@@ -173,10 +178,7 @@ fun DetailScreen(onBack: () -> Unit, onOpenTorrent: (String) -> Unit = {}, vm: D
                             MediaCard(
                                 m = m,
                                 posterPath = state.posterPath,
-                                releases = state.releases,
-                                loadingReleases = state.loadingReleases,
-                                onLoadReleases = vm::loadReleases,
-                                onOpenTorrent = onOpenTorrent,
+                                onOpenMedia = onOpenMedia,
                             )
                         }
                     },

@@ -90,8 +90,9 @@ import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SearchScreen(onOpen: (String) -> Unit, vm: SearchViewModel = viewModel()) {
+fun SearchScreen(onOpen: (String) -> Unit, onOpenMedia: (Long) -> Unit = {}, vm: SearchViewModel = viewModel()) {
     val state by vm.state.collectAsStateWithLifecycle()
+    val facets by vm.facets.collectAsStateWithLifecycle()
     val settings by vm.settings.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
     var showFilters by remember { mutableStateOf(false) }
@@ -110,6 +111,7 @@ fun SearchScreen(onOpen: (String) -> Unit, vm: SearchViewModel = viewModel()) {
                         IconButton(onClick = { showSort = true }) { Icon(AppIcons.Sort, "Sort") }
                         SortMenu(
                             expanded = showSort,
+                            withRating = state.filterMode == FilterMode.FULL,
                             sort = state.sort,
                             descending = state.descending,
                             onDismiss = { showSort = false },
@@ -117,7 +119,7 @@ fun SearchScreen(onOpen: (String) -> Unit, vm: SearchViewModel = viewModel()) {
                             onToggleDirection = { vm.toggleDirection(); showSort = false },
                         )
                     }
-                    IconButton(onClick = { showFilters = true }) {
+                    IconButton(onClick = { showFilters = true; vm.draftFilters(state.filters) }) {
                         BadgedBox(badge = {
                             if (state.filters.activeCount > 0) Badge { Text("${state.filters.activeCount}") }
                         }) { Icon(AppIcons.FilterList, "Filters") }
@@ -162,7 +164,7 @@ fun SearchScreen(onOpen: (String) -> Unit, vm: SearchViewModel = viewModel()) {
                         },
                     )
                 }
-                else -> ResultList(state, settings.trustThreshold, onOpen, vm::loadMore)
+                else -> ResultList(state, settings.trustThreshold, onOpen, onOpenMedia, vm::loadMore)
             }
         }
     }
@@ -171,8 +173,11 @@ fun SearchScreen(onOpen: (String) -> Unit, vm: SearchViewModel = viewModel()) {
         FilterSheet(
             initial = state.filters,
             defaultTrust = settings.trustThreshold,
-            onDismiss = { showFilters = false },
-            onApply = { vm.setFilters(it); showFilters = false },
+            mode = state.filterMode,
+            facets = facets,
+            onDraft = vm::draftFilters,
+            onDismiss = { showFilters = false; vm.draftFilters(null) },
+            onApply = { vm.setFilters(it); showFilters = false; vm.draftFilters(null) },
         )
     }
     if (showSave) {
@@ -185,7 +190,13 @@ fun SearchScreen(onOpen: (String) -> Unit, vm: SearchViewModel = viewModel()) {
 }
 
 @Composable
-private fun ResultList(state: SearchUiState, threshold: Int, onOpen: (String) -> Unit, loadMore: () -> Unit) {
+private fun ResultList(
+    state: SearchUiState,
+    threshold: Int,
+    onOpen: (String) -> Unit,
+    onOpenMedia: (Long) -> Unit,
+    loadMore: () -> Unit,
+) {
     val listState = rememberLazyListState()
     // A new search (text, filters, sort, saved search, settings) starts at the top, not at the
     // scroll position of the previous result list (which also kept triggering loadMore).
@@ -216,7 +227,7 @@ private fun ResultList(state: SearchUiState, threshold: Int, onOpen: (String) ->
             )
         }
         items(state.hits, key = { it.infohash }) { hit ->
-            ResultRow(hit, threshold, Modifier.clickable { onOpen(hit.infohash) })
+            ResultRow(hit, threshold, Modifier.clickable { onOpen(hit.infohash) }, onOpenMedia)
             HorizontalDivider()
         }
         if (state.loadingMore) {
@@ -233,12 +244,23 @@ fun peersText(seeders: UInt?, leechers: UInt?): String =
     if (seeders == null && leechers == null) "peers unknown" else "${seeders ?: "?"} S / ${leechers ?: "?"} L"
 
 @Composable
-private fun ResultRow(hit: FfiTorrentSummary, threshold: Int, modifier: Modifier) {
+private fun ResultRow(hit: FfiTorrentSummary, threshold: Int, modifier: Modifier, onOpenMedia: (Long) -> Unit) {
     ListItem(
         modifier = modifier,
         leadingContent = { CategoryIcon(hit.category) },
         overlineContent = hit.mediaTitle?.let { t ->
-            { Text(mediaHeadline(t, hit.mediaYear), maxLines = 1, overflow = TextOverflow.Ellipsis) }
+            {
+                // The linked title opens its page: every release of it, grouped (D44).
+                val id = hit.mediaId
+                val rating = hit.mediaRating?.let { " · ★ %.1f".format(it) } ?: ""
+                Text(
+                    mediaHeadline(t, hit.mediaYear) + rating + if (id != null) "  ›" else "",
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    color = if (id != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = if (id != null) Modifier.clickable { onOpenMedia(id) } else Modifier,
+                )
+            }
         },
         headlineContent = { Text(hit.title, maxLines = 2, overflow = TextOverflow.Ellipsis) },
         supportingContent = {
@@ -246,6 +268,15 @@ private fun ResultRow(hit: FfiTorrentSummary, threshold: Int, modifier: Modifier
             val pinned = if (hit.pinned) "📌 " else ""
             Column {
                 Text("$pinned${formatBytes(hit.totalSize)} · ${peersText(hit.seeders, hit.leechers)}$dead · ${formatAge(hit.createdAt)}")
+                hit.attrs?.badges?.takeIf { it.isNotEmpty() }?.let { b ->
+                    Text(
+                        b.joinToString(" · "),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.secondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
                 hit.matchedFile?.let { f ->
                     Text(
                         "matched in file: ${fileName(f)}",
@@ -264,6 +295,7 @@ private fun ResultRow(hit: FfiTorrentSummary, threshold: Int, modifier: Modifier
 @Composable
 private fun SortMenu(
     expanded: Boolean,
+    withRating: Boolean,
     sort: FfiSort,
     descending: Boolean,
     onDismiss: () -> Unit,
@@ -271,7 +303,8 @@ private fun SortMenu(
     onToggleDirection: () -> Unit,
 ) {
     DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
-        for (s in FfiSort.entries) {
+        // Rating needs a server with D44 filters (the phone only knows ratings of opened details).
+        for (s in FfiSort.entries.filter { withRating || it != FfiSort.RATING || sort == FfiSort.RATING }) {
             DropdownMenuItem(
                 text = { Text(s.name.lowercase().replaceFirstChar { it.uppercase() }) },
                 leadingIcon = { RadioButton(selected = s == sort, onClick = null) },
@@ -289,83 +322,8 @@ private fun SortMenu(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-private fun FilterSheet(
-    initial: SearchFilters,
-    defaultTrust: Int,
-    onDismiss: () -> Unit,
-    onApply: (SearchFilters) -> Unit,
-) {
-    var f by remember { mutableStateOf(initial) }
-    var minSize by remember { mutableStateOf(initial.minSizeMb?.toString() ?: "") }
-    var maxSize by remember { mutableStateOf(initial.maxSizeMb?.toString() ?: "") }
-    var minSeeders by remember { mutableStateOf(initial.minSeeders?.toString() ?: "") }
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
-        Column(Modifier.padding(horizontal = 16.dp).verticalScroll(rememberScrollState())) {
-            Text("Categories", style = MaterialTheme.typography.titleSmall)
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                for (c in FfiCategory.entries) {
-                    FilterChip(
-                        selected = c in f.categories,
-                        onClick = { f = f.copy(categories = if (c in f.categories) f.categories - c else f.categories + c) },
-                        label = { Text(categoryLabel(c)) },
-                    )
-                }
-            }
-            Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                NumberField("Min size (MiB)", minSize, { minSize = it }, Modifier.weight(1f))
-                NumberField("Max size (MiB)", maxSize, { maxSize = it }, Modifier.weight(1f))
-            }
-            Spacer(Modifier.height(8.dp))
-            Text("Published", style = MaterialTheme.typography.titleSmall)
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                for (p in DatePreset.entries) {
-                    FilterChip(selected = f.date == p, onClick = { f = f.copy(date = p) }, label = { Text(p.label) })
-                }
-            }
-            Spacer(Modifier.height(8.dp))
-            NumberField("Min seeders", minSeeders, { minSeeders = it }, Modifier.fillMaxWidth())
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text("Hide dead torrents", Modifier.weight(1f))
-                Switch(checked = f.hideDead, onCheckedChange = { f = f.copy(hideDead = it) })
-            }
-            val trust = f.minTrust ?: defaultTrust
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    "Min trust: $trust" + if (f.minTrust == null) " (default)" else "",
-                    Modifier.weight(1f),
-                    style = MaterialTheme.typography.titleSmall,
-                )
-                if (f.minTrust != null) TextButton(onClick = { f = f.copy(minTrust = null) }) { Text("Reset") }
-            }
-            Slider(
-                value = trust.toFloat(),
-                onValueChange = { f = f.copy(minTrust = it.roundToInt()) },
-                valueRange = 0f..100f,
-            )
-            Row(Modifier.fillMaxWidth().padding(vertical = 16.dp), horizontalArrangement = Arrangement.End) {
-                OutlinedButton(onClick = {
-                    f = SearchFilters(); minSize = ""; maxSize = ""; minSeeders = ""
-                }) { Text("Clear all") }
-                Spacer(Modifier.width(8.dp))
-                Button(onClick = {
-                    onApply(
-                        f.copy(
-                            minSizeMb = minSize.toLongOrNull(),
-                            maxSizeMb = maxSize.toLongOrNull(),
-                            minSeeders = minSeeders.toIntOrNull(),
-                        ),
-                    )
-                }) { Text("Apply") }
-            }
-        }
-    }
-}
-
-@Composable
-private fun NumberField(label: String, value: String, onChange: (String) -> Unit, modifier: Modifier) {
+fun NumberField(label: String, value: String, onChange: (String) -> Unit, modifier: Modifier) {
     OutlinedTextField(
         value = value,
         onValueChange = { v -> onChange(v.filter { it.isDigit() }.take(9)) },

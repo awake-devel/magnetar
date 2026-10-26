@@ -36,6 +36,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import app.magnetar.ffi.FfiSavedSearch
 import app.magnetar.ffi.FfiSearchQuery
+import app.magnetar.ffi.facetLabel
 import app.magnetar.formatAgo
 import app.magnetar.formatBytes
 import app.magnetar.ui.common.CenteredMessage
@@ -108,4 +109,19 @@ private fun describe(q: FfiSearchQuery): String = buildList {
     q.minSeeders?.let { add("≥ $it seeders") }
     if (q.hideDead) add("alive only")
     q.minTrust?.let { add("trust ≥ $it") }
+    // Release/media filters (D44).
+    val lists = listOf(
+        "language" to q.languages, "subtitles" to q.subtitles, "resolution" to q.resolutions,
+        "source" to q.sources, "codec" to q.videoCodecs, "hdr" to q.hdr, "audio" to q.audio, "genre" to q.genres,
+        "media_kind" to q.mediaKinds.map { it.name.lowercase() },
+    )
+    for ((field, values) in lists) {
+        if (values.isNotEmpty()) add(values.joinToString("/") { facetLabel(field, it) })
+    }
+    q.minRating?.let { add("★ ≥ %.1f".format(it)) }
+    when {
+        q.minYear != null && q.maxYear != null -> add("${q.minYear}–${q.maxYear}")
+        q.minYear != null -> add("≥ ${q.minYear}")
+        q.maxYear != null -> add("≤ ${q.maxYear}")
+    }
 }.joinToString(" · ")

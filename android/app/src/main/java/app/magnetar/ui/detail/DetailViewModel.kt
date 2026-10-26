@@ -9,7 +9,6 @@ import app.magnetar.ffi.FfiSavedSearch
 import app.magnetar.ffi.FfiSearchQuery
 import app.magnetar.ffi.FfiSort
 import app.magnetar.ffi.FfiTorrentDetail
-import app.magnetar.ffi.FfiTorrentSummary
 import kotlinx.coroutines.delay
 import app.magnetar.ffiCatching
 import app.magnetar.ui.common.BaseViewModel
@@ -30,9 +29,6 @@ data class DetailUiState(
     val checkingLiveness: Boolean = false,
     /** Local file of the media poster (fetched from the server, cached by ffi). */
     val posterPath: String? = null,
-    /** Other releases of the same media; null = not loaded. */
-    val releases: List<FfiTorrentSummary>? = null,
-    val loadingReleases: Boolean = false,
 )
 
 class DetailViewModel(application: Application, handle: SavedStateHandle) : BaseViewModel(application) {
@@ -90,17 +86,6 @@ class DetailViewModel(application: Application, handle: SavedStateHandle) : Base
                         onMedia(again, retry = false)
                     }
                 }
-            }
-        }
-    }
-
-    fun loadReleases() {
-        val m = _state.value.detail?.media ?: return
-        _state.update { it.copy(loadingReleases = true) }
-        launchFfi(onError = { msg -> _state.update { it.copy(loadingReleases = false) }; message(msg) }) { mag ->
-            val page = mag.mediaTorrents(m.mediaId)
-            _state.update { s ->
-                s.copy(loadingReleases = false, releases = page.hits.filter { it.infohash != infohash })
             }
         }
     }

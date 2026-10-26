@@ -3,6 +3,8 @@ package app.magnetar.ui.search
 import android.app.Application
 import androidx.lifecycle.viewModelScope
 import app.magnetar.ffi.FfiCategory
+import app.magnetar.ffi.FfiFacetSet
+import app.magnetar.ffi.FfiMediaKind
 import app.magnetar.ffi.FfiSavedSearch
 import app.magnetar.ffi.FfiSearchQuery
 import app.magnetar.ffi.FfiSort
@@ -41,13 +43,96 @@ data class SearchFilters(
     val hideDead: Boolean = false,
     /** null = the configured trust threshold. */
     val minTrust: Int? = null,
+    // Release/media filters (D44): codes as in docs/FILTERS.md, any of a set matches.
+    val languages: Set<String> = emptySet(),
+    val subtitles: Set<String> = emptySet(),
+    val resolutions: Set<String> = emptySet(),
+    val sources: Set<String> = emptySet(),
+    val codecs: Set<String> = emptySet(),
+    val hdr: Set<String> = emptySet(),
+    val audio: Set<String> = emptySet(),
+    val genres: Set<String> = emptySet(),
+    val kinds: Set<FfiMediaKind> = emptySet(),
+    /** IMDb-style rating 0–10; null = any. */
+    val minRating: Float? = null,
+    val minYear: Int? = null,
+    val maxYear: Int? = null,
 ) {
     val activeCount: Int
         get() = listOf(
             categories.isNotEmpty(), minSizeMb != null, maxSizeMb != null, date != DatePreset.ANY,
             minSeeders != null, hideDead, minTrust != null,
+            languages.isNotEmpty(), subtitles.isNotEmpty(), resolutions.isNotEmpty(), sources.isNotEmpty(),
+            codecs.isNotEmpty(), hdr.isNotEmpty(), audio.isNotEmpty(), genres.isNotEmpty(), kinds.isNotEmpty(),
+            minRating != null, minYear != null || maxYear != null,
         ).count { it }
+
+    /** The values selected for facet [field] (the names of `FACET_FIELDS`). */
+    fun selected(field: String): Set<String> = when (field) {
+        "language" -> languages
+        "subtitles" -> subtitles
+        "resolution" -> resolutions
+        "source" -> sources
+        "codec" -> codecs
+        "hdr" -> hdr
+        "audio" -> audio
+        "genre" -> genres
+        "media_kind" -> kinds.mapTo(HashSet()) { it.code() }
+        else -> emptySet()
+    }
+
+    /** [value] of facet [field] switched on or off. */
+    fun toggle(field: String, value: String): SearchFilters {
+        fun Set<String>.flip() = if (value in this) this - value else this + value
+        return when (field) {
+            "language" -> copy(languages = languages.flip())
+            "subtitles" -> copy(subtitles = subtitles.flip())
+            "resolution" -> copy(resolutions = resolutions.flip())
+            "source" -> copy(sources = sources.flip())
+            "codec" -> copy(codecs = codecs.flip())
+            "hdr" -> copy(hdr = hdr.flip())
+            "audio" -> copy(audio = audio.flip())
+            "genre" -> copy(genres = genres.flip())
+            "media_kind" -> {
+                val k = mediaKindOf(value) ?: return this
+                copy(kinds = if (k in kinds) kinds - k else kinds + k)
+            }
+            else -> this
+        }
+    }
+
+    /** Only what [mode] can apply (filters the server or the cache cannot test are dropped). */
+    fun supportedBy(mode: FilterMode): SearchFilters = when (mode) {
+        FilterMode.FULL -> this
+        FilterMode.LOCAL -> copy(genres = emptySet(), kinds = emptySet(), minRating = null)
+        FilterMode.BASIC -> copy(
+            languages = emptySet(), subtitles = emptySet(), resolutions = emptySet(), sources = emptySet(),
+            codecs = emptySet(), hdr = emptySet(), audio = emptySet(), genres = emptySet(), kinds = emptySet(),
+            minRating = null, minYear = null, maxYear = null,
+        )
+    }
 }
+
+fun FfiMediaKind.code(): String = name.lowercase()
+
+fun mediaKindOf(code: String): FfiMediaKind? = FfiMediaKind.entries.firstOrNull { it.code() == code }
+
+/**
+ * Which filters the app offers (D44). LOCAL: no server configured or it did not answer, so
+ * searches use the phone cache, which knows the release attributes and years but only the media
+ * (genre, kind, rating) of details opened online. FULL: a server with the `filters` feature.
+ * BASIC: a server older than D44, which would ignore the new filters.
+ */
+enum class FilterMode { LOCAL, FULL, BASIC }
+
+fun filterMode(hasServer: Boolean, features: List<String>?): FilterMode = when {
+    !hasServer || features == null -> FilterMode.LOCAL
+    "filters" in features -> FilterMode.FULL
+    else -> FilterMode.BASIC
+}
+
+/** Facets shown in the filter sheet, in order. */
+val FACET_FIELDS = listOf("language", "subtitles", "resolution", "source", "codec", "hdr", "audio", "genre", "media_kind")
 
 data class SearchUiState(
     val text: String = "",
@@ -67,9 +152,14 @@ data class SearchUiState(
     val serverError: String? = null,
     /** Bumped for every fresh first page, so the list can scroll back to the top. */
     val generation: Int = 0,
+    val filterMode: FilterMode = FilterMode.LOCAL,
+    /** The server can count facets (`facet_set`); still null counts while its index builds. */
+    val facetCounts: Boolean = false,
 )
 
 private const val MB = 1024L * 1024L
+/** Pause after a change in the filter sheet before its counts are refreshed. */
+const val FACET_DEBOUNCE_MS = 300L
 private const val PAGE = 50u
 /** Typing pause before a search runs; the server index answers in well under this. */
 const val SEARCH_DEBOUNCE_MS = 250L
@@ -89,6 +179,18 @@ fun SearchUiState.toQuery(offset: UInt = 0u, nowSec: Long = System.currentTimeMi
     limit = PAGE,
     offset = offset,
     includeHidden = false,
+    languages = filters.languages.sorted(),
+    subtitles = filters.subtitles.sorted(),
+    resolutions = filters.resolutions.sorted(),
+    sources = filters.sources.sorted(),
+    videoCodecs = filters.codecs.sorted(),
+    hdr = filters.hdr.sorted(),
+    audio = filters.audio.sorted(),
+    genres = filters.genres.sorted(),
+    mediaKinds = filters.kinds.sortedBy { it.ordinal },
+    minRating = filters.minRating,
+    minYear = filters.minYear,
+    maxYear = filters.maxYear,
 )
 
 /** Inverse of [toQuery], for running a saved search; `since` snaps to the nearest preset. */
@@ -105,6 +207,18 @@ fun FfiSearchQuery.toUiState(nowSec: Long = System.currentTimeMillis() / 1000) =
         minSeeders = minSeeders?.toInt(),
         hideDead = hideDead,
         minTrust = minTrust?.toInt(),
+        languages = languages.toSet(),
+        subtitles = subtitles.toSet(),
+        resolutions = resolutions.toSet(),
+        sources = sources.toSet(),
+        codecs = videoCodecs.toSet(),
+        hdr = hdr.toSet(),
+        audio = audio.toSet(),
+        genres = genres.toSet(),
+        kinds = mediaKinds.toSet(),
+        minRating = minRating,
+        minYear = minYear,
+        maxYear = maxYear,
     ),
     sort = sort,
     descending = descending,
@@ -116,6 +230,12 @@ class SearchViewModel(application: Application) : BaseViewModel(application) {
     val state: StateFlow<SearchUiState> = _state.asStateFlow()
 
     val settings get() = magApp.settings
+
+    /** Counts for the open filter sheet (D44); null = none (offline, old server, index building). */
+    private val _facets = MutableStateFlow<FfiFacetSet?>(null)
+    val facets: StateFlow<FfiFacetSet?> = _facets.asStateFlow()
+    /** Draft filters of the open sheet; counts follow them with a short debounce. */
+    private val facetDraft = MutableStateFlow<SearchFilters?>(null)
 
     private val textInput = MutableStateFlow("")
     private var searchJob: Job? = null
@@ -130,8 +250,15 @@ class SearchViewModel(application: Application) : BaseViewModel(application) {
         // "offline results (401)" banner after the token is fixed): run it again.
         viewModelScope.launch {
             magApp.settings.map { Triple(it.serverUrl, it.apiToken, it.trustThreshold) }
-                .distinctUntilChanged().drop(1).collect { search() }
+                .distinctUntilChanged().drop(1).collect {
+                    refreshFeatures()
+                    search()
+                }
         }
+        viewModelScope.launch {
+            facetDraft.filterNotNull().debounce(FACET_DEBOUNCE_MS).collectLatest { loadFacets(it) }
+        }
+        refreshFeatures()
         viewModelScope.launch {
             magApp.pendingSearch.filterNotNull().collect { q ->
                 magApp.pendingSearch.value = null
@@ -149,6 +276,37 @@ class SearchViewModel(application: Application) : BaseViewModel(application) {
     }
 
     fun submit() = search()
+
+    /** What the server supports decides which filters the sheet offers (D44). */
+    fun refreshFeatures() {
+        viewModelScope.launch {
+            val hasServer = magApp.settings.value.hasServer
+            val features = if (hasServer) ffiCatching { magApp.magnetar().serverFeatures() }.getOrNull() else null
+            _state.update {
+                it.copy(
+                    filterMode = filterMode(hasServer, features),
+                    facetCounts = features?.contains("facet_set") == true,
+                )
+            }
+        }
+    }
+
+    /** The filter sheet opened or its draft changed: count again (debounced). */
+    fun draftFilters(f: SearchFilters?) {
+        if (f == null) _facets.value = null
+        facetDraft.value = f
+    }
+
+    private suspend fun loadFacets(f: SearchFilters) {
+        val s = _state.value
+        if (!s.facetCounts || s.filterMode != FilterMode.FULL) {
+            _facets.value = null
+            return
+        }
+        val query = s.copy(filters = f).toQuery()
+        // 503 while the server builds its index: no counts, the chips still work.
+        _facets.value = ffiCatching { magApp.magnetar().facets(query, FACET_FIELDS) }.getOrNull()
+    }
 
     fun setFilters(f: SearchFilters) {
         _state.update { it.copy(filters = f) }

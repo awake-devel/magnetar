@@ -31,6 +31,7 @@ import app.magnetar.OpenRequest
 import app.magnetar.ui.common.AppIcons
 import app.magnetar.ui.detail.DetailScreen
 import app.magnetar.ui.downloads.DownloadsScreen
+import app.magnetar.ui.media.MediaScreen
 import app.magnetar.ui.saved.SavedScreen
 import app.magnetar.ui.search.SearchScreen
 import app.magnetar.ui.settings.SettingsScreen
@@ -47,6 +48,10 @@ private enum class Tab(val route: String, val label: String, val icon: () -> Ima
 }
 
 private const val DETAIL = "detail/{infohash}?magnet={magnet}"
+
+private const val MEDIA = "media/{mediaId}"
+
+private fun mediaRoute(mediaId: Long) = "media/$mediaId"
 
 private fun detailRoute(infohash: String, magnet: String? = null) =
     "detail/$infohash" + (magnet?.let { "?magnet=" + Uri.encode(it) } ?: "")
@@ -87,7 +92,12 @@ fun MagnetarNavHost(openRequests: MutableStateFlow<OpenRequest?>) {
             startDestination = Tab.SEARCH.route,
             modifier = Modifier.padding(padding).consumeWindowInsets(padding),
         ) {
-            composable(Tab.SEARCH.route) { SearchScreen(onOpen = { nav.navigate(detailRoute(it)) }) }
+            composable(Tab.SEARCH.route) {
+                SearchScreen(
+                    onOpen = { nav.navigate(detailRoute(it)) },
+                    onOpenMedia = { nav.navigate(mediaRoute(it)) },
+                )
+            }
             composable(Tab.SAVED.route) { SavedScreen(onRun = { nav.switchTab(Tab.SEARCH.route) }) }
             composable(Tab.DOWNLOADS.route) { DownloadsScreen() }
             composable(Tab.STATUS.route) { StatusScreen() }
@@ -104,6 +114,13 @@ fun MagnetarNavHost(openRequests: MutableStateFlow<OpenRequest?>) {
                 ),
             ) {
                 DetailScreen(
+                    onBack = { if (!nav.popBackStack()) nav.navigate(Tab.SEARCH.route) },
+                    onOpenTorrent = { nav.navigate(detailRoute(it)) },
+                    onOpenMedia = { nav.navigate(mediaRoute(it)) { launchSingleTop = true } },
+                )
+            }
+            composable(MEDIA, arguments = listOf(navArgument("mediaId") { type = NavType.LongType })) {
+                MediaScreen(
                     onBack = { if (!nav.popBackStack()) nav.navigate(Tab.SEARCH.route) },
                     onOpenTorrent = { nav.navigate(detailRoute(it)) },
                 )

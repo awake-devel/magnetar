@@ -17,7 +17,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Card
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
@@ -28,7 +27,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.ImageBitmap
@@ -39,10 +37,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.magnetar.ffi.FfiMediaInfo
 import app.magnetar.ffi.FfiMediaKind
-import app.magnetar.ffi.FfiTorrentSummary
-import app.magnetar.formatAge
-import app.magnetar.formatBytes
-import app.magnetar.ui.search.peersText
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -97,10 +91,7 @@ private fun Poster(path: String?, modifier: Modifier = Modifier) {
 fun MediaCard(
     m: FfiMediaInfo,
     posterPath: String?,
-    releases: List<FfiTorrentSummary>?,
-    loadingReleases: Boolean,
-    onLoadReleases: () -> Unit,
-    onOpenTorrent: (String) -> Unit,
+    onOpenMedia: (Long) -> Unit,
 ) {
     val context = LocalContext.current
     var overviewOpen by remember(m.mediaId) { mutableStateOf(false) }
@@ -146,31 +137,8 @@ fun MediaCard(
                         }
                     }) { Text("IMDb") }
                 }
-                if (releases == null) {
-                    TextButton(onClick = onLoadReleases, enabled = !loadingReleases) { Text("Other releases") }
-                }
-            }
-            if (loadingReleases) LinearProgressIndicator(Modifier.fillMaxWidth())
-            if (releases != null) {
-                Text(
-                    if (releases.isEmpty()) "No other releases known" else "Other releases (${releases.size})",
-                    style = MaterialTheme.typography.titleSmall,
-                    modifier = Modifier.padding(top = 8.dp),
-                )
-                releases.forEach { r ->
-                    Row(
-                        Modifier.fillMaxWidth().clickable { onOpenTorrent(r.infohash) }.padding(vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            Text(r.title, style = MaterialTheme.typography.bodyMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                            Text(
-                                "${formatBytes(r.totalSize)} · ${peersText(r.seeders, r.leechers)} · ${formatAge(r.createdAt)}",
-                                style = MaterialTheme.typography.labelSmall,
-                            )
-                        }
-                    }
-                }
+                // Every release of this title grouped by quality and language (D44).
+                TextButton(onClick = { onOpenMedia(m.mediaId) }) { Text("All releases") }
             }
         }
     }
