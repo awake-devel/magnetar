@@ -278,3 +278,75 @@ impl TestDb {
         )
     }
 }
+
+/// Query mix for search latency checks (tests/search_index.rs, tests/search_bench.rs, D43):
+/// browse, 1–3 letters, common and rare words, multi-word, typos, filters, every sort.
+pub fn search_query_set(now: i64) -> Vec<(String, magnetar_core::query::SearchQuery)> {
+    use magnetar_core::query::{SearchQuery, Sort};
+    let t = |s: &str| SearchQuery {
+        text: s.into(),
+        min_trust: Some(0),
+        descending: true,
+        ..Default::default()
+    };
+    let mut out: Vec<(String, SearchQuery)> = Vec::new();
+    for (name, text) in [
+        ("browse", ""),
+        ("1 letter", "a"),
+        ("1 letter", "e"),
+        ("2 letters", "th"),
+        ("2 letters", "le"),
+        ("3-letter prefix", "the"),
+        ("3-letter prefix", "one"),
+        ("common", "1080p"),
+        ("common", "french"),
+        ("common", "multi"),
+        ("common", "x265"),
+        ("rare", "chernobyl"),
+        ("rare", "documentaire"),
+        ("multi-word", "the lord of the rings"),
+        ("multi-word", "game of thrones s01"),
+        ("multi-word", "lord rings 1080p"),
+        ("typo", "interstelar"),
+        ("typo", "matirx"),
+        ("typo", "ubuntoo"),
+        (
+            "long",
+            "the lord of the rings complete integrale 1080p multi",
+        ),
+    ] {
+        out.push((format!("{name} {text:?}"), t(text)));
+    }
+    for sort in [Sort::Date, Sort::Size, Sort::Seeders] {
+        for desc in [true, false] {
+            let dir = if desc { "desc" } else { "asc" };
+            for text in ["french", ""] {
+                let mut f = t(text);
+                f.sort = sort;
+                f.descending = desc;
+                out.push((format!("sort {sort:?} {dir} {text:?}"), f));
+            }
+        }
+    }
+    let mut f = t("1080p");
+    f.categories = vec![Category::Video, Category::Anime];
+    f.min_size = Some(1 << 30);
+    f.hide_dead = true;
+    f.min_seeders = Some(5);
+    f.since = Some(now - 30_000_000);
+    out.push(("filters \"1080p\"".into(), f.clone()));
+    f.text = String::new();
+    out.push(("filters browse".into(), f));
+    let mut f = t("");
+    f.min_trust = Some(20);
+    out.push(("min_trust 20 browse".into(), f));
+    let mut f = t("french");
+    f.min_trust = Some(20);
+    f.sort = Sort::Seeders;
+    out.push(("min_trust 20 seeders \"french\"".into(), f));
+    let mut f = t("");
+    f.offset = 180;
+    f.limit = 20;
+    out.push(("deep page".into(), f));
+    out
+}

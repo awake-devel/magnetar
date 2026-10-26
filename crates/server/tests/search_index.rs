@@ -820,64 +820,6 @@ fn synthetic_docs(n: u64) -> Vec<IndexDoc> {
         .collect()
 }
 
-pub fn query_set() -> Vec<(&'static str, SearchQuery)> {
-    let mut out = Vec::new();
-    let t = |s: &str| SearchQuery {
-        text: s.into(),
-        min_trust: Some(0),
-        descending: true,
-        ..Default::default()
-    };
-    for (name, text) in [
-        ("empty", ""),
-        ("1 letter", "a"),
-        ("2 letters", "th"),
-        ("3-letter prefix", "the"),
-        ("common 1080p", "1080p"),
-        ("common french", "french"),
-        ("rare", "documentaire"),
-        ("multi-word", "lord rings 1080p"),
-        ("typo d1", "ubuntoo"),
-        ("typo d2", "intersteller"),
-        (
-            "long multi typo",
-            "the lord of the rings complete integrale 1080p multi",
-        ),
-    ] {
-        out.push((name, t(text)));
-    }
-    for sort in [Sort::Date, Sort::Size, Sort::Seeders] {
-        for desc in [true, false] {
-            let mut f = t("french");
-            f.sort = sort;
-            f.descending = desc;
-            out.push((if desc { "sort desc" } else { "sort asc" }, f.clone()));
-            f.text = String::new();
-            out.push((
-                if desc {
-                    "browse sort desc"
-                } else {
-                    "browse sort asc"
-                },
-                f,
-            ));
-        }
-    }
-    let mut f = t("1080p");
-    f.categories = vec![Category::Video, Category::Anime];
-    f.min_size = Some(1 << 30);
-    f.hide_dead = true;
-    f.min_seeders = Some(5);
-    f.since = Some(NOW - 30_000_000);
-    f.min_trust = Some(20);
-    out.push(("filters", f));
-    let mut f = t("");
-    f.offset = 180;
-    f.limit = 20;
-    out.push(("deep page", f));
-    out
-}
-
 #[test]
 fn latency_bounds_in_memory() {
     let dir = temp_index_dir();
@@ -894,7 +836,7 @@ fn latency_bounds_in_memory() {
     // Debug builds are ~10× slower than release; the bound only catches pathologies (a query
     // that scans postings per term, a prefix exploding over the dictionary).
     let bound = Duration::from_millis(if cfg!(debug_assertions) { 1500 } else { 150 });
-    for (name, sq) in query_set() {
+    for (name, sq) in search_query_set(NOW) {
         let iq = index_query(&sq, &sq.text, sq.min_trust.unwrap_or(0), None, NOW);
         let mut worst = Duration::ZERO;
         for _ in 0..3 {

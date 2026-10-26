@@ -231,10 +231,12 @@ impl SearchIndex {
     /// Start or resume a full build; returns the keyset cursor to continue after. Blocking.
     pub fn begin_build(&self) -> Result<String> {
         let p = self.payload.lock().unwrap().clone();
+        let mut w = self.writer.lock().unwrap();
+        // A failed attempt in this process may have left documents after its last commit.
+        w.rollback().map_err(ix)?;
         let cursor = match &p.cursor {
             Some(c) if !p.complete => c.clone(),
             _ => {
-                let mut w = self.writer.lock().unwrap();
                 w.delete_all_documents().map_err(ix)?;
                 let fresh = Payload {
                     complete: false,
@@ -291,11 +293,19 @@ impl SearchIndex {
         for ih in infohashes {
             w.delete_term(self.fields.infohash_term(ih));
         }
-        for d in &docs {
-            w.add_document(self.fields.document(d)).map_err(ix)?;
+        let mut res = docs
+            .iter()
+            .try_for_each(|d| w.add_document(self.fields.document(d)).map(drop))
+            .map_err(ix);
+        if res.is_ok() {
+            let p = self.payload.lock().unwrap().clone();
+            res = self.commit(&mut w, &p);
         }
-        let p = self.payload.lock().unwrap().clone();
-        self.commit(&mut w, &p)
+        if res.is_err() {
+            // Half a batch must not ride along with the next commit; the batch is retried.
+            let _ = w.rollback();
+        }
+        res
     }
 
     fn set_build_progress(&self, done: u64, total: u64) {
