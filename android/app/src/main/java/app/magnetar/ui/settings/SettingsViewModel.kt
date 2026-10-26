@@ -173,10 +173,17 @@ class SettingsViewModel(application: Application) : BaseViewModel(application) {
             backgroundSync = form.backgroundSync,
             showAdult = form.showAdult,
         )
-        return ffiCatching { magApp.updateSettings(settings) }
+        val pushed = ffiCatching { magApp.updateSettings(settings) }
             .onSuccess { _state.update { it.copy(dirty = false) } }
             .onFailure { message("Could not apply settings: ${it.userMessage()}") }
             .isSuccess
+        // With a server, trust is computed there: give it the same root and threshold.
+        if (pushed && settings.hasServer) {
+            ffiCatching {
+                magApp.magnetar().pushTrustSettings(settings.rootNpub.ifEmpty { null }, settings.trustThreshold.toUByte())
+            }.onFailure { message("Saved, but the server did not take the trust root: ${it.userMessage()}") }
+        }
+        return pushed
     }
 
     fun save() {

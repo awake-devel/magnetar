@@ -158,7 +158,7 @@ fun SearchScreen(onOpen: (String) -> Unit, onOpenMedia: (Long) -> Unit = {}, vm:
                     val emptyCache = state.text.isBlank() && state.source == "local" && state.filters.activeCount == 0
                     CenteredMessage(
                         if (emptyCache) {
-                            "Nothing cached yet. Crawl from the Status tab."
+                            "Nothing cached yet. Set your server in Settings."
                         } else {
                             "No results. Filters and the trust threshold (${settings.trustThreshold}) apply."
                         },

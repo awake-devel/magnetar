@@ -1220,6 +1220,24 @@ impl Magnetar {
         .await
     }
 
+    /// Sends the trust root and threshold to the server (`PUT /api/v1/settings/trust`): with a
+    /// server, trust scores and the web-of-trust graph are computed there, from its own copy.
+    /// `root` is an npub, nprofile or hex; empty or None clears it.
+    pub async fn push_trust_settings(
+        &self,
+        root: Option<String>,
+        threshold: u8,
+    ) -> Result<(), FfiError> {
+        let api = self.inner.require_api()?;
+        let root = root.map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
+        self.run(move |_| async move {
+            api.set_trust_settings(&magnetar_core::api::TrustSettings { root, threshold })
+                .await?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Phone engine (on_server=false) or server engine. Phone errors with Invalid if librqbit is unavailable.
     pub async fn download_start(
         &self,

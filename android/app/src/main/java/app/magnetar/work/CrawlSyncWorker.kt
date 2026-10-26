@@ -22,14 +22,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 /**
- * crawl → sync → cleanup → saved-search poll. Each step runs even if an earlier one failed;
- * failures are reported in the output data and in the log.
+ * Hourly background job (the app is a server frontend: the phone no longer crawls):
+ * cache cleanup, then the saved-search poll through the server, with notifications.
+ * Each step runs even if the other failed; failures are reported in the output data and the log.
  */
 class CrawlSyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
 
     override suspend fun doWork(): Result {
         val app = applicationContext as MagnetarApp
-        val mode = inputData.getString(KEY_MODE) ?: MODE_ALL
         val m = ffiCatching { app.magnetar() }.getOrElse {
             Log.w(TAG, "open failed", it)
             return Result.failure(workDataOf(KEY_ERRORS to arrayOf(it.userMessage())))
@@ -37,29 +37,13 @@ class CrawlSyncWorker(context: Context, params: WorkerParameters) : CoroutineWor
         val errors = mutableListOf<String>()
         val summary = mutableListOf<String>()
 
-        if (mode == MODE_ALL) {
-            ffiCatching { m.crawlOnce(CRAWL_SECONDS) }
-                .onSuccess { r ->
-                    summary += "crawl: ${r.inserted} new of ${r.eventsSeen} from ${r.relaysOk}/${r.relaysTried} relays"
-                    errors += r.errors.take(5)
-                }
-                .onFailure { errors += "crawl: ${it.userMessage()}" }
-        }
-        ffiCatching { m.syncNow() }
-            .onSuccess { r ->
-                summary += "sync (${r.method}): ${r.uploaded} uploaded"
-                r.error?.let { errors += "sync: $it" }
-            }
-            .onFailure { errors += "sync: ${it.userMessage()}" }
-        if (mode == MODE_ALL) {
-            ffiCatching { withContext(Dispatchers.IO) { m.cleanup() } }
-                .onSuccess { r -> if (r.evicted > 0u) summary += "cleanup: ${r.evicted} evicted" }
-                .onFailure { errors += "cleanup: ${it.userMessage()}" }
-        }
+        ffiCatching { withContext(Dispatchers.IO) { m.cleanup() } }
+            .onSuccess { r -> if (r.evicted > 0u) summary += "cleanup: ${r.evicted} evicted" }
+            .onFailure { errors += "cleanup: ${it.userMessage()}" }
         ffiCatching { m.pollSavedSearches() }
             .onSuccess { hits ->
                 val withNew = hits.filter { it.newHits.isNotEmpty() }
-                if (withNew.isNotEmpty()) summary += "saved searches: ${withNew.size} with new hits"
+                summary += if (withNew.isEmpty()) "saved searches: nothing new" else "saved searches: ${withNew.size} with new hits"
                 Notifications.postSavedSearchHits(applicationContext, withNew)
             }
             .onFailure { errors += "saved searches: ${it.userMessage()}" }
@@ -72,15 +56,11 @@ class CrawlSyncWorker(context: Context, params: WorkerParameters) : CoroutineWor
 
     companion object {
         private const val TAG = "CrawlSyncWorker"
-        private const val CRAWL_SECONDS = 120u
 
         const val PERIODIC_NAME = "crawl-sync"
         const val NOW_NAME = "crawl-sync-now"
-        const val KEY_MODE = "mode"
         const val KEY_SUMMARY = "summary"
         const val KEY_ERRORS = "errors"
-        const val MODE_ALL = "all"
-        const val MODE_SYNC = "sync"
 
         fun schedulePeriodic(context: Context, enabled: Boolean) {
             val wm = WorkManager.getInstance(context)
@@ -88,24 +68,22 @@ class CrawlSyncWorker(context: Context, params: WorkerParameters) : CoroutineWor
                 wm.cancelUniqueWork(PERIODIC_NAME)
                 return
             }
+            // A few small API calls: any network, no charging needed.
             val constraints = Constraints.Builder()
-                .setRequiredNetworkType(NetworkType.UNMETERED)
-                .setRequiresCharging(true)
+                .setRequiredNetworkType(NetworkType.CONNECTED)
                 .setRequiresBatteryNotLow(true)
                 .build()
             val request = PeriodicWorkRequestBuilder<CrawlSyncWorker>(1, TimeUnit.HOURS)
                 .setConstraints(constraints)
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 10, TimeUnit.MINUTES)
-                .setInputData(workDataOf(KEY_MODE to MODE_ALL))
                 .build()
             wm.enqueueUniquePeriodicWork(PERIODIC_NAME, ExistingPeriodicWorkPolicy.UPDATE, request)
         }
 
         /** User-requested run: any network, no charging requirement. */
-        fun runNow(context: Context, mode: String) {
+        fun runNow(context: Context) {
             val request = OneTimeWorkRequestBuilder<CrawlSyncWorker>()
                 .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-                .setInputData(workDataOf(KEY_MODE to mode))
                 .build()
             WorkManager.getInstance(context).enqueueUniqueWork(NOW_NAME, ExistingWorkPolicy.KEEP, request)
         }
