@@ -4,9 +4,11 @@
 //! **Binding rule**: nothing here logs, stores or returns the text it reads. A verdict carries
 //! only the tier of the rule that fired, never the matched term or the input.
 //!
-//! Input text is normalised ([`normalize`]): Unicode lowercase, Latin diacritics folded,
-//! everything that is not a letter or digit becomes a separator; a second variant undoes common
-//! digit/symbol substitutions (0→o, 1→i, 3→e, 4→a, 5→s, @→a). Every token and every token 2-
+//! Input text is normalised: Unicode NFKC, invisible characters and leftover combining marks
+//! removed (not separators), Unicode lowercase, Latin diacritics folded, everything else that
+//! is not a letter or digit becomes a separator; a second variant undoes common digit/symbol
+//! substitutions (0→o, 1→i, 3→e, 4→a, 5→s, @→a) and Cyrillic/Greek look-alikes, and each
+//! variant's collapsed form joins runs of one-character tokens (D71). Every token and every token 2-
 //! and 3-gram of each variant is hashed (`sha256("magnetar-blocklist-v1:" + ngram)`) and looked
 //! up in two sets:
 //! - **hard** terms block on their own;
@@ -19,9 +21,12 @@
 //! `MAGNETAR_BLOCKLIST_FILE`; nothing can remove one.
 
 use std::collections::HashSet;
+use std::hash::{BuildHasher, Hasher, RandomState};
 use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::char::is_combining_mark;
 
 /// The built-in list, `hard|context <sha256 hex>` per line.
 pub const BUILTIN: &str = include_str!("terms.v1");
@@ -200,60 +205,171 @@ impl Blocklist {
     /// Verdict over `texts` (both tiers) and `hard_only` (hard tier only: Nostr descriptions and
     /// hashtags). `adult` = the torrent is adult (classifier, or a Nostr `porn` category): only
     /// then do context terms and the age rule apply.
+    ///
+    /// Streaming: n-grams are hashed as the tokens go by and nothing is kept, so memory stays
+    /// proportional to one text (hostile 16 MiB info dicts included, D71).
     pub fn check<S: AsRef<str>, T: AsRef<str>>(
         &self,
         texts: &[S],
         hard_only: &[T],
         adult: bool,
     ) -> Verdict {
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut context_hit = false;
-        let mut age: Option<AgeMark> = None;
-        let mut scan = |text: &str, both: bool| -> bool {
-            for variant in normalize(text) {
-                if both && age != Some(AgeMark::Explicit) {
-                    age = age.max(age_mark(&variant));
-                }
-                let mut grams = ngrams(&variant);
-                for t in &variant {
-                    grams.extend(cjk_grams(t));
-                }
-                for g in grams {
-                    if !seen.insert(g.clone()) {
-                        continue;
-                    }
-                    let h = term_hash(&g);
-                    if self.hard.contains(&h) {
-                        return true;
-                    }
-                    if both && self.context.contains(&h) {
-                        context_hit = true;
-                    }
-                }
-            }
-            false
+        let mut prefix = Sha256::new();
+        prefix.update(HASH_PREFIX.as_bytes());
+        let mut st = ScanState {
+            list: self,
+            prefix,
+            context_hit: false,
+            age: None,
+            seen: HashSet::new(),
+            keys: RandomState::new(),
         };
         for t in texts {
-            if scan(t.as_ref(), true) {
+            if st.text(t.as_ref(), true) {
                 return Verdict::Block(Tier::Hard);
             }
         }
-        // A hard-only text whose n-grams were already seen in `texts` was already checked
-        // against the hard set; dedupe across both is therefore sound.
         for t in hard_only {
-            if scan(t.as_ref(), false) {
+            if st.text(t.as_ref(), false) {
                 return Verdict::Block(Tier::Hard);
             }
         }
-        if adult && context_hit {
+        if adult && st.context_hit {
             return Verdict::Block(Tier::Context);
         }
-        match age {
+        match st.age {
             Some(AgeMark::Explicit) => return Verdict::Block(Tier::Age),
             Some(AgeMark::Contextual) if adult => return Verdict::Block(Tier::Age),
             _ => {}
         }
         Verdict::Allow
+    }
+}
+
+/// Grams already looked up, by a keyed 64-bit hash (random keys per check, so an input cannot
+/// be built to collide with a term). Bounded: past this many, grams are simply hashed again.
+const SEEN_MAX: usize = 1 << 19;
+
+struct ScanState<'a> {
+    list: &'a Blocklist,
+    prefix: Sha256,
+    context_hit: bool,
+    age: Option<AgeMark>,
+    seen: HashSet<u64>,
+    keys: RandomState,
+}
+
+impl ScanState<'_> {
+    /// Look up one hash; true = hard hit.
+    fn hit(&mut self, h: Sha256, both: bool) -> bool {
+        let d: Hash = h.finalize().into();
+        if self.list.hard.contains(&d) {
+            return true;
+        }
+        if both && !self.context_hit && self.list.context.contains(&d) {
+            self.context_hit = true;
+        }
+        false
+    }
+
+    /// True when this gram was looked up before in this check (texts are scanned before
+    /// hard-only ones, so an earlier lookup covered at least the tiers this one needs).
+    fn seen_before<'b>(&mut self, parts: impl Iterator<Item = &'b [u8]>) -> bool {
+        let mut k = self.keys.build_hasher();
+        for p in parts {
+            k.write(p);
+            k.write_u8(0xff);
+        }
+        let k = k.finish();
+        if self.seen.contains(&k) {
+            return true;
+        }
+        if self.seen.len() < SEEN_MAX {
+            self.seen.insert(k);
+        }
+        false
+    }
+
+    fn gram(&mut self, parts: &[&str], both: bool) -> bool {
+        if self.seen_before(parts.iter().map(|p| p.as_bytes())) {
+            return false;
+        }
+        let mut h = self.prefix.clone();
+        for (i, p) in parts.iter().enumerate() {
+            if i > 0 {
+                h.update(b" ");
+            }
+            h.update(p.as_bytes());
+        }
+        self.hit(h, both)
+    }
+
+    /// Character 2- to [`MAX_CJK_GRAM`]-grams of every CJK run inside `token`, streamed (the
+    /// byte offsets of the last three CJK characters of the current run are all it keeps).
+    fn cjk(&mut self, token: &str, both: bool) -> bool {
+        let mut starts = [0usize; MAX_CJK_GRAM - 1];
+        let mut run = 0usize; // CJK characters in the current run
+        for (at, c) in token.char_indices() {
+            if !is_cjk(c) {
+                run = 0;
+                continue;
+            }
+            let end = at + c.len_utf8();
+            for back in 1..=run.min(MAX_CJK_GRAM - 1) {
+                let from = starts[MAX_CJK_GRAM - 1 - back];
+                let g = &token.as_bytes()[from..end];
+                // CJK grams share the cache with tokens; the 0x01 part keeps them apart.
+                if self.seen_before([b"\x01".as_slice(), g].into_iter()) {
+                    continue;
+                }
+                let mut h = self.prefix.clone();
+                h.update(g);
+                if self.hit(h, both) {
+                    return true;
+                }
+            }
+            starts.rotate_left(1);
+            starts[MAX_CJK_GRAM - 2] = at;
+            run += 1;
+        }
+        false
+    }
+
+    /// One input text, every variant. True = hard hit.
+    fn text(&mut self, text: &str, both: bool) -> bool {
+        for (variant, with_age) in variants(text) {
+            let age = both && with_age && self.age != Some(AgeMark::Explicit);
+            // The last three tokens, oldest first.
+            let mut win: [&str; MAX_NGRAM] = [""; MAX_NGRAM];
+            let mut k = 0usize;
+            for tok in variant.split_whitespace() {
+                win.rotate_left(1);
+                win[MAX_NGRAM - 1] = tok;
+                k += 1;
+                for n in 1..=k.min(MAX_NGRAM) {
+                    if self.gram(&win[MAX_NGRAM - n..], both) {
+                        return true;
+                    }
+                }
+                if tok.chars().any(is_cjk) && self.cjk(tok, both) {
+                    return true;
+                }
+                if age && k >= 3 {
+                    self.age = self.age.max(mark_at(win[0], Some(win[1]), Some(win[2])));
+                }
+            }
+            if age {
+                // The last two positions (and every position of a text under three tokens).
+                if k >= 2 {
+                    let t = &win[MAX_NGRAM - 2..];
+                    self.age = self.age.max(mark_at(t[0], Some(t[1]), None));
+                }
+                if k >= 1 {
+                    self.age = self.age.max(mark_at(win[MAX_NGRAM - 1], None, None));
+                }
+            }
+        }
+        false
     }
 }
 
@@ -273,8 +389,9 @@ pub fn global() -> Option<&'static Blocklist> {
 }
 
 /// Lowercase, fold Latin diacritics; any other character kept as is.
-fn fold_char(c: char, out: &mut String) {
+fn fold_char(c: char, out: &mut String, homoglyphs: bool) {
     for l in c.to_lowercase() {
+        let l = if homoglyphs { homoglyph(l) } else { l };
         let s = match l {
             'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => "a",
             'æ' => "ae",
@@ -308,12 +425,73 @@ fn fold_char(c: char, out: &mut String) {
     }
 }
 
-/// Folded text with every non letter/digit as a space (the base variant).
-fn base_text(s: &str) -> String {
+/// Cyrillic and Greek letters that look like Latin ones (lowercase), for the substitution
+/// variant: `zоrblax` with a Cyrillic `о` reads as the Latin word.
+fn homoglyph(c: char) -> char {
+    match c {
+        'а' | 'α' => 'a',
+        'е' | 'ё' | 'ε' => 'e',
+        'о' | 'ο' => 'o',
+        'р' | 'ρ' => 'p',
+        'с' | 'ϲ' => 'c',
+        'у' => 'y',
+        'х' | 'χ' => 'x',
+        'і' | 'ї' | 'ι' => 'i',
+        'ј' => 'j',
+        'ѕ' => 's',
+        'һ' => 'h',
+        'ԁ' => 'd',
+        'ԛ' => 'q',
+        'ԝ' => 'w',
+        'ӏ' => 'l',
+        'к' | 'κ' => 'k',
+        'м' => 'm',
+        'т' | 'τ' => 't',
+        'ν' => 'v',
+        'υ' => 'u',
+        'ɡ' => 'g',
+        c => c,
+    }
+}
+
+/// Invisible characters that must not split a word: format characters (zero-width space and
+/// joiners, soft hyphen, bidi controls, word joiner, BOM, variation selectors, tags, Hangul
+/// fillers) and controls other than whitespace (`NUL`: the stored title drops it, so the
+/// screen must read `a\0b` as `ab`).
+fn ignorable(c: char) -> bool {
+    (c.is_control() && !c.is_whitespace())
+        || matches!(c as u32,
+            0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x17B4 | 0x17B5
+            | 0x180B..=0x180F | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F
+            | 0x3164 | 0xFE00..=0xFE0F | 0xFEFF | 0xFFA0 | 0xFFF0..=0xFFF8
+            | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0000..=0xE0FFF)
+}
+
+/// NFKC (fullwidth, circled, mathematical and other compatibility letters become plain ones;
+/// a letter + combining accent becomes the precomposed letter), invisible characters and
+/// remaining combining marks removed, every other non letter/digit a separator; `leet` also
+/// reads digits/symbols and Latin look-alikes as letters.
+fn normal_text(s: &str, leet: bool) -> String {
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
+    for c in s.nfkc() {
+        if ignorable(c) || is_combining_mark(c) {
+            continue;
+        }
+        let c = if leet {
+            match c {
+                '0' => 'o',
+                '1' => 'i',
+                '3' => 'e',
+                '4' => 'a',
+                '5' => 's',
+                '@' => 'a',
+                c => c,
+            }
+        } else {
+            c
+        };
         if c.is_alphanumeric() {
-            fold_char(c, &mut out);
+            fold_char(c, &mut out, leet);
         } else {
             out.push(' ');
         }
@@ -321,24 +499,65 @@ fn base_text(s: &str) -> String {
     out
 }
 
-/// The substitution variant: digits/symbols read as letters, then like [`base_text`].
+/// Folded text with every non letter/digit as a space (the base variant).
+fn base_text(s: &str) -> String {
+    normal_text(s, false)
+}
+
+/// The substitution variant: digits/symbols and Latin look-alikes read as letters.
 fn leet_text(s: &str) -> String {
+    normal_text(s, true)
+}
+
+/// Runs of two or more one-character tokens joined (`z.o.r.b` → `zorb`); None when there is
+/// no such run.
+fn collapsed(s: &str) -> Option<String> {
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    let single = |t: &str| t.chars().nth(1).is_none();
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        let c = match c {
-            '0' => 'o',
-            '1' => 'i',
-            '3' => 'e',
-            '4' => 'a',
-            '5' => 's',
-            '@' => 'a',
-            c => c,
-        };
-        if c.is_alphanumeric() {
-            fold_char(c, &mut out);
-        } else {
+    let mut changed = false;
+    let mut i = 0;
+    while i < toks.len() {
+        if !out.is_empty() {
             out.push(' ');
         }
+        let mut j = i;
+        while j < toks.len() && single(toks[j]) {
+            j += 1;
+        }
+        if j - i >= 2 {
+            changed = true;
+            for t in &toks[i..j] {
+                out.push_str(t);
+            }
+            i = j;
+        } else {
+            out.push_str(toks[i]);
+            i += 1;
+        }
+    }
+    changed.then_some(out)
+}
+
+/// What the matcher scans: the base variant, the substitution variant when it differs, and
+/// each one's collapsed form when it has one. The flag says whether the age rule reads it (not
+/// the collapsed forms: `x 1 2 y o` must not read as `12yo`).
+fn variants(s: &str) -> Vec<(String, bool)> {
+    let base = base_text(s);
+    let leet = leet_text(s);
+    let mut out = Vec::with_capacity(4);
+    let cb = collapsed(&base);
+    let cl = if leet == base { None } else { collapsed(&leet) };
+    let leet_differs = leet != base;
+    out.push((base, true));
+    if let Some(c) = cb {
+        out.push((c, false));
+    }
+    if leet_differs {
+        out.push((leet, true));
+    }
+    if let Some(c) = cl {
+        out.push((c, false));
     }
     out
 }
@@ -347,8 +566,8 @@ fn tokens(s: &str) -> Vec<String> {
     s.split_whitespace().map(str::to_string).collect()
 }
 
-/// The token lists the matcher looks at: the base variant, and the substitution variant when
-/// it differs.
+/// The token lists of the base and substitution variants (the classifier's word lookup; the
+/// blocklist itself also scans collapsed forms, [`Blocklist::check`]).
 pub fn normalize(s: &str) -> Vec<Vec<String>> {
     let base = tokens(&base_text(s));
     let leet = tokens(&leet_text(s));
@@ -429,42 +648,45 @@ pub enum AgeMark {
     Explicit,
 }
 
+fn minor(t: &str) -> bool {
+    t.len() <= 2
+        && t.bytes().all(|b| b.is_ascii_digit())
+        && t.parse::<u32>().is_ok_and(|n| (1..AGE_LIMIT).contains(&n))
+}
+
+/// The age mark of token `t` followed by `n1`, `n2`.
+fn mark_at(t: &str, n1: Option<&str>, n2: Option<&str>) -> Option<AgeMark> {
+    let digits = t.bytes().take_while(u8::is_ascii_digit).count();
+    let rest = &t[digits..];
+    if digits > 0 && minor(&t[..digits]) && !rest.is_empty() {
+        // Glued: `12yo`, `12yrs old`, `12yearold`.
+        match rest {
+            "yo" | "yearold" | "yearsold" => Some(AgeMark::Explicit),
+            "yrs" | "yr" if n1 == Some("old") => Some(AgeMark::Explicit),
+            "yrs" | "yr" => Some(AgeMark::Contextual),
+            _ => None,
+        }
+    } else if minor(t) {
+        match n1 {
+            Some("yo") => Some(AgeMark::Explicit),
+            Some("y") if n2 == Some("o") => Some(AgeMark::Explicit),
+            Some("years" | "year" | "yrs" | "yr") if n2 == Some("old") => Some(AgeMark::Explicit),
+            Some("yrs" | "yr" | "ans" | "jahre" | "anos") => Some(AgeMark::Contextual),
+            _ => None,
+        }
+    } else if matches!(t, "aged" | "age") && n1.is_some_and(minor) {
+        Some(AgeMark::Contextual)
+    } else {
+        None
+    }
+}
+
 /// An age below [`AGE_LIMIT`] next to an age marker, the strongest form found.
 pub fn age_mark(toks: &[String]) -> Option<AgeMark> {
     let mut found = None;
-    let minor = |t: &str| -> bool {
-        t.len() <= 2
-            && t.bytes().all(|b| b.is_ascii_digit())
-            && t.parse::<u32>().is_ok_and(|n| (1..AGE_LIMIT).contains(&n))
-    };
     for (i, t) in toks.iter().enumerate() {
         let next = |k: usize| toks.get(i + k).map(String::as_str);
-        let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
-        let rest = &t[digits.len()..];
-        let mark = if !digits.is_empty() && minor(&digits) && !rest.is_empty() {
-            // Glued: `12yo`, `12yrs old`, `12yearold`.
-            match rest {
-                "yo" | "yearold" | "yearsold" => Some(AgeMark::Explicit),
-                "yrs" | "yr" if next(1) == Some("old") => Some(AgeMark::Explicit),
-                "yrs" | "yr" => Some(AgeMark::Contextual),
-                _ => None,
-            }
-        } else if minor(t) {
-            match next(1) {
-                Some("yo") => Some(AgeMark::Explicit),
-                Some("y") if next(2) == Some("o") => Some(AgeMark::Explicit),
-                Some("years" | "year" | "yrs" | "yr") if next(2) == Some("old") => {
-                    Some(AgeMark::Explicit)
-                }
-                Some("yrs" | "yr" | "ans" | "jahre" | "anos") => Some(AgeMark::Contextual),
-                _ => None,
-            }
-        } else if matches!(t.as_str(), "aged" | "age") && next(1).is_some_and(minor) {
-            Some(AgeMark::Contextual)
-        } else {
-            None
-        };
-        found = found.max(mark);
+        found = found.max(mark_at(t, next(1), next(2)));
         if found == Some(AgeMark::Explicit) {
             break;
         }
@@ -663,7 +885,29 @@ mod tests {
         let none: [&str; 0] = [];
         assert!(b.check(&["前文甲乙后文"], &none, false).is_block());
         assert!(b.check(&["x/前甲乙.mp4"], &none, false).is_block());
-        assert_eq!(b.check(&["甲 乙"], &none, false), Verdict::Allow, "split");
+        assert!(b.check(&["甲 乙"], &none, false).is_block(), "spaced out");
+        // 3- and 4-character terms at every offset of a run (the streaming window).
+        let l = Blocklist::default()
+            .with_extra("子丑寅\n卯辰巳午\n")
+            .unwrap();
+        for s in [
+            "子丑寅",
+            "前子丑寅",
+            "前後子丑寅x",
+            "卯辰巳午",
+            "一二卯辰巳午三",
+            "a卯辰巳午",
+        ] {
+            assert!(l.check(&[s], &none, false).is_block(), "{s}");
+        }
+        for s in ["子丑", "卯辰巳", "卯辰x巳午", "子丑 寅寅"] {
+            assert_eq!(l.check(&[s], &none, false), Verdict::Allow, "{s}");
+        }
+        assert_eq!(
+            b.check(&["甲 xy 乙"], &none, false),
+            Verdict::Allow,
+            "split"
+        );
         assert_eq!(b.check(&["前丙丁后"], &none, false), Verdict::Allow);
         assert_eq!(
             b.check(&["前丙丁后"], &none, true),
@@ -694,5 +938,145 @@ mod tests {
         assert_eq!(normalize("Été_ŁÓDŹ"), vec![vec!["ete", "lodz"]]);
         assert_eq!(normalize("h3ll0"), vec![vec!["h3ll0"], vec!["hello"]]);
         assert_eq!(normalize("Straße"), vec![vec!["strasse"]]);
+    }
+
+    #[test]
+    fn invisible_compat_and_lookalike_evasions_still_block() {
+        // Review fixes (D71): each of these read as `zorblax` to a person, and each passed
+        // the first version of the matcher.
+        let b = list();
+        let none: [&str; 0] = [];
+        for s in [
+            "zor\u{200B}blax",         // zero-width space
+            "zor\u{200D}blax",         // zero-width joiner
+            "zor\u{00AD}blax",         // soft hyphen
+            "zor\u{2060}blax",         // word joiner
+            "\u{FEFF}zorblax",         // BOM
+            "zor\u{0}blax",            // NUL (the stored title drops it)
+            "zo\u{0308}rblax",         // decomposed diaeresis
+            "zorbla\u{0301}\u{0327}x", // stacked combining marks
+            "ｚｏｒｂｌａｘ",          // fullwidth
+            "𝐳𝐨𝐫𝐛𝐥𝐚𝐱",                 // mathematical bold
+            "ⓩⓞⓡⓑⓛⓐⓧ",                 // circled
+            "z\u{043E}rbl\u{0430}x",   // Cyrillic о and а
+            "ZΟRBLΑX",                 // Greek capitals Ο, Α
+            "z.o.r.b.l.a.x",           // dotted out
+            "z o r b l a x 2024",      // spaced out
+            "Z_0_R_B_L_4_X",           // spaced out with substitutions
+            "quux.f.r.o.b.n.i.t.z",    // collapsed run inside a phrase
+        ] {
+            assert_eq!(
+                b.check(&[s], &none, false),
+                Verdict::Block(Tier::Hard),
+                "{}",
+                s.escape_unicode()
+            );
+        }
+        // Ordinary text in those scripts is not mangled: real Cyrillic words still differ.
+        assert_eq!(b.check(&["Брат 2"], &none, false), Verdict::Allow);
+        assert_eq!(b.check(&["a b c d"], &none, false), Verdict::Allow);
+        // Fullwidth digits are digits.
+        assert_eq!(
+            b.check(&["clip １２ｙｏ"], &none, false),
+            Verdict::Block(Tier::Age)
+        );
+    }
+
+    #[test]
+    fn streaming_scan_matches_every_ngram_position() {
+        // A term at the start, the middle and the end of texts of 1..6 tokens, as 1-, 2- and
+        // 3-grams: the sliding window must see each position exactly like `ngrams`.
+        let b = Blocklist::default()
+            .with_extra("zorblax\nquux frobnitz\naa bb cc\n")
+            .unwrap();
+        let none: [&str; 0] = [];
+        for term in ["zorblax", "quux frobnitz", "aa bb cc"] {
+            for pre in 0..3 {
+                for post in 0..3 {
+                    let mut t: Vec<String> = (0..pre).map(|i| format!("p{i}x")).collect();
+                    t.push(term.into());
+                    t.extend((0..post).map(|i| format!("q{i}y")));
+                    let s = t.join(" ");
+                    assert!(b.check(&[&s], &none, false).is_block(), "{s}");
+                }
+            }
+        }
+        // Age marks at the very end of a text, and in texts of one and two tokens.
+        assert_eq!(b.check(&["12yo"], &none, false), Verdict::Block(Tier::Age));
+        assert_eq!(b.check(&["12 yo"], &none, false), Verdict::Block(Tier::Age));
+        assert_eq!(
+            b.check(&["a b 12 y o"], &none, false),
+            Verdict::Block(Tier::Age)
+        );
+        assert_eq!(
+            b.check(&["aged 13"], &none, true),
+            Verdict::Block(Tier::Age)
+        );
+    }
+
+    #[test]
+    fn hostile_16_mib_input_is_bounded() {
+        // The largest info dict the fetcher accepts (16 MiB) as CJK text, the worst case for
+        // n-grams: the scan keeps no per-gram strings (the first version kept every gram in a
+        // set: about 1 GB here) and a bounded cache of keyed 64-bit gram hashes.
+        let b = list();
+        let none: [&str; 0] = [];
+        let unit = "前文中字日本語한국어"; // 30 bytes, CJK only
+        // 16 MiB in release; 2 MiB unoptimised (SHA-256 is ~40x slower there).
+        let size = if cfg!(debug_assertions) { 2 } else { 16 } << 20;
+        let big = unit.repeat(size / unit.len());
+        let t = std::time::Instant::now();
+        assert_eq!(b.check(&[&big], &none, true), Verdict::Allow);
+        let names: Vec<String> = (0..if cfg!(debug_assertions) {
+            10_000
+        } else {
+            100_000
+        })
+            .map(|i| format!("Some Directory/Sub Dir {i}/file name {i}.mkv"))
+            .collect();
+        assert_eq!(b.check(&names, &none, true), Verdict::Allow);
+        eprintln!("repetitive 16 MiB CJK + 100k paths: {:?}", t.elapsed());
+    }
+
+    #[test]
+    #[ignore = "timing probe: cargo test --release -p magnetar-core -- --ignored random_cjk"]
+    fn random_cjk_16_mib_timing() {
+        let b = list();
+        let none: [&str; 0] = [];
+        let mut x: u32 = 12345;
+        let big: String = (0..16 * 1024 * 1024 / 3)
+            .map(|_| {
+                x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                char::from_u32(0x4E00 + (x >> 8) % 0x5000).unwrap_or('中')
+            })
+            .collect();
+        let t = std::time::Instant::now();
+        let _ = b.check(&[&big], &none, true);
+        eprintln!("random 16 MiB CJK: {:?}", t.elapsed());
+    }
+
+    /// Re-derives every built-in hash from the plain source through the Rust normaliser (it
+    /// must agree with `scripts/blocklist-hash.sh`). Prints counts only, never a term.
+    #[test]
+    #[ignore = "needs the uncommitted plain list: BLOCKLIST_PLAIN=<path>"]
+    fn builtin_hashes_reproduce_through_the_normaliser() {
+        let Ok(path) = std::env::var("BLOCKLIST_PLAIN") else {
+            return;
+        };
+        let text = std::fs::read_to_string(path).expect("plain list");
+        let b = Blocklist::builtin().unwrap();
+        let (mut ok, mut total) = (0, 0);
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            let Some((tier, phrase)) = line.split_once(' ') else {
+                continue;
+            };
+            total += 1;
+            let h = term_hash(&tokens(&base_text(phrase)).join(" "));
+            let set = if tier == "hard" { &b.hard } else { &b.context };
+            ok += usize::from(set.contains(&h));
+        }
+        eprintln!("built-in terms reproduced: {ok}/{total}");
+        assert_eq!(ok, total);
     }
 }

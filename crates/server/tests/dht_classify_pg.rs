@@ -262,9 +262,20 @@ async fn stage2_rows_are_reclassified_and_rescreened() {
     insert_dht(pool, &ih(2), "Some.Film.2020.1080p.BluRay.x264", "other", 0).await;
     insert_dht(pool, &ih(3), "Studio.XXX.Wibblewob.Scene", "other", 0).await;
     insert_dht(pool, &ih(4), "Current.Row", "video", CLASSIFIER_VERSION).await;
+    sqlx::query("INSERT INTO torrent_attrs (infohash, parser_version, attrs) VALUES ($1, 1, '{}')")
+        .bind(ih(3))
+        .execute(pool)
+        .await
+        .unwrap();
     let screen = BlocklistScreen(Arc::new(test_list()));
-    let o = reclassify_batch(pool, &screen, 500, NOW).await.unwrap();
-    assert_eq!((o.rows, o.blocked), (3, 1), "{o:?}");
+    // Keyset pages of two: the second starts after the first's last infohash.
+    let o = reclassify_batch(pool, &screen, "", 2, NOW).await.unwrap();
+    assert_eq!((o.rows, o.last.clone()), (2, Some(ih(2))), "{o:?}");
+    let o2 = reclassify_batch(pool, &screen, &ih(2), 2, NOW)
+        .await
+        .unwrap();
+    assert_eq!((o2.rows, o2.last.clone()), (1, Some(ih(3))), "{o2:?}");
+    assert_eq!((o.blocked + o2.blocked), 1);
     let rows: Vec<(String, String, i16)> = sqlx::query_as(
         "SELECT infohash, category, classifier_version FROM dht_torrents ORDER BY infohash",
     )
@@ -286,8 +297,14 @@ async fn stage2_rows_are_reclassified_and_rescreened() {
             .await
             .unwrap();
     assert_eq!(origin, "sweep");
+    let attrs: i64 = sqlx::query_scalar("SELECT count(*) FROM torrent_attrs WHERE infohash = $1")
+        .bind(ih(3))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(attrs, 0, "attrs parsed from a blocked name go with it");
     assert_eq!(
-        reclassify_batch(pool, &screen, 500, NOW)
+        reclassify_batch(pool, &screen, "", 500, NOW)
             .await
             .unwrap()
             .rows,

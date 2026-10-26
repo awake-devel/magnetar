@@ -712,9 +712,12 @@ App: Settings → "Show adult content" (off), stored with the app's search prefe
 Input: **every** name and path variant in the info dict, not only the ones displayed: `name`
 and `name.utf-8`, every `path` and `path.utf-8`, v2 `file tree` keys, padding-file paths
 included (for Nostr: title, file names, and for the hard tier description and hashtags).
-Normalisation: Unicode lowercase, Latin diacritics folded,
+Normalisation: Unicode NFKC, invisible characters and leftover combining marks removed (not
+treated as separators; D71), Unicode lowercase, Latin diacritics folded,
 everything not a letter/digit → space, plus a second variant with common digit/symbol
-substitutions undone (0→o, 1→i, 3→e, 4→a, 5→s, @→a). Tokens and token 2-/3-grams are hashed
+substitutions and Cyrillic/Greek look-alikes undone (0→o, 1→i, 3→e, 4→a, 5→s, @→a, о→o, …),
+and for term lookup only a collapsed form of each where runs of one-character tokens are
+joined (`z.o.r.b` → `zorb`). Tokens and token 2-/3-grams are hashed
 (`sha256("magnetar-blocklist-v1:" + ngram)`) and looked up in two sets:
 
 - **hard** terms block on their own;
@@ -1038,7 +1041,8 @@ screen and `reclassify_batch` in `server::dht::persist`, `Rejection::Blocked` an
 `Store::{is_blocked, put_blocked}` on Nostr ingest, `SearchQuery.include_adult` through the
 index (`SCHEMA_VERSION` 3), the SQL fallback, the API (`adult=1`), the phone
 (`FfiConfig.show_adult`) and Android Settings (D70), and the IMDb/anime enrichers and attrs
-backfill on `torrent_rows`. No new dependency.
+backfill on `torrent_rows`. No new dependency (the stage 3 review made the workspace's
+`unicode-normalization` a plain `core` dependency, D71).
 
 **Order on the DHT path** (§7.1, as built): verify → parse → `classify` (pure, silent) →
 `Screen::verdict(all_names, adult)` → block (hashes only) or store with `category` and
@@ -1121,3 +1125,30 @@ languages beyond the samples; DHT rows in search results (stage 5 readers); the 
 phone (built and unit-tested only); TMDB decoration of DHT rows (follows the IMDb/anime links,
 not tested with DHT rows); the duration of the re-classification on a large table (669 rows
 here, not timed).
+
+**Stage 3 review fixes (D71).** (1) Seventeen placeholder bypasses of the first matcher, all
+`Allow` before and `Block(Hard)` now: zero-width space/joiner, soft hyphen, word joiner, BOM,
+`NUL` (the stored title drops it, so `zor\0blax` was screened as two words but stored as one),
+a decomposed or stacked combining accent, fullwidth, mathematical bold and circled letters,
+Cyrillic/Greek look-alikes, dotted and spaced-out letters (also inside a phrase and with
+substitutions); fullwidth digits now feed the age rule. All 79 built-in hashes still
+reproduce through the new normaliser (ignored test `builtin_hashes_reproduce_through_the_normaliser`
+with `BLOCKLIST_PLAIN=<plain list>`, prints counts only). (2) Memory on hostile input: the
+matcher kept every n-gram string of a check in a set and the classifier did the same for the
+adult words (≈ 1 GB for a 16 MiB CJK info dict, ×`decode_parallel`); the matcher now streams
+with a bounded keyed hash cache and the classifier reads ≤ 4 KiB per text. Measured (release,
+this laptop): 16 MiB repetitive CJK + 100 000 paths 3.5 s, 16 MiB random CJK 8.6 s. (3) The DHT
+writer classified and screened inside its open transaction on an async worker; it now does the
+whole batch first, under `block_in_place`. (4) Re-classification paged with `LIMIT` over
+`classifier_version < N` from the start of the key each time (quadratic on a large table, no
+index on that column); it now pages by `infohash > last`. (5) Blocked rows left their
+`torrent_attrs` row (parsed vocabulary only, no names) behind; DHT blocks, re-classification
+blocks and Nostr blocks now delete it unless a Nostr event owns the infohash.
+
+**Still open after the review.** The phone hides an infohash when *any* cached event is filed
+`porn`, the server only when the canonical category is `porn` (or a DHT row is): the two differ
+for an infohash with a non-canonical `porn` event. A Nostr event stored *before* its infohash
+was blocked (by the DHT or another event) stays until the stage 5 sweep. Re-classification
+re-screens only the first 5000 stored files of a row (`FILES_MAX`), not every name of the
+original info dict. A hostile 16 MiB info dict costs up to ~9 s of one core to screen.
+

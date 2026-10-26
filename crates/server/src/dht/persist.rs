@@ -189,6 +189,13 @@ async fn block(
         .bind(&hashes)
         .execute(&mut **tx)
         .await?;
+    sqlx::query(
+        "DELETE FROM torrent_attrs a WHERE a.infohash = ANY($1)
+         AND NOT EXISTS (SELECT 1 FROM torrents t WHERE t.infohash = a.infohash)",
+    )
+    .bind(&hashes)
+    .execute(&mut **tx)
+    .await?;
     sqlx::query("DELETE FROM dht_seen WHERE infohash = $1")
         .bind(f.sighted.as_slice())
         .execute(&mut **tx)
@@ -303,11 +310,30 @@ pub async fn persist_batch(
     now: i64,
 ) -> sqlx::Result<PersistOutcome> {
     let mut o = PersistOutcome::default();
+    // Classify and screen first, outside the transaction and off the async workers: on a
+    // hostile 16 MiB info dict this is seconds of CPU (D71).
+    let decisions: Vec<Option<(Classification, Verdict)>> = match screen {
+        Some(screen) => cpu(|| {
+            items
+                .iter()
+                .map(|it| match &it.result {
+                    Ok(Outcome::Ok(f)) => {
+                        // Classify (pure, silent) before the screen: the context tier needs
+                        // the adult result (docs/DHT.md §7.1 order).
+                        let class = classify(&f.info.name, &display_files(f));
+                        Some((class, screen.verdict(&f.info.all_names, class.adult())))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }),
+        None => vec![None; items.len()],
+    };
     let mut tx = pool.begin().await?;
-    for it in items {
+    for (it, decision) in items.iter().zip(decisions) {
         match &it.result {
             Ok(Outcome::Ok(f)) => {
-                let Some(screen) = screen else {
+                let (Some(screen), Some((class, verdict))) = (screen, decision) else {
                     sqlx::query(
                         "UPDATE dht_seen SET status = 0, next_attempt_at = $2,
                              last_error = 'unscreened'
@@ -320,10 +346,7 @@ pub async fn persist_batch(
                     o.unscreened += 1;
                     continue;
                 };
-                // Classify (pure, silent) before the screen: the context tier needs the
-                // adult result (docs/DHT.md §7.1 order).
-                let class = classify(&f.info.name, &display_files(f));
-                match screen.verdict(&f.info.all_names, class.adult()) {
+                match verdict {
                     Verdict::Block(tier) => {
                         block(&mut tx, f, screen.rule_version(), now).await?;
                         o.blocked += 1;
@@ -378,11 +401,25 @@ pub async fn persist_batch(
     Ok(o)
 }
 
+/// Run CPU-bound work without stalling the async workers: `block_in_place` on a
+/// multi-threaded runtime, inline otherwise (tests' current-thread runtime).
+fn cpu<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 pub struct ReclassifyOutcome {
     pub rows: u64,
     pub changed: u64,
     pub blocked: u64,
+    /// Last infohash read (keyset cursor for the next batch).
+    #[serde(skip)]
+    pub last: Option<String>,
 }
 
 /// Re-classify up to `limit` rows stored by an older classifier (`classifier_version` below
@@ -390,29 +427,46 @@ pub struct ReclassifyOutcome {
 /// result (the context tier depends on it). A row that is now blocked is deleted and only its
 /// hash kept (origin `sweep`); the others get the new category and, when no Nostr event
 /// owns the infohash, re-parsed release attributes. One transaction. Never logs a name.
+///
+/// Keyset pagination: `after` is the previous batch's [`ReclassifyOutcome::last`] (`""` to
+/// start), so each batch reads the primary key from where the last one stopped instead of
+/// re-walking rows already done (no index on `classifier_version`).
 pub async fn reclassify_batch(
     pool: &PgPool,
     screen: &dyn Screen,
+    after: &str,
     limit: i64,
     now: i64,
 ) -> sqlx::Result<ReclassifyOutcome> {
     let rows: Vec<(String, String, Json<Vec<TorrentFile>>)> = sqlx::query_as(
-        "SELECT infohash, title, files FROM dht_torrents WHERE classifier_version < $1
+        "SELECT infohash, title, files FROM dht_torrents
+         WHERE infohash > $3 AND classifier_version < $1
          ORDER BY infohash LIMIT $2",
     )
     .bind(CLASSIFIER_VERSION)
     .bind(limit)
+    .bind(after)
     .fetch_all(pool)
     .await?;
-    let mut o = ReclassifyOutcome::default();
+    let mut o = ReclassifyOutcome {
+        last: rows.last().map(|r| r.0.clone()),
+        ..Default::default()
+    };
+    let decided: Vec<(Classification, Verdict)> = cpu(|| {
+        rows.iter()
+            .map(|(_, title, Json(files))| {
+                let class = classify(title, files);
+                let mut names = Vec::with_capacity(files.len() + 1);
+                names.push(title.clone());
+                names.extend(files.iter().map(|f| f.path.clone()));
+                (class, screen.verdict(&names, class.adult()))
+            })
+            .collect()
+    });
     let mut tx = pool.begin().await?;
-    for (infohash, title, Json(files)) in rows {
+    for ((infohash, title, Json(files)), (class, verdict)) in rows.into_iter().zip(decided) {
         o.rows += 1;
-        let class = classify(&title, &files);
-        let mut names = Vec::with_capacity(files.len() + 1);
-        names.push(title.clone());
-        names.extend(files.iter().map(|f| f.path.clone()));
-        if let Verdict::Block(_) = screen.verdict(&names, class.adult()) {
+        if let Verdict::Block(_) = verdict {
             sqlx::query(
                 "INSERT INTO blocked_infohashes (infohash, blocked_at, rule_version, origin)
                  VALUES ($1, $2, $3, 'sweep') ON CONFLICT (infohash) DO NOTHING",
@@ -426,6 +480,15 @@ pub async fn reclassify_batch(
                 .bind(&infohash)
                 .execute(&mut *tx)
                 .await?;
+            // Its release attributes were parsed from the blocked name: gone too, unless a
+            // Nostr event still owns the infohash.
+            sqlx::query(
+                "DELETE FROM torrent_attrs WHERE infohash = $1
+                 AND NOT EXISTS (SELECT 1 FROM torrents t WHERE t.infohash = $1)",
+            )
+            .bind(&infohash)
+            .execute(&mut *tx)
+            .await?;
             o.blocked += 1;
             continue;
         }

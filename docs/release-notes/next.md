@@ -155,6 +155,10 @@ must be updated together to get all of it, but each side keeps working with an o
   minute, 1 477 stored, 16 blocked by the list (counted, never looked at), 2–3 % of a core,
   ≤ 107 MB RAM. One stored picture set labelled with a child's age slipped through the first
   version; it was removed by hand and is why such labels now block on their own.
+- The blocklist also sees through disguised spellings: invisible characters inside a word,
+  accents typed as separate marks, fullwidth or decorated letters, Cyrillic/Greek look-alike
+  letters, and words written with dots or spaces between the letters. Very large torrent
+  descriptions no longer cost the crawler a lot of memory to check.
 
 ## Older servers and offline mode
 

@@ -1038,6 +1038,15 @@ impl Store for PgStore {
             .execute(&mut *tx)
             .await
             .map_err(db)?;
+        // Release attributes parsed from that DHT name, unless a stored event owns them.
+        sqlx::query(
+            "DELETE FROM torrent_attrs WHERE infohash = $1
+             AND NOT EXISTS (SELECT 1 FROM torrents t WHERE t.infohash = $1)",
+        )
+        .bind(infohash)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
         tx.commit().await.map_err(db)
     }
 

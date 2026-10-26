@@ -288,9 +288,8 @@ fn strip_ext(path: &str) -> &str {
 pub fn adult_signal<S: AsRef<str>>(name: &str, paths: &[S]) -> bool {
     let l = adult_list();
     let mut weak: HashSet<String> = HashSet::new();
-    let mut texts: Vec<&str> = vec![name];
-    texts.extend(paths.iter().map(|p| strip_ext(p.as_ref())));
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut texts: Vec<&str> = vec![clip(name)];
+    texts.extend(paths.iter().map(|p| clip(strip_ext(p.as_ref()))));
     for (k, text) in texts.iter().enumerate() {
         if k == 0 && jav_shape(text) {
             return true;
@@ -319,9 +318,6 @@ pub fn adult_signal<S: AsRef<str>>(name: &str, paths: &[S]) -> bool {
                 }
             }
             for g in ngrams(&toks) {
-                if !seen.insert(g.clone()) {
-                    continue;
-                }
                 if l.strong.contains(&g) {
                     let leading_xxx =
                         k == 0 && g == "xxx" && toks.first().map(String::as_str) == Some("xxx");
@@ -512,9 +508,25 @@ fn has_any(grams: &HashSet<String>, words: &[&str]) -> bool {
     words.iter().any(|w| grams.contains(*w))
 }
 
+/// Longest text the classifier reads, in bytes (a name or one path; longer ones are cut at a
+/// character boundary): bounds its memory on hostile info dicts. The blocklist reads
+/// everything ([`crate::blocklist::Blocklist::check`]).
+pub const CLASSIFY_TEXT_MAX: usize = 4096;
+
+fn clip(s: &str) -> &str {
+    if s.len() <= CLASSIFY_TEXT_MAX {
+        return s;
+    }
+    let mut end = CLASSIFY_TEXT_MAX;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn grams_of(name: &str) -> HashSet<String> {
     let mut s = HashSet::new();
-    for toks in normalize(name) {
+    for toks in normalize(clip(name)) {
         s.extend(ngrams(&toks));
     }
     s

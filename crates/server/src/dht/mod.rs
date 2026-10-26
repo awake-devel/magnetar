@@ -889,15 +889,17 @@ pub async fn reclassify_all(
     screen: &dyn Screen,
 ) -> anyhow::Result<ReclassifyOutcome> {
     let mut total = ReclassifyOutcome::default();
+    let mut after = String::new();
     loop {
-        let o = persist::reclassify_batch(pool, screen, 500, magnetar_core::now())
+        let o = persist::reclassify_batch(pool, screen, &after, 500, magnetar_core::now())
             .await
             .map_err(|e| anyhow::anyhow!("DHT reclassify: {}", persist::error_class(&e)))?;
         total.rows += o.rows;
         total.changed += o.changed;
         total.blocked += o.blocked;
-        if o.rows < 500 {
-            break;
+        match o.last {
+            Some(last) if o.rows == 500 => after = last,
+            _ => break,
         }
     }
     if total.rows > 0 {
