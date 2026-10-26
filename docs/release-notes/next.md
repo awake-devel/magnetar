@@ -1,4 +1,4 @@
-Everything new since v0.1.0 + the metadata enrichment merge (`main` at `8444084`). Server and app
+v0.2.0 (pre-release): everything new since v0.1.0 + the metadata enrichment merge (`main` at `8444084`). Server and app
 must be updated together to get all of it, but each side keeps working with an older other side
 (details under "Older servers and offline mode").
 
@@ -59,6 +59,18 @@ must be updated together to get all of it, but each side keeps working with an o
   the IMDb id from TMDB's details and merges the two. Existing duplicates are fixed by a
   background pass after the update (needs `MAGNETAR_TMDB_TOKEN`; ~33.6 k rows on production,
   one TMDB request each at `MAGNETAR_TMDB_RPS`, about half an hour at the default 20/s).
+
+### Fixes from the first phone test
+
+- Posters keep their 2:3 shape (they were squeezed and cropped).
+- Filter sheet: chips stay in place while counts change (a value with no match is greyed
+  out, not removed), closing the sheet with Back or a swipe applies the picks, and the
+  categories show counts too.
+- Stats: "Not checked yet" is shown apart from "No answer" in the seed-check health bar.
+- Graphs: parts that are not linked to the rest stay close to it, so the view is no longer
+  shrunk to fit a far-away island.
+- Settings: "Get my key from Amber" fills the trust root from a NIP-55 signer (only the
+  public key is asked for). A private key (`nsec1…`) pasted into the field is cleared at once.
 
 ## Older servers and offline mode
 
