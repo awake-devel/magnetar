@@ -913,12 +913,11 @@ async fn ingest_fixtures() {
         .unwrap();
     assert_eq!(page.total, st.torrents);
     // Adult torrents are hidden by default (D52).
-    let adult: i64 = sqlx::query_scalar(
-        "SELECT count(DISTINCT infohash) FROM torrents WHERE category = 'porn'",
-    )
-    .fetch_one(s.pool())
-    .await
-    .unwrap();
+    let adult: i64 =
+        sqlx::query_scalar("SELECT count(DISTINCT infohash) FROM torrents WHERE category = 'porn'")
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
     let default = s
         .search(
             &SearchQuery {
