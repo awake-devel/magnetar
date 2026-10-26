@@ -2,6 +2,8 @@
 //! See ARCHITECTURE.md for the contracts.
 
 pub mod api;
+pub mod blocklist;
+pub mod classify;
 pub mod crawler;
 #[cfg(feature = "dht-crawl")]
 pub mod dht;

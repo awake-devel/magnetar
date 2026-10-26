@@ -1,0 +1,177 @@
+# Adult-content signals for core::classify (ARCHITECTURE.md D52, D69). Legal adult terms only.
+# `strong <phrase>`: one is enough. `weak <phrase>`: two distinct ones are needed (or one with a
+# strong one). `prefix <start>`: a strong signal on any word starting with it (≥ 4 letters).
+# Phrases are 1-3 words, matched as whole words after normalisation (lowercase, diacritics
+# folded, any non letter/digit a separator), on the name and on every file path.
+# Partly from bitmagnet's `keywords.xxx` (classifier.core.yml at e31b30d, MIT licence).
+prefix porn
+prefix fuck
+prefix gloryhole
+prefix wank
+prefix blowjob
+prefix creampie
+prefix gangbang
+prefix bukkake
+prefix onlyfans
+prefix camgirl
+prefix pornstar
+prefix brazzers
+strong xxx
+strong milf
+strong milfs
+strong handjob
+strong handjobs
+strong deepthroat
+strong cumshot
+strong cumshots
+strong facial cumshot
+strong orgasm
+strong orgasms
+strong hentai
+strong nsfw
+strong pussy licking
+strong bdsm
+strong porn
+strong sextape
+strong sex tape
+strong stepmom
+strong stepsis
+strong stepsister
+strong fc2ppv
+strong fc2 ppv
+strong jav uncensored
+# Studios, sites and networks
+strong bangbros
+strong realitykings
+strong reality kings
+strong naughtyamerica
+strong naughty america
+strong blacked
+strong blackedraw
+strong tushy
+strong tushyraw
+strong evilangel
+strong evil angel
+strong julesjordan
+strong jules jordan
+strong nubiles
+strong nubilefilms
+strong nubile films
+strong metart
+strong met art
+strong metartx
+strong xart
+strong hegre
+strong sexart
+strong teamskeet
+strong team skeet
+strong mofos
+strong digitalplayground
+strong digital playground
+strong fakehub
+strong faketaxi
+strong fake taxi
+strong publicagent
+strong public agent
+strong pornpros
+strong puremature
+strong legalporno
+strong analvids
+strong ddfnetwork
+strong 21sextury
+strong wowgirls
+strong manyvids
+strong chaturbate
+strong stripchat
+strong myfreecams
+strong camsoda
+strong clips4sale
+strong pervmom
+strong familystrokes
+strong sislovesme
+strong momsteachsex
+strong brattysis
+strong spizoo
+strong newsensations
+strong elegantangel
+strong girlsway
+strong adulttime
+strong adult time
+strong dorcel
+strong marc dorcel
+strong private gold
+strong sexmex
+strong caribbeancom
+strong 1pondo
+strong heyzo
+strong tokyo hot
+strong 10musume
+strong pacopacomama
+strong kink com
+strong xvideos
+strong xhamster
+strong youporn
+strong redtube
+strong spankbang
+strong eporner
+strong letsdoeit
+strong mylf
+strong bellesa
+strong lustery
+strong momxxx
+strong dogfartnetwork
+strong rk prime
+strong vixen com
+strong hardx
+strong darkx
+strong eroticax
+strong lubed
+strong passion hd
+strong exploited college girls
+# Weak: ordinary words that also name films, music or animals
+weak sex
+weak ass
+weak anal
+weak pov
+weak erotic
+weak erotica
+weak erotique
+weak nude
+weak nudes
+weak naked
+weak tits
+weak boobs
+weak cum
+weak cock
+weak cocks
+weak dick
+weak dicks
+weak pussy
+weak threesome
+weak orgy
+weak fetish
+weak bondage
+weak lesbian
+weak lesbians
+weak hardcore
+weak kink
+weak kinky
+weak slut
+weak sluts
+weak horny
+weak busty
+weak webcam
+weak striptease
+weak uncensored
+weak jav
+weak playboy
+weak penthouse
+weak hustler
+weak vivid
+weak wicked
+weak vixen
+weak seduced
+weak seduction
+weak sexy
+weak lingerie
+weak masturbation
