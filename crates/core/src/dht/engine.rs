@@ -1,0 +1,1121 @@
+//! The crawler node: one UDP socket per virtual node, transactions, the BEP 5/51 responder
+//! (aggressive), the BEP 51 sampler and maintenance (docs/DHT.md §3.2–§3.6, D54, D55).
+//!
+//! Concurrency: one receive task per socket, one sampler task, one maintenance task; queries are
+//! futures that register a transaction keyed by (virtual node, tid, remote address) and wait for
+//! the matching answer for up to [`QUERY_TIMEOUT`]. Shared state lives behind one `std` mutex that
+//! is never held across an `.await`.
+
+use std::collections::{HashMap, HashSet};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use rand::Rng;
+use serde::Serialize;
+use tokio::net::UdpSocket;
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::Instant;
+
+use super::addr::AddrFilter;
+use super::id::{NodeId, bep42_id, common_prefix_bits, random_id_in_bucket, spread_r_values};
+use super::krpc::{
+    self, Body, CompactNode, ERR_METHOD_UNKNOWN, ERR_PROTOCOL, Id, MAX_DATAGRAM, Message, Query,
+    Response,
+};
+use super::limiter::{Brake, Bucket, IP_BUCKETS_CAP, Pace, PerIp};
+use super::peerstore::{self, PeerStore};
+use super::pool::{Pool, PoolCounts};
+use super::routing::{K, RoutingTable, Seen};
+
+pub const QUERY_TIMEOUT: Duration = Duration::from_secs(4);
+/// `v` = "MG" (unregistered in BEP 20, checked 2026-10-26) + 2 version bytes.
+pub const VERSION: [u8; 4] = [b'M', b'G', 0, 2];
+/// Ids sharing this many leading bits with a target were made for it (D45's node-farm rule).
+pub const FARM_PREFIX_BITS: u32 = 64;
+const SECRET_ROTATION: Duration = Duration::from_secs(300);
+const SAMPLE_INTERVAL_SERVED: i64 = 3600;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// BEP 51 sampling only, every query `ro=1`, incoming queries ignored (BEP 43).
+    Polite,
+    /// Sampling and passive capture as a full BEP 5 node.
+    Aggressive,
+}
+
+/// External IP and the BEP 42 ids derived from it, persisted between runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Identity {
+    pub external_ip: Ipv4Addr,
+    pub ids: Vec<NodeId>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EngineConfig {
+    pub mode: Mode,
+    pub bind: Ipv4Addr,
+    /// One per virtual node; 0 = ephemeral.
+    pub ports: Vec<u16>,
+    pub qps: u32,
+    pub pool_cap: usize,
+    pub bootstrap: Vec<SocketAddrV4>,
+    /// Nodes saved by an earlier run (BEP 5: "the routing table should be saved").
+    pub known_nodes: Vec<CompactNode>,
+    pub identity: Option<Identity>,
+    /// Test seam: lets 127.0.0.0/8 through the address filter. Never set from configuration.
+    pub allow_loopback: bool,
+    pub query_timeout: Duration,
+    pub sighting_capacity: usize,
+    /// Run the BEP 51 sampler (tests may drive queries by hand).
+    pub sample: bool,
+    pub per_ip_qps: f64,
+    pub response_rate: f64,
+    pub response_per_ip: f64,
+    /// External IP vote: agreeing responders and distinct /16s needed.
+    pub vote_responders: usize,
+    pub vote_prefixes: usize,
+}
+
+impl EngineConfig {
+    pub fn new(mode: Mode) -> Self {
+        let (ports, qps, pool) = match mode {
+            Mode::Polite => (vec![0], 50, 200_000),
+            Mode::Aggressive => (vec![6891, 6892, 6893, 6894], 200, 1_000_000),
+        };
+        Self {
+            mode,
+            bind: Ipv4Addr::UNSPECIFIED,
+            ports,
+            qps,
+            pool_cap: pool,
+            bootstrap: Vec::new(),
+            known_nodes: Vec::new(),
+            identity: None,
+            allow_loopback: false,
+            query_timeout: QUERY_TIMEOUT,
+            sighting_capacity: 10_000,
+            sample: true,
+            per_ip_qps: 1.0,
+            response_rate: 300.0,
+            response_per_ip: 5.0,
+            vote_responders: 8,
+            vote_prefixes: 4,
+        }
+    }
+}
+
+/// How an infohash was seen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Via {
+    Sample,
+    Announce,
+    GetPeers,
+}
+
+impl Via {
+    /// `dht_seen.via` / `dht_torrents.discovered_via` codes (docs/DHT.md §2.3).
+    pub fn code(self) -> i16 {
+        match self {
+            Via::Sample => 0,
+            Via::Announce => 1,
+            Via::GetPeers => 2,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Via::Sample => "sample",
+            Via::Announce => "announce",
+            Via::GetPeers => "get_peers",
+        }
+    }
+}
+
+/// An infohash seen on the DHT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sighting {
+    pub info_hash: Id,
+    pub via: Via,
+    /// The node whose sample held it (it stores peers for exactly that hash).
+    pub source: Option<SocketAddrV4>,
+    /// The announcing peer (a peer that has the torrent).
+    pub peer: Option<SocketAddrV4>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueryError {
+    Filtered,
+    RateLimited,
+    Busy,
+    Timeout,
+    Remote(i64),
+    Io,
+    Stopped,
+}
+
+enum Reply {
+    Response(Response),
+    Error(i64),
+}
+
+#[derive(Default)]
+struct Counters {
+    sent: [AtomicU64; 5],
+    answered: AtomicU64,
+    errors: AtomicU64,
+    timeouts: AtomicU64,
+    unmatched: AtomicU64,
+    decode_errors: AtomicU64,
+    too_long: AtomicU64,
+    filtered: AtomicU64,
+    rate_limited: AtomicU64,
+    busy: AtomicU64,
+    incoming: [AtomicU64; 6],
+    incoming_ignored: AtomicU64,
+    responses_sent: AtomicU64,
+    responses_dropped: AtomicU64,
+    bad_tokens: AtomicU64,
+    samples: AtomicU64,
+    sightings: [AtomicU64; 3],
+    sightings_dropped: AtomicU64,
+    nodes_learnt: AtomicU64,
+    nodes_filtered: AtomicU64,
+    nodes_farm: AtomicU64,
+    ip_changes: AtomicU64,
+}
+
+fn bump(a: &AtomicU64) {
+    a.fetch_add(1, Ordering::Relaxed);
+}
+
+fn query_kind(q: &Query) -> usize {
+    match q {
+        Query::Ping => 0,
+        Query::FindNode { .. } => 1,
+        Query::GetPeers { .. } => 2,
+        Query::AnnouncePeer { .. } => 3,
+        Query::SampleInfohashes { .. } => 4,
+        Query::Unknown(_) => 5,
+    }
+}
+
+/// Counts and gauges for reports and `/api/v1/stats` (never addresses or names).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct EngineStats {
+    pub queries_sent: u64,
+    pub sent_ping: u64,
+    pub sent_find_node: u64,
+    pub sent_get_peers: u64,
+    pub sent_sample_infohashes: u64,
+    pub answered: u64,
+    pub errors: u64,
+    pub timeouts: u64,
+    pub unmatched: u64,
+    pub decode_errors: u64,
+    pub too_long: u64,
+    pub filtered: u64,
+    pub rate_limited: u64,
+    pub busy: u64,
+    pub incoming_ping: u64,
+    pub incoming_find_node: u64,
+    pub incoming_get_peers: u64,
+    pub incoming_announce_peer: u64,
+    pub incoming_sample_infohashes: u64,
+    pub incoming_unknown: u64,
+    pub incoming_ignored: u64,
+    pub responses_sent: u64,
+    pub responses_dropped: u64,
+    pub bad_tokens: u64,
+    pub samples_received: u64,
+    pub sightings_sample: u64,
+    pub sightings_announce: u64,
+    pub sightings_get_peers: u64,
+    pub sightings_dropped: u64,
+    pub nodes_learnt: u64,
+    pub nodes_filtered: u64,
+    pub nodes_farm: u64,
+    pub external_ip_known: bool,
+    pub external_ip_changes: u64,
+    pub brake_active: bool,
+    pub brake_engaged: u64,
+    pub pending: usize,
+    pub routing: Vec<usize>,
+    pub pool: PoolStats,
+    pub peer_store_hashes: usize,
+    pub peer_store_peers: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct PoolStats {
+    pub size: usize,
+    pub bep51_yes: usize,
+    pub bep51_no: usize,
+    pub bep51_unknown: usize,
+    pub evicted: u64,
+    pub dropped_silent: u64,
+}
+
+impl From<PoolCounts> for PoolStats {
+    fn from(c: PoolCounts) -> Self {
+        Self {
+            size: c.size,
+            bep51_yes: c.bep51_yes,
+            bep51_no: c.bep51_no,
+            bep51_unknown: c.bep51_unknown,
+            evicted: c.evicted,
+            dropped_silent: c.dropped_silent,
+        }
+    }
+}
+
+struct VNode {
+    routing: RoutingTable,
+    ro: bool,
+}
+
+#[derive(Default)]
+struct Vote {
+    responders: HashSet<Ipv4Addr>,
+    prefixes: HashSet<u16>,
+}
+
+struct State {
+    nodes: Vec<VNode>,
+    pool: Pool,
+    peers: PeerStore,
+    pending: HashMap<(usize, [u8; 2], SocketAddrV4), oneshot::Sender<Reply>>,
+    pending_cap: usize,
+    pace: Pace,
+    per_ip: PerIp,
+    brake: Brake,
+    resp_global: Bucket,
+    resp_ip: PerIp,
+    filter: AddrFilter,
+    external_ip: Option<Ipv4Addr>,
+    votes: HashMap<Ipv4Addr, Vote>,
+    secrets: [[u8; 16]; 2],
+    rr: usize,
+}
+
+struct Inner {
+    cfg: EngineConfig,
+    sockets: Vec<Arc<UdpSocket>>,
+    local_ports: Vec<u16>,
+    state: Mutex<State>,
+    c: Counters,
+    sightings: mpsc::Sender<Sighting>,
+    stop: watch::Receiver<bool>,
+}
+
+/// Handle to a running crawler node (cheap to clone).
+#[derive(Clone)]
+pub struct Dht {
+    inner: Arc<Inner>,
+    stop_tx: Arc<watch::Sender<bool>>,
+    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+fn token_for(secret: &[u8; 16], ip: Ipv4Addr) -> [u8; 8] {
+    let mut h = sha1_smol::Sha1::new();
+    h.update(secret);
+    h.update(&ip.octets());
+    let d = h.digest().bytes();
+    std::array::from_fn(|i| d[i])
+}
+
+fn ids_for(ip: Ipv4Addr, n: usize) -> Vec<NodeId> {
+    let mut rng = rand::rng();
+    spread_r_values(ip, n)
+        .into_iter()
+        .map(|r| {
+            let rand_byte = (rng.random::<u8>() & 0xf8) | r;
+            bep42_id(ip, rand_byte, rng.random())
+        })
+        .collect()
+}
+
+impl Dht {
+    /// Bind the sockets and start the node. Returns the handle and the stream of sightings.
+    pub async fn start(cfg: EngineConfig) -> std::io::Result<(Dht, mpsc::Receiver<Sighting>)> {
+        let n = cfg.ports.len().clamp(1, 8);
+        let mut sockets = Vec::with_capacity(n);
+        let mut local_ports = Vec::with_capacity(n);
+        for &port in cfg.ports.iter().take(n) {
+            let s = UdpSocket::bind(SocketAddrV4::new(cfg.bind, port)).await?;
+            local_ports.push(s.local_addr()?.port());
+            sockets.push(Arc::new(s));
+        }
+        let now = Instant::now();
+        let (ids, external_ip) = match &cfg.identity {
+            Some(id) if id.ids.len() >= n => (id.ids[..n].to_vec(), Some(id.external_ip)),
+            Some(id) => (ids_for(id.external_ip, n), Some(id.external_ip)),
+            None => ((0..n).map(|_| rand::random()).collect(), None),
+        };
+        let ro = |known: bool| cfg.mode == Mode::Polite || !known;
+        let mut filter = AddrFilter::new(cfg.allow_loopback);
+        if let Some(ip) = external_ip
+            && !ip.is_loopback()
+        {
+            filter.set_own(Some(ip));
+        }
+        let qps = cfg.qps.max(1);
+        let state = State {
+            nodes: ids
+                .iter()
+                .map(|id| VNode {
+                    routing: RoutingTable::new(*id, now),
+                    ro: ro(external_ip.is_some()),
+                })
+                .collect(),
+            pool: Pool::new(cfg.pool_cap),
+            peers: PeerStore::new(peerstore::CAP),
+            pending: HashMap::new(),
+            pending_cap: (qps as usize * cfg.query_timeout.as_secs().max(1) as usize * 2).max(64),
+            pace: Pace::new(qps, now),
+            per_ip: PerIp::new(
+                cfg.per_ip_qps,
+                (cfg.per_ip_qps * 2.0).max(2.0),
+                IP_BUCKETS_CAP,
+            ),
+            brake: Brake::default(),
+            resp_global: Bucket::new(cfg.response_rate, cfg.response_rate, now),
+            resp_ip: PerIp::new(cfg.response_per_ip, cfg.response_per_ip, IP_BUCKETS_CAP),
+            filter,
+            external_ip,
+            votes: HashMap::new(),
+            secrets: [rand::random(), rand::random()],
+            rr: 0,
+        };
+        let (tx, rx) = mpsc::channel(cfg.sighting_capacity.max(1));
+        let (stop_tx, stop) = watch::channel(false);
+        let inner = Arc::new(Inner {
+            cfg,
+            sockets,
+            local_ports,
+            state: Mutex::new(state),
+            c: Counters::default(),
+            sightings: tx,
+            stop,
+        });
+        let dht = Dht {
+            inner,
+            stop_tx: Arc::new(stop_tx),
+            tasks: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut tasks = Vec::new();
+        for i in 0..dht.inner.sockets.len() {
+            let d = dht.clone();
+            tasks.push(tokio::spawn(async move { d.recv_loop(i).await }));
+        }
+        let d = dht.clone();
+        tasks.push(tokio::spawn(async move { d.maintenance_loop().await }));
+        if dht.inner.cfg.sample {
+            let d = dht.clone();
+            tasks.push(tokio::spawn(async move { d.sampler_loop().await }));
+        }
+        *dht.tasks.lock().unwrap() = tasks;
+        Ok((dht, rx))
+    }
+
+    /// Stop every task and wait for them (bounded).
+    pub async fn shutdown(&self) {
+        let _ = self.stop_tx.send(true);
+        let tasks: Vec<_> = std::mem::take(&mut *self.tasks.lock().unwrap());
+        for t in tasks {
+            let abort = t.abort_handle();
+            if tokio::time::timeout(Duration::from_secs(5), t)
+                .await
+                .is_err()
+            {
+                abort.abort();
+            }
+        }
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        *self.inner.stop.borrow()
+    }
+
+    pub fn local_ports(&self) -> Vec<u16> {
+        self.inner.local_ports.clone()
+    }
+
+    pub fn virtual_nodes(&self) -> usize {
+        self.inner.sockets.len()
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.inner.cfg.mode
+    }
+
+    pub fn ids(&self) -> Vec<NodeId> {
+        let s = self.inner.state.lock().unwrap();
+        s.nodes.iter().map(|n| n.routing.own_id()).collect()
+    }
+
+    /// The voted (or persisted) external IP and current ids.
+    pub fn identity(&self) -> Option<Identity> {
+        let s = self.inner.state.lock().unwrap();
+        s.external_ip.map(|ip| Identity {
+            external_ip: ip,
+            ids: s.nodes.iter().map(|n| n.routing.own_id()).collect(),
+        })
+    }
+
+    /// Good routing contacts and recently answering pool nodes, for the next start.
+    pub fn nodes_to_save(&self, n: usize) -> Vec<CompactNode> {
+        let s = self.inner.state.lock().unwrap();
+        let now = Instant::now();
+        let mut out: Vec<CompactNode> = Vec::new();
+        let mut seen = HashSet::new();
+        for v in &s.nodes {
+            for c in v.routing.good(now, n) {
+                if seen.insert(c.addr) {
+                    out.push(c);
+                }
+            }
+        }
+        for c in s.pool.answered_recently(now, Duration::from_secs(3600), n) {
+            if out.len() >= n {
+                break;
+            }
+            if seen.insert(c.addr) {
+                out.push(c);
+            }
+        }
+        out.truncate(n);
+        out
+    }
+
+    /// The `k` closest routing contacts over every virtual node.
+    pub fn closest(&self, target: &Id, k: usize) -> Vec<CompactNode> {
+        let s = self.inner.state.lock().unwrap();
+        let mut all: Vec<CompactNode> = s
+            .nodes
+            .iter()
+            .flat_map(|v| v.routing.closest(target, k))
+            .collect();
+        all.sort_by_key(|c| super::id::distance(&c.id, target));
+        all.dedup_by_key(|c| c.addr);
+        all.truncate(k);
+        all
+    }
+
+    pub fn bootstrap_addrs(&self) -> &[SocketAddrV4] {
+        &self.inner.cfg.bootstrap
+    }
+
+    /// Round-robin virtual node for the next query.
+    pub fn next_node(&self) -> usize {
+        let mut s = self.inner.state.lock().unwrap();
+        s.rr = s.rr.wrapping_add(1);
+        s.rr % s.nodes.len()
+    }
+
+    pub fn stats(&self) -> EngineStats {
+        let c = &self.inner.c;
+        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let s = self.inner.state.lock().unwrap();
+        let now = Instant::now();
+        EngineStats {
+            queries_sent: c.sent.iter().map(g).sum(),
+            sent_ping: g(&c.sent[0]),
+            sent_find_node: g(&c.sent[1]),
+            sent_get_peers: g(&c.sent[2]),
+            sent_sample_infohashes: g(&c.sent[4]),
+            answered: g(&c.answered),
+            errors: g(&c.errors),
+            timeouts: g(&c.timeouts),
+            unmatched: g(&c.unmatched),
+            decode_errors: g(&c.decode_errors),
+            too_long: g(&c.too_long),
+            filtered: g(&c.filtered),
+            rate_limited: g(&c.rate_limited),
+            busy: g(&c.busy),
+            incoming_ping: g(&c.incoming[0]),
+            incoming_find_node: g(&c.incoming[1]),
+            incoming_get_peers: g(&c.incoming[2]),
+            incoming_announce_peer: g(&c.incoming[3]),
+            incoming_sample_infohashes: g(&c.incoming[4]),
+            incoming_unknown: g(&c.incoming[5]),
+            incoming_ignored: g(&c.incoming_ignored),
+            responses_sent: g(&c.responses_sent),
+            responses_dropped: g(&c.responses_dropped),
+            bad_tokens: g(&c.bad_tokens),
+            samples_received: g(&c.samples),
+            sightings_sample: g(&c.sightings[0]),
+            sightings_announce: g(&c.sightings[1]),
+            sightings_get_peers: g(&c.sightings[2]),
+            sightings_dropped: g(&c.sightings_dropped),
+            nodes_learnt: g(&c.nodes_learnt),
+            nodes_filtered: g(&c.nodes_filtered),
+            nodes_farm: g(&c.nodes_farm),
+            external_ip_known: s.external_ip.is_some(),
+            external_ip_changes: g(&c.ip_changes),
+            brake_active: s.brake.active(now),
+            brake_engaged: s.brake.engaged,
+            pending: s.pending.len(),
+            routing: s.nodes.iter().map(|n| n.routing.len()).collect(),
+            pool: s.pool.counts().into(),
+            peer_store_hashes: s.peers.hashes(),
+            peer_store_peers: s.peers.peers(),
+        }
+    }
+
+    fn sight(&self, s: Sighting) {
+        bump(&self.inner.c.sightings[s.via.code() as usize]);
+        if self.inner.sightings.try_send(s).is_err() {
+            bump(&self.inner.c.sightings_dropped);
+        }
+    }
+
+    /// Send one query and wait for its answer. Paced by the global QPS budget.
+    pub async fn query(
+        &self,
+        node: usize,
+        to: SocketAddrV4,
+        q: Query,
+    ) -> Result<Response, QueryError> {
+        self.query_inner(node, to, q, true).await
+    }
+
+    async fn query_inner(
+        &self,
+        node: usize,
+        to: SocketAddrV4,
+        q: Query,
+        pace: bool,
+    ) -> Result<Response, QueryError> {
+        let c = &self.inner.c;
+        if self.is_stopped() {
+            return Err(QueryError::Stopped);
+        }
+        let kind = query_kind(&q);
+        let (key, rx, at, wire) = {
+            let mut s = self.inner.state.lock().unwrap();
+            let node = node % s.nodes.len();
+            let now = Instant::now();
+            if !s.filter.allows(&to)
+                || (to.ip().is_loopback() && self.inner.local_ports.contains(&to.port()))
+            {
+                bump(&c.filtered);
+                return Err(QueryError::Filtered);
+            }
+            if !s.per_ip.try_take(*to.ip(), now) {
+                bump(&c.rate_limited);
+                return Err(QueryError::RateLimited);
+            }
+            if s.pending.len() >= s.pending_cap {
+                bump(&c.busy);
+                return Err(QueryError::Busy);
+            }
+            let braked = s.brake.active(now);
+            let at = if pace {
+                s.pace.reserve(now, braked)
+            } else {
+                now
+            };
+            let mut tid: [u8; 2] = rand::random();
+            while s.pending.contains_key(&(node, tid, to)) {
+                tid = rand::random();
+            }
+            let (tx, rx) = oneshot::channel();
+            s.pending.insert((node, tid, to), tx);
+            let v = &s.nodes[node];
+            let wire = krpc::encode(&Message {
+                tid: tid.to_vec(),
+                body: Body::Query {
+                    id: v.routing.own_id(),
+                    query: q,
+                    ro: v.ro,
+                },
+                ip: None,
+                version: Some(VERSION.to_vec()),
+            });
+            ((node, tid, to), rx, at, wire)
+        };
+        let unregister = || {
+            self.inner.state.lock().unwrap().pending.remove(&key);
+        };
+        if at > Instant::now() {
+            let mut stop = self.inner.stop.clone();
+            tokio::select! {
+                _ = tokio::time::sleep_until(at) => {}
+                _ = stop.wait_for(|s| *s) => { unregister(); return Err(QueryError::Stopped); }
+            }
+        }
+        if self.inner.sockets[key.0]
+            .send_to(&wire, SocketAddr::V4(to))
+            .await
+            .is_err()
+        {
+            unregister();
+            return Err(QueryError::Io);
+        }
+        bump(&c.sent[kind.min(4)]);
+        self.inner.state.lock().unwrap().brake.sent();
+        match tokio::time::timeout(self.inner.cfg.query_timeout, rx).await {
+            Ok(Ok(Reply::Response(r))) => Ok(r),
+            Ok(Ok(Reply::Error(code))) => Err(QueryError::Remote(code)),
+            Ok(Err(_)) => Err(QueryError::Stopped),
+            Err(_) => {
+                unregister();
+                bump(&c.timeouts);
+                let mut s = self.inner.state.lock().unwrap();
+                s.nodes[key.0].routing.failed(&to);
+                Err(QueryError::Timeout)
+            }
+        }
+    }
+
+    /// Learnt contacts → the crawl pool, after the address filter and the node-farm rule.
+    fn learn(&self, s: &mut State, nodes: &[CompactNode], target: &Id, now: Instant) {
+        for n in nodes {
+            if !s.filter.allows(&n.addr)
+                || (n.addr.ip().is_loopback() && self.inner.local_ports.contains(&n.addr.port()))
+            {
+                bump(&self.inner.c.nodes_filtered);
+            } else if common_prefix_bits(&n.id, target) >= FARM_PREFIX_BITS {
+                bump(&self.inner.c.nodes_farm);
+            } else if s.pool.add(*n, now) {
+                bump(&self.inner.c.nodes_learnt);
+            }
+        }
+    }
+
+    /// Record contacts learnt from a lookup answer (pool only; routing takes nodes that answer).
+    pub fn learn_nodes(&self, nodes: &[CompactNode], target: &Id) {
+        let mut s = self.inner.state.lock().unwrap();
+        self.learn(&mut s, nodes, target, Instant::now());
+    }
+
+    async fn recv_loop(&self, i: usize) {
+        let sock = self.inner.sockets[i].clone();
+        let mut stop = self.inner.stop.clone();
+        let mut buf = vec![0u8; MAX_DATAGRAM + 1];
+        loop {
+            let (n, src) = tokio::select! {
+                _ = stop.wait_for(|s| *s) => return,
+                r = sock.recv_from(&mut buf) => match r {
+                    Ok(x) => x,
+                    // ICMP errors surface as recv errors on Linux; keep going.
+                    Err(_) => continue,
+                },
+            };
+            let SocketAddr::V4(src) = src else { continue };
+            if n > MAX_DATAGRAM {
+                bump(&self.inner.c.too_long);
+                continue;
+            }
+            match krpc::decode(&buf[..n]) {
+                Ok(msg) => self.handle(i, src, msg),
+                Err(_) => bump(&self.inner.c.decode_errors),
+            }
+        }
+    }
+
+    fn handle(&self, i: usize, src: SocketAddrV4, msg: Message) {
+        let c = &self.inner.c;
+        let reply = match msg.body {
+            Body::Query { id, query, ro } => return self.respond(i, src, msg.tid, id, query, ro),
+            Body::Response(r) => Reply::Response(r),
+            Body::Error { code, .. } => Reply::Error(code),
+        };
+        let Ok(tid) = <[u8; 2]>::try_from(msg.tid.as_slice()) else {
+            bump(&c.unmatched);
+            return;
+        };
+        let mut s = self.inner.state.lock().unwrap();
+        let Some(tx) = s.pending.remove(&(i, tid, src)) else {
+            bump(&c.unmatched);
+            return;
+        };
+        s.brake.answered();
+        match &reply {
+            Reply::Response(r) => {
+                bump(&c.answered);
+                let now = Instant::now();
+                s.nodes[i].routing.insert(
+                    CompactNode {
+                        id: r.id,
+                        addr: src,
+                    },
+                    Seen::Answered,
+                    now,
+                );
+                if let Some(ip) = msg.ip {
+                    self.vote(&mut s, *ip.ip(), *src.ip(), now);
+                }
+            }
+            Reply::Error(_) => bump(&c.errors),
+        }
+        drop(s);
+        let _ = tx.send(reply);
+    }
+
+    /// Whether we may send to (or hand the fetcher) this address.
+    pub fn allows(&self, a: &SocketAddrV4) -> bool {
+        let s = self.inner.state.lock().unwrap();
+        s.filter.allows(a) && !(a.ip().is_loopback() && self.inner.local_ports.contains(&a.port()))
+    }
+
+    /// BEP 42 external IP vote: ≥ `vote_responders` responders from ≥ `vote_prefixes` /16s.
+    fn vote(&self, s: &mut State, seen_as: Ipv4Addr, responder: Ipv4Addr, now: Instant) {
+        let usable = super::addr::is_global(seen_as)
+            || (self.inner.cfg.allow_loopback && seen_as.is_loopback());
+        if !usable || Some(seen_as) == s.external_ip {
+            return;
+        }
+        if !s.votes.contains_key(&seen_as) && s.votes.len() >= 64 {
+            return;
+        }
+        let v = s.votes.entry(seen_as).or_default();
+        if v.responders.len() < 64 {
+            v.responders.insert(responder);
+            let o = responder.octets();
+            v.prefixes.insert(u16::from_be_bytes([o[0], o[1]]));
+        }
+        if v.responders.len() >= self.inner.cfg.vote_responders
+            && v.prefixes.len() >= self.inner.cfg.vote_prefixes
+        {
+            self.set_external(s, seen_as, now);
+        }
+    }
+
+    fn set_external(&self, s: &mut State, ip: Ipv4Addr, now: Instant) {
+        let ids = ids_for(ip, s.nodes.len());
+        let polite = self.inner.cfg.mode == Mode::Polite;
+        for (v, id) in s.nodes.iter_mut().zip(ids) {
+            v.routing.rebuild(id, now);
+            v.ro = polite;
+        }
+        if !ip.is_loopback() {
+            s.filter.set_own(Some(ip));
+        }
+        s.external_ip = Some(ip);
+        s.votes.clear();
+        bump(&self.inner.c.ip_changes);
+        tracing::info!("DHT: external address voted, BEP 42 ids derived");
+    }
+
+    fn respond(&self, i: usize, src: SocketAddrV4, tid: Vec<u8>, id: Id, q: Query, ro: bool) {
+        let c = &self.inner.c;
+        bump(&c.incoming[query_kind(&q)]);
+        if self.inner.cfg.mode == Mode::Polite {
+            // BEP 43: a read-only node "no longer responds to 'query' messages".
+            bump(&c.incoming_ignored);
+            return;
+        }
+        let now = Instant::now();
+        let mut sighting = None;
+        let body = {
+            let mut s = self.inner.state.lock().unwrap();
+            if !s.filter.allows(&src) {
+                bump(&c.incoming_ignored);
+                return;
+            }
+            if !s.resp_global.try_take(now) || !s.resp_ip.try_take(*src.ip(), now) {
+                bump(&c.responses_dropped);
+                return;
+            }
+            let sender = CompactNode { id, addr: src };
+            if !ro {
+                s.nodes[i].routing.insert(sender, Seen::Queried, now);
+                if s.pool.add(sender, now) {
+                    bump(&c.nodes_learnt);
+                }
+            }
+            let own = s.nodes[i].routing.own_id();
+            let resp = |nodes: Vec<CompactNode>| Response {
+                id: own,
+                nodes,
+                ..Default::default()
+            };
+            match q {
+                Query::Ping => Body::Response(resp(Vec::new())),
+                Query::FindNode { target } => {
+                    Body::Response(resp(s.nodes[i].routing.closest(&target, K)))
+                }
+                Query::GetPeers { info_hash } => {
+                    sighting = Some(Sighting {
+                        info_hash,
+                        via: Via::GetPeers,
+                        source: None,
+                        peer: None,
+                    });
+                    let mut r = resp(s.nodes[i].routing.closest(&info_hash, K));
+                    r.token = Some(token_for(&s.secrets[0], *src.ip()).to_vec());
+                    r.values = s.peers.get(&info_hash, now, krpc::MAX_VALUES);
+                    Body::Response(r)
+                }
+                Query::AnnouncePeer {
+                    info_hash,
+                    port,
+                    implied_port,
+                    token,
+                } => {
+                    let valid = s
+                        .secrets
+                        .iter()
+                        .any(|sec| token_for(sec, *src.ip()).as_slice() == token.as_slice());
+                    let port = if implied_port { src.port() } else { port };
+                    if !valid || port == 0 {
+                        bump(&c.bad_tokens);
+                        Body::Error {
+                            code: ERR_PROTOCOL,
+                            message: "bad token".into(),
+                        }
+                    } else {
+                        let peer = SocketAddrV4::new(*src.ip(), port);
+                        s.peers.announce(info_hash, peer, now);
+                        sighting = Some(Sighting {
+                            info_hash,
+                            via: Via::Announce,
+                            source: None,
+                            peer: Some(peer),
+                        });
+                        Body::Response(resp(Vec::new()))
+                    }
+                }
+                Query::SampleInfohashes { target } => {
+                    let mut r = resp(s.nodes[i].routing.closest(&target, K));
+                    r.samples = Some(s.peers.sample(krpc::MAX_SAMPLES));
+                    r.interval = Some(SAMPLE_INTERVAL_SERVED);
+                    r.num = Some(s.peers.hashes() as i64);
+                    Body::Response(r)
+                }
+                Query::Unknown(_) => Body::Error {
+                    code: ERR_METHOD_UNKNOWN,
+                    message: "Method Unknown".into(),
+                },
+            }
+        };
+        let wire = krpc::encode(&Message {
+            tid,
+            body,
+            ip: Some(src),
+            version: Some(VERSION.to_vec()),
+        });
+        if self.inner.sockets[i]
+            .try_send_to(&wire, SocketAddr::V4(src))
+            .is_ok()
+        {
+            bump(&c.responses_sent);
+        }
+        if let Some(sg) = sighting {
+            self.sight(sg);
+        }
+    }
+
+    async fn sampler_loop(&self) {
+        let mut stop = self.inner.stop.clone();
+        let mut inflight: JoinSet<()> = JoinSet::new();
+        loop {
+            while inflight.try_join_next().is_some() {}
+            let at = {
+                let mut s = self.inner.state.lock().unwrap();
+                let now = Instant::now();
+                let braked = s.brake.active(now);
+                s.pace.reserve(now, braked)
+            };
+            tokio::select! {
+                _ = tokio::time::sleep_until(at) => {}
+                _ = stop.wait_for(|s| *s) => break,
+            }
+            let now = Instant::now();
+            let (due, grow) = {
+                let mut s = self.inner.state.lock().unwrap();
+                match s.pool.pop_due(now) {
+                    Some(e) => (Some(e), None),
+                    None => {
+                        let mut seeds = s.pool.random(1);
+                        if seeds.is_empty() {
+                            let t: Id = rand::random();
+                            seeds = s
+                                .nodes
+                                .iter()
+                                .flat_map(|v| v.routing.closest(&t, 1))
+                                .collect();
+                        }
+                        (None, seeds.first().map(|n| n.addr))
+                    }
+                }
+            };
+            let node = self.next_node();
+            if let Some(e) = due {
+                let d = self.clone();
+                inflight.spawn(async move { d.sample_one(node, e.node.addr).await });
+            } else if let Some(addr) = grow {
+                let d = self.clone();
+                inflight.spawn(async move {
+                    let target: Id = rand::random();
+                    if let Ok(r) = d
+                        .query_inner(node, addr, Query::FindNode { target }, false)
+                        .await
+                    {
+                        d.learn_nodes(&r.nodes, &target);
+                    }
+                });
+            } else {
+                // Nothing known yet: wait for the bootstrap.
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    _ = stop.wait_for(|s| *s) => break,
+                }
+            }
+        }
+        inflight.shutdown().await;
+    }
+
+    async fn sample_one(&self, node: usize, addr: SocketAddrV4) {
+        let target: Id = rand::random();
+        let r = self
+            .query_inner(node, addr, Query::SampleInfohashes { target }, false)
+            .await;
+        let now = Instant::now();
+        let mut found = Vec::new();
+        {
+            let mut s = self.inner.state.lock().unwrap();
+            match r {
+                Ok(r) => {
+                    s.pool
+                        .answered(&addr, r.id, r.samples.is_some(), r.interval, now);
+                    self.learn(&mut s, &r.nodes, &target, now);
+                    found = r.samples.unwrap_or_default();
+                }
+                Err(QueryError::Remote(_)) => s.pool.unsupported(&addr, now),
+                Err(QueryError::Timeout) => {
+                    s.pool.failed(&addr, now);
+                }
+                Err(QueryError::Filtered) => s.pool.remove(&addr),
+                Err(QueryError::Stopped) => {}
+                Err(_) => s.pool.reschedule(&addr, now + Duration::from_secs(2)),
+            }
+        }
+        self.inner
+            .c
+            .samples
+            .fetch_add(found.len() as u64, Ordering::Relaxed);
+        for h in found {
+            self.sight(Sighting {
+                info_hash: h,
+                via: Via::Sample,
+                source: Some(addr),
+                peer: None,
+            });
+        }
+    }
+
+    async fn maintenance_loop(&self) {
+        let mut stop = self.inner.stop.clone();
+        let started = Instant::now();
+        let mut last_minute = started;
+        let mut last_rotation = started;
+        // Bootstrap: find the nodes closest to each own id (BEP 5).
+        let mut boot = JoinSet::new();
+        for i in 0..self.inner.sockets.len() {
+            let d = self.clone();
+            boot.spawn(async move { d.self_lookup(i).await });
+        }
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = stop.wait_for(|s| *s) => break,
+            }
+            while boot.try_join_next().is_some() {}
+            let now = Instant::now();
+            {
+                let mut s = self.inner.state.lock().unwrap();
+                if s.brake.tick(now) {
+                    tracing::warn!(
+                        "DHT: answered share collapsed, halving the query rate for 5 min"
+                    );
+                }
+                if now.saturating_duration_since(last_rotation) >= SECRET_ROTATION {
+                    s.secrets[1] = s.secrets[0];
+                    s.secrets[0] = rand::random();
+                    last_rotation = now;
+                }
+            }
+            if now.saturating_duration_since(last_minute) < Duration::from_secs(60) {
+                continue;
+            }
+            last_minute = now;
+            let mut work: Vec<(usize, SocketAddrV4, Query)> = Vec::new();
+            let mut thin = Vec::new();
+            {
+                let mut s = self.inner.state.lock().unwrap();
+                s.peers.purge(now);
+                for (i, v) in s.nodes.iter_mut().enumerate() {
+                    if v.routing.len() < 16 {
+                        thin.push(i);
+                    }
+                    for bits in v.routing.stale_buckets(now).into_iter().take(4) {
+                        let target = random_id_in_bucket(&v.routing.own_id(), bits, rand::random());
+                        if let Some(n) = v.routing.closest(&target, 1).first() {
+                            work.push((i, n.addr, Query::FindNode { target }));
+                        }
+                        v.routing.touch_bucket(bits, now);
+                    }
+                    for addr in v.routing.questionable(now, 4) {
+                        work.push((i, addr, Query::Ping));
+                    }
+                }
+            }
+            for i in thin {
+                if boot.len() < self.inner.sockets.len() {
+                    let d = self.clone();
+                    boot.spawn(async move { d.self_lookup(i).await });
+                }
+            }
+            for (i, addr, q) in work {
+                let d = self.clone();
+                boot.spawn(async move {
+                    let target = match &q {
+                        Query::FindNode { target } => Some(*target),
+                        _ => None,
+                    };
+                    if let (Ok(r), Some(t)) = (d.query(i, addr, q).await, target) {
+                        d.learn_nodes(&r.nodes, &t);
+                    }
+                });
+            }
+        }
+        boot.shutdown().await;
+    }
+
+    /// Iterative `find_node` towards a virtual node's own id from the bootstrap routers, the
+    /// saved nodes and the routing table.
+    async fn self_lookup(&self, i: usize) {
+        let own = self.ids()[i];
+        let mut seeds: Vec<CompactNode> = self.closest(&own, 16);
+        let mut extra: Vec<SocketAddrV4> = self.inner.cfg.bootstrap.clone();
+        extra.extend(self.inner.cfg.known_nodes.iter().map(|n| n.addr));
+        if seeds.len() >= 16 {
+            extra.clear();
+        }
+        seeds.retain(|n| !extra.contains(&n.addr));
+        let r = super::lookup::lookup(
+            self,
+            i,
+            own,
+            super::lookup::Method::FindNode,
+            seeds,
+            extra,
+            Duration::from_secs(15),
+            0,
+        )
+        .await;
+        tracing::debug!(
+            "DHT: self lookup of node {i}: {} answered of {} queried",
+            r.answered,
+            r.queried
+        );
+    }
+}

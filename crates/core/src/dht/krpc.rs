@@ -157,7 +157,9 @@ pub fn parse_nodes(b: &[u8]) -> Result<Vec<CompactNode>, DecodeError> {
     if !b.len().is_multiple_of(26) {
         return Err(DecodeError::BadField("nodes"));
     }
-    Ok(b.chunks_exact(26)
+    Ok(b.as_chunks::<26>()
+        .0
+        .iter()
         .filter_map(|c| {
             let id: Id = c.get(..20)?.try_into().ok()?;
             let addr = parse_compact_addr(c.get(20..26)?)?;
@@ -313,9 +315,11 @@ fn decode_response(r: &Value) -> Result<Response, DecodeError> {
                 return Err(DecodeError::BadField("samples"));
             }
             Some(
-                s.chunks_exact(20)
+                s.as_chunks::<20>()
+                    .0
+                    .iter()
                     .take(MAX_SAMPLES)
-                    .filter_map(|c| <[u8; 20]>::try_from(c).ok())
+                    .copied()
                     .collect(),
             )
         }

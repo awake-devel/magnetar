@@ -6,5 +6,15 @@
 //! for peer collection. The server (`server::dht`) owns triage, the persisted queue and stats.
 
 pub mod addr;
+pub mod engine;
 pub mod id;
 pub mod krpc;
+pub mod limiter;
+pub mod lookup;
+pub mod peerstore;
+pub mod pool;
+pub mod routing;
+
+pub use engine::{Dht, EngineConfig, EngineStats, Identity, Mode, QueryError, Sighting, Via};
+pub use krpc::{CompactNode, Id};
+pub use lookup::{Collected, collect_peers};
