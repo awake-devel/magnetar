@@ -147,3 +147,32 @@ async fn live_check_batch_fixture() {
     );
     assert_eq!(out.len(), items.len());
 }
+
+/// DHT walks one after another through a shared node cache (D45): later walks start next to
+/// the target. Prints the time and answering nodes per walk.
+#[tokio::test]
+#[ignore = "network"]
+async fn dht_walks_with_a_node_cache() {
+    let cache = dht::NodeCache::new(liveness::DHT_NODE_CACHE);
+    let mut total = Duration::ZERO;
+    let items = fixture();
+    for (ih, _) in items.iter().take(12) {
+        let start = Instant::now();
+        let r = dht::scrape_cached(&cache, &raw(ih), Duration::from_secs(12)).await;
+        let took = start.elapsed();
+        total += took;
+        match r {
+            Ok(d) => println!(
+                "{ih}: {took:?}, nodes {}, bf {}, values {}, est {}, ignored {}, cache {}",
+                d.nodes_queried,
+                d.bf_responses,
+                d.values_ips,
+                d.total_est,
+                d.ignored_answers,
+                cache.len()
+            ),
+            Err(e) => println!("{ih}: {took:?}, {e}"),
+        }
+    }
+    println!("12 walks in {total:?}");
+}

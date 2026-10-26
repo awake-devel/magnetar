@@ -484,7 +484,8 @@ async fn dht_walk_against_fake_nodes() {
     let near = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let near_addr = near.local_addr().unwrap();
     let mut near_id = target;
-    near_id[19] ^= 1;
+    // 27 bits in common with the target, like an honest close node (made-up ids are ignored).
+    near_id[3] ^= 0x10;
 
     let mut seeds = Bloom256::new();
     let mut peers = Bloom256::new();
@@ -1171,4 +1172,85 @@ fn next_check_schedule() {
     let lo = next_check(&alive, now - 400 * day, s0, false, now, -1.0).0 - now;
     let hi = next_check(&alive, now - 400 * day, s0, false, now, 1.0).0 - now;
     assert_eq!((lo, hi), (TTL_OLD * 9 / 10, TTL_OLD * 11 / 10));
+}
+
+/// Node farms (one IP, many ports) and ids made for the target answer every lookup with
+/// made-up peers on the live DHT; their swarm data is left out (D45).
+#[tokio::test]
+async fn dht_ignores_node_farms_and_made_up_ids() {
+    let target = h(77);
+    let id_near = |byte: usize, bit: u8| {
+        let mut id = target;
+        id[byte] ^= bit;
+        id
+    };
+    // (address, id, peer it reports)
+    let mut nodes: Vec<(UdpSocket, [u8; 20], [u8; 4])> = Vec::new();
+    nodes.push((
+        UdpSocket::bind("127.0.0.2:0").await.unwrap(),
+        id_near(19, 1), // 159 bits in common: made for this target
+        [10, 0, 0, 2],
+    ));
+    for i in 0..3u8 {
+        nodes.push((
+            UdpSocket::bind("127.0.0.3:0").await.unwrap(),
+            id_near(2, 0x40 >> i), // plausible ids, but one IP with three ports
+            [10, 0, 0, 3],
+        ));
+    }
+    nodes.push((
+        UdpSocket::bind("127.0.0.4:0").await.unwrap(),
+        id_near(3, 0x08),
+        [10, 0, 0, 4],
+    ));
+    let mut compact = Vec::new();
+    for (sock, id, _) in &nodes {
+        let SocketAddr::V4(a) = sock.local_addr().unwrap() else {
+            unreachable!()
+        };
+        compact.extend_from_slice(id);
+        compact.extend_from_slice(&a.ip().octets());
+        compact.extend_from_slice(&a.port().to_be_bytes());
+    }
+    let answer = |sock: UdpSocket, r: Value| {
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            loop {
+                let (n, src) = sock.recv_from(&mut buf).await.unwrap();
+                let q = bencode::decode(&buf[..n]).unwrap();
+                let reply = Value::Dict(vec![
+                    (b"t".to_vec(), q.get(b"t").unwrap().clone()),
+                    (b"y".to_vec(), bytes(b"r")),
+                    (b"r".to_vec(), r.clone()),
+                ]);
+                sock.send_to(&bencode::encode(&reply), src).await.unwrap();
+            }
+        });
+    };
+    for (sock, id, peer) in nodes {
+        let mut p = peer.to_vec();
+        p.extend_from_slice(&[0x1a, 0xe1]);
+        answer(
+            sock,
+            Value::Dict(vec![
+                (b"id".to_vec(), bytes(&id)),
+                (b"values".to_vec(), Value::List(vec![bytes(&p)])),
+            ]),
+        );
+    }
+    let boot = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let boot_addr = boot.local_addr().unwrap();
+    answer(
+        boot,
+        Value::Dict(vec![
+            (b"id".to_vec(), bytes(&[0xaa; 20])),
+            (b"nodes".to_vec(), bytes(&compact)),
+        ]),
+    );
+    let r = dht::scrape_from(&[boot_addr], &target, Duration::from_secs(3))
+        .await
+        .unwrap();
+    // Neither is walked through: only the bootstrap node and the honest one are asked.
+    assert_eq!(r.nodes_queried, 2);
+    assert_eq!(r.values_ips, 1, "{r:?}");
 }

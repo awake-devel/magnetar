@@ -241,19 +241,20 @@ async fn no_answer_keeps_the_last_result_and_backs_off() {
         "an answer resets the error streak"
     );
     let at = NOW + HISTORY_STEP + 1;
-    let changed = res(Some(6), LivenessSource::Udp, at);
+    let changed = res(Some(9), LivenessSource::Udp, at);
     live::write_results(s.pool(), &[row().await], &[changed], at, Expiry::Scheduled)
         .await
         .unwrap();
     assert_eq!(history_len(s, 7).await, 2);
     let at = at + HISTORY_STEP + 1;
-    let same = res(Some(6), LivenessSource::Udp, at);
+    // ±1 is wobble, not a change.
+    let same = res(Some(8), LivenessSource::Udp, at);
     live::write_results(s.pool(), &[row().await], &[same], at, Expiry::Scheduled)
         .await
         .unwrap();
     assert_eq!(history_len(s, 7).await, 2, "unchanged");
     let at = at + 8 * DAY;
-    let same = res(Some(6), LivenessSource::Udp, at);
+    let same = res(Some(8), LivenessSource::Udp, at);
     live::write_results(s.pool(), &[row().await], &[same], at, Expiry::Scheduled)
         .await
         .unwrap();
@@ -264,7 +265,7 @@ async fn no_answer_keeps_the_last_result_and_backs_off() {
         .unwrap()
         .unwrap();
     let seeders: Vec<_> = h.points.iter().map(|p| p.seeders).collect();
-    assert_eq!(seeders, [Some(5), Some(6), Some(6)]);
+    assert_eq!(seeders, [Some(5), Some(9), Some(8)]);
     assert!(h.points.windows(2).all(|w| w[0].at < w[1].at));
     assert_eq!(
         live::history(s.pool(), &ih(7), 1, at)

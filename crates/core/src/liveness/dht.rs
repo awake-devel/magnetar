@@ -28,10 +28,14 @@ pub const BOOTSTRAP: &[&str] = &[
 
 /// Bloom estimates saturate around here (BEP 33), so callers show "8000+".
 pub const ESTIMATE_CAP: u32 = 8000;
-/// The walk stops once this many closest known nodes have answered.
+/// Nodes queried in parallel are picked among this many closest known ones.
 const WALK_WIDTH: usize = 16;
+/// The walk stops once this many closest known nodes have answered (BEP 5's K: the nodes that
+/// store the swarm). Waiting for all of `WALK_WIDTH` let most walks run into their budget
+/// (D45: 9.5 s average against the live DHT, 4.5 s with K).
+const WALK_DONE: usize = 8;
 const MAX_IN_FLIGHT: usize = 8;
-const RPC_TIMEOUT: Duration = Duration::from_secs(2);
+const RPC_TIMEOUT: Duration = Duration::from_millis(1200);
 const MAX_NODES: usize = 2000;
 const BLOOM_BITS: usize = 2048;
 
@@ -91,6 +95,8 @@ pub struct DhtScrape {
     pub values_ips: u32,
     pub nodes_queried: u32,
     pub bf_responses: u32,
+    /// Answers with swarm data left out as node-farm / made-for-the-target ids (D45).
+    pub ignored_answers: u32,
 }
 
 /// DHT scrape from the public bootstrap nodes. `nodes_queried` counts nodes that answered;
@@ -245,14 +251,26 @@ struct Node {
     state: State,
 }
 
+/// Swarm data one node sent (values and/or BEP 33 filters).
+struct SwarmAnswer {
+    src: SocketAddr,
+    id: Option<[u8; 20]>,
+    values: Vec<IpAddr>,
+    bf: Vec<Vec<u8>>,
+    seeds_bf: Option<Vec<u8>>,
+}
+
+/// An id sharing this many leading bits with the target was made for it: honest nodes near a
+/// target share about log2(DHT size) ≈ 23 bits.
+const SYBIL_PREFIX_BITS: u32 = 64;
+/// One IP answering from this many ports in one walk is a node farm.
+const SYBIL_PORTS_PER_IP: usize = 3;
+
 struct Walk {
     target: [u8; 20],
     nodes: HashMap<SocketAddr, Node>,
-    seeds: Bloom256,
-    peers: Bloom256,
-    values: HashSet<IpAddr>,
+    swarm: Vec<SwarmAnswer>,
     answered: u32,
-    bf_responses: u32,
 }
 
 impl Walk {
@@ -263,12 +281,14 @@ impl Walk {
         }
     }
 
-    /// Non-failed nodes, closest first, limited to the walk window.
+    /// Non-failed nodes, closest first, limited to the walk window. Suspicious nodes are left
+    /// out: they sit "close" to every target and would end the walk before the real ones.
     fn window(&self) -> Vec<SocketAddr> {
+        let ports = self.ports_per_ip();
         let mut live: Vec<_> = self
             .nodes
             .iter()
-            .filter(|(_, n)| n.state != State::Failed)
+            .filter(|(a, n)| n.state != State::Failed && !self.suspicious(a, n.id, &ports))
             .map(|(a, n)| (self.distance(n), *a))
             .collect();
         live.sort_unstable();
@@ -320,51 +340,109 @@ impl Walk {
                 self.add_node((ip, port).into(), id);
             }
         }
+        let mut answer = SwarmAnswer {
+            src,
+            id: self.nodes.get(&src).and_then(|n| n.id),
+            values: Vec::new(),
+            bf: Vec::new(),
+            seeds_bf: None,
+        };
         for v in r
             .get(b"values")
             .and_then(Value::as_list)
             .unwrap_or_default()
         {
             match v.as_bytes() {
-                Some(p) if p.len() == 6 => {
-                    self.values
-                        .insert(IpAddr::from(<[u8; 4]>::try_from(&p[..4]).expect("4")));
-                }
-                Some(p) if p.len() == 18 => {
-                    self.values
-                        .insert(IpAddr::from(<[u8; 16]>::try_from(&p[..16]).expect("16")));
-                }
+                Some(p) if p.len() == 6 => answer
+                    .values
+                    .push(IpAddr::from(<[u8; 4]>::try_from(&p[..4]).expect("4"))),
+                Some(p) if p.len() == 18 => answer
+                    .values
+                    .push(IpAddr::from(<[u8; 16]>::try_from(&p[..16]).expect("16"))),
                 _ => {}
             }
         }
-        let mut got_bf = false;
-        for (key, bloom) in [(&b"BFsd"[..], &mut self.seeds), (b"BFpe", &mut self.peers)] {
-            if let Some(bf) = r.get(key).and_then(Value::as_bytes)
-                && bf.len() == 256
-            {
-                bloom.union(bf);
-                got_bf = true;
-            }
+        if let Some(bf) = r.get(b"BFsd").and_then(Value::as_bytes)
+            && bf.len() == 256
+        {
+            answer.seeds_bf = Some(bf.to_vec());
         }
-        if got_bf {
-            self.bf_responses += 1;
+        if let Some(bf) = r.get(b"BFpe").and_then(Value::as_bytes)
+            && bf.len() == 256
+        {
+            answer.bf.push(bf.to_vec());
+        }
+        if !answer.values.is_empty() || answer.seeds_bf.is_some() || !answer.bf.is_empty() {
+            self.swarm.push(answer);
         }
     }
 
+    fn ports_per_ip(&self) -> HashMap<IpAddr, usize> {
+        let mut ports: HashMap<IpAddr, usize> = HashMap::new();
+        for a in self.nodes.keys() {
+            *ports.entry(a.ip()).or_default() += 1;
+        }
+        ports
+    }
+
+    /// Node farms and ids made for the target answer every lookup with made-up peers (seen on
+    /// the live DHT, D45): they are not walked through and their swarm data is left out.
+    fn suspicious(
+        &self,
+        addr: &SocketAddr,
+        id: Option<[u8; 20]>,
+        ports: &HashMap<IpAddr, usize>,
+    ) -> bool {
+        let prefix = id.map_or(0, |id| {
+            let mut bits = 0;
+            for (x, t) in id.iter().zip(&self.target) {
+                let d = x ^ t;
+                bits += d.leading_zeros();
+                if d != 0 {
+                    break;
+                }
+            }
+            bits
+        });
+        prefix >= SYBIL_PREFIX_BITS
+            || ports.get(&addr.ip()).copied().unwrap_or(0) >= SYBIL_PORTS_PER_IP
+    }
+
     fn result(&self) -> DhtScrape {
-        let mut peers = self.peers.clone();
-        for ip in &self.values {
+        let mut seeds = Bloom256::new();
+        let mut peers = Bloom256::new();
+        let mut values: HashSet<IpAddr> = HashSet::new();
+        let (mut bf_responses, mut ignored) = (0, 0);
+        let ports = self.ports_per_ip();
+        for a in &self.swarm {
+            if self.suspicious(&a.src, a.id, &ports) {
+                ignored += 1;
+                continue;
+            }
+            values.extend(&a.values);
+            if let Some(bf) = &a.seeds_bf {
+                seeds.union(bf);
+            }
+            for bf in &a.bf {
+                peers.union(bf);
+            }
+            if a.seeds_bf.is_some() || !a.bf.is_empty() {
+                bf_responses += 1;
+            }
+        }
+        for ip in &values {
             peers.insert_ip(ip);
         }
         let mut total = peers.clone();
-        total.union(&self.seeds.0);
+        total.union(&seeds.0);
         DhtScrape {
-            seeds_est: self.seeds.count(),
+            seeds_est: seeds.count(),
             peers_est: peers.count(),
             total_est: total.count(),
-            values_ips: self.values.len() as u32,
+            values_ips: values.len() as u32,
             nodes_queried: self.answered,
-            bf_responses: self.bf_responses,
+            bf_responses,
+            ignored_answers: ignored,
         }
     }
 }
@@ -396,11 +474,8 @@ async fn walk(
                 )
             })
             .collect(),
-        seeds: Bloom256::new(),
-        peers: Bloom256::new(),
-        values: HashSet::new(),
+        swarm: Vec::new(),
         answered: 0,
-        bf_responses: 0,
     };
     let mut buf = vec![0u8; 4096];
 
@@ -415,7 +490,12 @@ async fn walk(
             }
         }
         let window = w.window();
-        if !window.is_empty() && window.iter().all(|a| w.nodes[a].state == State::Answered) {
+        if !window.is_empty()
+            && window
+                .iter()
+                .take(WALK_DONE)
+                .all(|a| w.nodes[a].state == State::Answered)
+        {
             break;
         }
         let mut in_flight = w

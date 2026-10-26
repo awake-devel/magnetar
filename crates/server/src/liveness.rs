@@ -39,7 +39,7 @@ pub const HOT_FOR: i64 = 3 * 86400;
 const MAX_PENDING_BOOSTS: usize = 50_000;
 
 /// History: one point per infohash at most this often (a 6 h re-check with −10 % jitter still
-/// gets one), an unchanged value at most weekly, 90 days kept.
+/// gets one), an unchanged value (see `moved`) at most weekly, 90 days kept.
 pub const HISTORY_STEP: i64 = 5 * 3600;
 pub const HISTORY_UNCHANGED_EVERY: i64 = 7 * 86400;
 pub const HISTORY_KEEP_DAYS: u32 = 90;
@@ -49,6 +49,8 @@ const MAINTENANCE_EVERY: Duration = Duration::from_secs(3600);
 const SAVED_SEARCH_BOOST: u32 = 100;
 /// Pause between batches while more is due than one batch takes.
 const BACKLOG_PAUSE: Duration = Duration::from_secs(1);
+/// Longest DHT walk of the checker (most end after 1-7 s, D45).
+const SERVER_DHT_BUDGET: Duration = Duration::from_secs(10);
 /// `/api/v1/stats` reuses counts this fresh (two scans of ~0.5 M narrow rows each).
 const STATS_MAX_AGE: Duration = Duration::from_secs(30);
 
@@ -192,6 +194,7 @@ pub fn liveness_config(cfg: &Config) -> LivenessConfig {
         tracker_rps: cfg.liveness_tracker_rps,
         use_dht: cfg.liveness_dht,
         dht_concurrency: cfg.liveness_dht_concurrency.max(1),
+        dht_budget: SERVER_DHT_BUDGET,
         fallback_trackers: DEFAULT_TRACKERS.iter().map(|t| t.to_string()).collect(),
         ..LivenessConfig::default()
     }
@@ -269,6 +272,16 @@ fn small(v: u16) -> i16 {
     i16::try_from(v).unwrap_or(i16::MAX)
 }
 
+/// A history-worthy change: dead ↔ alive, or more than ±1 and ±10 % (smaller wobble waits
+/// for the weekly point, D45).
+fn moved(now: Option<i32>, before: Option<i32>) -> bool {
+    match (now, before) {
+        (Some(a), Some(b)) => (a == 0) != (b == 0) || (a - b).abs() > 1.max(a.max(b) / 10),
+        (None, None) => false,
+        _ => true,
+    }
+}
+
 struct SchedUpdate<'a> {
     infohash: &'a str,
     due_at: i64,
@@ -331,7 +344,10 @@ pub async fn write_results(
                 opt_i32(l.leechers),
                 opt_i32(l.dht_peers_est),
             );
-            let changed = !r.has_result || point != (r.seeders, r.leechers, r.dht_peers_est);
+            let changed = !r.has_result
+                || moved(point.0, r.seeders)
+                || moved(point.1, r.leechers)
+                || moved(point.2, r.dht_peers_est);
             let since = r.history_at.map(|h| now - h);
             let due_point = match since {
                 None => true,
@@ -614,6 +630,37 @@ async fn boost_saved_searches(store: &PgStore, svc: &LivenessService, now: i64) 
     }
 }
 
+/// `magnetar-server liveness --limit N`: batches until `limit` infohashes were checked or
+/// nothing is due; one JSON report per batch on stdout (with the time the write took).
+pub async fn run_once(store: &PgStore, cfg: &Config, limit: usize) -> anyhow::Result<()> {
+    let svc = LivenessService::new(liveness_config(cfg));
+    let batch = cfg.liveness_batch_size();
+    let mut done = 0;
+    while done < limit {
+        let started = Instant::now();
+        let n = svc
+            .run_batch(store.pool(), magnetar_core::now(), batch.min(limit - done))
+            .await?;
+        if n == 0 {
+            break;
+        }
+        done += n;
+        let report = svc.last.lock().unwrap().clone().map(|(_, r)| r);
+        let (trackers, backed_off, dht_nodes) = svc.scraper.state();
+        println!(
+            "{}",
+            serde_json::json!({
+                "report": report,
+                "total_ms": started.elapsed().as_millis() as u64,
+                "trackers": trackers,
+                "trackers_backed_off": backed_off,
+                "dht_nodes": dht_nodes,
+            })
+        );
+    }
+    Ok(())
+}
+
 /// `serve` daemon: batches back to back while a full batch is due, else every `interval`;
 /// history pruning and saved-search boosts hourly.
 pub async fn liveness_loop(
@@ -664,5 +711,22 @@ pub async fn liveness_loop(
             _ = tokio::time::sleep(pause) => {}
             _ = stop_requested(&mut shutdown) => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_changes() {
+        assert!(!moved(Some(50), Some(54)), "wobble");
+        assert!(moved(Some(50), Some(56)));
+        assert!(!moved(Some(3), Some(4)));
+        assert!(moved(Some(3), Some(5)));
+        assert!(moved(Some(1), Some(0)), "alive again");
+        assert!(moved(Some(0), Some(1)), "dead now");
+        assert!(moved(Some(2), None) && moved(None, Some(2)));
+        assert!(!moved(None, None));
     }
 }

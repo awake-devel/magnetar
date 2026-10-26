@@ -51,6 +51,12 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Check up to `limit` due infohashes now (seed checks, D45), batch by batch with the
+    /// configured rates, and print a JSON report per batch.
+    Liveness {
+        #[arg(long, default_value_t = 2000)]
+        limit: usize,
+    },
     /// Parse the release attributes (D44) of every torrent without current ones, print a report.
     Attrs {
         /// Re-parse every torrent, also those already parsed by this version.
@@ -183,7 +189,7 @@ pub struct Config {
     #[arg(long, env = "MAGNETAR_LIVENESS_DHT", default_value_t = true, action = clap::ArgAction::Set)]
     pub liveness_dht: bool,
     /// DHT walks at the same time.
-    #[arg(long, env = "MAGNETAR_LIVENESS_DHT_CONCURRENCY", default_value_t = 16)]
+    #[arg(long, env = "MAGNETAR_LIVENESS_DHT_CONCURRENCY", default_value_t = 32)]
     pub liveness_dht_concurrency: usize,
 }
 
