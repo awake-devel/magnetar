@@ -831,6 +831,121 @@ async fn merge_into(conn: &mut PgConnection, keep: i64, drop: i64) -> anyhow::Re
     Ok(())
 }
 
+/// What [`adopt_tmdb_imdb`] did with an IMDb id that TMDB gave an IMDb-less row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImdbAdoption {
+    /// The row now carries the IMDb id (and the dataset's title/year/rating/... when imported).
+    Set,
+    /// Another row already had that IMDb id: the row was merged into it (this id) and is gone.
+    Merged(i64),
+    /// Nothing written: the row is gone, already has an IMDb id, is an anime row (D41's), or
+    /// the IMDb id is held by an anime row.
+    Skipped,
+}
+
+/// D48: TMDB says IMDb-less row `media_id` (created from a TMDB-only release) is IMDb title
+/// `tt`. If another row already holds that IMDb id, merge into it (keep = the IMDb row: links
+/// move, and with them the search documents through the `torrent_media` triggers); otherwise
+/// set the id on the row with the dataset's fields, as `media_for_imdb` would. Rows of kind
+/// `anime` are D41's and never written, on either side. Takes the D46 lock; retried once on a
+/// deadlock / serialization failure.
+pub async fn adopt_tmdb_imdb(
+    pool: &PgPool,
+    media_id: i64,
+    tt: u32,
+    now: i64,
+) -> anyhow::Result<ImdbAdoption> {
+    match adopt_tmdb_imdb_tx(pool, media_id, tt, now).await {
+        Err(e) if media_lock::is_conflict_any(&e) => {
+            media_lock::retry_pause().await;
+            adopt_tmdb_imdb_tx(pool, media_id, tt, now).await
+        }
+        r => r,
+    }
+}
+
+async fn adopt_tmdb_imdb_tx(
+    pool: &PgPool,
+    media_id: i64,
+    tt: u32,
+    now: i64,
+) -> anyhow::Result<ImdbAdoption> {
+    let mut tx = pool.begin().await?;
+    media_lock::lock(&mut tx).await?;
+    let row: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT kind, imdb FROM media WHERE id = $1 FOR UPDATE")
+            .bind(media_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((kind, None)) = row else {
+        return Ok(ImdbAdoption::Skipped);
+    };
+    if kind == "anime" {
+        return Ok(ImdbAdoption::Skipped);
+    }
+    // An episode id resolves to its series (as in `media_for_imdb`).
+    let title = imdb::resolve_title(&mut tx, tt).await?.map(|(r, _, _)| r);
+    let tt = title
+        .as_ref()
+        .and_then(|r| u32::try_from(r.id).ok())
+        .unwrap_or(tt);
+    let imdb_id = ids::format_imdb(u64::from(tt));
+    let holder: Option<(i64, String)> =
+        sqlx::query_as("SELECT id, kind FROM media WHERE imdb = $1")
+            .bind(&imdb_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let out = match holder {
+        Some((_, k)) if k == "anime" => ImdbAdoption::Skipped,
+        Some((keep, _)) => {
+            merge_into(&mut tx, keep, media_id).await?;
+            ImdbAdoption::Merged(keep)
+        }
+        None => {
+            match title {
+                Some(r) => {
+                    let kind = imdb_match::TitleType::from_code(r.title_type)
+                        .map(|t| t.media_kind().as_str())
+                        .unwrap_or(kind.as_str());
+                    sqlx::query(
+                        "UPDATE media SET imdb = $2, kind = $3, title = $4, original_title = $5,
+                                year = $6, end_year = $7, genres = $8, rating = $9, votes = $10,
+                                runtime_min = $11, updated_at = $12
+                         WHERE id = $1",
+                    )
+                    .bind(media_id)
+                    .bind(&imdb_id)
+                    .bind(kind)
+                    .bind(&r.title)
+                    .bind(&r.original_title)
+                    .bind(r.year.map(i32::from))
+                    .bind(r.end_year.map(i32::from))
+                    .bind(&r.genres)
+                    .bind(r.rating)
+                    .bind(r.votes)
+                    .bind(r.runtime_min)
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                // Not in the dataset (IMDb off, or newer than the import): the id alone; the next
+                // import fills the row (`imdb::refresh_media`).
+                None => {
+                    sqlx::query("UPDATE media SET imdb = $2, updated_at = $3 WHERE id = $1")
+                        .bind(media_id)
+                        .bind(&imdb_id)
+                        .bind(now)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
+            ImdbAdoption::Set
+        }
+    };
+    tx.commit().await?;
+    Ok(out)
+}
+
 /// The D41 row (kind `anime`) holding one of the torrent's MAL/AniList/AniDB ids, if any.
 async fn anime_row(conn: &mut PgConnection, ids: &StrongIds) -> anyhow::Result<Option<i64>> {
     if ids.mal.is_none() && ids.anilist.is_none() && ids.anidb.is_none() {
