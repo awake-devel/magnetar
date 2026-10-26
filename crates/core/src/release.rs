@@ -475,10 +475,12 @@ fn resolution_height(t: &str) -> Option<(u32, bool)> {
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(rest.len());
     let (num, suffix) = rest.split_at(num_end);
-    if !matches!(suffix, "p" | "i") {
+    let h: u32 = num.parse().ok()?;
+    // "HD1080", "BD720": a tag prefix makes the bare height explicit too.
+    let prefixed = !prefix.is_empty() && suffix.is_empty() && matches!(h, 720 | 1080 | 2160);
+    if !matches!(suffix, "p" | "i") && !prefixed {
         return None;
     }
-    let h: u32 = num.parse().ok()?;
     (240..=4400).contains(&h).then_some((h, true))
 }
 
@@ -543,6 +545,30 @@ fn cross_episode(t: &str) -> Option<(i32, i32)> {
     Some((s.parse().ok()?, e.parse().ok()?))
 }
 
+/// A height alone in a bracket (`[1080]`): a resolution, not an episode.
+fn bare_height_bracket(toks: &[Tok], i: usize) -> bool {
+    let b = toks[i].bracket;
+    b != 0
+        && matches!(
+            toks[i].low.as_str(),
+            "1080" | "720" | "576" | "480" | "2160"
+        )
+        && toks.iter().filter(|t| t.bracket == b).count() == 1
+}
+
+/// `2nd`, `4th`, `3rd`, `1st` → 2, 4, 3, 1 (seasons up to 99).
+fn ordinal(t: &str) -> Option<i32> {
+    let n = t
+        .strip_suffix("st")
+        .or_else(|| t.strip_suffix("nd"))
+        .or_else(|| t.strip_suffix("rd"))
+        .or_else(|| t.strip_suffix("th"))?;
+    (!n.is_empty() && n.len() <= 2 && n.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| n.parse().ok())
+        .flatten()
+        .filter(|n| (1..100).contains(n))
+}
+
 /// `13v2` (a fansub's second version of episode 13) → 13.
 fn versioned_episode(t: &str) -> Option<i64> {
     let (n, v) = t.split_once('v')?;
@@ -564,6 +590,7 @@ fn bare_episode(t: &str) -> Option<i32> {
 fn is_tagish(t: &Tok, next: Option<&Tok>) -> bool {
     is_strong(t, next)
         || language(&t.low).is_some()
+        || season_episode(&t.low).is_some()
         || matches!(
             t.low.as_str(),
             "vo" | "vf"
@@ -598,6 +625,7 @@ fn is_tagish(t: &Tok, next: Option<&Tok>) -> bool {
                 | "dvd5"
                 | "dvd9"
                 | "dvd"
+                | "ad"
         )
 }
 
@@ -792,7 +820,12 @@ fn stem_of(path: &str) -> &str {
 /// Words that end a release group search (`WEB-DL` must not give group "DL").
 fn not_a_group(w: &str) -> bool {
     let l = w.to_lowercase();
-    if language(&l).is_some() || two_letter(&l).is_some() {
+    if language(&l).is_some()
+        || two_letter(&l).is_some()
+        || bare_episode(&l).is_some()
+        || season_episode(&l).is_some()
+        || versioned_episode(&l).is_some()
+    {
         return true;
     }
     matches!(
@@ -951,6 +984,17 @@ fn parse_one(name: &str, ctx: &Ctx) -> ReleaseAttrs {
         };
         i + 1 == toks.len() || near(i + 1) || (i > 0 && near(i - 1))
     };
+    // A book format right next to it ("…2025.fr.epub" filed as audio).
+    let format_neighbour = |i: usize| {
+        let fmt = |t: &Tok| BOOK_EXT.contains(&t.low.as_str());
+        toks.get(i + 1).is_some_and(fmt) || (i > 0 && fmt(&toks[i - 1]))
+    };
+    // "Uldis Zarins - EN - PDF": an unambiguous tag next to it.
+    let strong_neighbour = |i: usize| {
+        toks.get(i + 1)
+            .is_some_and(|n| is_strong(n, toks.get(i + 2)))
+            || (i > 0 && is_strong(&toks[i - 1], Some(&toks[i])))
+    };
     let lang_ok = |i: usize| {
         let t = &toks[i];
         i > title_start
@@ -958,11 +1002,12 @@ fn parse_one(name: &str, ctx: &Ctx) -> ReleaseAttrs {
                 || (in_tags(i) && (t.upper() || tag_neighbour(i)))
                 // "…l.Ouest.FRENCH.1080p": an uppercase language right before the first tag.
                 || (t.upper() && t.low.len() > 2 && tag_neighbour(i))
-                || (ctx.book && t.low == "fr" && tag_neighbour(i)))
+                || ((ctx.book || format_neighbour(i)) && t.low == "fr" && tag_neighbour(i)))
     };
 
     let mut years: Vec<(usize, i32)> = Vec::new();
     let mut streaming_tag = false;
+    let mut explicit_res = false;
     let mut i = 0;
     while i < toks.len() {
         let t = &toks[i];
@@ -990,9 +1035,11 @@ fn parse_one(name: &str, ctx: &Ctx) -> ReleaseAttrs {
             && (w != "2160" || in_tags(i))
         {
             let r = resolution_bucket(h);
-            if explicit || a.resolution.is_none() {
+            // The first explicit one wins ("1080p.BDRip … & 480p.LDRip" is a 1080p release).
+            if (explicit && !explicit_res) || a.resolution.is_none() {
                 a.resolution = Some(r.to_string());
             }
+            explicit_res |= explicit;
             if w.starts_with("bd") && a.source.is_none() {
                 a.source = Some("bluray".into());
             }
@@ -1002,6 +1049,16 @@ fn parse_one(name: &str, ctx: &Ctx) -> ReleaseAttrs {
         }
         if w == "sd" && in_tags(i) && a.resolution.is_none() {
             a.resolution = Some("sd".into());
+        }
+        // A bare height next to a source tag ("FRENCH 1080 HDTV") or alone in brackets ("[1080]").
+        if matches!(w, "1080" | "720" | "576" | "480")
+            && (in_tags(i) || bare_height_bracket(&toks, i))
+            && a.resolution.is_none()
+            && (bare_height_bracket(&toks, i)
+                || next.is_some_and(|n| is_strong(n, toks.get(i + 2)))
+                || (i > 0 && is_strong(&toks[i - 1], Some(t))))
+        {
+            a.resolution = Some(format!("{w}p"));
         }
 
         // --- season / episode
@@ -1065,11 +1122,17 @@ fn parse_one(name: &str, ctx: &Ctx) -> ReleaseAttrs {
             && w != "e"
         {
             a.episode.get_or_insert(e);
+        } else if matches!(w, "season" | "saison")
+            && let Some(n) = ordinal(prev_low)
+        {
+            // "Jigokuraku 2nd Season - 01": the number after is the episode.
+            a.season.get_or_insert(n);
         } else if matches!(
             w,
             "season" | "saison" | "seasons" | "saisons" | "staffel" | "temporada"
         ) && let Some(n) = next.and_then(Tok::digits)
             && (1..100).contains(&n)
+            && !next.is_some_and(|n| n.sep_before.contains('-'))
         {
             a.season.get_or_insert(n as i32);
             // "Season 1-5", "Saison 1 à 3"
@@ -1099,6 +1162,8 @@ fn parse_one(name: &str, ctx: &Ctx) -> ReleaseAttrs {
             "complete" | "integrale" | "intégrale" | "integral" | "batch"
         ) && after_title
             && ctx.video
+            // "COMPLETE.BLURAY" / "Complete UHD BluRay" is a full disc, not a complete series.
+            && !matches!(next_low, "bluray" | "uhd" | "bdmv" | "bd" | "bd25" | "bd50" | "bd66")
         {
             a.complete = true;
         } else if fansub
@@ -1109,6 +1174,7 @@ fn parse_one(name: &str, ctx: &Ctx) -> ReleaseAttrs {
             && is_year(t).is_none()
             // "Gintama - 3-nen Z-gumi" is a title word, not episode 3.
             && !next.is_some_and(|n| n.sep_before == "-" && n.digits().is_none())
+            && !bare_height_bracket(&toks, i)
             && (t.sep_before.contains(" - ")
                 || t.sep_before.ends_with("- ")
                 || (t.bracket != 0
@@ -1149,7 +1215,7 @@ fn parse_one(name: &str, ctx: &Ctx) -> ReleaseAttrs {
             "hdtv" | "pdtv" | "dsr" | "tvrip" | "hdtvrip" | "satrip" | "dvb" | "dvbrip" => {
                 Some("hdtv")
             }
-            "dvdrip" | "dvd" | "dvd5" | "dvd9" | "dvdr" => Some("dvd"),
+            "dvdrip" | "dvd" | "dvd5" | "dvd9" | "dvdr" | "fulldvd" | "dvdfull" => Some("dvd"),
             "vhsrip" | "vhs" if in_tags(i) => Some("vhs"),
             "dvdscr" | "bdscr" | "screener" | "r5" => Some("screener"),
             "scr" if in_tags(i) => Some("screener"),
@@ -1194,7 +1260,15 @@ fn parse_one(name: &str, ctx: &Ctx) -> ReleaseAttrs {
         {
             a.video_codec = Some(c.to_string());
         }
-        match w {
+        // "FLAC16BITS": the codec glued to the bit depth.
+        let bits = match w.strip_prefix("flac").filter(|r| r.contains("bit")) {
+            Some(r) => {
+                push(&mut a.audio, "flac");
+                r
+            }
+            None => w,
+        };
+        match bits {
             "10bit" | "10bits" | "hi10p" | "hi10" => a.bit_depth = Some(10),
             "12bit" | "12bits" => a.bit_depth = Some(12),
             "8bit" | "8bits" => {
@@ -1397,7 +1471,15 @@ fn parse_one(name: &str, ctx: &Ctx) -> ReleaseAttrs {
 
         // --- languages
         if after_title {
-            language_token(&mut a, &toks, i, &lang_ok, in_tags(i), ctx);
+            language_token(
+                &mut a,
+                &toks,
+                i,
+                &lang_ok,
+                in_tags(i),
+                (strong_neighbour(i), format_neighbour(i)),
+                ctx,
+            );
         }
         i += 1;
     }
@@ -1487,6 +1569,9 @@ fn cjk_languages(name: &str, a: &mut ReleaseAttrs) {
     {
         push(&mut a.subtitles, "zh");
     }
+    if has("英配") {
+        push(&mut a.languages, "en");
+    }
     if has("中配") || has("国语") || has("國語") || has("粤语") || has("粵語") || has("国漫")
     {
         push(&mut a.languages, "zh");
@@ -1500,6 +1585,8 @@ fn language_token(
     i: usize,
     lang_ok: &dyn Fn(usize) -> bool,
     in_tags: bool,
+    // An unambiguous tag / a book format right next to the token.
+    (strong_near, format_near): (bool, bool),
     ctx: &Ctx,
 ) {
     let t = &toks[i];
@@ -1599,6 +1686,14 @@ fn language_token(
         "chs" | "cht" | "big5" if t.upper() || t.bracket != 0 => push(&mut a.subtitles, "zh"),
         "gb" if t.upper() && t.bracket != 0 => push(&mut a.subtitles, "zh"),
         "esub" | "esubs" => push(&mut a.subtitles, "en"),
+        // Erai-raws marks Chinese animation "(CA)".
+        "ca" if ctx.anime
+            && t.upper()
+            && t.bracket != 0
+            && toks.iter().filter(|x| x.bracket == t.bracket).count() == 1 =>
+        {
+            audio(a, "zh")
+        }
         _ if w.starts_with("multi")
             && w[5..].bytes().all(|b| b.is_ascii_digit())
             && w.len() > 5 =>
@@ -1622,15 +1717,16 @@ fn language_token(
                     None => (w, false),
                 },
             };
+            let near = strong_near || format_near;
             let code = language(word).or_else(|| {
                 (word.len() == 2
-                    && (in_tags || ctx.book)
-                    && (t.upper() || (ctx.book && word == "fr")))
+                    && (in_tags || ctx.book || near)
+                    && (t.upper() || ((ctx.book || format_near) && word == "fr")))
                     .then(|| two_letter(word))
                     .flatten()
             });
             let Some(code) = code else { return };
-            if !(sub_suffix || lang_ok(i) || (word.len() == 2 && in_tags)) {
+            if !(sub_suffix || lang_ok(i) || (word.len() == 2 && (in_tags || near))) {
                 return;
             }
             if sub_suffix || sub_word(next) || sub_word(prev) {
@@ -1799,7 +1895,10 @@ pub fn parse_release(title: &str, files: &[TorrentFile], category: Category) -> 
     }
 
     // DVD is SD by definition.
-    if a.resolution.is_none() && (a.source.as_deref() == Some("dvd") || dvd_seen(title)) {
+    if a.resolution.is_none()
+        && ctx.video
+        && (a.source.as_deref() == Some("dvd") || dvd_seen(title))
+    {
         a.resolution = Some("sd".into());
     }
     // Anime: Japanese audio unless the name names another track (an English or French dub).
