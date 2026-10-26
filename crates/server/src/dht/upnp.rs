@@ -30,6 +30,8 @@ use crate::daemons::stop_requested;
 pub const DESCRIPTION: &str = "magnetar-dht";
 pub const LEASE_SECS: u32 = 3600;
 pub const RENEW_EVERY: Duration = Duration::from_secs(30 * 60);
+/// Budget for removing the mappings at stop (all ports at once).
+pub const UNMAP_TIMEOUT: Duration = Duration::from_secs(2);
 const SSDP_PORT: u16 = 1900;
 /// Backoff after a failed discovery or mapping round: 1 min doubling to 30 min.
 #[cfg(feature = "upnp")]
@@ -159,6 +161,16 @@ fn set(status: &Status, f: impl FnOnce(&mut UpnpStatus)) {
 pub struct Round {
     pub mapped: Vec<UpnpMapping>,
     pub errors: Vec<String>,
+    /// Ports the router says another host holds (718): never ours to remove at stop.
+    pub in_use: Vec<(Protocol, u16)>,
+}
+
+/// Why one mapping failed.
+#[cfg(feature = "upnp")]
+enum MapError {
+    /// `ConflictInMappingEntry` (718): another host holds the port.
+    InUse(String),
+    Other(String),
 }
 
 #[cfg(feature = "upnp")]
@@ -224,7 +236,7 @@ mod igd {
         local: Ipv4Addr,
         lease: u32,
         description: &str,
-    ) -> Result<u32, String> {
+    ) -> Result<u32, MapError> {
         let local = SocketAddr::V4(SocketAddrV4::new(local, port));
         match gw.add_port(proto(p), port, local, lease, description).await {
             Ok(()) => Ok(lease),
@@ -232,12 +244,12 @@ mod igd {
                 .add_port(proto(p), port, local, 0, description)
                 .await
                 .map(|()| 0)
-                .map_err(|e| e.to_string()),
-            Err(AddPortError::PortInUse) => Err(format!(
+                .map_err(|e| MapError::Other(format!("{} {port}: {e}", p.as_str()))),
+            Err(AddPortError::PortInUse) => Err(MapError::InUse(format!(
                 "{} {port} is already mapped to another host",
                 p.as_str()
-            )),
-            Err(e) => Err(format!("{} {port}: {e}", p.as_str())),
+            ))),
+            Err(e) => Err(MapError::Other(format!("{} {port}: {e}", p.as_str()))),
         }
     }
 
@@ -269,7 +281,11 @@ pub async fn map_once(
                 port,
                 lease_secs,
             }),
-            Err(e) => round.errors.push(e),
+            Err(MapError::InUse(e)) => {
+                round.in_use.push((p, port));
+                round.errors.push(e);
+            }
+            Err(MapError::Other(e)) => round.errors.push(e),
         }
     }
     let ext = igd::external_ip(&gw).await;
@@ -351,18 +367,20 @@ pub async fn upnp_loop(
                             .unwrap_or_default()
                     );
                 }
-                mapped = round
-                    .mapped
-                    .iter()
-                    .map(|m| {
-                        let p = if m.protocol == "tcp" {
-                            Protocol::Tcp
-                        } else {
-                            Protocol::Udp
-                        };
-                        (p, m.port)
-                    })
-                    .collect();
+                // Accumulate: a renewal round that fails must not forget a mapping an
+                // earlier round made (a lease-0 one would otherwise stay on the router
+                // forever after the stop).
+                for m in &round.mapped {
+                    let p = if m.protocol == "tcp" {
+                        Protocol::Tcp
+                    } else {
+                        Protocol::Udp
+                    };
+                    if !mapped.contains(&(p, m.port)) {
+                        mapped.push((p, m.port));
+                    }
+                }
+                mapped.retain(|m| !round.in_use.contains(m));
                 gw = Some(g);
                 if round.mapped.is_empty() {
                     let w = retry;
@@ -390,13 +408,17 @@ pub async fn upnp_loop(
         }
     }
     if let Some(gw) = gw {
-        for (p, port) in &mapped {
-            match tokio::time::timeout(Duration::from_secs(2), igd::unmap(&gw, *p, *port)).await {
+        // Concurrently, so the whole removal fits the caller's grace (≤ UNMAP_TIMEOUT, not
+        // that per port: four ports one after the other outlasted `run`'s 3 s wait).
+        let gw = &gw;
+        let removals = mapped.iter().map(|&(p, port)| async move {
+            match tokio::time::timeout(UNMAP_TIMEOUT, igd::unmap(gw, p, port)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => tracing::warn!("UPnP: removing {} {port}: {e}", p.as_str()),
                 Err(_) => tracing::warn!("UPnP: removing {} {port}: timed out", p.as_str()),
             }
-        }
+        });
+        futures::future::join_all(removals).await;
         if !mapped.is_empty() {
             tracing::info!("UPnP: {} mapping(s) removed", mapped.len());
         }

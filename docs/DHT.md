@@ -800,8 +800,10 @@ when that is off. `--dry-run`: no database at all (dedupe in memory). `serve` st
 - Discovery order: unicast M-SEARCH to `MAGNETAR_DHT_UPNP_GATEWAY` (default gateway), then
   multicast. **UDP only**: one mapping per virtual node, external port = internal port,
   description `magnetar-dht`, lease 3600 s renewed every 30 min (falls back to lease 0 when the
-  router answers `OnlyPermanentLeasesSupported`), removed on clean shutdown. A port already mapped
-  by someone else → logged, the node runs unmapped. No TCP mapping: we never accept peer
+  router answers `OnlyPermanentLeasesSupported`), removed on clean shutdown (every port mapped in
+  any round, removed concurrently within 2 s, so a failed renewal never strands a lease-0
+  mapping). A port already mapped by someone else (718) → logged, the node runs unmapped, and
+  that port is never removed at stop (it is the other host's). No TCP mapping: we never accept peer
   connections (§4).
 - Reachability is observed, not assumed: stats count incoming queries per minute; zero after
   10 min with a mapping means the router or a firewall drops them.
@@ -1186,7 +1188,9 @@ difference (category filter on any row, DHT rows included). `server/tests/dht_up
 in-process fake IGD (SSDP over UDP, device/service XML and SOAP over HTTP on 127.0.0.1, no
 multicast): UDP and TCP mapped through unicast discovery with our LAN address and a 1 h lease;
 725 → lease 0; 718 → `partial` with the error; the loop maps, then removes everything on
-stop; no gateway → `failed`, softly; the crawler (fake DHT, 2 virtual nodes) maps exactly its
+stop; after a renewal round in which every mapping fails, the lease-0 mappings of earlier rounds
+are still removed at stop (within one 2 s budget); a port lost to another host (718 at renewal)
+is not removed; no gateway → `failed`, softly; the crawler (fake DHT, 2 virtual nodes) maps exactly its
 bound UDP ports, shows in `/health` (`dht`, `origin`) and `/api/v1/stats.dht`, and unmaps at
 stop. Android `DhtTest` (chip ↔ query, breakdown fields per feature, labels, crawler lines,
 uptime) with the existing unit tests, `assembleDebug`.
@@ -1264,6 +1268,6 @@ the app on a phone (built and unit-tested only); the SQL fallback's speed at pro
 with DHT rows (only the plan shape, on a test database); `both`-origin torrents at scale (the
 crawler skips hashes known from Nostr, `MAGNETAR_DHT_FETCH_KNOWN=false`, so none appeared in the
 run: they arise only when a Nostr event arrives later for a DHT hash); the cost of the
-`DhtStats` totals query (`count(*)` on `dht_torrents` and `dht_seen`, cached 60 s) at
-millions of rows; the cause of the end-of-run latency outlier; the Nostr sweep of §7.1
+`DhtStats` totals query (`count(*)` on `dht_torrents` and `dht_seen`, cached 60 s, one refresh
+at a time, 5 s statement timeout after which the last value is kept) at millions of rows; the cause of the end-of-run latency outlier; the Nostr sweep of §7.1
 (not built).

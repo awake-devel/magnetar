@@ -25,6 +25,8 @@ use crate::stats;
 const WINDOW: usize = 11;
 pub const SAMPLE_EVERY: Duration = Duration::from_secs(60);
 const TOTALS_TTL: Duration = Duration::from_secs(60);
+/// The totals are whole-table counts (`dht_seen` grows without a cap): bounded per refresh.
+const TOTALS_TIMEOUT_MS: u32 = 5_000;
 
 pub const DHT_HASHES_SEEN: &str = "dht_hashes_seen";
 pub const DHT_FETCH_OK: &str = "dht_fetch_ok";
@@ -74,6 +76,8 @@ pub struct DhtService {
     mode: Mode,
     pub upnp: super::upnp::Status,
     inner: Mutex<Inner>,
+    /// One totals refresh at a time; concurrent requests serve the stale value meanwhile.
+    refreshing: tokio::sync::Mutex<()>,
 }
 
 fn snap(p: &Pipeline, dht: &Dht) -> Snap {
@@ -113,6 +117,7 @@ impl DhtService {
                 ..Default::default()
             })),
             inner: Mutex::default(),
+            refreshing: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -225,24 +230,31 @@ impl DhtService {
     /// `live()` plus the database totals (cached for a minute: `dht_seen` can be large).
     pub async fn stats(&self, pool: &PgPool) -> DhtStats {
         let mut out = self.live();
-        let cached = {
+        let cached = || {
             let i = self.inner.lock().unwrap();
             i.totals
                 .as_ref()
-                .filter(|(at, _)| at.elapsed() < TOTALS_TTL)
-                .map(|(_, t)| t.clone())
+                .map(|(at, t)| (at.elapsed() < TOTALS_TTL, t.clone()))
         };
-        let totals = match cached {
-            Some(t) => Some(t),
-            None => match totals(pool).await {
-                Ok(t) => {
-                    self.inner.lock().unwrap().totals = Some((Instant::now(), t.clone()));
-                    Some(t)
-                }
-                Err(e) => {
-                    tracing::warn!("DHT stats: {e}");
-                    None
-                }
+        let totals = match cached() {
+            Some((true, t)) => Some(t),
+            stale => match self.refreshing.try_lock() {
+                // Another request is counting: the stale value (or none yet) meanwhile.
+                Err(_) => stale.map(|(_, t)| t),
+                Ok(_guard) => match totals(pool).await {
+                    Ok(t) => {
+                        self.inner.lock().unwrap().totals = Some((Instant::now(), t.clone()));
+                        Some(t)
+                    }
+                    Err(e) => {
+                        tracing::warn!("DHT stats: {e}");
+                        // Do not retry on every request: keep the old value for another TTL.
+                        if let Some((_, t)) = &stale {
+                            self.inner.lock().unwrap().totals = Some((Instant::now(), t.clone()));
+                        }
+                        stale.map(|(_, t)| t)
+                    }
+                },
             },
         };
         if let Some(t) = totals {
@@ -258,15 +270,22 @@ impl DhtService {
 }
 
 async fn totals(pool: &PgPool) -> Result<Totals, sqlx::Error> {
-    sqlx::query_as(
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+        .bind(format!("{TOTALS_TIMEOUT_MS}ms"))
+        .execute(&mut *tx)
+        .await?;
+    let t = sqlx::query_as(
         "SELECT (SELECT count(*) FROM dht_torrents) AS stored,
                 (SELECT count(*) FROM dht_torrents WHERE category = 'porn') AS adult,
                 (SELECT count(*) FROM blocked_infohashes) AS blocked,
                 (SELECT count(*) FROM dht_seen WHERE status = 0) AS queued,
                 (SELECT count(*) FROM dht_seen WHERE status = 2) AS failed",
     )
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(t)
 }
 
 /// Every minute: one rate sample, and the growth of the counters into `stats_series`.

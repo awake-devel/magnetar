@@ -26,6 +26,8 @@ struct Igd {
     searches: u32,
     only_permanent: bool,
     in_use: Option<u16>,
+    /// Every AddPortMapping fails (501): a router that went bad between renewals.
+    fail_add: bool,
 }
 
 type Shared = Arc<Mutex<Igd>>;
@@ -116,6 +118,9 @@ async fn control(State(igd): State<Shared>, headers: HeaderMap, body: String) ->
             let proto = tag(&body, "NewProtocol").to_string();
             let port: u16 = tag(&body, "NewExternalPort").parse().unwrap_or(0);
             let lease: u32 = tag(&body, "NewLeaseDuration").parse().unwrap_or(0);
+            if g.fail_add {
+                return fault(501, "ActionFailed");
+            }
             if g.in_use == Some(port) {
                 return fault(718, "ConflictInMappingEntry");
             }
@@ -276,11 +281,12 @@ async fn loop_maps_then_removes_its_mappings_on_stop() {
         rx,
     ));
     let t0 = std::time::Instant::now();
-    while igd.lock().unwrap().mappings.len() < 2 {
+    // The status is set after the whole round (mappings, then the external address): wait for
+    // it, not only for the gateway's table (a race under a loaded test run).
+    while igd.lock().unwrap().mappings.len() < 2 || status.lock().unwrap().state != "mapped" {
         assert!(t0.elapsed() < Duration::from_secs(10), "not mapped");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(status.lock().unwrap().state, "mapped");
     tx.send(true).unwrap();
     tokio::time::timeout(Duration::from_secs(5), task)
         .await
@@ -292,6 +298,89 @@ async fn loop_maps_then_removes_its_mappings_on_stop() {
     let s = status.lock().unwrap();
     assert_eq!(s.state, "off");
     assert!(s.mappings.is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_renewal_still_removes_earlier_mappings_at_stop() {
+    // Lease-0 mappings (725 router) never expire: forgetting them after a failed renewal
+    // round would leave the ports open on the router for good.
+    let igd: Shared = Arc::new(Mutex::new(Igd {
+        only_permanent: true,
+        ..Default::default()
+    }));
+    let gw = fake_igd(igd.clone()).await;
+    let status: upnp::Status = Arc::default();
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let mut c = cfg(gw);
+    c.renew_every = Duration::from_millis(200);
+    let task = tokio::spawn(upnp::upnp_loop(c, WANTED.to_vec(), status.clone(), rx));
+    let t0 = std::time::Instant::now();
+    while igd.lock().unwrap().mappings.len() < 3 {
+        assert!(t0.elapsed() < Duration::from_secs(10), "not mapped");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    igd.lock().unwrap().fail_add = true;
+    while status.lock().unwrap().state != "failed" {
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "renewal did not run"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .expect("all removals fit one 2 s budget")
+        .unwrap();
+    let g = igd.lock().unwrap();
+    assert!(g.mappings.is_empty(), "{:?}", g.mappings);
+    assert_eq!(g.deleted.len(), 3);
+}
+
+#[tokio::test]
+async fn a_port_lost_to_another_host_is_never_removed() {
+    let igd: Shared = Arc::default();
+    let gw = fake_igd(igd.clone()).await;
+    let status: upnp::Status = Arc::default();
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let mut c = cfg(gw);
+    c.renew_every = Duration::from_millis(200);
+    let task = tokio::spawn(upnp::upnp_loop(c, WANTED[..2].to_vec(), status.clone(), rx));
+    let t0 = std::time::Instant::now();
+    while igd.lock().unwrap().mappings.len() < 2 {
+        assert!(t0.elapsed() < Duration::from_secs(10), "not mapped");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Our lease on 6892 lapsed and another LAN host took it.
+    {
+        let mut g = igd.lock().unwrap();
+        g.in_use = Some(6892);
+        g.mappings.insert(
+            ("UDP".into(), 6892),
+            ("192.168.1.50".into(), 6892, 0, "other".into()),
+        );
+    }
+    while status.lock().unwrap().state != "partial" {
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "renewal did not run"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap();
+    let g = igd.lock().unwrap();
+    assert_eq!(g.deleted, vec![("UDP".to_string(), 6891)]);
+    assert_eq!(
+        g.mappings
+            .get(&("UDP".to_string(), 6892))
+            .map(|m| m.0.as_str()),
+        Some("192.168.1.50"),
+        "the other host's mapping stays"
+    );
 }
 
 #[tokio::test]
@@ -400,7 +489,9 @@ async fn crawler_maps_its_ports_and_reports_live_stats() {
     let t0 = std::time::Instant::now();
     loop {
         let live = svc.live();
-        if live.running && igd.lock().unwrap().mappings.len() == 2 {
+        // The status follows the whole round (see loop_maps_then_removes_its_mappings_on_stop).
+        let mapped = live.upnp.as_ref().is_some_and(|u| u.state == "mapped");
+        if live.running && mapped && igd.lock().unwrap().mappings.len() == 2 {
             assert_eq!(live.mode, "aggressive");
             assert_eq!(live.virtual_nodes, 2);
             assert_eq!(live.ports.len(), 2);

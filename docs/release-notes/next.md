@@ -174,7 +174,7 @@ must be updated together to get all of it, but each side keeps working with an o
   router ports); Status: a DHT crawler card. API: `origin` on results, `origin=` filter, `dht`
   in `/api/v1/stats` and `/stats/health`, features `origin` and `dht`.
 - **Router ports**: in aggressive mode the server maps its UDP ports with UPnP (and removes them
-  when it stops); `MAGNETAR_DHT_UPNP=false` turns that off. Docker: `docker/compose.dht.yml`
+  when it stops, also after a failed renewal; a port another device took is left alone); `MAGNETAR_DHT_UPNP=false` turns that off. Docker: `docker/compose.dht.yml`
   publishes UDP 6891–6894 and turns the crawler on; set `MAGNETAR_DHT_UPNP_GATEWAY` and
   `MAGNETAR_DHT_UPNP_LOCAL_IP` for UPnP from a container. Only UDP: nothing listens on TCP.
 - Measured on a copy of production (10.7 min, home connection, no port opened): 837 torrents
