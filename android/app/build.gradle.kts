@@ -76,6 +76,8 @@ dependencies {
     implementation("androidx.work:work-runtime-ktx:2.12.0")
     implementation("net.java.dev.jna:jna:5.19.1@aar")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
+    // Time-series charts (D47): Apache-2.0, Compose only, no Play Services.
+    implementation("com.patrykandpatrick.vico:compose-m3:3.3.1")
 
     testImplementation("junit:junit:4.13.2")
 }

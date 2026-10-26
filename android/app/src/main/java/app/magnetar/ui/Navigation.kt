@@ -5,7 +5,6 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
@@ -35,7 +34,8 @@ import app.magnetar.ui.media.MediaScreen
 import app.magnetar.ui.saved.SavedScreen
 import app.magnetar.ui.search.SearchScreen
 import app.magnetar.ui.settings.SettingsScreen
-import app.magnetar.ui.status.StatusScreen
+import app.magnetar.ui.graph.GraphScreen
+import app.magnetar.ui.stats.StatsScreen
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.filterNotNull
 
@@ -43,7 +43,8 @@ private enum class Tab(val route: String, val label: String, val icon: () -> Ima
     SEARCH("search", "Search", { Icons.Filled.Search }),
     SAVED("saved", "Saved", { Icons.Filled.Star }),
     DOWNLOADS("downloads", "Downloads", { AppIcons.Download }),
-    STATUS("status", "Status", { Icons.Filled.Info }),
+    // Stats replaced Status (D47): its Status section holds what the Status tab showed.
+    STATS("stats", "Stats", { AppIcons.Insights }),
     SETTINGS("settings", "Settings", { Icons.Filled.Settings }),
 }
 
@@ -52,6 +53,11 @@ private const val DETAIL = "detail/{infohash}?magnet={magnet}"
 private const val MEDIA = "media/{mediaId}"
 
 private fun mediaRoute(mediaId: Long) = "media/$mediaId"
+
+/** A D47 graph: `path` is "wot", "relays", "media/{id}" or "swarm/{infohash}". */
+private const val GRAPH = "graph?path={path}"
+
+fun graphRoute(path: String) = "graph?path=" + Uri.encode(path)
 
 private fun detailRoute(infohash: String, magnet: String? = null) =
     "detail/$infohash" + (magnet?.let { "?magnet=" + Uri.encode(it) } ?: "")
@@ -100,7 +106,19 @@ fun MagnetarNavHost(openRequests: MutableStateFlow<OpenRequest?>) {
             }
             composable(Tab.SAVED.route) { SavedScreen(onRun = { nav.switchTab(Tab.SEARCH.route) }) }
             composable(Tab.DOWNLOADS.route) { DownloadsScreen() }
-            composable(Tab.STATUS.route) { StatusScreen() }
+            composable(Tab.STATS.route) {
+                StatsScreen(
+                    onSearch = { nav.switchTab(Tab.SEARCH.route) },
+                    onOpenGraph = { nav.navigate(graphRoute(it)) },
+                )
+            }
+            composable(GRAPH, arguments = listOf(navArgument("path") { type = NavType.StringType; defaultValue = "wot" })) {
+                GraphScreen(
+                    onBack = { if (!nav.popBackStack()) nav.navigate(Tab.STATS.route) },
+                    onOpenTorrent = { nav.navigate(detailRoute(it)) },
+                    onOpenMedia = { nav.navigate(mediaRoute(it)) },
+                )
+            }
             composable(Tab.SETTINGS.route) { SettingsScreen() }
             composable(
                 DETAIL,
@@ -117,12 +135,14 @@ fun MagnetarNavHost(openRequests: MutableStateFlow<OpenRequest?>) {
                     onBack = { if (!nav.popBackStack()) nav.navigate(Tab.SEARCH.route) },
                     onOpenTorrent = { nav.navigate(detailRoute(it)) },
                     onOpenMedia = { nav.navigate(mediaRoute(it)) { launchSingleTop = true } },
+                    onOpenGraph = { nav.navigate(graphRoute(it)) },
                 )
             }
             composable(MEDIA, arguments = listOf(navArgument("mediaId") { type = NavType.LongType })) {
                 MediaScreen(
                     onBack = { if (!nav.popBackStack()) nav.navigate(Tab.SEARCH.route) },
                     onOpenTorrent = { nav.navigate(detailRoute(it)) },
+                    onOpenGraph = { nav.navigate(graphRoute(it)) },
                 )
             }
         }

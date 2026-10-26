@@ -77,7 +77,12 @@ fun groupHeading(g: FfiReleaseGroup): String = listOfNotNull(
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-fun MediaScreen(onBack: () -> Unit, onOpenTorrent: (String) -> Unit, vm: MediaViewModel = viewModel()) {
+fun MediaScreen(
+    onBack: () -> Unit,
+    onOpenTorrent: (String) -> Unit,
+    onOpenGraph: (String) -> Unit = {},
+    vm: MediaViewModel = viewModel(),
+) {
     val state by vm.state.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(vm) { vm.messages.collect { snackbar.showSnackbar(it) } }
@@ -89,6 +94,14 @@ fun MediaScreen(onBack: () -> Unit, onOpenTorrent: (String) -> Unit, vm: MediaVi
             TopAppBar(
                 title = { Text(media?.title ?: "Releases", maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
+                actions = {
+                    // The release graph (D47) is drawn from the server's data.
+                    if (state.releases?.source == "server") {
+                        IconButton(onClick = { onOpenGraph("media/${vm.mediaId}") }) {
+                            Icon(app.magnetar.ui.common.AppIcons.Graph, "Release graph")
+                        }
+                    }
+                },
             )
         },
         snackbarHost = { SnackbarHost(snackbar) },

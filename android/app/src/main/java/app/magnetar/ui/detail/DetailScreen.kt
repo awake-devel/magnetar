@@ -89,6 +89,7 @@ fun DetailScreen(
     onBack: () -> Unit,
     onOpenTorrent: (String) -> Unit = {},
     onOpenMedia: (Long) -> Unit = {},
+    onOpenGraph: (String) -> Unit = {},
     vm: DetailViewModel = viewModel(),
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -174,6 +175,13 @@ fun DetailScreen(
                     onDownloadPhone = vm::downloadOnPhone,
                     onDownloadServer = vm::downloadOnServer,
                     onCheckLiveness = vm::checkLiveness,
+                    swarm = {
+                        SwarmExtras(
+                            history = state.history,
+                            graphs = state.graphs,
+                            onGraph = { onOpenGraph("swarm/${vm.infohash}") },
+                        )
+                    },
                     media = {
                         detail.media?.let { m ->
                             MediaCard(
@@ -250,6 +258,7 @@ private fun DetailBody(
     onDownloadPhone: () -> Unit,
     onDownloadServer: () -> Unit,
     onCheckLiveness: () -> Unit,
+    swarm: @Composable () -> Unit = {},
     media: @Composable () -> Unit = {},
 ) {
     val s = detail.summary
@@ -340,7 +349,7 @@ private fun DetailBody(
 
         item { TrustCard(detail.trust, threshold, trustOpen) { trustOpen = !trustOpen } }
 
-        item { LivenessCard(detail.liveness, checkingLiveness, onCheckLiveness) }
+        item { LivenessCard(detail.liveness, checkingLiveness, onCheckLiveness, swarm) }
 
         if (detail.files.isNotEmpty()) {
             item { SectionTitle("Files (${detail.files.size})") }
@@ -483,7 +492,7 @@ private fun TrustCard(trust: FfiTrust, threshold: Int, open: Boolean, onToggle: 
 }
 
 @Composable
-private fun LivenessCard(l: FfiLiveness?, checking: Boolean, onCheck: () -> Unit) {
+private fun LivenessCard(l: FfiLiveness?, checking: Boolean, onCheck: () -> Unit, extras: @Composable () -> Unit = {}) {
     Card(Modifier.fillMaxWidth().padding(top = 12.dp)) {
         Column(Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -506,7 +515,25 @@ private fun LivenessCard(l: FfiLiveness?, checking: Boolean, onCheck: () -> Unit
                     style = MaterialTheme.typography.labelSmall,
                 )
             }
+            extras()
         }
+    }
+}
+
+/** Seeders/leechers history (D45) and the swarm graph button (D47), when the server has them. */
+@Composable
+private fun SwarmExtras(history: app.magnetar.ffi.FfiLivenessHistory?, graphs: Boolean, onGraph: () -> Unit) {
+    val colors = app.magnetar.ui.theme.chartColors()
+    if (history != null) {
+        Text(
+            "Last ${history.keepDays} days",
+            style = MaterialTheme.typography.labelSmall,
+            modifier = Modifier.padding(top = 8.dp),
+        )
+        app.magnetar.ui.charts.SwarmHistoryChart(history.points, colors)
+    }
+    if (graphs) {
+        TextButton(onClick = onGraph) { Text("Swarm graph: trackers, DHT, publishers") }
     }
 }
 

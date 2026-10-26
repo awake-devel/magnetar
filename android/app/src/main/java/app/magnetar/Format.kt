@@ -144,3 +144,33 @@ fun parseOpenUri(s: String): OpenRequest? = when {
             ?.let { OpenRequest(it, null) }
     else -> null
 }
+
+/** Grouped integer in the device locale: "1,234,567" in English, "1 234 567" in French (D47 charts). */
+fun formatNumber(n: Long, locale: Locale = Locale.getDefault()): String =
+    java.text.NumberFormat.getIntegerInstance(locale).format(n)
+
+/**
+ * Short axis label in the device locale: "950", "12.3k", "4.5M" (French "12,3 k", "4,5 M").
+ * Plain suffixes rather than CompactDecimalFormat, which needs API 24 ICU data per locale.
+ */
+fun formatCompact(v: Double, locale: Locale = Locale.getDefault()): String {
+    val a = kotlin.math.abs(v)
+    val (scaled, suffix) = when {
+        a >= 1e9 -> v / 1e9 to "G"
+        a >= 1e6 -> v / 1e6 to "M"
+        a >= 1e3 -> v / 1e3 to "k"
+        else -> return formatNumber(Math.round(v), locale)
+    }
+    val nf = java.text.NumberFormat.getNumberInstance(locale).apply {
+        maximumFractionDigits = if (kotlin.math.abs(scaled) < 10) 1 else 0
+    }
+    val sep = if (locale.language == "fr") " " else ""
+    return nf.format(scaled) + sep + suffix
+}
+
+/** "42 %" (French) / "42%" share of [part] in [total], or "" when there is no total. */
+fun formatShare(part: ULong, total: ULong, locale: Locale = Locale.getDefault()): String {
+    if (total == 0uL) return ""
+    val nf = java.text.NumberFormat.getPercentInstance(locale).apply { maximumFractionDigits = 0 }
+    return nf.format(part.toDouble() / total.toDouble())
+}

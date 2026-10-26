@@ -60,7 +60,7 @@ would be readable: anything but loopback and Tailscale (`100.64.0.0/10`,
 |---|---|
 | `MagnetarApp` | the single `Magnetar` instance, opened lazily off the main thread at `getDatabasePath("magnetar.db")`; settings flow |
 | Settings | `SharedPreferences` → `FfiConfig` (`Settings.kt`); downloads in `getExternalFilesDir(DOWNLOADS)/magnetar`, librqbit state in `filesDir/rqbit` |
-| Screens | `ui/` (Search, Detail, Saved, Downloads, Status, Settings) with one ViewModel each |
+| Screens | `ui/` (Search, Detail, Media, Saved, Downloads, Stats with its Status section, Graph, Settings) with one ViewModel each; charts in `ui/charts/` (Vico for time series, Canvas for the rest), force layout in `ui/graph/` (D47) |
 | `CrawlSyncWorker` | hourly unique periodic work (unmetered + charging + battery not low): crawl 120 s → sync → cleanup → poll saved searches → notifications. "Crawl now" / "Sync now" enqueue a one-time run that only needs a network connection |
 | `DownloadService` | `dataSync` foreground service, started only from a user tap; progress notification; `onTimeout` (Android 15+ 6 h cap) pauses every download and stops |
 | Links | the app handles `magnet:` links (opens the detail page for that infohash) and `magnetar://torrent/<infohash>` (used by notifications) |

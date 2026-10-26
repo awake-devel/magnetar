@@ -29,6 +29,10 @@ data class DetailUiState(
     val checkingLiveness: Boolean = false,
     /** Local file of the media poster (fetched from the server, cached by ffi). */
     val posterPath: String? = null,
+    /** Seeders/leechers over time (D45, server only); null offline or from an older server. */
+    val history: app.magnetar.ffi.FfiLivenessHistory? = null,
+    /** The server draws swarm graphs (D47). */
+    val graphs: Boolean = false,
 )
 
 class DetailViewModel(application: Application, handle: SavedStateHandle) : BaseViewModel(application) {
@@ -59,6 +63,7 @@ class DetailViewModel(application: Application, handle: SavedStateHandle) : Base
                 .onSuccess { d ->
                     _state.update { it.copy(loading = false, detail = d) }
                     onMedia(d, retry = true)
+                    loadServerExtras()
                 }
                 .onFailure { e -> _state.update { it.copy(loading = false, error = e.userMessage()) } }
         }
@@ -87,6 +92,21 @@ class DetailViewModel(application: Application, handle: SavedStateHandle) : Base
                     }
                 }
             }
+        }
+    }
+
+    /** History chart and swarm-graph button: only what the server offers. */
+    private fun loadServerExtras() {
+        if (!magApp.settings.value.hasServer) return
+        viewModelScope.launch {
+            val m = magApp.magnetar()
+            val features = ffiCatching { m.serverFeatures() }.getOrNull().orEmpty()
+            val history = if ("liveness_history" in features) {
+                ffiCatching { m.livenessHistory(infohash, 90u) }.getOrNull()
+            } else {
+                null
+            }
+            _state.update { it.copy(history = history, graphs = "graphs" in features) }
         }
     }
 
