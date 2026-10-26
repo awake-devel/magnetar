@@ -123,7 +123,9 @@ joined to `liveness`, grouped and sorted) took 534 ms for 500 rows on the copy a
 production logs. The new one picks 2000 rows in 5.4 ms through `liveness_schedule_due`
 (index scans that stop at the limit); with the trackers and the result row the whole
 statement is 46–97 ms, and stays index-driven with 0.5 M result rows (nested loop on
-`liveness_pkey`). The migration takes 12 s on the copy.
+`liveness_pkey`). The migration takes 12 s on the copy. The old `liveness_expires` index
+served only the old query and is dropped (one index write less per check, and result
+updates can be HOT).
 
 **Throughput**, three batches of 2000 random torrents:
 

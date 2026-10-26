@@ -372,3 +372,42 @@ async fn seeder_updates_reach_the_search_index() {
     assert_eq!(got, vec![(ih(9), Some(9))]);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn a_torrent_deleted_during_a_batch_does_not_fail_it() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    let t = "udp://127.0.0.1:9/announce";
+    put_with(s, 1, NOW - 3600, 1, t).await;
+    put_with(s, 2, NOW - 3600, 2, t).await;
+    let rows = live::due(s.pool(), NOW, 10).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    // Deleted while the batch was out scraping: its schedule row goes, history would fail
+    // the foreign key.
+    sqlx::query("DELETE FROM torrents WHERE infohash = $1")
+        .bind(ih(1))
+        .execute(s.pool())
+        .await
+        .unwrap();
+    let results: Vec<Liveness> = rows
+        .iter()
+        .map(|r| Liveness {
+            infohash: r.infohash.clone(),
+            seeders: Some(5),
+            leechers: Some(1),
+            completed: Some(0),
+            dht_peers_est: None,
+            source: LivenessSource::Udp,
+            trackers_ok: 1,
+            trackers_failed: 0,
+            checked_at: NOW,
+            expires_at: NOW + TTL_NEW,
+        })
+        .collect();
+    live::write_results(s.pool(), &rows, &results, NOW, Expiry::Scheduled)
+        .await
+        .unwrap();
+    assert_eq!(history_len(s, 1).await, 0);
+    assert_eq!(history_len(s, 2).await, 1);
+    assert_eq!(schedule(s, 2).await.3, Some(NOW));
+}

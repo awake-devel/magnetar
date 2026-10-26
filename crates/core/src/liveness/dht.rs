@@ -546,8 +546,11 @@ async fn walk(
     }
     let mut answered = Vec::new();
     let mut failed = Vec::new();
+    // Node farms stay out of the cache, or later walks would start from them.
+    let ports = w.ports_per_ip();
     for (a, n) in &w.nodes {
         match (n.state, n.id) {
+            (State::Answered, Some(id)) if w.suspicious(a, Some(id), &ports) => {}
             (State::Answered, Some(id)) => answered.push((*a, id)),
             (State::Failed, _) => failed.push(*a),
             _ => {}

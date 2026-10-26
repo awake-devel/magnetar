@@ -1002,9 +1002,6 @@ impl Magnetar {
         Ok(self.inner.store.set_relay_enabled_sync(url, enabled)?)
     }
 
-    /// Ok(false) when the server is unreachable or unhealthy. `GET /health` needs no token, so a
-    /// healthy server is also asked one authenticated question: a rejected token is an error
-    /// (`Server{401}`), not "reachable".
     /// The server's seed-check backlog (D45). None: offline, unreachable, or a server older
     /// than D45 (the Status screen then leaves the card out).
     pub async fn server_liveness(&self) -> Option<FfiLivenessStats> {
@@ -1031,6 +1028,9 @@ impl Magnetar {
             .await
     }
 
+    /// Ok(false) when the server is unreachable or unhealthy. `GET /health` needs no token, so a
+    /// healthy server is also asked one authenticated question: a rejected token is an error
+    /// (`Server{401}`), not "reachable".
     pub async fn server_health(&self) -> Result<bool, FfiError> {
         let Some(api) = self.inner.api() else {
             return Ok(false);

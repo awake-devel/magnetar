@@ -441,8 +441,12 @@ pub async fn write_results(
     .map_err(db)?;
     if !hist.is_empty() {
         sqlx::query(
+            // Joined so an infohash deleted since the due query (its schedule row went with
+            // it) is skipped instead of failing the whole batch on the foreign key.
             "INSERT INTO liveness_history (infohash, at, seeders, leechers, peers_est)
-             SELECT * FROM unnest($1::text[], $2::bigint[], $3::int[], $4::int[], $5::int[])
+             SELECT u.* FROM unnest($1::text[], $2::bigint[], $3::int[], $4::int[], $5::int[])
+                  AS u(infohash, at, seeders, leechers, peers_est)
+             JOIN torrent_infohashes ti ON ti.infohash = u.infohash
              ON CONFLICT DO NOTHING",
         )
         .bind(hist.iter().map(|h| h.infohash).collect::<Vec<_>>())
