@@ -47,8 +47,9 @@ pub async fn open_store(cfg: &Config) -> anyhow::Result<Arc<PgStore>> {
     Ok(Arc::new(store))
 }
 
-/// Open (or start building) the search index and attach it to the store, so searches use it
-/// once ready (D43). Disabled or failing to open: searches stay on Postgres.
+/// Open (or start building) the search index in the background and attach it to the store, so
+/// searches use it once ready (D43); the API listens meanwhile. Disabled or failing to open:
+/// searches stay on Postgres.
 async fn start_search_index(
     store: &Arc<PgStore>,
     cfg: &Config,
@@ -63,25 +64,25 @@ async fn start_search_index(
         }
         return tokio::spawn(search_index::discard_loop(store.pool().clone(), stop));
     }
-    let opened = match search_index::load::database_id(store.pool()).await {
-        Ok(id) => SearchIndex::open_async(dir.clone(), id).await,
-        Err(e) => Err(e),
-    };
-    match opened {
-        Ok(idx) => {
-            tracing::info!(
-                "search index in {} ({})",
-                dir.display(),
-                if idx.is_ready() { "ready" } else { "to build" }
-            );
-            store.attach_search_index(idx.clone());
-            tokio::spawn(search_index::index_loop(store.pool().clone(), idx, stop))
+    let store = store.clone();
+    tokio::spawn(async move {
+        let opened = match search_index::load::database_id(store.pool()).await {
+            Ok(id) => SearchIndex::open_async(dir.clone(), id).await,
+            Err(e) => Err(e),
+        };
+        match opened {
+            Ok(idx) => {
+                tracing::info!(
+                    "search index in {} ({})",
+                    dir.display(),
+                    if idx.is_ready() { "ready" } else { "to build" }
+                );
+                store.attach_search_index(idx.clone());
+                search_index::index_loop(store.pool().clone(), idx, stop).await;
+            }
+            Err(e) => tracing::error!("search index disabled: {e}"),
         }
-        Err(e) => {
-            tracing::error!("search index disabled: {e}");
-            tokio::spawn(async {})
-        }
-    }
+    })
 }
 
 pub async fn serve(cfg: Config) -> anyhow::Result<()> {

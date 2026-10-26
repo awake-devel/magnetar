@@ -63,7 +63,18 @@ pub const FACETS: &[FacetDef] = &[
     },
     FacetDef {
         name: "genre",
-        values: |d| d.media.iter().flat_map(|m| m.genres.clone()).collect(),
+        // Sources disagree on case (IMDb `Drama`, anime lists `drama`).
+        values: |d| {
+            let mut g: Vec<String> = d
+                .media
+                .iter()
+                .flat_map(|m| m.genres.iter().map(|g| g.trim().to_lowercase()))
+                .filter(|g| !g.is_empty())
+                .collect();
+            g.sort_unstable();
+            g.dedup();
+            g
+        },
     },
     FacetDef {
         name: "year",

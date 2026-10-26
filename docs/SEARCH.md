@@ -69,8 +69,9 @@ lowest id (D6). Fields:
   (constant score; descriptions from 4); fuzzy matching (Levenshtein, transposition = 1) at
   distance 1 from 5 letters and 2 from 8, on titles only, never on words containing digits
   (`s01e02` must not find `s01e01`, nor `2019` find `2018`), and not for a word already found as
-  is in 50 titles or more (`complete`, `french`: expanding those cost tens of milliseconds at
-  3 M documents and only added near-misses).
+  is in max(50, documents / 10 000) titles (`complete`, `french`: expanding those cost tens of
+  milliseconds at 3 M documents and only added near-misses). A fuzzy match scores below an exact
+  one, so a title holding the typo itself ranks first.
 - Documents whose title holds every word get a flat +10 000, so title hits always rank above
   file-only and description-only hits; ties go to the newest.
 - Filters (`categories`, size range, `since`/`until`, `min_trust` incl. local trust overrides,
@@ -120,38 +121,39 @@ matched-file query: what the API handler waits for), 25 runs per query after one
 
 | | |
 |---|---|
-| Full build | 3 236 660 documents in 269 s (12 000 docs/s; 4 document queries in flight, 4 writer threads); production size (462 k) ≈ 40 s |
-| Index on disk | 2.2 GB (≈ 0.7 KiB per infohash; production size ≈ 320 MB) |
-| Memory | process opening the built index: 38 MB anonymous after the query run, plus 587 MB of mapped index pages (page cache, reclaimable); while building: 1.2 GB peak RSS, of which ~670 MB anonymous (writer arenas, merges, row batches) |
-| Update | one changed torrent → searchable 230–350 ms after the trigger (commit + reader reload), plus up to 1 s of polling |
-| Throughput | 8 concurrent clients, 296 queries in 7.1–7.4 s (40–42 queries/s) |
+| Full build | 3 236 660 documents in 221–269 s (12 000–14 700 docs/s; 4 document queries in flight, 4 writer threads); production size (462 k) ≈ 35 s |
+| Index on disk | 2.2 GB, 32 segments (≈ 0.7 KiB per infohash; production size ≈ 320 MB) |
+| Memory | process opening the built index: 38 MB anonymous after the query run, plus 655 MB of mapped index pages (page cache, reclaimable); while building: 1.2 GB peak RSS, of which ~680 MB anonymous (writer arenas, merges, row batches) |
+| Update | one changed torrent → searchable 0.2–0.35 s after its commit (log read + reload + commit + reader reload; 1.2 s once, under merge load right after the build), plus up to 1 s of polling |
+| Throughput | 8 concurrent clients, 296 queries in 7.2–7.5 s (40–41 queries/s) |
 
-Latency, index already built (second run; ms):
+Latency, index already built (`MAGNETAR_BENCH_INDEX_DIR` reused, so the process did not build;
+ms):
 
 | query | p50 | p95 | max | total |
 |---|---|---|---|---|
-| browse `""` (date) | 17.8 | 18.8 | 19.0 | 3 236 660 |
-| 1 letter `a` / `e` | 22.5 / 4.2 | 23.7 / 5.3 | 25.9 / 5.6 | 2 120 750 / 283 987 |
-| 2 letters `th` / `le` | 1.3 / 15.4 | 1.7 / 22.1 | 1.7 / 23.6 | 27 398 / 1 241 386 |
-| 3-letter prefix `the` / `one` | 23.0 / 7.7 | 25.9 / 8.0 | 26.4 / 8.2 | 1 005 264 / 135 623 |
-| common `1080p` | 39.1 | 41.5 | 47.2 | 1 719 046 |
-| common `french` / `multi` / `x265` | 21.0 / 22.4 / 13.4 | 24.0 / 24.5 / 16.5 | 24.3 / 25.5 / 16.6 | 808 053 / 813 015 / 391 964 |
-| rare `chernobyl` / `documentaire` | 5.2 / 7.1 | 5.9 / 7.5 | 6.0 / 7.8 | 329 / 50 764 |
-| `the lord of the rings` / `game of thrones s01` / `lord rings 1080p` | 10.8 / 11.7 / 18.0 | 11.6 / 12.8 / 19.4 | 12.1 / 13.4 / 20.1 | 1 596 / 259 / 813 |
-| typo `interstelar` / `matirx` / `ubuntoo` | 35.0 / 16.1 / 9.8 | 39.0 / 18.5 / 10.2 | 42.0 / 18.5 / 10.6 | 210 / 448 / 0 |
-| 9 words `the lord of the rings complete integrale 1080p multi` | 19.7 | 20.8 | 20.8 | 0 |
-| sorts: date, size, seeders × asc/desc, with `french` and browse (12 queries) | 17.8–37.0 | 19.8–39.0 | 22.9–40.4 | |
-| filters (categories, ≥ 1 GiB, hide dead, ≥ 5 seeders, 1 year) `1080p` / browse | 60.9 / 31.2 | 63.2 / 35.6 | 81.2 / 36.1 | 39 152 / 47 770 |
-| `min_trust` 20, browse / seeders `french` | 21.1 / 37.5 | 23.7 / 40.5 | 26.5 / 40.8 | 943 999 / 274 725 |
-| page 10 (offset 180) | 30.3 | 33.2 | 33.3 | |
-| **all 37 queries × 25 runs** | **21.8** | **39.0** | **81.2** | |
-| facets `category` / `genre` (`french`) / `year`, one run | 16.7 / 24.3 / 26.9 | | | |
+| browse `""` (date) | 15.6 | 19.9 | 20.4 | 3 236 660 |
+| 1 letter `a` / `e` | 26.1 / 5.2 | 29.1 / 5.8 | 30.1 / 5.9 | 2 120 750 / 283 987 |
+| 2 letters `th` / `le` | 1.7 / 18.9 | 2.3 / 20.9 | 2.3 / 21.2 | 27 398 / 1 241 386 |
+| 3-letter prefix `the` / `one` | 31.8 / 9.1 | 36.6 / 10.8 | 40.6 / 11.2 | 1 005 264 / 135 623 |
+| common `1080p` | 51.6 | 56.0 | 59.1 | 1 719 046 |
+| common `french` / `multi` / `x265` | 26.9 / 28.8 / 17.8 | 28.7 / 30.7 / 21.0 | 28.8 / 30.8 / 23.8 | 808 053 / 813 015 / 391 964 |
+| rare `chernobyl` / `documentaire` (both expanded with distance 2) | 49.8 / 49.4 | 54.2 / 50.4 | 61.8 / 50.7 | 840 / 50 876 |
+| `the lord of the rings` / `game of thrones s01` / `lord rings 1080p` | 13.9 / 15.4 / 25.0 | 14.5 / 15.8 / 27.9 | 14.7 / 15.9 / 28.1 | 1 596 / 259 / 813 |
+| typo `interstelar` / `matirx` / `ubuntoo` | 49.3 / 21.3 / 12.0 | 52.2 / 21.8 / 12.4 | 53.2 / 21.9 / 12.5 | 210 / 448 / 0 |
+| 9 words `the lord of the rings complete integrale 1080p multi` | 27.2 | 29.4 | 33.6 | 0 |
+| sorts: date, size, seeders × asc/desc, with `french` and browse (12 queries) | 18.0–42.7 | 19.3–54.0 | 20.2–57.5 | |
+| filters (categories, ≥ 1 GiB, hide dead, ≥ 5 seeders, 1 year) `1080p` / browse | 61.6 / 34.5 | 69.7 / 40.2 | 71.3 / 41.5 | 39 253 / 47 887 |
+| `min_trust` 20, browse / seeders `french` | 20.8 / 31.7 | 22.2 / 38.2 | 22.5 / 40.5 | 943 999 / 274 725 |
+| page 10 (offset 180) | 18.1 | 21.6 | 21.7 | |
+| **all 37 queries × 25 runs** | **26.2** | **51.6** | **71.3** | |
+| facets `category` / `genre` (`french`) / `year`, one run | 11.7 / 20.0 / 18.9 | | | |
 
-The first run (right after the build in the same process) measured p50 26 ms, p95 53 ms,
-max 76 ms. Before the merge-policy cap and the fuzzy gating, the same set had p95 103 ms and a
-max of 220 ms (the 9-word query) and 139 ms (size sort over `french`, which also spent its time
-reading 5000-file lists for the matched-file line; now only hits that matched a file name fetch
-at most 1000 paths).
+In the run that built the index in the same process (merges still running): p50 28.1 ms, p95
+57.4 ms, max 76.0 ms. Before the merge-policy cap, the fuzzy gating and the matched-file
+changes, the same set had p95 103–116 ms and maxima of 220 ms (the 9-word query, two words
+expanded at distance 2 over titles and file names) and 139 ms (size sort over `french`, which
+spent its time reading 5000-file lists of description-only hits for the matched-file line).
 
 The Postgres search on the same 3.2 M rows (fallback path, count capped at 1000, one run each):
 `a` 33.9 s, `1080p` 129 s, `the lord of the rings` 2.2 s, `interstelar` 0.7 s, seeders sort over

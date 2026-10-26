@@ -383,12 +383,20 @@ impl SearchIndex {
         self.progress.lock().unwrap().error = Some(e.to_string());
     }
 
+    fn query(&self, searcher: &tantivy::Searcher, words: &[String]) -> Box<dyn Query> {
+        let max_df = query::fuzzy_max_df(searcher.num_docs());
+        query::build(
+            &self.fields,
+            words,
+            &|t| searcher.doc_freq(t).unwrap_or(0),
+            max_df,
+        )
+    }
+
     /// Run one query. Blocking (CPU-bound: call through `spawn_blocking`).
     pub fn search(&self, q: &IndexQuery) -> Result<IndexResult> {
         let searcher = self.reader.searcher();
-        let query = query::build(&self.fields, &q.words, &|t| {
-            searcher.doc_freq(t).unwrap_or(0)
-        });
+        let query = self.query(&searcher, &q.words);
         let collector = TopFiltered {
             filter: q.filter.clone(),
             sort: q.sort,
@@ -441,9 +449,7 @@ impl SearchIndex {
             return Ok(None);
         };
         let searcher = self.reader.searcher();
-        let query = query::build(&self.fields, &q.words, &|t| {
-            searcher.doc_freq(t).unwrap_or(0)
-        });
+        let query = self.query(&searcher, &q.words);
         let collector = FacetCounts {
             filter: q.filter.clone(),
             field: self.fields.schema.get_field_name(field).to_string(),

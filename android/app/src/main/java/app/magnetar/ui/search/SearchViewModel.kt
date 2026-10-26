@@ -173,7 +173,8 @@ class SearchViewModel(application: Application) : BaseViewModel(application) {
         val query = _state.value.toQuery()
         val server = magApp.settings.value.hasServer
         magApp.lastQuery = query
-        _state.update { it.copy(loading = true, error = null, endReached = false) }
+        // A cancelled loadMore never clears its own flag.
+        _state.update { it.copy(loading = true, loadingMore = false, error = null, endReached = false) }
         searchJob = viewModelScope.launch {
             if (server) {
                 // The local cache answers in milliseconds: show it while the server works.
@@ -226,7 +227,7 @@ class SearchViewModel(application: Application) : BaseViewModel(application) {
             ffiCatching { magApp.magnetar().search(query, magApp.settings.value.hasServer) }
                 .onSuccess { page ->
                     _state.update {
-                        if (seq != searchSeq) return@update it
+                        if (seq != searchSeq) return@update it.copy(loadingMore = false)
                         val known = it.hits.mapTo(HashSet()) { h -> h.infohash }
                         val merged = it.hits + page.hits.filter { h -> h.infohash !in known }
                         it.copy(

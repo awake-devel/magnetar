@@ -24,9 +24,18 @@ const BOOST_DESCRIPTION: f32 = 0.6;
 /// Prefix and fuzzy matches score a constant (times these), below a real BM25 term hit.
 const BOOST_PREFIX: f32 = 1.0;
 const BOOST_FUZZY: f32 = 0.5;
-/// A word found as is in at least this many titles is taken as typed: no fuzzy expansion
-/// (`complete`, `french`: expanding them costs tens of ms at 3 M documents and only adds noise).
+/// A word found as is in at least this many titles, and in at least 1 / `FUZZY_DF_RATIO` of the
+/// documents, is taken as typed: no fuzzy expansion (`complete`, `french`: expanding them costs
+/// tens of ms at 3 M documents and only adds near-misses). The ratio keeps the gate from
+/// tightening as the index grows: a typo copied into a few hundred release names (they are
+/// re-published under many names) must still find the correctly spelt ones.
 pub const FUZZY_MAX_DF: u64 = 50;
+pub const FUZZY_DF_RATIO: u64 = 10_000;
+
+/// Title document frequency from which a word is not expanded, for an index of `num_docs`.
+pub fn fuzzy_max_df(num_docs: u64) -> u64 {
+    FUZZY_MAX_DF.max(num_docs / FUZZY_DF_RATIO)
+}
 
 /// Words as the index sees them: split on non-alphanumerics, lowercased, accents folded.
 pub fn tokens(text: &str) -> Vec<String> {
@@ -105,9 +114,14 @@ fn union(qs: Vec<Box<dyn Query>>) -> Box<dyn Query> {
 }
 
 /// The query for analysed words; `AllQuery` when there are none (browse). `title_df` gives the
-/// number of documents whose title holds a word as is (fuzzy matching is skipped for common
-/// words, see `FUZZY_MAX_DF`).
-pub fn build(f: &Fields, words: &[String], title_df: &dyn Fn(&Term) -> u64) -> Box<dyn Query> {
+/// number of documents whose title holds a word as is: from `max_df` on, the word gets no fuzzy
+/// expansion (`fuzzy_max_df`).
+pub fn build(
+    f: &Fields,
+    words: &[String],
+    title_df: &dyn Fn(&Term) -> u64,
+    max_df: u64,
+) -> Box<dyn Query> {
     if words.is_empty() {
         return Box::new(AllQuery);
     }
@@ -116,7 +130,7 @@ pub fn build(f: &Fields, words: &[String], title_df: &dyn Fn(&Term) -> u64) -> B
     let mut title_all = Vec::with_capacity(n);
     for (i, w) in words.iter().enumerate() {
         let last = i + 1 == n;
-        let fuzzy = fuzzy_distance(w) > 0 && title_df(&term(f.title, w)) < FUZZY_MAX_DF;
+        let fuzzy = fuzzy_distance(w) > 0 && title_df(&term(f.title, w)) < max_df;
         let mut title = Vec::new();
         variants(f.title, w, last, fuzzy, BOOST_TITLE, &mut title);
         let mut any = title.iter().map(|q| q.box_clone()).collect::<Vec<_>>();
@@ -294,6 +308,13 @@ mod tests {
         );
         assert!(tokens(" .. ").is_empty());
         assert_eq!(tokens(&"a ".repeat(40)).len(), MAX_TOKENS);
+    }
+
+    #[test]
+    fn fuzzy_gate_scales_with_the_index() {
+        assert_eq!(fuzzy_max_df(0), FUZZY_MAX_DF);
+        assert_eq!(fuzzy_max_df(462_000), FUZZY_MAX_DF);
+        assert_eq!(fuzzy_max_df(3_236_660), 323);
     }
 
     #[test]
