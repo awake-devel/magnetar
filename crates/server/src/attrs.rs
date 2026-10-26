@@ -145,25 +145,36 @@ pub async fn backfill(
     Ok(report)
 }
 
+/// Wait before retrying a backfill that failed (Postgres restarting, …).
+pub const RETRY_PAUSE: Duration = Duration::from_secs(300);
+
 /// `serve`: one backfill at startup when something is pending (after a parser change, or rows
-/// written before D44). New torrents are parsed at ingest, so nothing runs afterwards.
-pub async fn backfill_loop(pool: PgPool, shutdown: watch::Receiver<bool>) {
-    match pending(&pool).await {
-        Ok(false) => return,
-        Ok(true) => {}
-        Err(e) => {
-            tracing::warn!("release attributes: {e}");
-            return;
+/// written before D44), retried after an error. New torrents are parsed at ingest, so nothing
+/// runs once it has finished.
+pub async fn backfill_loop(pool: PgPool, mut shutdown: watch::Receiver<bool>) {
+    loop {
+        match pending(&pool).await {
+            Ok(false) => return,
+            Ok(true) => {
+                tracing::info!("release attributes: parsing torrents (parser v{PARSER_VERSION})");
+                match backfill(&pool, false, Some(shutdown.clone())).await {
+                    Ok(r) => {
+                        tracing::info!(
+                            "release attributes: {} parsed of {} infohashes in {:.0} s",
+                            r.parsed,
+                            r.scanned,
+                            r.secs
+                        );
+                        return;
+                    }
+                    Err(e) => tracing::warn!("release attributes backfill: {e}"),
+                }
+            }
+            Err(e) => tracing::warn!("release attributes: {e}"),
         }
-    }
-    tracing::info!("release attributes: parsing torrents (parser v{PARSER_VERSION})");
-    match backfill(&pool, false, Some(shutdown)).await {
-        Ok(r) => tracing::info!(
-            "release attributes: {} parsed of {} infohashes in {:.0} s",
-            r.parsed,
-            r.scanned,
-            r.secs
-        ),
-        Err(e) => tracing::warn!("release attributes backfill: {e}"),
+        tokio::select! {
+            _ = tokio::time::sleep(RETRY_PAUSE) => {}
+            _ = stop_requested(&mut shutdown) => return,
+        }
     }
 }

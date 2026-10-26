@@ -369,6 +369,14 @@ impl PgStore {
         }) {
             return Err(Error::Invalid(format!("unknown facet {bad:?}")));
         }
+        // Each facet once (one count vector per field and segment, whatever the body says).
+        let mut uniq: Vec<String> = Vec::with_capacity(fields.len());
+        for f in fields {
+            if !uniq.contains(f) {
+                uniq.push(f.clone());
+            }
+        }
+        let fields = &uniq[..];
         let Some(idx) = self.ready_index() else {
             return Ok(None);
         };

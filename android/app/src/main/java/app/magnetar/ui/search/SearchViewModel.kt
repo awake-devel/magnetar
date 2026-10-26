@@ -352,6 +352,8 @@ class SearchViewModel(application: Application) : BaseViewModel(application) {
             }
             ffiCatching { magApp.magnetar().search(query, server) }
                 .onSuccess { page ->
+                    // The server answers again after an offline start: offer its filters.
+                    if (page.source == "server" && _state.value.filterMode == FilterMode.LOCAL) refreshFeatures()
                     _state.update {
                         if (seq != searchSeq) {
                             it

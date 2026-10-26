@@ -1,5 +1,6 @@
 //! Shared state behind the `Magnetar` object (store, config, API client, download engine).
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::Duration;
 
@@ -31,6 +32,9 @@ pub struct Inner {
     state: RwLock<State>,
     /// Poster files fetched from the server (next to the database).
     pub poster_dir: std::path::PathBuf,
+    /// Whether the configured server has `features::FILTERS` (D44): `FILTERS_UNKNOWN` until
+    /// a `/health` answer, reset by a config change.
+    server_filters: AtomicU8,
     #[cfg(feature = "downloads")]
     engine: tokio::sync::Mutex<Option<Arc<magnetar_core::downloads::Downloader>>>,
 }
@@ -46,6 +50,10 @@ pub fn norm_infohash(s: &str) -> Result<String, FfiError> {
         })
     }
 }
+
+const FILTERS_UNKNOWN: u8 = 0;
+const FILTERS_YES: u8 = 1;
+const FILTERS_NO: u8 = 2;
 
 fn non_empty(s: &Option<String>) -> Option<&str> {
     s.as_deref().map(str::trim).filter(|s| !s.is_empty())
@@ -65,6 +73,7 @@ impl Inner {
                 root: None,
             }),
             poster_dir: "posters".into(),
+            server_filters: AtomicU8::new(FILTERS_UNKNOWN),
             #[cfg(feature = "downloads")]
             engine: tokio::sync::Mutex::new(None),
         }
@@ -198,7 +207,35 @@ impl Inner {
         store.set_setting_sync(CONFIG_KEY, &json(&StoredConfig::from(&config)))?;
         let mut st = self.state.write().unwrap_or_else(|e| e.into_inner());
         *st = State { config, api, root };
+        self.server_filters
+            .store(FILTERS_UNKNOWN, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Remember what a `/health` answer of the configured server listed.
+    pub fn note_features(&self, features: &[String]) {
+        let has = features
+            .iter()
+            .any(|f| f == magnetar_core::api::features::FILTERS);
+        let v = if has { FILTERS_YES } else { FILTERS_NO };
+        self.server_filters.store(v, Ordering::Relaxed);
+    }
+
+    /// Whether `q` may go to the server: one older than D44 would ignore its release/media
+    /// filters and answer unfiltered results (or reject `Sort::Rating`), so such a query uses
+    /// the local cache, which applies them. Asks `/health` once when not known yet.
+    pub async fn server_can_run(&self, api: &ApiClient, q: &SearchQuery) -> bool {
+        if !q.needs_filter_feature() {
+            return true;
+        }
+        if self.server_filters.load(Ordering::Relaxed) == FILTERS_UNKNOWN {
+            match api.health().await {
+                Ok(h) => self.note_features(&h.features),
+                // Unreachable: the search itself fails and falls back to the cache.
+                Err(_) => return true,
+            }
+        }
+        self.server_filters.load(Ordering::Relaxed) != FILTERS_NO
     }
 
     /// Ffi query -> core query; `min_trust: None` means the configured threshold.
@@ -266,7 +303,14 @@ impl Inner {
             if let Some(w) = s.last_seen_created_at {
                 q.since = Some(q.since.map_or(w, |since| since.max(w)));
             }
-            let mut page = match api.search(&q).await {
+            let on_server = if self.server_can_run(api, &q).await {
+                api.search(&q).await
+            } else {
+                Err(magnetar_core::Error::Invalid(
+                    "the server is older than the release filters".into(),
+                ))
+            };
+            let mut page = match on_server {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!("saved search {} on server: {e}; using local", s.id);

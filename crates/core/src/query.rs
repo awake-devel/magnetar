@@ -90,6 +90,12 @@ impl SearchQuery {
             || self.min_year.is_some()
             || self.max_year.is_some()
     }
+
+    /// Needs a server with `api::features::FILTERS`: an older one would ignore the D44
+    /// filters (unfiltered results) and reject `Sort::Rating`.
+    pub fn needs_filter_feature(&self) -> bool {
+        self.has_attr_filters() || self.sort == Sort::Rating
+    }
 }
 
 impl SearchQuery {

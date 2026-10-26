@@ -45,8 +45,9 @@ torrents list every book format among their files.
 (same files for every publisher; their titles differ little) into `torrent_attrs`. A row of an
 older `PARSER_VERSION` is re-parsed: by `serve` at startup (one pass over `torrent_infohashes`
 in chunks of 2000, parsing on blocking threads, 20 ms between chunks) or by
-`magnetar-server attrs [--force]`. The phone does the same in its SQLite cache (V4), at
-ingest and in the background after `Magnetar::open`, 500 rows per lock.
+`magnetar-server attrs [--force]`; a failed startup pass is retried every 5 minutes until it
+completes. The phone does the same in its SQLite cache (V4), at ingest and in the background
+after `Magnetar::open`, 500 infohashes per lock, walking the infohash index with a cursor.
 
 ## Values
 
@@ -173,6 +174,11 @@ back to the local cache's grouping for the title page.
 | genre, type, min rating, rating sort | hidden (the cache only knows media of details opened online) | hidden | server |
 | counts next to chips | no (built-in value lists) | no | yes (`facet_set`; none while the index builds) |
 | title page | cached releases linked to the media | cached releases | server |
+
+A query that needs `filters` (any release/media filter or rating sort, e.g. from a saved search
+made against a newer server) is never sent to a server whose `/health` does not list it: that
+server would ignore the filters and answer unfiltered results. The ffi asks `/health` once per
+configuration and searches the local cache instead; saved-search notifications do the same.
 
 ## Performance (2026-10-26, this laptop: 12 threads, NVMe, Postgres 18 in docker)
 

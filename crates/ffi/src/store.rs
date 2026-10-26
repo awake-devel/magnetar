@@ -292,32 +292,36 @@ impl SqliteStore {
         Ok(true)
     }
 
-    /// Parse the release attributes of up to `limit` infohashes that have none or an older
-    /// parser's (D44). Returns how many were written; call until 0. The parsing runs without
-    /// the connection lock.
-    pub fn backfill_attrs(&self, limit: usize) -> Result<usize> {
+    /// Parse the release attributes of up to `limit` infohashes after `after` (in infohash
+    /// order) that have none or an older parser's (D44), and move `after` past them. Returns
+    /// how many were written; call until 0, starting from "". The parsing runs without the
+    /// connection lock, and each call walks the infohash index from the cursor, not the table.
+    pub fn backfill_attrs(&self, after: &mut String, limit: usize) -> Result<usize> {
         let rows: Vec<(String, String, String, String)> = {
             let conn = self.conn();
             let mut st = conn
                 .prepare(
                     "SELECT t.infohash, t.title, t.category, t.files FROM torrents t
                      LEFT JOIN torrent_attrs a ON a.infohash = t.infohash
-                     WHERE (a.infohash IS NULL OR a.parser_version < ?1)
+                     WHERE t.infohash > ?3
+                       AND (a.infohash IS NULL OR a.parser_version < ?1)
                        AND t.rowid = (SELECT MIN(t2.rowid) FROM torrents t2
                                       WHERE t2.infohash = t.infohash)
+                     ORDER BY t.infohash
                      LIMIT ?2",
                 )
                 .db()?;
-            st.query_map(params![PARSER_VERSION, limit as i64], |r| {
+            st.query_map(params![PARSER_VERSION, limit as i64, after.as_str()], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })
             .db()?
             .collect::<rusqlite::Result<_>>()
             .db()?
         };
-        if rows.is_empty() {
+        let Some(last) = rows.last().map(|r| r.0.clone()) else {
             return Ok(0);
-        }
+        };
+        *after = last;
         let parsed: Vec<(String, ReleaseAttrs)> = rows
             .into_iter()
             .map(|(ih, title, cat, files)| {

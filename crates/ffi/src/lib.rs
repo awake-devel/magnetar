@@ -501,8 +501,9 @@ impl Magnetar {
         // caller's thread.
         let backfill = inner.store.clone();
         runtime.spawn_blocking(move || {
+            let mut after = String::new();
             loop {
-                match backfill.backfill_attrs(store::ATTRS_CHUNK) {
+                match backfill.backfill_attrs(&mut after, store::ATTRS_CHUNK) {
                     Ok(0) => break,
                     Ok(_) => {}
                     Err(e) => {
@@ -540,7 +541,10 @@ impl Magnetar {
         let q = self.inner.query(query);
         self.run(move |inner| async move {
             let mut server_error = None;
-            if prefer_server && let Some(api) = inner.api() {
+            if prefer_server
+                && let Some(api) = inner.api()
+                && inner.server_can_run(&api, &q).await
+            {
                 match api.search(&q).await {
                     Ok(mut p) => {
                         p.source = "server".into();
@@ -723,9 +727,13 @@ impl Magnetar {
     /// a server older than D44. The app hides the filters the answer lacks.
     pub async fn server_features(&self) -> Option<Vec<String>> {
         let api = self.inner.api()?;
-        self.run(move |_| async move { Ok(api.health().await?.features) })
-            .await
-            .ok()
+        self.run(move |inner| async move {
+            let features = api.health().await?.features;
+            inner.note_features(&features);
+            Ok(features)
+        })
+        .await
+        .ok()
     }
 
     pub async fn crawl_once(&self, max_seconds: u32) -> Result<FfiCrawlReport, FfiError> {
@@ -890,8 +898,14 @@ impl Magnetar {
         self.run(move |inner| async move {
             let now = magnetar_core::now();
             let api = match inner.api() {
-                Some(api) if api.health().await.is_ok() => Some(api),
-                _ => None,
+                Some(api) => match api.health().await {
+                    Ok(h) => {
+                        inner.note_features(&h.features);
+                        Some(api)
+                    }
+                    Err(_) => None,
+                },
+                None => None,
             };
             let results = match api {
                 Some(api) => inner.poll_via_server(&api, now).await?,

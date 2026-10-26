@@ -247,9 +247,10 @@ fn backfill_parses_rows_without_attributes() {
         )
         .is_empty()
     );
-    assert_eq!(s.backfill_attrs(1).unwrap(), 1);
-    assert_eq!(s.backfill_attrs(10).unwrap(), 1);
-    assert_eq!(s.backfill_attrs(10).unwrap(), 0);
+    let mut after = String::new();
+    assert_eq!(s.backfill_attrs(&mut after, 1).unwrap(), 1);
+    assert_eq!(s.backfill_attrs(&mut after, 10).unwrap(), 1);
+    assert_eq!(s.backfill_attrs(&mut after, 10).unwrap(), 0);
     assert_eq!(
         ihs(
             &s,
@@ -358,4 +359,70 @@ fn offline_title_page_and_server_only_facets() {
         block_on(m.facets(all, vec!["language".into()])),
         Err(FfiError::Invalid { .. })
     ));
+}
+
+/// Fake server older than D44: `/health` lists no features, `/api/v1/search` ignores the new
+/// filters (answers an empty page). Returns its base URL.
+fn spawn_old_server() -> String {
+    use axum::routing::get;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let health = || async {
+                axum::Json(serde_json::json!({"status":"ok","version":"0.1.0","db":true}))
+            };
+            let search = || async {
+                axum::Json(magnetar_core::query::SearchPage {
+                    hits: vec![],
+                    total: 0,
+                    source: "x".into(),
+                    total_is_lower_bound: false,
+                })
+            };
+            let app = axum::Router::new()
+                .route("/health", get(health))
+                .route("/api/v1/search", get(search).post(search));
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            tx.send(l.local_addr().unwrap()).unwrap();
+            axum::serve(l, app).await.unwrap();
+        });
+    });
+    format!("http://{}", rx.recv().unwrap())
+}
+
+#[test]
+fn old_server_gets_no_filtered_query() {
+    let dir = TempDir::new("oldsrv");
+    let mut cfg = offline();
+    cfg.server_url = Some(spawn_old_server());
+    cfg.api_token = Some("t".into());
+    let m = Magnetar::open(dir.0.join("m.db").display().to_string(), cfg).unwrap();
+    corpus(m.store());
+    // No D44 filter: the server answers.
+    let p = block_on(m.search(SearchQuery::default().into(), true)).unwrap();
+    assert_eq!(p.source, "server");
+    // A release filter it would ignore: the local cache applies it instead.
+    let fr_ca = SearchQuery {
+        languages: vec!["fr-ca".into()],
+        ..Default::default()
+    };
+    let p = block_on(m.search(fr_ca.into(), true)).unwrap();
+    assert_eq!(p.source, "local");
+    let mut got: Vec<String> = p.hits.into_iter().map(|h| h.infohash).collect();
+    got.sort();
+    assert_eq!(got, vec![ih(1), ih(2)]);
+    // Rating sort, which it would reject, too.
+    let rating = SearchQuery {
+        sort: Sort::Rating,
+        ..Default::default()
+    };
+    assert_eq!(
+        block_on(m.search(rating.into(), true)).unwrap().source,
+        "local"
+    );
+    assert_eq!(block_on(m.server_features()), Some(vec![]));
 }

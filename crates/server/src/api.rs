@@ -320,7 +320,13 @@ pub fn parse_search_query(raw: Option<&str>) -> ApiResult<SearchQuery> {
                     }
                 }
             }
-            "min_rating" => q.min_rating = Some(parse_num(&k, &v)?),
+            "min_rating" => {
+                let r: f32 = parse_num(&k, &v)?;
+                if !r.is_finite() {
+                    return Err(ApiError::bad_request(format!("bad value for {k}: {v:?}")));
+                }
+                q.min_rating = Some(r);
+            }
             "min_year" => q.min_year = Some(parse_num(&k, &v)?),
             "max_year" => q.max_year = Some(parse_num(&k, &v)?),
             _ => {}
