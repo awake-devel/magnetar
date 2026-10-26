@@ -1776,12 +1776,15 @@ impl SqliteStore {
     /// accessed first. `sync_ids` is never touched and unsynced rows are never deleted.
     /// `cap_bytes = 0` means no cap.
     pub fn cleanup(&self, cap_bytes: u64) -> Result<CleanupReport> {
-        let mut conn = self.conn();
-        let bytes_before = db_bytes(&conn)?;
+        // The connection is taken per batch, not for the whole run: a search waits for one
+        // batch at most (the first cleanup after the cap drops can evict tens of thousands).
+        let bytes_before = db_bytes(&self.conn())?;
         let mut evicted = 0u64;
         if cap_bytes > 0 {
-            for _ in 0..8 {
-                let size = db_bytes(&conn)?;
+            for _ in 0..64 {
+                let mut conn = self.conn();
+                // Free pages first, so the size reflects what earlier batches deleted.
+                let size = db_bytes(&conn)? - free_bytes(&conn)?;
                 if size <= cap_bytes {
                     break;
                 }
@@ -1791,16 +1794,20 @@ impl SqliteStore {
                 if rows == 0 {
                     break;
                 }
-                // Evict roughly the excess at the average row cost, at least a small batch.
+                // Evict roughly the excess at the average row cost, in batches short enough
+                // not to hold searches up.
                 let per_row = (size / rows as u64).max(1);
-                let want = ((size - cap_bytes) / per_row + 1).clamp(16, 5000);
+                let want = ((size - cap_bytes) / per_row + 1).clamp(16, 1000);
                 let n = evict_batch(&mut conn, want)?;
                 if n == 0 {
                     break;
                 }
                 evicted += n;
-                compact(&conn)?;
             }
+        }
+        let conn = self.conn();
+        if evicted > 0 {
+            compact(&conn)?;
         }
         crate::media::prune(&conn)?;
         let bytes_after = db_bytes(&conn)?;
@@ -1996,6 +2003,15 @@ impl Derived {
     }
 }
 
+/// Bytes in free pages (deleted rows not yet given back to the filesystem).
+fn free_bytes(conn: &Connection) -> Result<u64> {
+    let pages: i64 = conn
+        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+        .db()?;
+    let size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0)).db()?;
+    Ok((pages.max(0) * size.max(0)) as u64)
+}
+
 fn db_bytes(conn: &Connection) -> Result<u64> {
     let pages: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0)).db()?;
     let size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0)).db()?;
@@ -2069,7 +2085,6 @@ fn evict_batch(conn: &mut Connection, want: u64) -> Result<u64> {
         let mut st = tx
             .prepare(
                 "SELECT t.event_id FROM torrents t
-                 JOIN sync_ids s ON s.id = t.event_id AND s.synced = 1
                  LEFT JOIN torrent_flags f ON f.infohash = t.infohash
                  WHERE COALESCE(f.pinned, 0) = 0
                  ORDER BY COALESCE(f.last_access, 0), t.created_at, t.event_id
@@ -2082,20 +2097,19 @@ fn evict_batch(conn: &mut Connection, want: u64) -> Result<u64> {
             .db()?
     };
     {
-        // Only synced comments go; an unsynced comment outlives its evicted torrent body.
+        // Sync state no longer matters: the app is a server frontend that neither crawls nor
+        // syncs, so a cached event is always a copy of what the server has. (Before, events
+        // the phone crawled stayed "unsynced" forever and could never be evicted.)
         let mut del_comment_events = tx
             .prepare_cached(
                 "DELETE FROM events WHERE id IN (
-                    SELECT c.event_id FROM comments c JOIN sync_ids s ON s.id = c.event_id
-                    WHERE c.torrent_event_id = ?1 AND s.synced = 1)",
+                    SELECT event_id FROM comments WHERE torrent_event_id = ?1)",
             )
             .db()?;
         let mut del_comments = tx
-            .prepare_cached(
-                "DELETE FROM comments WHERE torrent_event_id = ?1 AND event_id IN (
-                    SELECT id FROM sync_ids WHERE synced = 1)",
-            )
+            .prepare_cached("DELETE FROM comments WHERE torrent_event_id = ?1")
             .db()?;
+
         let mut del_torrent = tx
             .prepare_cached("DELETE FROM torrents WHERE event_id = ?1")
             .db()?;

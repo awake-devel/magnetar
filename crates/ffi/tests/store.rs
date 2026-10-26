@@ -726,22 +726,13 @@ fn cleanup_invariant() {
     assert_eq!(r.bytes_before, before.db_bytes);
     assert!(r.bytes_after < r.bytes_before, "{r:?}");
     assert!(r.bytes_after <= cap, "under cap: {r:?}");
-    assert_eq!(r.unsynced_kept, 200, "100 torrents + 100 comments");
     let file_len = std::fs::metadata(dir.0.join("cache.db")).unwrap().len();
     assert!(file_len <= r.bytes_after, "file shrank too: {file_len}");
-
-    // Unsynced rows untouched, and their bodies are still loadable for upload.
+    // Sync state does not protect anything any more: the app is a server frontend, so
+    // events it once crawled itself (never marked synced) are evictable like the rest.
+    let gone = |t: &T| s.get_raw_events_sync(&[t.id()]).unwrap().is_empty();
+    assert!(unsynced.iter().any(gone), "unsynced rows are evicted too");
     let after = s.stats_sync().unwrap();
-    assert_eq!(after.unsynced, before.unsynced);
-    for t in &unsynced {
-        assert!(s.known_torrent_event_sync(&t.id()).unwrap());
-        assert_eq!(s.get_raw_events_sync(&[t.id()]).unwrap().len(), 1);
-    }
-    assert_eq!(
-        s.get_raw_events_sync(&unsynced_comments).unwrap().len(),
-        unsynced_comments.len()
-    );
-    assert_eq!(s.unsynced_sync(1000).unwrap().len(), 200);
     // Pinned and recently used survive.
     let present = |ih: &str| {
         let mut f = q("");
@@ -761,7 +752,8 @@ fn cleanup_invariant() {
     assert_eq!(s.neg_items_sync().unwrap(), neg_before);
     let evicted: Vec<&T> = synced
         .iter()
-        .filter(|t| s.get_raw_events_sync(&[t.id()]).unwrap().is_empty())
+        .chain(unsynced.iter())
+        .filter(|t| gone(t))
         .collect();
     assert_eq!(evicted.len() as u64, r.evicted);
     for t in &evicted {
@@ -773,17 +765,15 @@ fn cleanup_invariant() {
     let evicted_title = evicted[0].parsed.title.clone();
     assert!(!titles(&s, &q(&evicted_title)).contains(&evicted_title));
     assert_eq!(after.torrents, 400 - r.evicted);
-    // Synced comments on evicted torrents are gone; others stay.
-    assert!(after.comments >= 100);
+    // Comments go with their torrent; those of kept torrents stay.
+    assert_eq!(after.comments, 400 - r.evicted);
 
     // No cap = no-op; a cap we are already under = no-op.
     assert_eq!(s.cleanup(0).unwrap().evicted, 0);
     assert_eq!(s.cleanup(u64::MAX / 2).unwrap().evicted, 0);
-    // Nothing evictable left except pinned/unsynced/recent: tiny cap stops instead of looping.
-    let r2 = s.cleanup(1).unwrap();
-    assert_eq!(r2.unsynced_kept, 200);
+    // A tiny cap evicts everything but pinned torrents, then stops instead of looping.
+    s.cleanup(1).unwrap();
     assert!(present(&pinned));
-    assert!(s.get_raw_events_sync(&[unsynced[0].id()]).unwrap().len() == 1);
 }
 
 #[test]
