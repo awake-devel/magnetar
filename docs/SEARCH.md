@@ -31,9 +31,11 @@ lowest id (D6). Fields:
   publisher); stored: `publisher_trust` (one per publisher), `infohash`, `event_id`, `pubkey`,
   `source_url`, `media_title`, `media_kind`;
 - facets (keyword, fast): `f_category`, `f_category_path`, `f_media_kind`, `f_genre`, `f_year`
-  from the media link shown to users (confidence ≥ 0.5, D40). STAGE 2 adds parsed attributes
-  (language, resolution, source, codec, hdr, …) as more `FACETS` entries and a
-  `SCHEMA_VERSION` bump.
+  from the media link shown to users (confidence ≥ 0.5, D40; `year` is the media year, else the
+  year in the name), and since `SCHEMA_VERSION` 2 the release attributes of `torrent_attrs`
+  (D44, docs/FILTERS.md): `f_language`, `f_subtitles`, `f_resolution`, `f_source`, `f_codec`,
+  `f_hdr`, `f_audio`, `f_channels`, `f_edition`, `f_format`, `f_group`; plus fast `year` and the
+  stored `attrs` JSON returned in every hit.
 
 ## Lifecycle
 
@@ -107,8 +109,11 @@ and then sends `1000` with the flag, which the app shows as "1,000+".
 `GET /api/v1/facets?field=<name>&size=<n>&<search parameters>` → `FacetsResponse { field,
 total, counts: [{value, count}] }`, most frequent first, over the results of the search
 parameters (same parsing as `/api/v1/search`). Names: `category`, `category_path`,
-`media_kind`, `genre`, `year`. 400 for an unknown name, 503 `search_index_unavailable` while the
-index is disabled or building (older servers: 404), so the app hides facet UI then.
+`media_kind`, `genre`, `year`, and the D44 attributes `language`, `subtitles`, `resolution`,
+`source`, `codec`, `hdr`, `audio`, `channels`, `edition`, `format`, `group`. 400 for an unknown
+name, 503 `search_index_unavailable` while the index is disabled or building (older servers:
+404), so the app hides facet UI then. `POST /api/v1/facets` (D44) counts several at once over a
+JSON `SearchQuery`; every facet is counted without its own filter (docs/FILTERS.md).
 
 ## Stats counters
 

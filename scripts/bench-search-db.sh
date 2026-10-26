@@ -6,7 +6,9 @@
 # Copies the torrents (plus liveness and media links) of a running Magnetar database with a
 # read-only COPY ... TO STDOUT, then inflates them: copy k > 0 of every torrent gets a derived
 # infohash and event id, a varied title (resolution, codec, language, source, group, year),
-# a shifted date and size. The source database is only read.
+# a shifted date and size. The release attributes (D44) are then parsed with
+# `magnetar-server attrs` (its JSON report shows how long that takes). The source database is
+# only read.
 #
 # Environment:
 #   SRC_PSQL   psql command for the source  (default: docker exec -i magnetar-db-1 psql -U magnetar -d magnetar)
@@ -118,6 +120,11 @@ SQL
   pids+=($!)
 done
 for p in "${pids[@]}"; do wait "$p"; done
+
+step "release attributes (D44), parsed by the server binary"
+dst -c "ALTER TABLE torrent_attrs DISABLE TRIGGER search_changes_ins"
+DATABASE_URL=$url "$BIN" attrs
+dst -c "ALTER TABLE torrent_attrs ENABLE TRIGGER search_changes_ins"
 
 step "indexes back, analyze"
 dst <<'SQL'

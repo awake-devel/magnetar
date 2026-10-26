@@ -59,6 +59,8 @@ of the app on an Android 17 (API 37) x86_64 emulator against a live server crawl
 | Relay discovery (seed list, NIP-65, kind 3 maps, tag hints) | core | Tested |
 | Full-text search: Postgres `tsvector` + `pg_trgm`, SQLite FTS5 offline on the phone | server, ffi | Tested |
 | Filters (category, size, date, seeders, hide dead, trust) and sorts (relevance, date, size, seeders) | both | Tested (hide dead: no dead torrent was available to observe) |
+| Release filters like a private tracker: audio and subtitle language (French scene tags VFF, VFQ, VF2, VFI, VOF, TRUEFRENCH, MULTi, VOSTFR, SUBFRENCH, … and 30 other languages), resolution, source, codec, HDR, audio, genre, IMDb rating, year; live counts next to every choice; sort by rating; saved searches and notifications keep them | core, server, app | New (D44, docs/FILTERS.md): parser checked by hand on 320 production titles (first pass: languages 97.5 %, every field 93.1 %); server and phone cache in automated tests; app built and unit-tested, **UNVERIFIED** on a device or emulator |
+| Title page: every release of a movie or series grouped by season/episode, quality and language, with seeders | server, app | New (D44): server and offline cache in automated tests; app screen **UNVERIFIED** on a device or emulator |
 | Detail: files, trackers, infohash, npub, open/copy magnet, pin, hide, block publisher | app | Tested |
 | Web-of-trust score 0-100 with explanation (follows, mutes, reports, PoW bonus) | core | Tested |
 | Swarm liveness: UDP (BEP 15), HTTP scrape (BEP 48), DHT scrape (BEP 33), TTL cache | core | Tested against real trackers and the DHT |

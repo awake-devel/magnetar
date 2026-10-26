@@ -348,5 +348,55 @@ pub fn search_query_set(now: i64) -> Vec<(String, magnetar_core::query::SearchQu
     f.offset = 180;
     f.limit = 20;
     out.push(("deep page".into(), f));
+    // Release/media filters (D44).
+    out.push((
+        "lang fr-ca browse".into(),
+        SearchQuery {
+            languages: vec!["fr-ca".into()],
+            ..t("")
+        },
+    ));
+    out.push((
+        "fr + 1080p + h265 browse".into(),
+        SearchQuery {
+            languages: vec!["fr".into()],
+            resolutions: vec!["1080p".into()],
+            video_codecs: vec!["h265".into()],
+            ..t("")
+        },
+    ));
+    out.push((
+        "fr subs \"one piece\"".into(),
+        SearchQuery {
+            subtitles: vec!["fr".into()],
+            ..t("one piece")
+        },
+    ));
+    out.push((
+        "remux + dv + atmos browse".into(),
+        SearchQuery {
+            sources: vec!["remux".into()],
+            hdr: vec!["dv".into()],
+            audio: vec!["atmos".into(), "truehd".into()],
+            ..t("")
+        },
+    ));
+    out.push((
+        "drama, rating 7, 2010-2020".into(),
+        SearchQuery {
+            genres: vec!["drama".into()],
+            min_rating: Some(7.0),
+            min_year: Some(2010),
+            max_year: Some(2020),
+            ..t("")
+        },
+    ));
+    out.push((
+        "sort rating \"french\"".into(),
+        SearchQuery {
+            sort: Sort::Rating,
+            ..t("french")
+        },
+    ));
     out
 }

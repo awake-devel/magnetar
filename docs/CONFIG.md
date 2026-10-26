@@ -11,6 +11,7 @@ magnetar-server migrate               # apply sqlx migrations (idempotent)
 magnetar-server crawl-once [--seconds N]
 magnetar-server selftest              # DB, DNS, TLS (NIP-11 of a seed relay), UDP
 magnetar-server enrich [--reimport] [--rematch]   # refresh IMDb datasets, link all pending torrents, JSON report
+magnetar-server attrs [--force]       # parse release attributes (language, quality, …) of torrents without current ones, JSON report
 magnetar-server --version
 ```
 
@@ -55,6 +56,12 @@ the last pass), `last_report`, `passes` since start, `last_error` and `next_run`
 and the search index under `search_index` (null when disabled): `state` (`building` | `ready` |
 `error`), `docs`, `build_done`/`build_total`, `build_secs`, `last_commit`, `pending` changes,
 `lag_secs` (age of the oldest pending change), `bytes` on disk, `error`.
+
+Release attributes (ARCHITECTURE.md D44, docs/FILTERS.md) need no configuration: `serve` parses
+new torrents as they arrive and, at startup, any torrent stored before D44 or by an older parser
+(`release::PARSER_VERSION`), in chunks of 2000 off the async runtime; `magnetar-server attrs`
+does the same once (`--force`: every torrent again). `GET /health` lists `features`
+(`filters`, `facet_set`, `media_releases`); the app hides what a server does not list.
 
 librqbit keeps its session and DHT state in `<state dir>/downloads`, where the state dir is
 `$XDG_STATE_HOME/magnetar` (default `~/.local/state/magnetar`). The image keeps it under

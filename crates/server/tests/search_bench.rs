@@ -155,6 +155,59 @@ async fn search_at_scale() {
         );
     }
 
+    // The app's filter sheet (D44): every facet at once, disjunctive, with and without filters.
+    let fields: Vec<String> = [
+        "language",
+        "subtitles",
+        "resolution",
+        "source",
+        "codec",
+        "hdr",
+        "audio",
+        "genre",
+        "media_kind",
+    ]
+    .map(String::from)
+    .to_vec();
+    for (name, q) in [
+        (
+            "browse",
+            SearchQuery {
+                min_trust: Some(0),
+                ..Default::default()
+            },
+        ),
+        (
+            "\"french\" fr-ca 1080p",
+            SearchQuery {
+                text: "french".into(),
+                languages: vec!["fr-ca".into()],
+                resolutions: vec!["1080p".into()],
+                min_trust: Some(0),
+                ..Default::default()
+            },
+        ),
+    ] {
+        let mut samples: Vec<Duration> = Vec::new();
+        let mut total = 0;
+        for _ in 0..5 {
+            let t = Instant::now();
+            total = store
+                .facet_set(&q, &fields, 50, now)
+                .await
+                .unwrap()
+                .unwrap()
+                .total;
+            samples.push(t.elapsed());
+        }
+        samples.sort();
+        eprintln!(
+            "facet set (9 facets) {name:<22} p50 {:>8.2} ms max {:>8.2} ms ({total} results)",
+            ms(pct(&samples, 0.5)),
+            ms(*samples.last().unwrap())
+        );
+    }
+
     // Throughput: the whole set from 8 concurrent clients.
     let t = Instant::now();
     let store = Arc::new(store);
