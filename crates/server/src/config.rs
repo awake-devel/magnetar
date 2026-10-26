@@ -256,6 +256,10 @@ pub struct Config {
         default_value = "1.1.1.1:443,9.9.9.9:443"
     )]
     pub dht_probe: String,
+    /// Extra hard-blocklist terms (D53): plain text, one per line, `context:` prefix for the
+    /// context tier. Additive only; a file that does not load stops the server.
+    #[arg(long, env = "MAGNETAR_BLOCKLIST_FILE")]
+    pub blocklist_file: Option<std::path::PathBuf>,
 }
 
 impl Config {

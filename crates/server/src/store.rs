@@ -1009,6 +1009,50 @@ impl Store for PgStore {
             .map_err(db)
     }
 
+    async fn put_blocked(&self, infohash: &str, event_id: &str, rule_version: i16) -> Result<()> {
+        // Hash and id only (D53): the event's text is never stored or logged.
+        let now = magnetar_core::now();
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        sqlx::query(
+            "INSERT INTO blocked_infohashes (infohash, blocked_at, rule_version, origin)
+             VALUES ($1, $2, $3, 'nostr') ON CONFLICT (infohash) DO NOTHING",
+        )
+        .bind(infohash)
+        .bind(now)
+        .bind(rule_version)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        sqlx::query(
+            "INSERT INTO blocked_events (id, blocked_at) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(event_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        // A DHT row under the same hash goes too (its name passed the screen without the
+        // publisher's adult category or description).
+        sqlx::query("DELETE FROM dht_torrents WHERE infohash = $1")
+            .bind(infohash)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        tx.commit().await.map_err(db)
+    }
+
+    async fn is_blocked(&self, infohash: &str, event_id: &str) -> Result<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM blocked_infohashes WHERE infohash = $1)
+                 OR EXISTS (SELECT 1 FROM blocked_events WHERE id = $2)",
+        )
+        .bind(infohash)
+        .bind(event_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db)
+    }
+
     async fn known_torrent_event(&self, id: &str) -> Result<bool> {
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM torrents WHERE event_id = $1)")
             .bind(id)

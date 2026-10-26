@@ -208,6 +208,9 @@ pub enum Rejection {
     NoInfohash,
     OrphanComment,
     TooLarge,
+    /// The hard illegal-content blocklist matched (D53), or the infohash/event was blocked
+    /// before. Never says which rule or term.
+    Blocked,
 }
 
 impl Rejection {
@@ -222,6 +225,7 @@ impl Rejection {
             Rejection::NoInfohash => "invalid: no valid infohash",
             Rejection::OrphanComment => "blocked: comment references unknown torrent",
             Rejection::TooLarge => "invalid: event too large",
+            Rejection::Blocked => "blocked: content policy",
         }
     }
 }

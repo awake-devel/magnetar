@@ -18,6 +18,9 @@ async fn main() -> anyhow::Result<()> {
     magnetar_core::http::install_crypto_provider();
 
     let cli = Cli::parse();
+    // D53: the hard blocklist is loaded before any command; a list that does not load stops
+    // the process (fail closed).
+    dht::screen::install_from_config(&cli.config)?;
     match cli.command {
         Command::Serve => server::serve(cli.config).await,
         Command::Migrate => {

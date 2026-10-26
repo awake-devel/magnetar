@@ -1,5 +1,7 @@
 //! Verify + classify raw events; store them (D5, D7). Owner: nostr agent.
 
+use crate::blocklist::{self, Verdict};
+use crate::classify;
 use crate::error::Error;
 use crate::model::*;
 use crate::nip35;
@@ -19,9 +21,39 @@ pub enum IngestOutcome {
     Rejected(Rejection),
 }
 
-/// Size/kind/time checks, id + signature verification, then NIP-35/replaceable classification.
+/// Size/kind/time checks, id + signature verification, NIP-35/replaceable classification, then
+/// the hard illegal-content blocklist on torrents ([`screen_torrent`], D53).
 /// Kind 1111 is accepted only with a `K` tag of "2003"; 30007 only with `d` = "2003".
 pub fn classify(raw: RawEvent, now: i64) -> Result<IngestItem, Rejection> {
+    let item = classify_unscreened(raw, now)?;
+    if let IngestItem::Torrent(t, _) = &item
+        && screen_torrent(t).is_block()
+    {
+        return Err(Rejection::Blocked);
+    }
+    Ok(item)
+}
+
+/// The blocklist verdict on a kind 2003 (D53): title and file names with both tiers,
+/// description and hashtags with the hard tier only; the context tier applies when the
+/// publisher filed it under `porn` or its name/files carry an adult signal (`core::classify`).
+/// No list loaded at all → blocked (fail closed). Never logs anything.
+pub fn screen_torrent(t: &ParsedTorrent) -> Verdict {
+    let Some(list) = blocklist::global() else {
+        return Verdict::Block(blocklist::Tier::Hard);
+    };
+    let mut texts: Vec<&str> = Vec::with_capacity(t.files.len() + 1);
+    texts.push(&t.title);
+    texts.extend(t.files.iter().map(|f| f.path.as_str()));
+    let mut hard_only: Vec<&str> = vec![&t.description];
+    hard_only.extend(t.hashtags.iter().map(String::as_str));
+    let adult = t.category == Category::Porn || classify::adult_signal(&t.title, &texts[1..]);
+    list.check(&texts, &hard_only, adult)
+}
+
+/// [`classify`] without the blocklist (`ingest_into` screens itself so it can record the
+/// blocked hash).
+pub fn classify_unscreened(raw: RawEvent, now: i64) -> Result<IngestItem, Rejection> {
     // Cheap checks first; verification is the expensive part.
     if !ACCEPTED_KINDS.contains(&raw.kind) {
         return Err(Rejection::UnsupportedKind);
@@ -80,12 +112,22 @@ pub async fn ingest_into<S: Store + ?Sized>(
     raw: RawEvent,
     now: i64,
 ) -> crate::Result<IngestOutcome> {
-    let item = match classify(raw, now) {
+    let item = match classify_unscreened(raw, now) {
         Ok(item) => item,
         Err(r) => return Ok(IngestOutcome::Rejected(r)),
     };
     let inserted = match &item {
-        IngestItem::Torrent(t, raw) => store.put_torrent(t, raw).await?,
+        IngestItem::Torrent(t, raw) => {
+            if store.is_blocked(&t.infohash, &t.event_id).await? {
+                return Ok(IngestOutcome::Rejected(Rejection::Blocked));
+            }
+            if screen_torrent(t).is_block() {
+                let version = blocklist::global().map_or(0, |b| b.version());
+                store.put_blocked(&t.infohash, &t.event_id, version).await?;
+                return Ok(IngestOutcome::Rejected(Rejection::Blocked));
+            }
+            store.put_torrent(t, raw).await?
+        }
         IngestItem::Comment(c, raw) => {
             if !store.known_torrent_event(&c.torrent_event_id).await? {
                 return Ok(IngestOutcome::Rejected(Rejection::OrphanComment));

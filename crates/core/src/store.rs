@@ -28,6 +28,20 @@ pub trait Store: Send + Sync {
     async fn has_event(&self, id: &str) -> Result<bool>;
     async fn known_torrent_event(&self, id: &str) -> Result<bool>;
     async fn get_raw_events(&self, ids: &[String]) -> Result<Vec<RawEvent>>;
+    /// D53: remember a torrent event the blocklist rejected — its infohash and event id only,
+    /// never its text — so neither is accepted (or refetched) again. Default: nothing kept.
+    async fn put_blocked(
+        &self,
+        _infohash: &str,
+        _event_id: &str,
+        _rule_version: i16,
+    ) -> Result<()> {
+        Ok(())
+    }
+    /// D53: the infohash or the event id was blocked before (any origin). Default: never.
+    async fn is_blocked(&self, _infohash: &str, _event_id: &str) -> Result<bool> {
+        Ok(false)
+    }
 
     // ---- relays + cursors
     /// Insert if missing. Never changes `enabled` or a "manual" source of an existing row.
