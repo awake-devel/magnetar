@@ -641,6 +641,8 @@ async fn import_locked(
 
     let now = magnetar_core::now();
     let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    // Before the table locks: an enricher batch holding the media lock reads imdb_titles.
+    crate::media_lock::lock(&mut tx).await?;
     sqlx::raw_sql(
         "DROP TABLE imdb_titles;
          ALTER TABLE imdb_titles_new RENAME TO imdb_titles;

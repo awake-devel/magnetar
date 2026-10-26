@@ -471,3 +471,132 @@ async fn e2e_production_sample() {
         }
     }
 }
+
+/// Both enrichers on the same works at the same time (D46): the IMDb enricher creates and
+/// links rows by `i` tag while the anime enricher adopts the same rows and relinks the same
+/// torrents. Before the media-links lock this could end in "deadlock detected".
+#[tokio::test]
+async fn imdb_and_anime_enrichers_run_concurrently() {
+    use magnetar_server::enrich::{self, EnrichConfig};
+    let Some(db) = test_db().await else { return };
+    let pool = db.store.pool().clone();
+    let dir = scratch("concurrent");
+    let (aod, fribb) = write_datasets(&dir);
+    let cfg = cfg(&aod, &fribb);
+    enrich_anime::refresh(&pool, &cfg, true).await.unwrap();
+    let (ix, version) = enrich_anime::load_index(&pool, true)
+        .await
+        .unwrap()
+        .unwrap();
+    let ix = std::sync::Arc::new(ix);
+    let works = [
+        ("Jujutsu Kaisen", "tt12343534"),
+        ("Golden Kamuy", "tt7999998"),
+        ("Sousou no Frieren", "tt22248376"),
+    ];
+    for n in 1..=300u64 {
+        let (title, imdb) = works[n as usize % works.len()];
+        let mut t = anime_torrent(n, &format!("[Group] {title} - {:02} (1080p)", n % 24 + 1));
+        t.p.external_ids.push(("imdb".into(), imdb.into()));
+        put(&db.store, t).await;
+    }
+    let ecfg = EnrichConfig {
+        imdb: None,
+        refresh: std::time::Duration::from_secs(3600),
+        fuzzy: false,
+    };
+    for round in 0..4 {
+        // Make everything due again for both.
+        pool.execute("DELETE FROM enrich_checked; DELETE FROM anime_attempts")
+            .await
+            .unwrap();
+        let (a, b) = tokio::join!(
+            enrich::drain(&db.store, &ecfg),
+            enrich_anime::match_all(&pool, &ix, &version)
+        );
+        let a = a.unwrap_or_else(|e| panic!("round {round}: imdb enricher: {e:#}"));
+        let b = b.unwrap_or_else(|e| panic!("round {round}: anime enricher: {e}"));
+        assert_eq!((a.checked, b.scanned), (300, 300), "round {round}");
+    }
+    // Both writers queue on the media-links lock: while someone holds it, neither commits.
+    pool.execute("DELETE FROM enrich_checked; DELETE FROM anime_attempts")
+        .await
+        .unwrap();
+    let mut holder = pool.begin().await.unwrap();
+    magnetar_server::media_lock::lock(&mut holder)
+        .await
+        .unwrap();
+    let both = async {
+        tokio::join!(
+            enrich::drain(&db.store, &ecfg),
+            enrich_anime::match_all(&pool, &ix, &version)
+        )
+    };
+    tokio::pin!(both);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), &mut both)
+            .await
+            .is_err(),
+        "a writer went ahead without the lock"
+    );
+    let committed: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM enrich_checked) + (SELECT count(*) FROM anime_attempts)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(committed, 0, "no batch committed while the lock was held");
+    holder.rollback().await.unwrap();
+    let (a, b) = both.await;
+    assert_eq!((a.unwrap().checked, b.unwrap().scanned), (300, 300));
+
+    let links: i64 = sqlx::query_scalar("SELECT count(*) FROM torrent_media")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(links, 300, "one link per torrent");
+    let per_imdb: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT imdb, count(*) FROM media WHERE imdb IS NOT NULL GROUP BY imdb ORDER BY imdb",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(per_imdb.iter().all(|(_, n)| *n == 1), "{per_imdb:?}");
+}
+
+/// A real deadlock is recognised as retryable (the enrichers retry such a batch once).
+#[tokio::test]
+async fn deadlocks_are_recognised() {
+    use sqlx::Connection;
+    let Some(db) = test_db().await else { return };
+    let pool = db.store.pool().clone();
+    pool.execute(
+        "CREATE TABLE dl (id int PRIMARY KEY, v int); INSERT INTO dl VALUES (1, 0), (2, 0)",
+    )
+    .await
+    .unwrap();
+    let mut a = pool.acquire().await.unwrap();
+    let mut b = pool.acquire().await.unwrap();
+    let mut ta = a.begin().await.unwrap();
+    let mut tb = b.begin().await.unwrap();
+    sqlx::query("UPDATE dl SET v = 1 WHERE id = 1")
+        .execute(&mut *ta)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE dl SET v = 1 WHERE id = 2")
+        .execute(&mut *tb)
+        .await
+        .unwrap();
+    let (ra, rb) = tokio::join!(
+        sqlx::query("UPDATE dl SET v = 2 WHERE id = 2").execute(&mut *ta),
+        sqlx::query("UPDATE dl SET v = 2 WHERE id = 1").execute(&mut *tb),
+    );
+    let err = ra
+        .err()
+        .or(rb.err())
+        .expect("one of them is the deadlock victim");
+    assert!(magnetar_server::media_lock::is_conflict(&err), "{err}");
+    assert!(magnetar_server::media_lock::is_conflict_any(
+        &anyhow::Error::from(err)
+    ));
+}

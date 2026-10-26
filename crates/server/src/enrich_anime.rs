@@ -845,7 +845,7 @@ struct MediaIds {
 /// external ids cannot fail. A row created by another matcher for the same work (same IMDb /
 /// TMDB / TVDB id, no anime ids yet) is adopted and gets the anime ids; its title and kind are
 /// left to its owner.
-async fn upsert_media(conn: &mut PgConnection, ix: &AnimeIndex, entry: usize) -> Result<i64> {
+async fn upsert_media(conn: &mut PgConnection, ix: &AnimeIndex, entry: usize) -> sqlx::Result<i64> {
     let e = &ix.entries[entry];
     let c = ix.cross_ids(entry).owned();
     let (mal, anilist, anidb) = (opt_i32(e.mal), opt_i32(e.anilist), opt_i32(e.anidb));
@@ -863,8 +863,7 @@ async fn upsert_media(conn: &mut PgConnection, ix: &AnimeIndex, entry: usize) ->
     .bind(tmdb_tv)
     .bind(tvdb)
     .fetch_all(&mut *conn)
-    .await
-    .map_err(db)?;
+    .await?;
     let own = rows
         .iter()
         .find(|r| mal.is_some() && r.mal == mal)
@@ -933,8 +932,7 @@ async fn upsert_media(conn: &mut PgConnection, ix: &AnimeIndex, entry: usize) ->
             .bind(runtime)
             .bind(now)
             .execute(&mut *conn)
-            .await
-            .map_err(db)?;
+            .await?;
             Ok(r.id)
         }
         None => sqlx::query_scalar::<_, i64>(
@@ -957,32 +955,32 @@ async fn upsert_media(conn: &mut PgConnection, ix: &AnimeIndex, entry: usize) ->
         .bind(runtime)
         .bind(now)
         .fetch_one(&mut *conn)
-        .await
-        .map_err(db),
+        .await,
     }
 }
 
 /// `upsert_media` in a savepoint, retried once: a concurrent matcher may insert the same
 /// external id between our SELECT and INSERT.
-async fn upsert_media_retry(conn: &mut PgConnection, ix: &AnimeIndex, entry: usize) -> Result<i64> {
+async fn upsert_media_retry(
+    conn: &mut PgConnection,
+    ix: &AnimeIndex,
+    entry: usize,
+) -> sqlx::Result<i64> {
     for attempt in 0..2 {
         sqlx::query("SAVEPOINT anime_media")
             .execute(&mut *conn)
-            .await
-            .map_err(db)?;
+            .await?;
         match upsert_media(conn, ix, entry).await {
             Ok(id) => {
                 sqlx::query("RELEASE SAVEPOINT anime_media")
                     .execute(&mut *conn)
-                    .await
-                    .map_err(db)?;
+                    .await?;
                 return Ok(id);
             }
             Err(e) => {
                 sqlx::query("ROLLBACK TO SAVEPOINT anime_media")
                     .execute(&mut *conn)
-                    .await
-                    .map_err(db)?;
+                    .await?;
                 if attempt == 1 {
                     return Err(e);
                 }
@@ -1043,7 +1041,38 @@ pub async fn match_pending(
     .map_err(|e| Error::Other(e.to_string()))?;
 
     let now = magnetar_core::now();
-    let mut tx = pool.begin().await.map_err(db)?;
+    let written = match write_matches(pool, ix, dataset, &results, now).await {
+        // Rolled back as a whole: run it once more (D46).
+        Err(e) if crate::media_lock::is_conflict(&e) => {
+            tracing::warn!("anime: {e}; retrying the batch once");
+            crate::media_lock::retry_pause().await;
+            write_matches(pool, ix, dataset, &results, now).await
+        }
+        r => r,
+    }
+    .map_err(db)?;
+    report.low_confidence = written.low_confidence;
+    report.kept = written.kept;
+    report.unmatched = written.unmatched;
+    report.matched = written.matched;
+    report.by_method = written.by_method;
+    report.media_rows = written.media_rows;
+    report.duration_ms = started.elapsed().as_millis() as u64;
+    Ok(report)
+}
+
+/// Write one batch of match results in one transaction under the media-links lock. Counts go
+/// to the returned report (only the write-side fields).
+async fn write_matches(
+    pool: &PgPool,
+    ix: &AnimeIndex,
+    dataset: &str,
+    results: &[(String, Option<AnimeMatch>)],
+    now: i64,
+) -> sqlx::Result<MatchReport> {
+    let mut report = MatchReport::default();
+    let mut tx = pool.begin().await?;
+    crate::media_lock::lock(&mut tx).await?;
     let hashes: Vec<&str> = results.iter().map(|(h, _)| h.as_str()).collect();
     // Existing links we must not replace: manual ones, and other matchers' at least as
     // confident as ours (the upsert below re-checks this, for races).
@@ -1054,13 +1083,12 @@ pub async fn match_pending(
         )
         .bind(&hashes)
         .fetch_all(&mut *tx)
-        .await
-        .map_err(db)?
+        .await?
         .into_iter()
         .map(|(h, method, conf, kind)| (h, (method, conf, kind)))
         .collect();
     let mut media_ids: HashMap<usize, i64> = HashMap::new();
-    for (infohash, m) in &results {
+    for (infohash, m) in results {
         let m = m.as_ref().filter(|m| {
             let ok = m.confidence >= MIN_CONFIDENCE;
             if !ok {
@@ -1111,8 +1139,7 @@ pub async fn match_pending(
                 .bind(anime::MATCHER_VERSION)
                 .bind(now)
                 .execute(&mut *tx)
-                .await
-                .map_err(db)?
+                .await?
                 .rows_affected();
                 if written == 0 {
                     report.kept += 1;
@@ -1134,15 +1161,14 @@ pub async fn match_pending(
                 )
                 .bind(infohash)
                 .execute(&mut *tx)
-                .await
-                .map_err(db)?;
+                .await?;
             }
         }
     }
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "INSERT INTO anime_attempts (infohash, dataset, matcher_version, matched, tried_at) ",
     );
-    qb.push_values(&results, |mut b, (infohash, m)| {
+    qb.push_values(results, |mut b, (infohash, m)| {
         b.push_bind(infohash)
             .push_bind(dataset)
             .push_bind(anime::MATCHER_VERSION)
@@ -1154,10 +1180,9 @@ pub async fn match_pending(
               matcher_version = EXCLUDED.matcher_version, matched = EXCLUDED.matched,
               tried_at = EXCLUDED.tried_at",
     );
-    qb.build().execute(&mut *tx).await.map_err(db)?;
-    tx.commit().await.map_err(db)?;
+    qb.build().execute(&mut *tx).await?;
+    tx.commit().await?;
     report.media_rows = media_ids.len() as u64;
-    report.duration_ms = started.elapsed().as_millis() as u64;
     Ok(report)
 }
 

@@ -8,6 +8,7 @@ pub mod discovery;
 pub mod enrich;
 pub mod enrich_anime;
 pub mod filter;
+pub mod media_lock;
 pub mod relay;
 mod search;
 pub mod search_index;

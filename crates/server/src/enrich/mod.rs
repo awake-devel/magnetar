@@ -45,6 +45,7 @@ use tokio::sync::watch;
 
 use crate::config::Config;
 use crate::daemons::stop_requested;
+use crate::media_lock;
 use crate::store::PgStore;
 
 /// Infohashes per batch (one read of their events, one write transaction).
@@ -999,6 +1000,7 @@ async fn apply(
 ) -> anyhow::Result<EnrichReport> {
     let mut rep = EnrichReport::default();
     let mut tx = pool.begin().await?;
+    media_lock::lock(&mut tx).await?;
     let mut imdb_cache: HashMap<u32, (i64, Option<i32>, Option<i32>)> = HashMap::new();
     for (g, d) in groups.iter().zip(decisions) {
         rep.checked += 1;
@@ -1154,7 +1156,15 @@ pub async fn enrich_batch(
     let groups = load_groups(pool, &infohashes).await?;
     let (decisions, fallback_ms) = decide(pool, &groups, imported.is_some(), cfg.fuzzy).await?;
     let now = magnetar_core::now();
-    let mut rep = apply(pool, &groups, decisions, now).await?;
+    let mut rep = match apply(pool, &groups, decisions.clone(), now).await {
+        // Rolled back as a whole: run it once more (D46).
+        Err(e) if media_lock::is_conflict_any(&e) => {
+            tracing::warn!("enrich: {e:#}; retrying the batch once");
+            media_lock::retry_pause().await;
+            apply(pool, &groups, decisions, now).await?
+        }
+        r => r?,
+    };
     rep.fallback_ms = fallback_ms;
     rep.ms = started.elapsed().as_millis() as u64;
     Ok(rep)
