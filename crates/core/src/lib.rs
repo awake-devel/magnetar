@@ -14,6 +14,8 @@ pub mod http;
 pub mod ingest;
 pub mod liveness;
 pub mod magnet;
+#[cfg(feature = "dht-crawl")]
+pub mod metainfo;
 pub mod model;
 pub mod nip35;
 pub mod nip66;

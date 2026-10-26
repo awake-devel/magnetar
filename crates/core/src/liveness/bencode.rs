@@ -63,6 +63,15 @@ pub fn decode(input: &[u8]) -> Result<Value, String> {
     Ok(v)
 }
 
+/// Decode one value at the start of `input` and return it with the number of bytes it took;
+/// whatever follows is left to the caller (BEP 9 `data` messages append the metadata block
+/// after the bencoded dict).
+pub fn decode_prefix(input: &[u8]) -> Result<(Value, usize), String> {
+    let mut p = Parser { buf: input, pos: 0 };
+    let v = p.value(0)?;
+    Ok((v, p.pos))
+}
+
 pub fn encode(v: &Value) -> Vec<u8> {
     let mut out = Vec::new();
     encode_into(v, &mut out);

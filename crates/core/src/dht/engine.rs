@@ -187,6 +187,8 @@ struct Counters {
     nodes_filtered: AtomicU64,
     nodes_farm: AtomicU64,
     ip_changes: AtomicU64,
+    udp_bytes_in: AtomicU64,
+    udp_bytes_out: AtomicU64,
 }
 
 fn bump(a: &AtomicU64) {
@@ -250,6 +252,10 @@ pub struct EngineStats {
     pub pool: PoolStats,
     pub peer_store_hashes: usize,
     pub peer_store_peers: usize,
+    /// UDP payload bytes received / sent by every virtual node (bandwidth, IP/UDP headers not
+    /// included).
+    pub udp_bytes_in: u64,
+    pub udp_bytes_out: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -696,6 +702,8 @@ impl Dht {
             pool: s.pool.counts().into(),
             peer_store_hashes: s.peers.hashes(),
             peer_store_peers: s.peers.peers(),
+            udp_bytes_in: g(&c.udp_bytes_in),
+            udp_bytes_out: g(&c.udp_bytes_out),
         }
     }
 
@@ -794,6 +802,8 @@ impl Dht {
             return Err(QueryError::Io);
         }
         bump(&c.sent[kind.min(4)]);
+        c.udp_bytes_out
+            .fetch_add(wire.len() as u64, Ordering::Relaxed);
         self.inner.state.lock().unwrap().brake.sent();
         let rx = guard.rx.as_mut().expect("receiver until drop");
         match tokio::time::timeout(self.inner.cfg.query_timeout, rx).await {
@@ -844,6 +854,10 @@ impl Dht {
                     Err(_) => continue,
                 },
             };
+            self.inner
+                .c
+                .udp_bytes_in
+                .fetch_add(n as u64, Ordering::Relaxed);
             let SocketAddr::V4(src) = src else { continue };
             if n > MAX_DATAGRAM {
                 bump(&self.inner.c.too_long);
@@ -1044,6 +1058,8 @@ impl Dht {
             .is_ok()
         {
             bump(&c.responses_sent);
+            c.udp_bytes_out
+                .fetch_add(wire.len() as u64, Ordering::Relaxed);
         }
         if let Some(sg) = sighting {
             self.sight(sg);
