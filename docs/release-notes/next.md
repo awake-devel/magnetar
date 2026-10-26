@@ -52,6 +52,14 @@ must be updated together to get all of it, but each side keeps working with an o
 - Interactive network graphs: web of trust, relays and publishers, a title's releases, and a
   torrent's swarm (from its detail page).
 
+### One title page per film (D48)
+
+- A film or show whose releases carried only a TMDB id no longer has a second, rating-less
+  title page next to its IMDb one (e.g. Dune (2021) was split 17 / 9 releases): the server reads
+  the IMDb id from TMDB's details and merges the two. Existing duplicates are fixed by a
+  background pass after the update (needs `MAGNETAR_TMDB_TOKEN`; ~33.6 k rows on production,
+  one TMDB request each at `MAGNETAR_TMDB_RPS`, about half an hour at the default 20/s).
+
 ## Older servers and offline mode
 
 - The app asks `GET /health` for `features` and hides what the server lacks: an older server

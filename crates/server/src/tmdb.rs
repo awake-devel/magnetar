@@ -23,6 +23,7 @@ use sqlx::{FromRow, PgPool};
 use tokio::sync::{mpsc, watch};
 
 use crate::config::Config;
+use crate::enrich::{ImdbAdoption, adopt_tmdb_imdb};
 use crate::store::db;
 
 pub const API_BASE: &str = "https://api.themoviedb.org/3";
@@ -48,6 +49,17 @@ const PURGE_EVERY: Duration = Duration::from_secs(6 * 3600);
 pub const SRC_DETAILS: &str = "tmdb";
 pub const SRC_FIND: &str = "tmdb_find";
 pub const SRC_IMAGE: &str = "tmdb_image";
+/// D48: the IMDb id TMDB gave an IMDb-less row (`ImdbSeen`, lang ''), so the backfill does not
+/// ask again before [`NEGATIVE_SECS`].
+pub const SRC_IMDB: &str = "tmdb_imdb";
+/// Rows per backfill query (D48).
+pub const BACKFILL_BATCH: i64 = 100;
+/// Pause between backfill passes (new TMDB-only rows keep appearing).
+const BACKFILL_EVERY: Duration = Duration::from_secs(6 * 3600);
+/// Wait after start before the first pass, so the enrichers and the index go first.
+const BACKFILL_DELAY: Duration = Duration::from_secs(120);
+/// A pass stops after this many failures in a row (bad token, TMDB down).
+const BACKFILL_MAX_FAILURES: u32 = 5;
 
 pub fn season_source(season: i32) -> String {
     format!("tmdb_season:{season}")
@@ -172,6 +184,22 @@ pub struct SeasonText {
 pub struct FindResult {
     pub movie: Option<u32>,
     pub tv: Option<u32>,
+}
+
+/// What TMDB said about the IMDb id of an IMDb-less row (lang '', D48).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ImdbSeen {
+    pub imdb: Option<String>,
+}
+
+/// The IMDb id in a details body: movies carry `imdb_id`, shows only through
+/// `append_to_response=external_ids` (`external_ids.imdb_id`). Empty or malformed = None.
+pub fn imdb_from_details(body: &Value) -> Option<u32> {
+    [&body["imdb_id"], &body["external_ids"]["imdb_id"]]
+        .into_iter()
+        .filter_map(|v| v.as_str())
+        .find_map(|s| magnetar_core::enrich::ids::imdb_num(s.trim()))
+        .filter(|n| *n > 0)
 }
 
 /// A cached poster file (lang '').
@@ -412,6 +440,23 @@ pub struct Refreshed {
     pub details: bool,
     pub season: bool,
     pub poster: bool,
+    /// D48: an IMDb-less row learned its IMDb id from the details (set, or merged away).
+    pub imdb: Option<ImdbAdoption>,
+}
+
+/// What one backfill run did (D48).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BackfillReport {
+    pub checked: u64,
+    pub set: u64,
+    pub merged: u64,
+    /// TMDB has no IMDb id for the entry (or no entry any more).
+    pub no_imdb: u64,
+    /// IMDb id held by an anime row, or the row changed meanwhile.
+    pub skipped: u64,
+    pub failed: u64,
+    /// No candidate left.
+    pub done: bool,
 }
 
 pub struct Tmdb {
@@ -674,6 +719,12 @@ impl Tmdb {
     /// for every language (`append_to_response=translations`), one season call per language,
     /// one poster download.
     pub async fn refresh(&self, job: Job, now: i64) -> Result<Refreshed> {
+        self.refresh_with(job, now, false).await
+    }
+
+    /// [`Tmdb::refresh`]; `backfill` (D48) forces the details call (it carries the IMDb id)
+    /// and skips the poster.
+    async fn refresh_with(&self, job: Job, now: i64, backfill: bool) -> Result<Refreshed> {
         let x = load_extras(&self.pool, job.media_id).await?;
         let mut out = Refreshed::default();
         let Some((kind, id)) = self.resolve(job.media_id, now, &x).await? else {
@@ -695,21 +746,37 @@ impl Tmdb {
             .any_details()
             .filter(|_| same_target)
             .and_then(|t| t.poster_path.clone());
-        if !details_ok {
+        if !details_ok || backfill {
             let lang = self.cfg.langs[0].as_str();
+            // Movie details carry `imdb_id`; a show's IMDb id is in its external ids.
+            let append = match kind {
+                MediaKind::Movie => "translations",
+                _ => "translations,external_ids",
+            };
             let body = self
                 .get_json(
                     &format!("/{path_kind}/{id}"),
-                    &[("language", lang), ("append_to_response", "translations")],
+                    &[("language", lang), ("append_to_response", append)],
                 )
                 .await?;
-            if let Some(body) = body {
-                let texts = texts_from_details(&body, kind_str, id, &self.cfg.langs);
+            if let Some(body) = &body {
+                let texts = texts_from_details(body, kind_str, id, &self.cfg.langs);
                 poster_path = texts.first().and_then(|(_, t)| t.poster_path.clone());
                 for (lang, t) in texts {
                     put_extra(&self.pool, job.media_id, SRC_DETAILS, &lang, &t, now).await?;
                 }
                 out.details = true;
+            }
+            out.imdb = self.learn_imdb(job.media_id, body.as_ref(), now).await?;
+            if let Some(ImdbAdoption::Merged(keep)) = out.imdb {
+                // This row is gone (its media_extra with it); decorate the row it joined.
+                if !backfill {
+                    self.enqueue(Job {
+                        media_id: keep,
+                        season: job.season,
+                    });
+                }
+                return Ok(out);
             }
         }
         if let Some(season) = job.season.filter(|_| kind != MediaKind::Movie) {
@@ -730,7 +797,7 @@ impl Tmdb {
                 out.season = true;
             }
         }
-        if let Some(p) = poster_path {
+        if let Some(p) = poster_path.filter(|_| !backfill) {
             let cached = x
                 .image
                 .as_ref()
@@ -740,6 +807,114 @@ impl Tmdb {
             }
         }
         Ok(out)
+    }
+
+    /// D48: give an IMDb-less, non-anime row the IMDb id of its TMDB details (`body`; None =
+    /// TMDB answered 404), merging it into the row that already has that id. Records what was
+    /// seen ([`SRC_IMDB`]) so the backfill does not ask again soon.
+    async fn learn_imdb(
+        &self,
+        media_id: i64,
+        body: Option<&Value>,
+        now: i64,
+    ) -> Result<Option<ImdbAdoption>> {
+        let wanted: Option<bool> =
+            sqlx::query_scalar("SELECT imdb IS NULL AND kind <> 'anime' FROM media WHERE id = $1")
+                .bind(media_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db)?;
+        if wanted != Some(true) {
+            return Ok(None);
+        }
+        let tt = body.and_then(imdb_from_details);
+        let seen = ImdbSeen {
+            imdb: tt.map(|n| magnetar_core::enrich::ids::format_imdb(u64::from(n))),
+        };
+        put_extra(&self.pool, media_id, SRC_IMDB, "", &seen, now).await?;
+        let Some(tt) = tt else { return Ok(None) };
+        let r = adopt_tmdb_imdb(&self.pool, media_id, tt, now)
+            .await
+            .map_err(|e| Error::Other(format!("media {media_id} imdb tt{tt}: {e:#}")))?;
+        tracing::debug!("tmdb: media {media_id} is tt{tt}: {r:?}");
+        Ok(Some(r))
+    }
+
+    /// IMDb-less, non-anime rows with a TMDB id that TMDB was not asked about recently, by id
+    /// after `after` (D48 backfill).
+    pub async fn backfill_candidates(&self, now: i64, after: i64, limit: i64) -> Result<Vec<i64>> {
+        sqlx::query_scalar(
+            "SELECT m.id FROM media m
+             WHERE m.imdb IS NULL AND (m.tmdb_movie IS NOT NULL OR m.tmdb_tv IS NOT NULL)
+               AND m.kind <> 'anime' AND m.id > $1
+               AND NOT EXISTS (SELECT 1 FROM media_extra e WHERE e.media_id = m.id
+                   AND e.source = 'tmdb_imdb' AND e.fetched_at > $2)
+             ORDER BY m.id LIMIT $3",
+        )
+        .bind(after)
+        .bind(now - NEGATIVE_SECS)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)
+    }
+
+    /// D48 backfill: one details call per IMDb-less row with a TMDB id (paced by the shared
+    /// token bucket), at most `max` rows. Resumable: a row asked is marked ([`SRC_IMDB`]) or
+    /// leaves the candidates (IMDb id set, or merged away), so a later run continues where an
+    /// interrupted one stopped. Stops with an error after [`BACKFILL_MAX_FAILURES`] failures
+    /// in a row.
+    pub async fn backfill_imdb(&self, now: i64, max: u64) -> Result<BackfillReport> {
+        let mut rep = BackfillReport::default();
+        let mut after = 0i64;
+        let mut failures = 0u32;
+        loop {
+            let left = max.saturating_sub(rep.checked);
+            if left == 0 {
+                return Ok(rep);
+            }
+            let ids = self
+                .backfill_candidates(
+                    now,
+                    after,
+                    BACKFILL_BATCH.min(i64::try_from(left).unwrap_or(i64::MAX)),
+                )
+                .await?;
+            if ids.is_empty() {
+                rep.done = true;
+                return Ok(rep);
+            }
+            for media_id in ids {
+                after = media_id;
+                rep.checked += 1;
+                let job = Job {
+                    media_id,
+                    season: None,
+                };
+                match self.refresh_with(job, now, true).await {
+                    Ok(r) => {
+                        failures = 0;
+                        match r.imdb {
+                            Some(ImdbAdoption::Set) => rep.set += 1,
+                            Some(ImdbAdoption::Merged(_)) => rep.merged += 1,
+                            Some(ImdbAdoption::Skipped) => rep.skipped += 1,
+                            None if r.tmdb.is_some() => rep.no_imdb += 1,
+                            None => rep.skipped += 1,
+                        }
+                    }
+                    Err(e) => {
+                        rep.failed += 1;
+                        failures += 1;
+                        tracing::debug!("tmdb backfill: media {media_id}: {e}");
+                        if failures >= BACKFILL_MAX_FAILURES {
+                            return Err(Error::Other(format!(
+                                "tmdb backfill: {failures} failures in a row, last: {e}"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn image_file(&self, i: &ImageRef) -> PathBuf {
@@ -943,6 +1118,33 @@ fn remove_unreferenced(dir: &Path, keep: &std::collections::HashSet<String>) -> 
         }
     }
     removed
+}
+
+/// D48: backfill pass shortly after start, then every [`BACKFILL_EVERY`] (rows created from
+/// TMDB-only releases since then). Only runs with a TMDB token (no `Tmdb` otherwise).
+pub async fn backfill_loop(tmdb: Arc<Tmdb>, mut shutdown: watch::Receiver<bool>) {
+    let mut wait = BACKFILL_DELAY;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = crate::daemons::stop_requested(&mut shutdown) => return,
+        }
+        wait = BACKFILL_EVERY;
+        let started = Instant::now();
+        let run = tmdb.backfill_imdb(magnetar_core::now(), u64::MAX);
+        tokio::select! {
+            r = run => match r {
+                Ok(r) if r.checked > 0 => tracing::info!(
+                    checked = r.checked, set = r.set, merged = r.merged, no_imdb = r.no_imdb,
+                    skipped = r.skipped, failed = r.failed,
+                    "tmdb imdb backfill: done in {:.0} s", started.elapsed().as_secs_f64()
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("{e}"),
+            },
+            _ = crate::daemons::stop_requested(&mut shutdown) => return,
+        }
+    }
 }
 
 /// Background prefetch of recently matched popular media plus the 6-month purge.

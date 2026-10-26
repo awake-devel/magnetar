@@ -168,6 +168,10 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
             t.clone(),
             stop_rx.clone(),
         )));
+        daemons.push(tokio::spawn(tmdb::backfill_loop(
+            t.clone(),
+            stop_rx.clone(),
+        )));
     }
 
     let listener = tokio::net::TcpListener::bind(cfg.bind)
