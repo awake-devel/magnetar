@@ -34,9 +34,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import app.magnetar.backlogEta
+import app.magnetar.ffi.FfiLivenessStats
 import app.magnetar.ffi.FfiStats
 import app.magnetar.formatAgo
 import app.magnetar.formatBytes
+import app.magnetar.formatCount
 import app.magnetar.ui.common.Banner
 import app.magnetar.ui.common.SectionTitle
 
@@ -62,6 +65,7 @@ fun StatusScreen(vm: StatusViewModel = viewModel()) {
                 Column(Modifier.padding(horizontal = 16.dp)) {
                     state.stats?.let { StatsCard(it) }
                     ServerCard(state, vm.hasServer, vm::checkServer)
+                    state.liveness?.let { LivenessCard(it) }
                     Row(Modifier.padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(onClick = vm::crawlNow, enabled = !state.workRunning) { Text("Crawl now") }
                         OutlinedButton(onClick = vm::syncNow, enabled = !state.workRunning && vm.hasServer) {
@@ -115,6 +119,29 @@ private fun StatsCard(s: FfiStats) {
             StatLine("Database size", formatBytes(s.dbBytes))
             StatLine("Last crawl", s.lastCrawl?.let { formatAgo(it) } ?: "never")
             StatLine("Last sync", s.lastSync?.let { formatAgo(it) } ?: "never")
+        }
+    }
+}
+
+/** Seed checks on the server (D45): backlog, pace, latest results. */
+@Composable
+private fun LivenessCard(l: FfiLivenessStats) {
+    Card(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+        Column(Modifier.padding(12.dp)) {
+            Text("Seed checks (server)", style = MaterialTheme.typography.titleSmall)
+            if (!l.enabled) Text("Turned off on the server", style = MaterialTheme.typography.bodySmall)
+            StatLine("Never checked", "${formatCount(l.neverChecked)} of ${formatCount(l.torrents)}")
+            StatLine("Due now", formatCount(l.dueNow))
+            StatLine("Checked, last 24 h", formatCount(l.checked24h))
+            StatLine("Checks per hour", formatCount(l.checksPerHour))
+            backlogEta(l.dueNow, l.checksPerHour)?.let { StatLine("Backlog cleared in", it) }
+            StatLine("Seeded / dead / no answer", "${formatCount(l.alive)} / ${formatCount(l.dead)} / ${formatCount(l.unknown)}")
+            if (l.trackersBackedOff > 0uL) {
+                StatLine("Trackers backing off", "${formatCount(l.trackersBackedOff)} of ${formatCount(l.trackers)}")
+            }
+            l.lastBatchAt?.let {
+                StatLine("Last batch", "${formatCount(l.lastBatchSize)} in ${l.lastBatchMs.toLong() / 1000} s, ${formatAgo(it)}")
+            }
         }
     }
 }

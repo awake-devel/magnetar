@@ -26,6 +26,15 @@ class FormatTest {
     }
 
     @Test
+    fun backlogEtas() {
+        assertNull(backlogEta(0u, 6000u))
+        assertNull(backlogEta(500u, 0u))
+        assertEquals("under an hour", backlogEta(500u, 6000u))
+        assertEquals("≈ 18 h", backlogEta(430_000u, 24_000u))
+        assertEquals("≈ 3 d", backlogEta(430_000u, 6000u))
+    }
+
+    @Test
     fun fileNames() {
         assertEquals("E01.mkv", fileName("Season 1/E01.mkv"))
         assertEquals("E01.mkv", fileName("E01.mkv"))

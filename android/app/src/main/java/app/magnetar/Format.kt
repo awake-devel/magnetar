@@ -22,6 +22,20 @@ fun formatRate(bps: ULong): String = formatBytes(bps) + "/s"
 fun formatCount(n: ULong, lowerBound: Boolean = false): String =
     String.format(Locale.ROOT, "%,d", n.toLong()) + if (lowerBound) "+" else ""
 
+/**
+ * How long the server's seed checker needs for what is due now at its last-hour pace (D45):
+ * "under an hour", "≈ 5 h", "≈ 3 d"; null when nothing is due or nothing was checked lately.
+ */
+fun backlogEta(due: ULong, checksPerHour: ULong): String? {
+    if (due == 0uL || checksPerHour == 0uL) return null
+    val hours = due.toDouble() / checksPerHour.toDouble()
+    return when {
+        hours < 1 -> "under an hour"
+        hours < 48 -> "≈ ${Math.round(hours)} h"
+        else -> "≈ ${Math.round(hours / 24)} d"
+    }
+}
+
 /** Last path component of a file inside a torrent ("Season 1/E01.mkv" -> "E01.mkv"). */
 fun fileName(path: String): String = path.trimEnd('/').substringAfterLast('/')
 
