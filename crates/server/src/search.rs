@@ -84,6 +84,7 @@ impl HitRow {
             } else {
                 Origin::Nostr
             },
+            best_peers: self.best_peers.and_then(|b| u32::try_from(b).ok()),
         }
     }
 }

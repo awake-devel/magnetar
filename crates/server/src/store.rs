@@ -579,7 +579,9 @@ impl PgStore {
             .collect()
     }
 
-    /// Union of trackers of every event that published this infohash; None if unknown.
+    /// Union of trackers of every event that published this infohash; None if unknown. A
+    /// DHT-only torrent (D51) has none: `Some([])`, checked on the default trackers and the DHT
+    /// like a tracker-less Nostr torrent (before D77 a forced check of one answered 404).
     pub async fn trackers_for(&self, infohash: &str) -> Result<Option<Vec<String>>> {
         let rows: Vec<Vec<String>> = sqlx::query_scalar(
             "SELECT trackers FROM torrents WHERE infohash = $1 ORDER BY created_at, event_id",
@@ -589,7 +591,14 @@ impl PgStore {
         .await
         .map_err(db)?;
         if rows.is_empty() {
-            return Ok(None);
+            let dht: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM dht_torrents WHERE infohash = $1)",
+            )
+            .bind(infohash)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db)?;
+            return Ok(dht.then(Vec::new));
         }
         let mut out: Vec<String> = Vec::new();
         for t in rows.into_iter().flatten() {
@@ -654,6 +663,7 @@ impl PgStore {
             media_rating: media.as_ref().and_then(|m| m.rating),
             attrs: attrs.map(|a| a.0),
             origin: Origin::Dht,
+            best_peers: liveness.as_ref().and_then(|l| l.best_peers()),
         };
         let magnet = magnet::build_magnet(infohash, Some(&d.title), &[], total_size);
         let files = d.files.0.clone();
@@ -1523,6 +1533,7 @@ impl Store for PgStore {
             media_rating: media.as_ref().and_then(|m| m.rating),
             attrs: attrs.map(|a| a.0),
             origin: Origin::from_sources(true, dht.is_some()),
+            best_peers: liveness.as_ref().and_then(|l| l.best_peers()),
         };
         let events = rows
             .iter()

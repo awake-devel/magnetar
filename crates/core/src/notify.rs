@@ -1,7 +1,8 @@
 //! ntfy notifications + saved-search evaluation (D25). Owner: trust-sync agent.
 
+use crate::api::{SavedSearchHits, SavedSearchPoll};
 use crate::model::{SavedSearch, TorrentSummary};
-use crate::query::Sort;
+use crate::query::{MAX_LIMIT, Sort};
 use crate::store::Store;
 
 /// ntfy message body limit (larger bodies become attachments).
@@ -162,4 +163,56 @@ pub async fn poll_saved_searches<S: Store + ?Sized>(
         }
     }
     Ok(out)
+}
+
+/// New hits of `searches` since a client-held watermark (D77, `GET /api/v1/saved-searches/poll`).
+/// Reads only: no watermark is stored, so it never takes hits from `poll_saved_searches` (the
+/// server's ntfy notifier) or from another client. `since` None = first poll: no hits, the
+/// watermark is `now`. Same semantics as the notifier otherwise: each search runs newest first
+/// with `since` raised to `since + 1` (so `created_at`, not arrival time, decides "new").
+/// `include_adult` adds the client's "Show adult content" switch to every query (D70).
+pub async fn new_hits_since<S: Store + ?Sized>(
+    store: &S,
+    searches: Vec<SavedSearch>,
+    since: Option<i64>,
+    include_adult: bool,
+    now: i64,
+) -> crate::Result<SavedSearchPoll> {
+    let Some(since) = since else {
+        return Ok(SavedSearchPoll {
+            watermark: now,
+            results: Vec::new(),
+        });
+    };
+    let mut watermark = since;
+    let mut results = Vec::new();
+    for s in searches {
+        let mut q = s.query.clone();
+        q.sort = Sort::Date;
+        q.descending = true;
+        q.offset = 0;
+        q.limit = MAX_LIMIT;
+        q.include_adult |= include_adult;
+        let after = since.saturating_add(1);
+        q.since = Some(q.since.map_or(after, |s| s.max(after)));
+        let page = store.search(&q, now).await?;
+        let hits: Vec<TorrentSummary> = page
+            .hits
+            .into_iter()
+            .filter(|h| h.created_at > since)
+            .collect();
+        if hits.is_empty() {
+            continue;
+        }
+        if let Some(n) = hits.iter().map(|h| h.created_at).max() {
+            watermark = watermark.max(n);
+        }
+        let truncated = page.total > hits.len() as u64 || page.total_is_lower_bound;
+        results.push(SavedSearchHits {
+            search: s,
+            hits,
+            truncated,
+        });
+    }
+    Ok(SavedSearchPoll { watermark, results })
 }

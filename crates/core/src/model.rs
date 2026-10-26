@@ -317,7 +317,7 @@ pub enum OverrideAction {
     Trust,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct SavedSearch {
     pub id: i64,
     pub name: String,
@@ -440,6 +440,11 @@ pub struct TorrentSummary {
     /// trust 0 and `publisher_count` 0; older servers send none (`Nostr`).
     #[serde(default)]
     pub origin: Origin,
+    /// What the latest seed check found: max(tracker seeders, DHT peer estimate), None =
+    /// never checked (D76). A DHT-only torrent without trackers has only the DHT estimate, so
+    /// `seeders` alone reads as unknown. Older servers send none.
+    #[serde(default)]
+    pub best_peers: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

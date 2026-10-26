@@ -641,6 +641,7 @@ impl SearchIndex {
                 .map(|r| r as f32 / 10.0),
             attrs: text(f.attrs).and_then(|j| serde_json::from_str(&j).ok()),
             origin,
+            best_peers: u32::try_from(best).ok(),
         };
         (summary, titles.join(" "))
     }

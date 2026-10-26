@@ -424,6 +424,11 @@ async fn empty_query_lists_dht_only_torrents_once_seeded() {
         ] {
             assert_eq!(keys_of(&p), set(&[1, 2, 5, 6]), "{path} {sort:?}");
             assert_eq!(p.total, 4, "{path} {sort:?}");
+            // `best_peers` carries what let it in: 6 has no tracker seeders, only DHT peers.
+            let six = p.hits.iter().find(|h| h.infohash == ih(6)).unwrap();
+            assert_eq!((six.seeders, six.best_peers), (None, Some(2)), "{path}");
+            let one = p.hits.iter().find(|h| h.infohash == ih(1)).unwrap();
+            assert_eq!(one.best_peers, None, "{path}: never checked");
         }
     }
     // Other filters keep the rule (still the empty query).
@@ -453,6 +458,32 @@ async fn empty_query_lists_dht_only_torrents_once_seeded() {
         pg.search(&chip, NOW).await.unwrap(),
     ] {
         assert_eq!(keys_of(&p), set(&[2, 3, 4, 5, 6, 7]));
+    }
+    // A forced seed check of a DHT-only torrent (no trackers) runs instead of answering 404.
+    // (No tracker and the DHT off: the check answers nothing, without touching the network.)
+    let offline = magnetar_core::liveness::LivenessConfig {
+        use_dht: false,
+        ..Default::default()
+    };
+    let state = magnetar_server::AppState::new(Arc::new(s.clone()), TOKEN).with_liveness(Arc::new(
+        magnetar_server::liveness::LivenessService::new(offline),
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, magnetar_server::router(state))
+            .await
+            .unwrap();
+    });
+    let http = magnetar_core::http::client(std::time::Duration::from_secs(20)).unwrap();
+    for (n, want) in [(3, 200), (99, 404)] {
+        let r = http
+            .post(format!("{base}/api/v1/torrents/{}/liveness", ih(n)))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), want, "infohash {n}");
     }
     let mut both = browse.clone();
     both.origins = vec!["dht".into(), "nostr".into()];

@@ -243,7 +243,13 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/saved-searches",
             get(saved_searches).post(put_saved_search),
         )
-        .route("/api/v1/saved-searches/{id}", delete(delete_saved_search))
+        .route("/api/v1/saved-searches/poll", get(poll_saved_searches))
+        .route(
+            "/api/v1/saved-searches/{id}",
+            get(saved_search)
+                .put(update_saved_search)
+                .delete(delete_saved_search),
+        )
         .route("/api/v1/downloads", get(downloads).post(add_download))
         .route("/api/v1/downloads/{id}", delete(remove_download))
         .route("/api/v1/downloads/{id}/{action}", post(download_action))
@@ -950,6 +956,90 @@ async fn put_saved_search(
     }
     s.id = st.store.put_saved_search(&s).await?;
     Ok(Json(s))
+}
+
+async fn saved_search(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<SavedSearch>> {
+    st.store
+        .list_saved_searches()
+        .await?
+        .into_iter()
+        .find(|s| s.id == id)
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("no such saved search"))
+}
+
+/// `PUT /api/v1/saved-searches/{id}` (D77): name, query and notify from the body; the server's
+/// own notifier watermarks (`last_checked`, `last_seen_created_at`) are kept, so editing a
+/// search from a client never replays or skips its ntfy notifications.
+async fn update_saved_search(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    body: Result<Json<SavedSearch>, JsonRejection>,
+) -> ApiResult<Json<SavedSearch>> {
+    let Json(body) = body?;
+    if body.name.trim().is_empty() {
+        return Err(ApiError::bad_request("name must not be empty"));
+    }
+    let Some(mut s) = st
+        .store
+        .list_saved_searches()
+        .await?
+        .into_iter()
+        .find(|s| s.id == id)
+    else {
+        return Err(ApiError::not_found("no such saved search"));
+    };
+    let query_changed = s.query != body.query;
+    s.name = body.name;
+    s.query = body.query;
+    s.notify = body.notify;
+    if query_changed {
+        // A new query starts over: its first notifier run records the newest match.
+        s.last_seen_created_at = None;
+    }
+    st.store.put_saved_search(&s).await?;
+    Ok(Json(s))
+}
+
+/// `GET /api/v1/saved-searches/poll?since=&adult=&id=&all=` (D77): the new hits of the saved
+/// searches (those with `notify`, or all with `all=1`; `id` = comma list) since the client's
+/// watermark. Stateless: see `core::notify::new_hits_since`.
+async fn poll_saved_searches(
+    State(st): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> ApiResult<Json<SavedSearchPoll>> {
+    let mut since = None;
+    let mut adult = false;
+    let mut all = false;
+    let mut ids: Vec<i64> = Vec::new();
+    for (k, v) in url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes()) {
+        match k.as_ref() {
+            "since" => since = Some(parse_num::<i64>(&k, &v)?),
+            "adult" => adult = parse_bool(&v)?,
+            "all" => all = parse_bool(&v)?,
+            "id" => {
+                for x in v.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+                    ids.push(parse_num(&k, x)?);
+                }
+            }
+            // Unknown parameters are ignored, as in the search query string.
+            _ => {}
+        }
+    }
+    let searches: Vec<SavedSearch> = st
+        .store
+        .list_saved_searches()
+        .await?
+        .into_iter()
+        .filter(|s| (all || s.notify) && (ids.is_empty() || ids.contains(&s.id)))
+        .collect();
+    let now = magnetar_core::now();
+    let poll =
+        magnetar_core::notify::new_hits_since(&*st.store, searches, since, adult, now).await?;
+    Ok(Json(poll))
 }
 
 async fn delete_saved_search(

@@ -68,6 +68,7 @@ pub fn summary(infohash: &str, title: &str, created_at: i64) -> TorrentSummary {
         media_rating: None,
         attrs: None,
         origin: Default::default(),
+        best_peers: None,
     }
 }
 

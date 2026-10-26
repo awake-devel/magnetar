@@ -44,6 +44,10 @@ pub mod features {
     /// `StatsHealth.dht` / `StatsResponse.dht` are filled. Not in `ALL` (it depends on the
     /// configuration).
     pub const DHT: &str = "dht";
+    /// `GET /api/v1/saved-searches/poll` (new hits since a client-held watermark) and
+    /// `GET|PUT /api/v1/saved-searches/{id}` (D77): saved searches and their notifications
+    /// from a thin client.
+    pub const SAVED_SEARCH_POLL: &str = "saved_search_poll";
     /// The empty query hides DHT-only torrents no seed check found peers for (D76).
     pub const BROWSE_CHECKED_DHT: &str = "browse_checked_dht";
     pub const ALL: &[&str] = &[
@@ -55,6 +59,7 @@ pub mod features {
         GRAPHS,
         ADULT_FILTER,
         ORIGIN,
+        SAVED_SEARCH_POLL,
         BROWSE_CHECKED_DHT,
     ];
 }
@@ -301,6 +306,29 @@ pub struct FacetSet {
     /// Results of the query with every filter.
     pub total: u64,
     pub facets: Vec<FacetsResponse>,
+}
+
+/// `GET /api/v1/saved-searches/poll` (D77): what the server's saved searches found since the
+/// client's watermark. Stateless on the server: the client keeps `watermark` and sends it back
+/// as `since`, so several clients and the server's own ntfy notifier never take each other's
+/// new hits.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct SavedSearchPoll {
+    /// Send this as `since` on the next poll: the newest `created_at` seen (or `since`), or
+    /// the server's clock when `since` was not given.
+    pub watermark: i64,
+    /// One entry per polled search with at least one new hit, in id order.
+    pub results: Vec<SavedSearchHits>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct SavedSearchHits {
+    pub search: SavedSearch,
+    /// Newest first, at most `query::MAX_LIMIT`.
+    pub hits: Vec<TorrentSummary>,
+    /// More new hits than returned.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// Releases of one movie/series (`GET /api/v1/media/{id}/releases`, D44), grouped by
@@ -788,6 +816,36 @@ impl ApiClient {
     pub async fn delete_saved_search(&self, id: i64) -> crate::Result<()> {
         let path = format!("/api/v1/saved-searches/{id}");
         self.send(self.req(Method::DELETE, &path)).await.map(drop)
+    }
+    /// `GET /api/v1/saved-searches/{id}` (D77).
+    pub async fn saved_search(&self, id: i64) -> crate::Result<SavedSearch> {
+        let path = format!("/api/v1/saved-searches/{id}");
+        self.json(self.req(Method::GET, &path)).await
+    }
+    /// `PUT /api/v1/saved-searches/{id}` (D77): name, query, notify; the server keeps its
+    /// notifier watermarks.
+    pub async fn update_saved_search(&self, s: &SavedSearch) -> crate::Result<SavedSearch> {
+        let path = format!("/api/v1/saved-searches/{}", s.id);
+        self.json(self.req(Method::PUT, &path).json(s)).await
+    }
+    /// `GET /api/v1/saved-searches/poll` (D77): new hits since `since` (None = first poll).
+    pub async fn poll_saved_searches(
+        &self,
+        since: Option<i64>,
+        include_adult: bool,
+    ) -> crate::Result<SavedSearchPoll> {
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(s) = since {
+            query.push(("since", s.to_string()));
+        }
+        if include_adult {
+            query.push(("adult", "1".into()));
+        }
+        self.json(
+            self.req(Method::GET, "/api/v1/saved-searches/poll")
+                .query(&query),
+        )
+        .await
     }
     pub async fn downloads(&self) -> crate::Result<Vec<DownloadInfo>> {
         self.json(self.req(Method::GET, "/api/v1/downloads")).await

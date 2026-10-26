@@ -907,6 +907,7 @@ impl SqliteStore {
                     media_rating: r.get::<_, Option<f64>>(31)?.map(|r| r as f32),
                     // The phone's cache holds Nostr events only (D51).
                     origin: Origin::Nostr,
+                    best_peers: liveness.as_ref().and_then(|l| l.best_peers()),
                 })
             })
             .db()?
@@ -1072,6 +1073,7 @@ impl SqliteStore {
             media_rating: media.as_ref().and_then(|m| m.rating),
             attrs,
             origin: Origin::Nostr,
+            best_peers: liveness.as_ref().and_then(|l| l.best_peers()),
         };
         let events = rows
             .iter()

@@ -42,6 +42,7 @@ fn summary() -> TorrentSummary {
         media_rating: None,
         attrs: None,
         origin: Origin::Both,
+        best_peers: Some(12),
     }
 }
 

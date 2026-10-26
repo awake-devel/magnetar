@@ -751,3 +751,164 @@ async fn negentropy_interop_nostr_sdk() {
     assert!(again.value.sent.is_empty() && again.value.received.is_empty());
     client.shutdown().await;
 }
+
+/// D77: saved searches and their notifications from a thin client — GET/PUT by id, and the
+/// stateless poll (client-held watermark; the server's own notifier watermarks untouched).
+#[tokio::test]
+async fn saved_searches_for_a_thin_client() {
+    use magnetar_core::query::SearchQuery;
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    let base = spawn_server(s).await;
+    let api = ApiClient::new(&base, Some(TOKEN.into())).unwrap();
+    let health = api.health().await.unwrap();
+    assert!(
+        health
+            .features
+            .iter()
+            .any(|f| f == features::SAVED_SEARCH_POLL)
+    );
+    put(s, torrent(1, 1, NOW - 100, 1, "ubuntu desktop")).await;
+    put(s, torrent(2, 1, NOW - 90, 2, "fedora workstation")).await;
+    let query = |text: &str| SearchQuery {
+        text: text.into(),
+        min_trust: Some(0),
+        ..Default::default()
+    };
+    let ubuntu = api
+        .put_saved_search(&SavedSearch {
+            name: "Ubuntu".into(),
+            query: query("ubuntu"),
+            notify: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let fedora = api
+        .put_saved_search(&SavedSearch {
+            name: "Fedora".into(),
+            query: query("fedora"),
+            notify: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(ubuntu.id > 0 && fedora.id > ubuntu.id);
+    assert_eq!(api.saved_search(ubuntu.id).await.unwrap(), ubuntu);
+    let (status, code) = error_code(get(&base, "/api/v1/saved-searches/999999").await).await;
+    assert_eq!(
+        (status, code.as_str()),
+        (StatusCode::NOT_FOUND, "not_found")
+    );
+
+    // First poll: no hits, the server's clock as the watermark.
+    let before = magnetar_core::now();
+    let p = api.poll_saved_searches(None, false).await.unwrap();
+    assert!(p.results.is_empty());
+    assert!(p.watermark >= before);
+    // Since a watermark: notify=true searches only, newest first.
+    let p = api
+        .poll_saved_searches(Some(NOW - 150), false)
+        .await
+        .unwrap();
+    assert_eq!(p.results.len(), 1);
+    assert_eq!(p.results[0].search.id, ubuntu.id);
+    let titles = |h: &SavedSearchHits| h.hits.iter().map(|t| t.title.clone()).collect::<Vec<_>>();
+    assert_eq!(titles(&p.results[0]), vec!["ubuntu desktop"]);
+    assert!(!p.results[0].truncated);
+    assert_eq!(p.watermark, NOW - 100);
+    // Something newer arrives: only it is new; polling again with the new watermark is empty.
+    put(s, torrent(3, 1, NOW - 50, 3, "ubuntu server")).await;
+    let p = api
+        .poll_saved_searches(Some(p.watermark), false)
+        .await
+        .unwrap();
+    assert_eq!(titles(&p.results[0]), vec!["ubuntu server"]);
+    assert_eq!(p.watermark, NOW - 50);
+    let again = api
+        .poll_saved_searches(Some(p.watermark), false)
+        .await
+        .unwrap();
+    assert!(again.results.is_empty());
+    assert_eq!(again.watermark, NOW - 50);
+    // The adult switch (D70) is the client's: hidden by default, shown with adult=1.
+    put(
+        s,
+        torrent(4, 1, NOW - 40, 4, "ubuntu xxx clip").cat(Category::Porn),
+    )
+    .await;
+    let hidden = api
+        .poll_saved_searches(Some(NOW - 50), false)
+        .await
+        .unwrap();
+    assert!(hidden.results.is_empty());
+    let shown = api.poll_saved_searches(Some(NOW - 50), true).await.unwrap();
+    assert_eq!(titles(&shown.results[0]), vec!["ubuntu xxx clip"]);
+    // all=1 includes notify=false searches; id= narrows.
+    let p: SavedSearchPoll = get(
+        &base,
+        &format!(
+            "/api/v1/saved-searches/poll?since={}&all=1&id={}",
+            NOW - 150,
+            fedora.id
+        ),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(p.results.len(), 1);
+    assert_eq!(titles(&p.results[0]), vec!["fedora workstation"]);
+    let r = get(&base, "/api/v1/saved-searches/poll?since=soon").await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    // Polling never moved the server's own notifier watermark.
+    let stored = s.list_saved_searches().await.unwrap();
+    assert!(stored.iter().all(|x| x.last_seen_created_at.is_none()));
+
+    // PUT by id: name/query/notify from the body; the notifier watermark survives a rename,
+    // and a new query starts over.
+    let mut watched = ubuntu.clone();
+    watched.last_seen_created_at = Some(NOW - 60);
+    watched.last_checked = Some(NOW - 1);
+    s.put_saved_search(&watched).await.unwrap();
+    let renamed = api
+        .update_saved_search(&SavedSearch {
+            name: "Ubuntu releases".into(),
+            last_seen_created_at: None,
+            ..ubuntu.clone()
+        })
+        .await
+        .unwrap();
+    assert_eq!(renamed.name, "Ubuntu releases");
+    assert_eq!(renamed.last_seen_created_at, Some(NOW - 60));
+    assert_eq!(renamed.last_checked, Some(NOW - 1));
+    assert_eq!(api.saved_search(ubuntu.id).await.unwrap(), renamed);
+    let requery = api
+        .update_saved_search(&SavedSearch {
+            query: query("ubuntu server"),
+            ..renamed.clone()
+        })
+        .await
+        .unwrap();
+    assert_eq!(requery.last_seen_created_at, None);
+    let missing = api
+        .update_saved_search(&SavedSearch {
+            id: 999_999,
+            ..renamed.clone()
+        })
+        .await;
+    assert!(missing.is_err());
+    let r = http()
+        .put(format!("{base}/api/v1/saved-searches/{}", ubuntu.id))
+        .bearer_auth(TOKEN)
+        .json(&SavedSearch {
+            name: " ".into(),
+            ..renamed.clone()
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    api.delete_saved_search(fedora.id).await.unwrap();
+    assert!(api.saved_search(fedora.id).await.is_err());
+}
