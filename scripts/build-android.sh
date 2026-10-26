@@ -40,7 +40,7 @@ if [[ "${SKIP_NATIVE:-0}" != 1 ]]; then
     cargo build -p magnetar-ffi --lib
     rm -rf "$APP_MAIN/java/app/magnetar/ffi"
     cargo run -q -p uniffi-bindgen -- generate \
-        --library "$ROOT/target/debug/libmagnetar_ffi.so" \
+        --library "${CARGO_TARGET_DIR:-$ROOT/target}/debug/libmagnetar_ffi.so" \
         --language kotlin --out-dir "$APP_MAIN/java" --no-format
 fi
 
