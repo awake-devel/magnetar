@@ -53,6 +53,8 @@ data class StatsUiState(
     val hasServer: Boolean = false,
     /** null until asked, or when the server did not answer. */
     val features: List<String>? = null,
+    /** The server was asked for its features (so a null [features] means it did not answer). */
+    val featuresChecked: Boolean = false,
     val filters: SearchFilters = SearchFilters(),
     val breakdowns: FfiBreakdownSet? = null,
     val years: FfiBreakdown? = null,
@@ -100,7 +102,7 @@ class StatsViewModel(application: Application) : BaseViewModel(application) {
         _state.update { it.copy(hasServer = hasServer) }
         viewModelScope.launch {
             val features = if (hasServer) ffiCatching { magApp.magnetar().serverFeatures() }.getOrNull() else null
-            _state.update { it.copy(features = features) }
+            _state.update { it.copy(features = features, featuresChecked = true) }
             loadBreakdowns()
             if (_state.value.stats) {
                 loadSeries()

@@ -57,6 +57,7 @@ import com.patrykandpatrick.vico.compose.common.component.rememberLineComponent
 import com.patrykandpatrick.vico.compose.common.component.rememberTextComponent
 import java.time.Instant
 import java.time.ZoneId
+import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.time.format.FormatStyle
 import java.util.Locale
@@ -64,9 +65,18 @@ import java.util.Locale
 /** What a metric's values are, for its labels. */
 enum class ValueUnit { COUNT, BYTES }
 
-/** Bucket start → short local date ("12 oct.", "Oct 12") or hour ("14:00"). */
-fun bucketLabel(at: Long, hourly: Boolean, locale: Locale = Locale.getDefault()): String {
-    val t = Instant.ofEpochSecond(at).atZone(ZoneId.systemDefault())
+/**
+ * Bucket start → short date ("12 oct.", "Oct 12") or hour ("14:00") in [zone]. Day buckets of
+ * the activity series are UTC days, so they are labelled in UTC (a local zone west of UTC
+ * would name the day before); hours and history points use the device's zone.
+ */
+fun bucketLabel(
+    at: Long,
+    hourly: Boolean,
+    locale: Locale = Locale.getDefault(),
+    zone: ZoneId = ZoneId.systemDefault(),
+): String {
+    val t = Instant.ofEpochSecond(at).atZone(zone)
     return if (hourly) {
         DateTimeFormatter.ofPattern("HH:mm", locale).format(t)
     } else {
@@ -92,6 +102,7 @@ fun ActivityChart(series: FfiTimeseries, unit: ValueUnit, colors: ChartColors, m
     }
     val hourly = series.bucket == "hour"
     val counter = series.kind == "counter"
+    val zone = if (hourly) ZoneId.systemDefault() else ZoneOffset.UTC
     val model = remember(series) {
         val x = points.indices.toList()
         val y = points.map { it.value }
@@ -110,7 +121,7 @@ fun ActivityChart(series: FfiTimeseries, unit: ValueUnit, colors: ChartColors, m
         guideline = null,
         valueFormatter = remember(series) {
             CartesianValueFormatter { _, x, _ ->
-                points.getOrNull(x.toInt())?.let { bucketLabel(it.at, hourly) } ?: " "
+                points.getOrNull(x.toInt())?.let { bucketLabel(it.at, hourly, zone = zone) } ?: " "
             }
         },
         itemPlacer = remember(points.size) {
@@ -129,7 +140,7 @@ fun ActivityChart(series: FfiTimeseries, unit: ValueUnit, colors: ChartColors, m
             com.patrykandpatrick.vico.compose.cartesian.marker.DefaultCartesianMarker.ValueFormatter { _, targets ->
                 val i = targets.firstOrNull()?.x?.toInt() ?: return@ValueFormatter ""
                 val p = points.getOrNull(i) ?: return@ValueFormatter ""
-                bucketLabel(p.at, hourly) + ": " + when (unit) {
+                bucketLabel(p.at, hourly, zone = zone) + ": " + when (unit) {
                     ValueUnit.COUNT -> formatNumber(p.value)
                     ValueUnit.BYTES -> formatBytes(p.value.coerceAtLeast(0).toULong())
                 }

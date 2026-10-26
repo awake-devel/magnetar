@@ -23,7 +23,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -172,6 +174,9 @@ fun BreakdownDonut(
 ) {
     val order = DONUT_ORDER[b.field].orEmpty()
     val parts = remember(b, colors) { slices(b, order, colors) }
+    // The gesture handler outlives a recomposition: it calls the latest callbacks.
+    val toggle by rememberUpdatedState(onToggle)
+    val open by rememberUpdatedState(onOpen)
     val sum = parts.sumOf { it.n.toDouble() }.coerceAtLeast(1.0)
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Box(Modifier.size(132.dp), contentAlignment = Alignment.Center) {
@@ -195,8 +200,8 @@ fun BreakdownDonut(
                             return null
                         }
                         detectTapGestures(
-                            onTap = { o -> hit(o)?.let(onToggle) },
-                            onLongPress = { o -> hit(o)?.let(onOpen) },
+                            onTap = { o -> hit(o)?.let(toggle) },
+                            onLongPress = { o -> hit(o)?.let(open) },
                         )
                     },
             ) {
@@ -305,6 +310,8 @@ fun YearColumns(
     val span = (last - first + 1).coerceAtLeast(1)
     val max = years.maxOf { it.second.count }.coerceAtLeast(1uL).toDouble()
     val byYear = years.associate { it.first to it.second }
+    val toggle by rememberUpdatedState(onToggle)
+    val open by rememberUpdatedState(onOpen)
     fun at(x: Float, width: Float): FfiFacetCount? = byYear[first + (x / width * span).toInt().coerceIn(0, span - 1)]
     Column(Modifier.fillMaxWidth()) {
         Canvas(
@@ -316,8 +323,8 @@ fun YearColumns(
                 }
                 .pointerInput(years) {
                     detectTapGestures(
-                        onTap = { o -> at(o.x, size.width.toFloat())?.let(onToggle) },
-                        onLongPress = { o -> at(o.x, size.width.toFloat())?.let(onOpen) },
+                        onTap = { o -> at(o.x, size.width.toFloat())?.let(toggle) },
+                        onLongPress = { o -> at(o.x, size.width.toFloat())?.let(open) },
                     )
                 },
         ) {

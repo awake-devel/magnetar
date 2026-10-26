@@ -756,13 +756,16 @@ async fn stats_health(State(st): State<AppState>) -> ApiResult<Json<StatsHealth>
 }
 
 /// A graph through the shared cache; None (unknown media/infohash) answers 404.
-async fn cached_graph<F, Fut>(st: &AppState, key: String, make: F) -> ApiResult<Json<Graph>>
+async fn cached_graph<F, Fut>(
+    cache: &stats::Cache<Option<Graph>>,
+    key: String,
+    make: F,
+) -> ApiResult<Json<Graph>>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = magnetar_core::Result<Option<Graph>>>,
 {
-    st.stats
-        .graphs
+    cache
         .get_or(key, make)
         .await?
         .as_ref()
@@ -773,7 +776,7 @@ where
 
 async fn graph_wot(State(st): State<AppState>) -> ApiResult<Json<Graph>> {
     let store = st.store.clone();
-    cached_graph(&st, "wot".into(), || async move {
+    cached_graph(&st.stats.graphs, "wot".into(), || async move {
         graphs::wot(&store).await.map(Some)
     })
     .await
@@ -781,7 +784,7 @@ async fn graph_wot(State(st): State<AppState>) -> ApiResult<Json<Graph>> {
 
 async fn graph_relays(State(st): State<AppState>) -> ApiResult<Json<Graph>> {
     let store = st.store.clone();
-    cached_graph(&st, "relays".into(), || async move {
+    cached_graph(&st.stats.graphs, "relays".into(), || async move {
         graphs::relays(&store, magnetar_core::now()).await.map(Some)
     })
     .await
@@ -789,7 +792,7 @@ async fn graph_relays(State(st): State<AppState>) -> ApiResult<Json<Graph>> {
 
 async fn graph_media(State(st): State<AppState>, Path(id): Path<i64>) -> ApiResult<Json<Graph>> {
     let store = st.store.clone();
-    cached_graph(&st, format!("media/{id}"), || async move {
+    cached_graph(&st.stats.graphs, format!("media/{id}"), || async move {
         graphs::media(&store, id, magnetar_core::now()).await
     })
     .await
@@ -801,7 +804,7 @@ async fn graph_swarm(
 ) -> ApiResult<Json<Graph>> {
     let ih = infohash_param(&infohash)?;
     let (store, live) = (st.store.clone(), st.liveness.clone());
-    cached_graph(&st, format!("swarm/{ih}"), || async move {
+    cached_graph(&st.stats.swarms, format!("swarm/{ih}"), || async move {
         graphs::swarm(&store, &live, &ih, magnetar_core::now()).await
     })
     .await

@@ -24,6 +24,8 @@ data class MediaUiState(
     /** In-page filters: one language group key and one resolution, null = all. */
     val language: String? = null,
     val resolution: String? = null,
+    /** The server draws release graphs (D47); false offline or from an older server. */
+    val graphs: Boolean = false,
 ) {
     /** Groups passing the in-page filters. */
     val shown: List<FfiReleaseGroup>
@@ -51,6 +53,10 @@ class MediaViewModel(application: Application, handle: SavedStateHandle) : BaseV
             ffiCatching { magApp.magnetar().mediaReleases(mediaId, query) }
                 .onSuccess { r ->
                     _state.update { it.copy(loading = false, releases = r) }
+                    if (r.source == "server") {
+                        val features = ffiCatching { magApp.magnetar().serverFeatures() }.getOrNull().orEmpty()
+                        _state.update { it.copy(graphs = "graphs" in features) }
+                    }
                     val poster = r.media?.poster
                     if (poster != null) {
                         ffiCatching { magApp.magnetar().mediaPoster(mediaId, poster) }

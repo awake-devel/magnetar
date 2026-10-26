@@ -71,6 +71,8 @@ pub const BREAKDOWN_TTL: Duration = Duration::from_secs(120);
 pub const TIMESERIES_TTL: Duration = Duration::from_secs(60);
 pub const HEALTH_TTL: Duration = Duration::from_secs(30);
 pub const GRAPH_TTL: Duration = Duration::from_secs(300);
+/// A swarm graph shows seed-check state, which a "check now" on the detail page changes.
+pub const SWARM_TTL: Duration = Duration::from_secs(30);
 /// Distinct answers kept per cache (filters make keys); the oldest go first.
 const CACHE_ENTRIES: usize = 64;
 
@@ -137,6 +139,7 @@ pub struct StatsService {
     pub series: Cache<TimeseriesSet>,
     pub health: Cache<StatsHealth>,
     pub graphs: Cache<Option<Graph>>,
+    pub swarms: Cache<Option<Graph>>,
 }
 
 impl Default for StatsService {
@@ -146,6 +149,7 @@ impl Default for StatsService {
             series: Cache::new(TIMESERIES_TTL),
             health: Cache::new(HEALTH_TTL),
             graphs: Cache::new(GRAPH_TTL),
+            swarms: Cache::new(SWARM_TTL),
         }
     }
 }

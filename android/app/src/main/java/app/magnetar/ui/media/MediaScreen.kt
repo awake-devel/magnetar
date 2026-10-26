@@ -96,7 +96,7 @@ fun MediaScreen(
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
                 actions = {
                     // The release graph (D47) is drawn from the server's data.
-                    if (state.releases?.source == "server") {
+                    if (state.releases?.source == "server" && state.graphs) {
                         IconButton(onClick = { onOpenGraph("media/${vm.mediaId}") }) {
                             Icon(app.magnetar.ui.common.AppIcons.Graph, "Release graph")
                         }

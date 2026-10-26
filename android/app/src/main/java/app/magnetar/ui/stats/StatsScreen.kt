@@ -121,6 +121,7 @@ private fun Charts(state: StatsUiState, colors: ChartColors, vm: StatsViewModel,
             !state.hasServer -> item {
                 Banner("No server: counts of the torrents cached on this phone (no filters, fewer charts).")
             }
+            !state.featuresChecked -> {}
             state.features == null -> item { Banner("The server did not answer: showing the phone's cache.") }
             !state.stats -> item { Banner("This server is older than the app and has no charts: showing the phone's cache.") }
             local -> item {
@@ -328,6 +329,10 @@ private fun ActivityCard(state: StatsUiState, colors: ChartColors, vm: StatsView
 private fun Graphs(state: StatsUiState, onOpen: (String) -> Unit) {
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
         if (!state.graphs) {
+            if (state.hasServer && !state.featuresChecked) {
+                item { LinearProgressIndicator(Modifier.fillMaxWidth().padding(vertical = 12.dp)) }
+                return@LazyColumn
+            }
             item {
                 Banner(
                     when {

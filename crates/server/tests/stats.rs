@@ -535,8 +535,29 @@ async fn api() {
             .status(),
         400
     );
+    // Every new route is behind the token.
+    for path in [
+        "stats/breakdown?field=language",
+        "stats/timeseries?metric=db_size",
+        "stats/health",
+        "graphs/wot",
+        "graphs/relays",
+        "graphs/media/1",
+        "graphs/swarm/0000000000000000000000000000000000000000",
+    ] {
+        assert_eq!(
+            http.get(format!("{base}/api/v1/{path}"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401,
+            "{path}"
+        );
+    }
     assert_eq!(
-        http.get(format!("{base}/api/v1/stats/health"))
+        http.post(format!("{base}/api/v1/stats/breakdown"))
+            .json(&serde_json::json!({"fields": ["language"]}))
             .send()
             .await
             .unwrap()

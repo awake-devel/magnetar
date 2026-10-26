@@ -29,7 +29,7 @@ class ForceLayoutTest {
         val a = ForceLayout(50, edges).apply { run() }
         val b = ForceLayout(50, edges).apply { run() }
         assertTrue(a.x.contentEquals(b.x) && a.y.contentEquals(b.y))
-        assertTrue("stops before the cap once settled", a.steps in 51..400)
+        assertTrue("stops before the cap once settled: ${a.steps}", a.steps in 51 until 400)
     }
 
     @Test

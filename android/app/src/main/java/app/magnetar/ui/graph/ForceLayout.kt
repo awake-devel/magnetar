@@ -44,7 +44,7 @@ class ForceLayout(
         pinned?.let { x[it] = 0f; y[it] = 0f }
     }
 
-    /** One step; returns the largest move (a settled layout moves under ~0.5). */
+    /** One step; returns the largest move (a settled layout moves under 0.5). */
     fun step(): Float {
         dx.fill(0f)
         dy.fill(0f)
@@ -92,7 +92,9 @@ class ForceLayout(
                 moved = max(moved, m)
             }
         }
-        temperature = max(temperature * 0.97f, 0.5f)
+        // Cools below the settle threshold, so `run` stops once the layout has frozen (a floor
+        // at the threshold itself would keep `moved` at 0.5 and always run to the cap).
+        temperature = max(temperature * 0.97f, 0.25f)
         steps++
         return moved
     }

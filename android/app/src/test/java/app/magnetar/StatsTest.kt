@@ -49,6 +49,10 @@ class StatsTest {
             assertEquals("Oct 12", bucketLabel(1_760_227_200, hourly = false, locale = Locale.US))
             assertEquals("12 oct.", bucketLabel(1_760_227_200, hourly = false, locale = Locale.FRANCE))
             assertEquals("00:00", bucketLabel(1_760_227_200, hourly = true, locale = Locale.FRANCE))
+            // A UTC day bucket keeps its date in a zone west of UTC.
+            val ny = java.time.ZoneId.of("America/New_York")
+            assertEquals("Oct 11", bucketLabel(1_760_227_200, hourly = false, locale = Locale.US, zone = ny))
+            assertEquals("Oct 12", bucketLabel(1_760_227_200, hourly = false, locale = Locale.US, zone = java.time.ZoneOffset.UTC))
         } finally {
             java.util.TimeZone.setDefault(tz)
         }

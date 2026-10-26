@@ -13,7 +13,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.isActive
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -73,7 +73,9 @@ class GraphViewModel(application: Application, handle: SavedStateHandle) : BaseV
             val l = ForceLayout(g.nodes.size, edges, pinned = subject)
             withContext(Dispatchers.Default) {
                 l.run { x, y ->
-                    if (isActive) _state.update { it.copy(x = x, y = y) }
+                    // Leaving the screen stops the layout at its next progress report.
+                    ensureActive()
+                    _state.update { it.copy(x = x, y = y) }
                 }
             }
             _state.update { it.copy(x = l.x.copyOf(), y = l.y.copyOf(), settled = true) }

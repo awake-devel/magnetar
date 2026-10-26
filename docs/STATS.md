@@ -56,7 +56,7 @@ written next to it. Numbers follow the phone's locale ("1 234 567", "12,3 k" in 
 ## API
 
 All endpoints need the bearer token. Answers are cached on the server (breakdowns 2 min,
-series 1 min, health 30 s, graphs 5 min).
+series 1 min, health 30 s, graphs 5 min, the swarm graph 30 s since a seed check changes it).
 
 ### `GET|POST /api/v1/stats/breakdown`
 
