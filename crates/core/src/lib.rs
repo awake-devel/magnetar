@@ -3,6 +3,8 @@
 
 pub mod api;
 pub mod crawler;
+#[cfg(feature = "dht-crawl")]
+pub mod dht;
 #[cfg(feature = "downloads")]
 pub mod downloads;
 pub mod enrich;

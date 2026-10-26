@@ -10,6 +10,8 @@ default = []
 downloads = ["dep:librqbit"]
 # Title parsing + IMDb ranking (server only; keeps the phone library small).
 enrich = ["dep:parse-torrent-title", "dep:unicode-normalization"]
+# Native DHT crawler (server only, docs/DHT.md, D49): KRPC node, BEP 51 sampling, passive capture.
+dht-crawl = []
 
 [dependencies]
 nostr.workspace = true
@@ -38,3 +40,4 @@ unicode-normalization = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
