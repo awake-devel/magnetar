@@ -833,7 +833,7 @@ blocked names anywhere; nothing from the DHT is published to Nostr.
 |---|---|---|
 | 0 | this document, D49–D58 | production counts, librqbit-dht API, BEP texts, router UPnP (read-only) |
 | 1 | `core::dht` KRPC, BEP 42 ids, routing, pool, sampler, limiter, responder, peer store; **pulled forward from stage 4** (swarm plan): migration §2.3, `server::dht` triage, `dht_seen` queue, retry, peer collection, `dht` CLI, config, `serve` daemon | BEP 5/42/51 vectors (BEP 42 over 4 bytes), arbitrary-bytes no-panic decoders, address filter, map caps (§3.8), fake-network tests, Postgres tests, bounded live aggressive runs (§13) |
-| 2 | `core::metainfo` BEP 3/10/9 fetcher, v1/hybrid/v2 verification | fake-peer tests (reject, short piece, wrong hash, hybrid, private, duplicate keys, LAN/loopback peer refused), bounded live fetch of sampled hashes |
+| 2 (built, §14) | `core::metainfo` BEP 3/10/9 fetcher, v1/hybrid/v2 verification; **pulled forward from stage 4**: fetch workers, `server::dht::persist` (dht_torrents + attrs batches, alias rows, final statuses), the fail-closed content-screen seam (D65) | fake-peer tests (reject, short piece, wrong hash, hybrid, private, duplicate keys, LAN/loopback peer refused), a real librqbit seed, Postgres storage tests, bounded live fetch of sampled hashes |
 | 3 | `core::classify`, `core::blocklist`, `Rejection::Blocked`, `scripts/blocklist-hash.sh` | accuracy sample, blocklist vectors (hashed, every name/path variant), Nostr ingest rejection (description/hashtags too), no-name-in-logs test at `TRACE` |
 | 4 | `server::dht::persist` (dht_torrents + attrs batches, alias rows), fetch results into `dht_seen` | Postgres tests, hybrid alias, bounded live aggressive run without UPnP |
 | 5 | `torrent_rows` readers, index `SCHEMA_VERSION` 3 (origin, eligible_trust, include_adult), API/ffi types, sweep | search/filters/detail tests on both paths (DHT rows pass `min_trust` in the SQL fallback too, `EXPLAIN` shows no seq scan of `dht_torrents`), `recompute_published` Nostr-only, sweep vacuum + merge |
@@ -914,3 +914,69 @@ malformed line. Not changed, noted: a triage batch that fails on a database erro
 the Bloom generation rotates (its hashes are already marked seen); a lookup that ends while its
 queries wait for a pace slot wastes those slots (part of the 164-of-200 q/s gap); the stage 1
 hourly re-collection described in §3.7.
+
+## 14. Stage 2: built and measured (2026-10-26)
+
+**Code.** `crates/core/src/metainfo/` (wire, fetch, info; feature `dht-crawl`, no new
+dependency), `crates/server/src/dht/persist.rs` (fetch results → Postgres) and
+`crates/server/src/dht/screen.rs` (the content-screen seam, D65); fetch workers and a batching
+persister in `server::dht`; `MAGNETAR_DHT_FETCH_CONCURRENCY`, `MAGNETAR_DHT_METADATA_MAX`.
+Protocol refinements are D64; the fail-closed storage rule is D65.
+
+**Tests.** Unit: wire layout against the BEP 9/10 example messages, info dict parser (padding
+files, `name.utf-8`, duplicate keys at any depth, v2 `file tree`, sizes overflowing, NUL),
+v1 / hybrid / v2-only verification, proptest "arbitrary bytes never panic" on every decoder.
+Fake peers (`core/tests/metainfo_fetch.rs`, 127.0.0.1): a good multi-block peer, and reject,
+short block, wrong bytes (hash mismatch), oversize claim, zero/negative size, size off by ±1,
+wrong `total_size`, no extension bit (we then send nothing after the handshake), wrong
+infohash, no `ut_metadata`, silent peer, 4 GiB length prefix, 1 MiB extended message, `have`
+flood, garbage stream, a peer asking us for metadata (answered with `reject`), private,
+hybrid sighted by its truncated v2 hash, pure v2, duplicate keys, LAN/loopback refused in
+production config, the 12-peer cap and the hash budget — every hostile case ends in < 5 s with
+its error code. **Real client** (`core/tests/metainfo_librqbit.rs`): an in-process librqbit
+9.0.1 session seeds a generated 402-file torrent (25 732-byte info dict, 2 metadata blocks) on
+127.0.0.1; the fetcher verifies it in ~3 ms. Postgres (`server/tests/dht_fetch_pg.rs`):
+storage with its triggers (infohash row with `dht`, seed-check schedule, search log, SQL
+`search_tsv` match, release attributes), duplicates, the screen blocking on a padding path with
+no trace of the name anywhere, no screen → nothing stored and the row re-queued, hybrid alias,
+hybrid whose SHA-1 is known, final statuses and backoff, and the whole pipeline (6-node fake
+DHT → peer collection → fake seeder → Postgres): 20/20 fetched, 19 stored, 1 blocked.
+
+**Live run** (release build, home IP, aggressive, 4 virtual nodes on UDP 6891–6894, **no UPnP,
+no router port opened**, no content screen so nothing named stored; scratch database
+`dht_stage2_live`, 540 s, `MAGNETAR_DHT_FETCH_CONCURRENCY` 128, 25 new TCP connections/s):
+
+| | |
+|---|---|
+| unique infohashes / queued | 11 175 / 11 173 (sampling paused 497 s of 540 by backpressure, D62) |
+| hashes given peers (≥ 1 peer) | 4 138 collected, 3 176 with peers (77 %); mean 8.3 peers, median 2, p90 25 |
+| metadata fetches finished / verified | 2 910 / **522** (2 hybrid) → **58 verified info dicts per minute**, success rate **17.9 %** of finished fetches |
+| hash-level failures (`last_error`) | 1 187 timeout (30 s hash budget), 936 connect, 198 closed, 29 no metadata, 24 handshake, 13 no `ut_metadata`, 1 reject; plus 962 `no_peers` from collection |
+| peer sessions | 13 890 started, 1 674 TCP connections established (12 %); 6 756 connect failures, 747 closed, 146 timeouts, 66 no `ut_metadata`, 35 no `metadata_size`, 25 bad handshake, 3 reject |
+| mean time of a successful fetch | 16.4 s |
+| verified metadata | 25.1 MB (≈ 48 KB per info dict) |
+| bandwidth | UDP 11.1 MB in / 7.7 MB out, TCP 38.3 MB in / 0.3 MB out → 0.73 Mbit/s in, 0.12 Mbit/s out |
+| KRPC | 134 queries/s, 51 % answered |
+| CPU / RSS | 10.7 s (2.0 % of one core) / 67.5 MB peak |
+| database after the run | `dht_torrents` 0 rows (no screen, D65); `dht_seen`: 7 303 queued, 522 `unscreened` (due again in 6 h), 2 388 failed |
+
+**Reading.** The fetch rate is bound by the **new-connection pace**: 13 890 attempts in 540 s
+is exactly the 25/s cap, and only 1 674 of them (12 %) reached a peer that accepted TCP —
+DHT peer lists are mostly stale or NAT-ed. Attempts queue for a pace slot, which is why a
+successful fetch takes 16 s on average and 1 187 hashes ran out of their 30 s budget. Pace
+slots are reserved ahead of time (`Pace::reserve`): when a hash finishes or times out, its
+still-waiting attempts are dropped and the slots they reserved go unused, so the real
+connection rate is below 25/s (≈ 5 600 of the 13 890 started sessions ended without any
+recorded outcome, most of them in this state — not measured precisely). This run predates
+D66 (commit "router-measured TCP bounds"), which raised the default to 150 attempts/s with
+≤ 350 open connections after a benchmark of the user's router (knee ~200 attempts/s,
+docs/research/router-bench.md); the fetch rate at the new defaults is **not measured here**.
+Replacing slot reservation with a polled token bucket (a dropped attempt then costs nothing)
+remains open for stage 8 tuning.
+
+**Not verified in stage 2.** Storage of real DHT names (deliberately: no blocklist yet, D65);
+the Tantivy index and app-side visibility of DHT rows (stage 5 readers); uTP-only peers
+(TCP only); behaviour past 9 minutes (retry of `unscreened` rows after 6 h, the 1 h / 6 h /
+24 h backoffs on real failures); memory with 16 MiB info dicts under load (the largest seen
+live is not recorded; only the 48 KB mean); passive capture with an open port (announcer path
+exercised only in the fake-network tests); IPv6 peers (dropped, BEP 32 later).

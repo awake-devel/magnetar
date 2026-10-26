@@ -107,6 +107,23 @@ must be updated together to get all of it, but each side keeps working with an o
   announcing a look-alike hash first; if the crawler cannot start (no network yet at boot), `serve`
   retries it after 30 s, then up to every 15 min, instead of leaving it off.
 
+### DHT crawler: metadata fetch (stage 2; docs/DHT.md §14, D64–D65)
+
+- The crawler now downloads each found torrent's metadata (name, files, sizes) from its peers
+  over TCP (BEP 3/10/9) and checks it against the infohash (SHA-1, or SHA-256 for hybrid
+  torrents). Private torrents, v2-only torrents, malformed or oversized metadata are recorded
+  and not retried; other failures back off 1 h, 6 h, 24 h, then stop.
+- **Nothing found on the DHT is stored or shown yet**: the illegal-content blocklist (next
+  stage) must check every name first, and until it exists the server drops the verified
+  metadata and keeps only the hash in its queue (fail closed).
+- New settings: `MAGNETAR_DHT_FETCH_CONCURRENCY` (128 aggressive / 16 polite) and
+  `MAGNETAR_DHT_METADATA_MAX` (16 MiB). The `dht` report adds fetch counts, verified
+  metadata per minute, success rate and bandwidth.
+- Live measurement from the home connection (9 min, no port opened): 58 torrents' metadata
+  verified per minute, 18 % of fetch attempts succeeded (most DHT peers no longer accept
+  connections), 0.7 Mbit/s down, 2 % of a core, 68 MB RAM. Tested against a real BitTorrent
+  client (librqbit) and 16 kinds of broken or hostile peers.
+
 ## Older servers and offline mode
 
 - The app asks `GET /health` for `features` and hides what the server lacks: an older server
