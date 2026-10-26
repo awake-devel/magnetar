@@ -121,7 +121,7 @@ crawler shows up in `/api/v1/stats`, `/api/v1/stats/health` and `/health` (featu
 | `MAGNETAR_DHT_QPS` | `200` / `50` | outbound DHT queries per second, all kinds (router benchmark: 300 safe, 400 breaks the neufbox) |
 | `MAGNETAR_DHT_POOL` | `1000000` / `200000` | nodes kept for sampling (1000–20000000) |
 | `MAGNETAR_DHT_FETCH_KNOWN` | `false` | also queue infohashes already known from Nostr |
-| `MAGNETAR_DHT_PEER_LOOKUPS` | `64` / `8` | peer collections running at once (1–512) |
+| `MAGNETAR_DHT_PEER_LOOKUPS` | `64` / `8` | peer collections running at once (1–8192; each is a light task, the KRPC rate is the real limit) |
 | `MAGNETAR_DHT_FETCH_CONCURRENCY` | `128` / `16` | metadata fetches in flight (1–2048); each opens ≤ 4 TCP connections at once, within the two limits below |
 | `MAGNETAR_DHT_TCP_RATE` | `150` | new TCP connection attempts per second, all fetches (1–2000). Each attempt is a NAT entry on the router: on the user's SFR neufbox 200/s was safe and 400/s cut the line (docs/research/router-bench.md) |
 | `MAGNETAR_DHT_TCP_MAX` | `350` | TCP connections open at once (1–10000); the same router held ~440 |

@@ -234,7 +234,7 @@ pub struct Config {
     pub dht_fetch_known: bool,
     /// Peer collections (get_peers to the sampling node, then a lookup) running at once
     /// (default 64 aggressive, 8 polite).
-    #[arg(long, env = "MAGNETAR_DHT_PEER_LOOKUPS", value_parser = clap::value_parser!(u32).range(1..=512))]
+    #[arg(long, env = "MAGNETAR_DHT_PEER_LOOKUPS", value_parser = clap::value_parser!(u32).range(1..=8192))]
     pub dht_peer_lookups: Option<u32>,
     /// BEP 9 metadata fetches in flight (default 128 aggressive, 16 polite).
     #[arg(long, env = "MAGNETAR_DHT_FETCH_CONCURRENCY", value_parser = clap::value_parser!(u32).range(1..=2048))]
