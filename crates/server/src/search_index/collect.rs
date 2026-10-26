@@ -44,6 +44,8 @@ pub struct Filter {
     pub max_year: Option<i64>,
     /// AND over fields, any value within one (D44).
     pub attrs: Vec<AttrFilter>,
+    /// Leave out adult documents (D52).
+    pub hide_adult: bool,
     pub now: i64,
 }
 
@@ -70,6 +72,7 @@ struct Columns {
     media_id: I64Col,
     media_rating: I64Col,
     year: I64Col,
+    adult: U64Col,
     /// One per `Filter::attrs`, same order: the column and the term ordinals wanted in this
     /// segment (a value the segment never saw has no ordinal: nothing there matches it).
     attrs: Vec<(Option<StrColumn>, Vec<u64>)>,
@@ -107,6 +110,7 @@ impl Columns {
             media_id: i("media_id")?,
             media_rating: i("media_rating")?,
             year: i("year")?,
+            adult: u("adult")?,
             attrs,
         })
     }
@@ -151,6 +155,9 @@ impl Columns {
     fn base_passes(&self, f: &Filter, doc: DocId) -> bool {
         // Some event passes (its trust, or its publisher is trusted locally), as in Postgres.
         if f.min_trust > 0 && self.eligible_trust.get_val(doc) < f.min_trust {
+            return false;
+        }
+        if f.hide_adult && self.adult.get_val(doc) != 0 {
             return false;
         }
         if f.categories != 0 && f.categories & (1 << self.category.get_val(doc).min(63)) == 0 {

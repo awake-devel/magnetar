@@ -24,6 +24,8 @@ class SettingsTest {
         assertEquals(emptyList<String>(), c.seedRelays)
         assertEquals("/data/dl/magnetar", c.downloadDir)
         assertEquals("/data/files/rqbit", c.stateDir)
+        assertFalse("adult content hidden by default (D52)", c.showAdult)
+        assertTrue(AppSettings(showAdult = true).toFfiConfig(dirs).showAdult)
     }
 
     @Test

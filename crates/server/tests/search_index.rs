@@ -918,6 +918,7 @@ fn synthetic_docs(n: u64) -> Vec<IndexDoc> {
                 expires_at: (seeded > 0).then_some(NOW + 3600),
                 media: None,
                 attrs: Some(magnetar_core::release::parse_release(&title, &[], cat)),
+                dht_adult: false,
             }
         })
         .collect()
@@ -957,4 +958,65 @@ fn latency_bounds_in_memory() {
     }
     drop(idx);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// D52: adult documents (canonical `porn`, or a DHT row classified `porn` under a Nostr event
+/// filed elsewhere) are hidden by default on both search paths; `include_adult` or selecting
+/// `porn` shows them.
+#[tokio::test]
+async fn adult_hidden_by_default_on_both_paths() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    put(
+        s,
+        torrent(1, 1, NOW - 300, 1, "clip one").cat(Category::Video),
+    )
+    .await;
+    put(
+        s,
+        torrent(2, 1, NOW - 200, 2, "clip two").cat(Category::Porn),
+    )
+    .await;
+    put(
+        s,
+        torrent(3, 1, NOW - 100, 3, "clip three").cat(Category::Video),
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO dht_torrents (infohash, title, file_count, total_size, category,
+             metadata_size, first_seen, fetched_at, discovered_via, classifier_version)
+         VALUES ($1, 'clip three dht', 1, 10, 'porn', 100, $2, $2, 'sample', 1)",
+    )
+    .bind(ih(3))
+    .bind(NOW)
+    .execute(s.pool())
+    .await
+    .unwrap();
+    let ix = index_for(s).await;
+    sync(s, &ix).await;
+    let pg = pg_only(s);
+    let run = async |q: SearchQuery| {
+        let a = s.search(&q, NOW).await.unwrap();
+        let b = pg.search(&q, NOW).await.unwrap();
+        assert_eq!(shape(&a), shape(&b), "index vs Postgres for {q:?}");
+        let mut t = titles(&a);
+        t.sort();
+        t
+    };
+    assert_eq!(run(q("clip")).await, vec!["clip one"]);
+    assert_eq!(run(q("")).await, vec!["clip one"], "browse too");
+    let mut all = q("clip");
+    all.include_adult = true;
+    assert_eq!(run(all).await, vec!["clip one", "clip three", "clip two"]);
+    let mut porn = q("clip");
+    porn.categories = vec![Category::Porn];
+    assert_eq!(
+        run(porn).await,
+        vec!["clip two"],
+        "choosing porn is consent"
+    );
+    // The API's query string: `adult=1`.
+    let parsed = magnetar_server::api::parse_search_query(Some("q=clip&adult=1")).unwrap();
+    assert!(parsed.include_adult);
+    drop(ix);
 }

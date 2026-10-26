@@ -296,6 +296,7 @@ fn offline() -> FfiConfig {
         seed_relays: vec![],
         download_dir: String::new(),
         state_dir: String::new(),
+        show_adult: false,
     }
 }
 

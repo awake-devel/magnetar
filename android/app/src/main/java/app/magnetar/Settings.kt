@@ -13,6 +13,8 @@ data class AppSettings(
     /** One relay URL per entry; empty = core defaults. */
     val seedRelays: List<String> = emptyList(),
     val backgroundSync: Boolean = true,
+    /** Settings → "Show adult content" (D52): off = adult torrents hidden everywhere. */
+    val showAdult: Boolean = false,
 ) {
     val hasServer: Boolean get() = serverUrl.isNotBlank()
 
@@ -25,6 +27,7 @@ data class AppSettings(
         seedRelays = seedRelays.map { it.trim() }.filter { it.isNotEmpty() },
         downloadDir = dirs.download.absolutePath,
         stateDir = dirs.state.absolutePath,
+        showAdult = showAdult,
     )
 
     companion object {
@@ -48,6 +51,7 @@ class SettingsStore(context: Context) {
                 ?.lines()?.map { it.trim() }?.filter { it.isNotEmpty() }
                 ?: d.seedRelays,
             backgroundSync = prefs.getBoolean(K_BACKGROUND, d.backgroundSync),
+            showAdult = prefs.getBoolean(K_ADULT, d.showAdult),
         )
     }
 
@@ -59,6 +63,7 @@ class SettingsStore(context: Context) {
         putInt(K_CACHE, s.cacheCapMb)
         putString(K_RELAYS, s.seedRelays.joinToString("\n"))
         putBoolean(K_BACKGROUND, s.backgroundSync)
+        putBoolean(K_ADULT, s.showAdult)
     }
 
     private companion object {
@@ -69,5 +74,6 @@ class SettingsStore(context: Context) {
         const val K_CACHE = "cache_cap_mb"
         const val K_RELAYS = "seed_relays"
         const val K_BACKGROUND = "background_sync"
+        const val K_ADULT = "show_adult"
     }
 }

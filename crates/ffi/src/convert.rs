@@ -115,6 +115,7 @@ impl From<FfiSearchQuery> for SearchQuery {
             min_rating: q.min_rating,
             min_year: q.min_year,
             max_year: q.max_year,
+            include_adult: q.include_adult,
         }
     }
 }
@@ -148,6 +149,7 @@ impl From<SearchQuery> for FfiSearchQuery {
             min_rating: q.min_rating,
             min_year: q.min_year,
             max_year: q.max_year,
+            include_adult: q.include_adult,
         }
     }
 }
@@ -559,6 +561,7 @@ pub struct StoredConfig {
     pub seed_relays: Vec<String>,
     pub download_dir: String,
     pub state_dir: String,
+    pub show_adult: bool,
 }
 
 impl From<&FfiConfig> for StoredConfig {
@@ -572,6 +575,7 @@ impl From<&FfiConfig> for StoredConfig {
             seed_relays: c.seed_relays.clone(),
             download_dir: c.download_dir.clone(),
             state_dir: c.state_dir.clone(),
+            show_adult: c.show_adult,
         }
     }
 }

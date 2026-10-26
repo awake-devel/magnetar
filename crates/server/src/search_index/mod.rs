@@ -717,6 +717,7 @@ pub fn index_query(
                     values,
                 })
                 .collect(),
+            hide_adult: q.hides_adult(),
             now,
         },
         sort,

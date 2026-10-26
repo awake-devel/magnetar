@@ -20,7 +20,8 @@ use tantivy::{TantivyDocument, Term};
 /// Bump on any change to fields, analyzer or document contents: the index is rebuilt.
 /// 2: release attributes (D44): `attrs`, `year`, the attribute facets, `year` facet = media
 /// year else parsed year.
-pub const SCHEMA_VERSION: u32 = 2;
+/// 3: `adult` (D52): canonical category `porn` or a DHT row classified `porn`.
+pub const SCHEMA_VERSION: u32 = 3;
 pub const TOKENIZER: &str = "magnetar";
 /// Descriptions are indexed up to this many characters (lower weight, mostly boilerplate).
 pub const DESCRIPTION_CHARS: i32 = 2000;
@@ -202,6 +203,8 @@ pub struct IndexDoc {
     pub media: Option<DocMedia>,
     /// Parsed release attributes (`torrent_attrs`, D44); None before the backfill reached it.
     pub attrs: Option<ReleaseAttrs>,
+    /// A DHT row of this infohash is classified `porn` (D52).
+    pub dht_adult: bool,
 }
 
 impl IndexDoc {
@@ -211,6 +214,11 @@ impl IndexDoc {
             .as_ref()
             .and_then(|m| m.year)
             .or_else(|| self.attrs.as_ref().and_then(|a| a.year))
+    }
+
+    /// Hidden unless the query asks for adult content (D52).
+    pub fn adult(&self) -> bool {
+        self.category == Category::Porn || self.dht_adult
     }
 }
 
@@ -249,6 +257,8 @@ pub struct Fields {
     pub year: Field,
     /// `ReleaseAttrs` as JSON (stored).
     pub attrs: Field,
+    /// 1 = adult (D52), fast.
+    pub adult: Field,
     /// One keyword field per `FACETS` entry, same order.
     pub facets: Vec<Field>,
 }
@@ -298,6 +308,7 @@ impl Fields {
         let media_rating = b.add_i64_field("media_rating", num.clone());
         let year = b.add_i64_field("year", num);
         let attrs = b.add_text_field("attrs", STORED);
+        let adult = b.add_u64_field("adult", NumericOptions::default().set_fast());
         let facets = FACETS
             .iter()
             .map(|f| b.add_text_field(&facet_field_name(f.name), STRING | FAST))
@@ -331,6 +342,7 @@ impl Fields {
             media_rating,
             year,
             attrs,
+            adult,
             facets,
         }
     }
@@ -411,6 +423,7 @@ impl Fields {
             }
         }
         doc.add_i64(self.year, d.year().map_or(NONE, i64::from));
+        doc.add_u64(self.adult, u64::from(d.adult()));
         if let Some(a) = &d.attrs
             && let Ok(j) = serde_json::to_string(a)
         {

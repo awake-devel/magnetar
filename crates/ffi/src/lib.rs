@@ -49,6 +49,10 @@ pub struct FfiConfig {
     pub download_dir: String,
     /// App-private dir for librqbit session + DHT state.
     pub state_dir: String,
+    /// Settings → "Show adult content" (D52): off by default; searches, browse, saved-search
+    /// notifications and stats then leave adult torrents out.
+    #[uniffi(default)]
+    pub show_adult: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -117,6 +121,9 @@ pub struct FfiSearchQuery {
     pub min_year: Option<i32>,
     #[uniffi(default)]
     pub max_year: Option<i32>,
+    /// Show adult content in this query (D52); `FfiConfig::show_adult` turns it on for all.
+    #[uniffi(default)]
+    pub include_adult: bool,
 }
 
 /// `core::release::ReleaseAttrs` (D44): what the name and files say about a release.
@@ -685,7 +692,7 @@ impl Magnetar {
                 match api.search(&q).await {
                     Ok(mut p) => {
                         p.source = "server".into();
-                        inner.overlay_flags(&mut p, q.include_hidden)?;
+                        inner.overlay_flags(&mut p, q.include_hidden, q.hides_adult())?;
                         return Ok(convert::page(p, None));
                     }
                     Err(e) => server_error = Some(e.to_string()),
@@ -752,7 +759,7 @@ impl Magnetar {
                 match api.media_torrents(media_id, media::MEDIA_RELEASES, 0).await {
                     Ok(mut p) => {
                         p.source = "server".into();
-                        inner.overlay_flags(&mut p, false)?;
+                        inner.overlay_flags(&mut p, false, !inner.state().config.show_adult)?;
                         return Ok(convert::page(p, None));
                     }
                     Err(e) => server_error = Some(e.to_string()),
@@ -813,7 +820,7 @@ impl Magnetar {
                                 hits: std::mem::take(&mut g.releases),
                                 ..Default::default()
                             };
-                            inner.overlay_flags(&mut page, q.include_hidden)?;
+                            inner.overlay_flags(&mut page, q.include_hidden, q.hides_adult())?;
                             g.releases = page.hits;
                         }
                         r.groups.retain(|g| !g.releases.is_empty());
@@ -1154,7 +1161,10 @@ impl Magnetar {
                 }
             }
             let top = if top == 0 { 10 } else { top.min(50) } as usize;
-            let set = inner.store.local_breakdown(&fields, top)?;
+            let set =
+                inner
+                    .store
+                    .local_breakdown(&fields, top, !inner.state().config.show_adult)?;
             Ok(convert::breakdowns(set, "local", server_error))
         })
         .await

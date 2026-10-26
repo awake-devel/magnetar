@@ -34,6 +34,9 @@ pub mod features {
     pub const STATS: &str = "stats";
     /// `/api/v1/graphs/{wot,relays,media/{id},swarm/{infohash}}` (D47).
     pub const GRAPHS: &str = "graphs";
+    /// `SearchQuery.include_adult` (D52): adult documents are left out unless it is set or
+    /// `porn` is selected. Older servers ignore it; the app then drops `porn` hits itself.
+    pub const ADULT_FILTER: &str = "adult_filter";
     pub const ALL: &[&str] = &[
         FILTERS,
         FACET_SET,
@@ -41,6 +44,7 @@ pub mod features {
         LIVENESS_HISTORY,
         STATS,
         GRAPHS,
+        ADULT_FILTER,
     ];
 }
 

@@ -775,6 +775,14 @@ impl SqliteStore {
             }
             sql.push_str(&format!(" AND c.category IN ({})", list.join(", ")));
         }
+        if q.hides_adult() {
+            // D52: no event of the infohash filed under `porn` (as the server's canonical
+            // category rule, plus any publisher's own `porn` filing).
+            sql.push_str(
+                " AND c.category <> 'porn' AND NOT EXISTS (SELECT 1 FROM torrents p \
+                 WHERE p.infohash = c.infohash AND p.category = 'porn')",
+            );
+        }
         if let Some(v) = q.min_size {
             push(
                 &mut sql,
@@ -1537,13 +1545,31 @@ impl SqliteStore {
 
     /// Offline charts (D47): counts of the cached torrents for the fields the cache can answer
     /// without the server (category, and the release attributes parsed on the phone); other
-    /// fields are left out. No filters: cross-filtering needs the server.
-    pub fn local_breakdown(&self, fields: &[String], top: usize) -> Result<BreakdownSet> {
+    /// fields are left out. No filters (cross-filtering needs the server), except that adult
+    /// torrents are left out when `hide_adult` (D52).
+    pub fn local_breakdown(
+        &self,
+        fields: &[String],
+        top: usize,
+        hide_adult: bool,
+    ) -> Result<BreakdownSet> {
         let conn = self.conn();
+        // Infohashes left out: every event of an adult torrent (any `porn` event).
+        let (t_where, a_where) = if hide_adult {
+            (
+                " WHERE infohash NOT IN (SELECT infohash FROM torrents WHERE category = 'porn')",
+                " AND torrent_attrs.infohash NOT IN \
+                 (SELECT infohash FROM torrents WHERE category = 'porn')",
+            )
+        } else {
+            ("", "")
+        };
         let total: i64 = conn
-            .query_row("SELECT COUNT(DISTINCT infohash) FROM torrents", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                &format!("SELECT COUNT(DISTINCT infohash) FROM torrents{t_where}"),
+                [],
+                |r| r.get(0),
+            )
             .db()?;
         let total = total.max(0) as u64;
         let mut out = Vec::new();
@@ -1551,28 +1577,30 @@ impl SqliteStore {
             // The value counts, and how many torrents have a value at all.
             let (values, with) = match LOCAL_FIELDS.iter().find(|(f, _, _)| f == field) {
                 Some((_, "category", _)) => (
-                    "SELECT category, COUNT(DISTINCT infohash) FROM torrents GROUP BY 1"
-                        .to_string(),
-                    "SELECT COUNT(DISTINCT infohash) FROM torrents".to_string(),
+                    format!(
+                        "SELECT category, COUNT(DISTINCT infohash) FROM torrents{t_where} GROUP BY 1"
+                    ),
+                    format!("SELECT COUNT(DISTINCT infohash) FROM torrents{t_where}"),
                 ),
                 Some((_, key, false)) => (
                     format!(
                         "SELECT json_extract(attrs, '$.{key}') AS v, COUNT(*) FROM torrent_attrs
-                         WHERE v IS NOT NULL GROUP BY 1"
+                         WHERE v IS NOT NULL{a_where} GROUP BY 1"
                     ),
                     format!(
                         "SELECT COUNT(*) FROM torrent_attrs
-                         WHERE json_extract(attrs, '$.{key}') IS NOT NULL"
+                         WHERE json_extract(attrs, '$.{key}') IS NOT NULL{a_where}"
                     ),
                 ),
                 Some((_, key, true)) => (
                     format!(
                         "SELECT j.value, COUNT(*)
-                         FROM torrent_attrs, json_each(torrent_attrs.attrs, '$.{key}') j GROUP BY 1"
+                         FROM torrent_attrs, json_each(torrent_attrs.attrs, '$.{key}') j
+                         WHERE TRUE{a_where} GROUP BY 1"
                     ),
                     format!(
                         "SELECT COUNT(*) FROM torrent_attrs
-                         WHERE json_array_length(attrs, '$.{key}') > 0"
+                         WHERE json_array_length(attrs, '$.{key}') > 0{a_where}"
                     ),
                 ),
                 None => continue,

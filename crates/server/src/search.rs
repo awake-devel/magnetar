@@ -230,6 +230,13 @@ fn push_attr_filters(qb: &mut QueryBuilder<Postgres>, q: &SearchQuery) {
 /// `WHERE ...` on `hits` (liveness filters).
 fn push_hit_filters(qb: &mut QueryBuilder<Postgres>, q: &SearchQuery, now: i64) {
     qb.push(" WHERE TRUE");
+    if q.hides_adult() {
+        // D52: canonical category, or a DHT row the classifier tagged adult.
+        qb.push(
+            " AND h.category <> 'porn' AND NOT EXISTS (SELECT 1 FROM dht_torrents d \
+             WHERE d.infohash = h.infohash AND d.category = 'porn')",
+        );
+    }
     if q.hide_dead {
         qb.push(" AND NOT coalesce(expires_at > ")
             .push_bind(now)
@@ -248,7 +255,7 @@ pub(crate) const COUNT_CAP: i64 = 1000;
 pub(crate) fn count_query(q: &SearchQuery, now: i64, min_trust: u8) -> QueryBuilder<Postgres> {
     let mut qb = QueryBuilder::new("");
     push_hits_cte(&mut qb, q, min_trust);
-    qb.push("SELECT count(*) FROM (SELECT 1 FROM hits");
+    qb.push("SELECT count(*) FROM (SELECT 1 FROM hits h");
     push_hit_filters(&mut qb, q, now);
     qb.push(" LIMIT ").push_bind(COUNT_CAP + 1).push(") capped");
     qb

@@ -314,6 +314,7 @@ pub fn parse_search_query(raw: Option<&str>) -> ApiResult<SearchQuery> {
             "until" => q.until = Some(parse_num(&k, &v)?),
             "min_seeders" => q.min_seeders = Some(parse_num(&k, &v)?),
             "hide_dead" => q.hide_dead = parse_bool(&v)?,
+            "adult" => q.include_adult = parse_bool(&v)?,
             "min_trust" => q.min_trust = Some(parse_num(&k, &v)?),
             "sort" => {
                 q.sort = match v.as_ref() {

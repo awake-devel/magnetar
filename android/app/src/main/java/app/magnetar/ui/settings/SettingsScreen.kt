@@ -116,6 +116,16 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
                 onValueChange = { v -> vm.edit { it.copy(trustThreshold = v.roundToInt()) } },
                 valueRange = 0f..100f,
             )
+            Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Show adult content")
+                    Text(
+                        "Off: adult torrents stay out of search, browse, saved-search alerts and stats",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Switch(checked = form.showAdult, onCheckedChange = { v -> vm.edit { it.copy(showAdult = v) } })
+            }
 
             SectionTitle("Cache and crawling")
             Field(

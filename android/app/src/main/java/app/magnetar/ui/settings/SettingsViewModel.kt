@@ -23,6 +23,7 @@ data class SettingsForm(
     val cacheCapMb: String,
     val seedRelays: String,
     val backgroundSync: Boolean,
+    val showAdult: Boolean,
 ) {
     companion object {
         fun from(s: AppSettings) = SettingsForm(
@@ -33,6 +34,7 @@ data class SettingsForm(
             cacheCapMb = s.cacheCapMb.toString(),
             seedRelays = s.seedRelays.joinToString("\n"),
             backgroundSync = s.backgroundSync,
+            showAdult = s.showAdult,
         )
     }
 }
@@ -169,6 +171,7 @@ class SettingsViewModel(application: Application) : BaseViewModel(application) {
             cacheCapMb = cache!!,
             seedRelays = form.seedRelays.lines().map { it.trim() }.filter { it.isNotEmpty() },
             backgroundSync = form.backgroundSync,
+            showAdult = form.showAdult,
         )
         return ffiCatching { magApp.updateSettings(settings) }
             .onSuccess { _state.update { it.copy(dirty = false) } }

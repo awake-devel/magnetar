@@ -107,6 +107,16 @@ pub async fn load_docs(pool: &PgPool, infohashes: &[String]) -> Result<Vec<Index
             .fetch_all(pool)
             .await
             .map_err(db)?;
+    // D52: a DHT row the classifier tagged `porn` makes the document adult whatever the
+    // Nostr publisher filed it under.
+    let dht_adult: Vec<String> = sqlx::query_scalar(
+        "SELECT infohash FROM dht_torrents WHERE infohash = ANY($1) AND category = 'porn'",
+    )
+    .bind(infohashes)
+    .fetch_all(pool)
+    .await
+    .map_err(db)?;
+    let dht_adult: std::collections::HashSet<String> = dht_adult.into_iter().collect();
     let mut attrs: HashMap<String, ReleaseAttrs> =
         attrs.into_iter().map(|(ih, a)| (ih, a.0)).collect();
     let mut live: HashMap<String, LiveRow> =
@@ -167,6 +177,7 @@ pub async fn load_docs(pool: &PgPool, infohashes: &[String]) -> Result<Vec<Index
             expires_at: l.map(|l| l.expires_at),
             media: m,
             attrs: attrs.remove(&r.infohash),
+            dht_adult: dht_adult.contains(&r.infohash),
             infohash: r.infohash,
         });
     }

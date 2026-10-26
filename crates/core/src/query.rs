@@ -25,6 +25,11 @@ pub struct SearchQuery {
     pub limit: u32,
     pub offset: u32,
     pub include_hidden: bool,
+    /// Show adult documents (D52). Default false: documents whose canonical category is
+    /// `porn`, or with a DHT row classified `porn`, are left out — unless `categories`
+    /// selects `porn` (choosing it is consent). Older apps never send it, so they get the
+    /// default too.
+    pub include_adult: bool,
     // Release and media filters (D44). Within one field any value matches; fields combine
     // with AND. Values are the lowercase codes of `release::ReleaseAttrs` (docs/FILTERS.md).
     // Older servers ignore these fields, so the app only offers them when the server says it
@@ -99,6 +104,11 @@ impl SearchQuery {
 }
 
 impl SearchQuery {
+    /// Adult documents are left out of this query (D52).
+    pub fn hides_adult(&self) -> bool {
+        !self.include_adult && !self.categories.contains(&Category::Porn)
+    }
+
     /// Effective limit (default 50, max 200).
     pub fn effective_limit(&self) -> u32 {
         match self.limit {
@@ -212,5 +222,23 @@ mod tests {
         assert_eq!(pg_tsquery("o"), Some("'o'".into()));
         assert_eq!(pg_tsquery("onl"), Some("'onl':*".into()));
         assert_eq!(tokens("Été 1080p"), vec!["été", "1080p"]);
+    }
+
+    #[test]
+    fn adult_hidden_by_default() {
+        let q = SearchQuery::default();
+        assert!(q.hides_adult());
+        let q: SearchQuery = serde_json::from_str(r#"{"text":"x"}"#).unwrap();
+        assert!(q.hides_adult(), "older apps send no include_adult");
+        let q = SearchQuery {
+            include_adult: true,
+            ..Default::default()
+        };
+        assert!(!q.hides_adult());
+        let q = SearchQuery {
+            categories: vec![Category::Video, Category::Porn],
+            ..Default::default()
+        };
+        assert!(!q.hides_adult(), "selecting porn is consent");
     }
 }

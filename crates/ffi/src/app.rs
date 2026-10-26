@@ -244,6 +244,7 @@ impl Inner {
         if q.min_trust.is_none() {
             q.min_trust = Some(self.state().config.trust_threshold);
         }
+        q.include_adult |= self.state().config.show_adult;
         q
     }
 
@@ -260,12 +261,21 @@ impl Inner {
         cfg
     }
 
-    /// Apply phone-local pinned/hidden flags to server hits; drop hidden ones unless asked.
+    /// Apply phone-local pinned/hidden flags to server hits; drop hidden ones unless asked,
+    /// and adult ones when `hide_adult` (D52: a server older than the adult filter ignores
+    /// `include_adult`, so its `porn` hits are dropped here).
     pub fn overlay_flags(
         &self,
         page: &mut SearchPage,
         include_hidden: bool,
+        hide_adult: bool,
     ) -> Result<(), FfiError> {
+        if hide_adult {
+            let before = page.hits.len();
+            page.hits
+                .retain(|h| h.category != magnetar_core::model::Category::Porn);
+            page.total = page.total.saturating_sub((before - page.hits.len()) as u64);
+        }
         let ids: Vec<String> = page.hits.iter().map(|h| h.infohash.clone()).collect();
         let flags = self.store.flags(&ids)?;
         for h in &mut page.hits {
@@ -300,6 +310,7 @@ impl Inner {
             q.descending = true;
             q.offset = 0;
             q.min_trust.get_or_insert(threshold);
+            q.include_adult |= self.state().config.show_adult;
             if let Some(w) = s.last_seen_created_at {
                 q.since = Some(q.since.map_or(w, |since| since.max(w)));
             }
@@ -317,7 +328,7 @@ impl Inner {
                     self.store.search_sync(&q, now)?
                 }
             };
-            self.overlay_flags(&mut page, q.include_hidden)?;
+            self.overlay_flags(&mut page, q.include_hidden, q.hides_adult())?;
             let newest = page.hits.iter().map(|h| h.created_at).max();
             let hits = match s.last_seen_created_at {
                 None => {

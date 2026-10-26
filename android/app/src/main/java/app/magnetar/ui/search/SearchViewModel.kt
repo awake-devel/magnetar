@@ -246,10 +246,11 @@ class SearchViewModel(application: Application) : BaseViewModel(application) {
         viewModelScope.launch {
             textInput.drop(1).debounce(SEARCH_DEBOUNCE_MS).distinctUntilChanged().collectLatest { search() }
         }
-        // A new server URL, token or trust threshold changes what a search returns (e.g. the
-        // "offline results (401)" banner after the token is fixed): run it again.
+        // A new server URL, token, trust threshold or adult switch changes what a search
+        // returns (e.g. the "offline results (401)" banner after the token is fixed): run it
+        // again.
         viewModelScope.launch {
-            magApp.settings.map { Triple(it.serverUrl, it.apiToken, it.trustThreshold) }
+            magApp.settings.map { listOf(it.serverUrl, it.apiToken, it.trustThreshold, it.showAdult) }
                 .distinctUntilChanged().drop(1).collect {
                     refreshFeatures()
                     search()
