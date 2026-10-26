@@ -96,6 +96,21 @@ lowest id (D6). Fields:
 - Adult documents are left out unless `include_adult` is set or `categories` selects `porn`
   (D52; query string `adult=1`; the SQL fallback tests the canonical category plus an `EXISTS`
   on `dht_torrents`, so both paths agree, tested in `tests/it/search_index.rs`).
+- **Empty-query browse and the DHT** (D76): with no text (no words and no media token) and no
+  source filter (`origins` empty, or both values), a **DHT-only** document (no Nostr event) is
+  listed only once a seed check found peers (`best_peers` = max(tracker seeders, DHT peer
+  estimate) > 0; unknown or 0 → left out). Without it the newest-first list is flooded by
+  fresh, never-checked DHT torrents ("peers unknown"); the seed checker reaches new torrents
+  first (D45), so a live one appears within minutes. Any sort and any other filter keep the
+  rule (the list's membership does not change with the sort). Unchanged: Nostr results and
+  torrents known from both sources, every text search, `media:`/`imdb:` tokens (title pages),
+  and the explicit **DHT** chip (`origin=dht`), which lists every DHT result. The browse sheet's
+  facet counts follow the list; Stats breakdowns (`/api/v1/stats/breakdown`) do not (they
+  describe the catalogue). Index: per segment the `f_origin` column and the ordinal of `nostr`
+  (no schema change); SQL fallback: `h.origin <> 'dht' OR best_peers > 0 OR EXISTS` a Nostr
+  event of the infohash. Tested on both paths in `tests/it/dht_search_pg.rs`
+  (`empty_query_lists_dht_only_torrents_once_seeded`). `Health.features`:
+  `browse_checked_dht`.
 - Filters (`categories`, size range, `since`/`until`, `min_trust` incl. local trust overrides,
   `hide_dead`, `min_seeders`, media tokens such as `imdb:tt…` resolved to a media id through
   Postgres) and sorts (relevance, date, size, seeders, both directions, unknown last) run in one

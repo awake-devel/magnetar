@@ -620,6 +620,10 @@ user's "mixed equally, not hidden by min_trust".
 - **Index** (`SCHEMA_VERSION` 4; version 3 is the stage 3 `adult` flag, D70): facet `f_origin` (`nostr`, `dht`, both values when both), stored
   `origin`. `SearchQuery.origins: Vec<String>` (serde default, any-of; empty = all) — an optional
   filter chip, not a default.
+- **Empty-query browse** (D76, user choice 2026-10-26, after the live crawl flooded the default
+  list): with no text and no source filter, a DHT-only torrent is listed once a seed check
+  found peers (> 0); Nostr results unchanged; any text search or the DHT chip returns every DHT
+  result (docs/SEARCH.md "Query").
 - **API types** (all `#[serde(default)]`, so old apps and old servers interoperate):
   - `TorrentSummary.origin: Origin { Nostr (default), Dht, Both }`. DHT-only: `event_id`,
     `pubkey`, `npub` = `""`, `trust` 0, `pow_bits` 0, `publisher_count` 0.

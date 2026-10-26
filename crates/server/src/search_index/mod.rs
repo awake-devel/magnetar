@@ -733,6 +733,7 @@ pub fn index_query(
                 })
                 .collect(),
             hide_adult: q.hides_adult(),
+            hide_unchecked_dht: q.browse_hides_unchecked_dht(),
             now,
         },
         sort,
@@ -866,7 +867,10 @@ pub async fn facet_tallies(
     let Some((text, media_id)) = media_filter(pool, &q.text).await? else {
         return Ok(Some((0, vec![FacetTally::default(); names.len()])));
     };
-    let iq = index_query(q, &text, min_trust, media_id, now);
+    let mut iq = index_query(q, &text, min_trust, media_id, now);
+    // Stats breakdowns describe the whole catalogue: the browse-only DHT rule (D76) is not
+    // applied there.
+    iq.filter.hide_unchecked_dht = false;
     let idx = idx.clone();
     let names = names.to_vec();
     tokio::task::spawn_blocking(move || idx.facet_tallies(&iq, &names))

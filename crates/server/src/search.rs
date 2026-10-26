@@ -267,6 +267,15 @@ fn push_hit_filters(qb: &mut QueryBuilder<Postgres>, q: &SearchQuery, now: i64) 
         }
         _ => {}
     }
+    if q.browse_hides_unchecked_dht() {
+        // D76: the empty query lists a DHT-only torrent once a seed check found peers. The
+        // canonical row is a DHT row only when no eligible Nostr event exists; one below
+        // `min_trust` still makes the torrent "known from Nostr", as in the index.
+        qb.push(
+            " AND (h.origin <> 'dht' OR coalesce(h.best_peers, 0) > 0 OR EXISTS \
+             (SELECT 1 FROM torrents t WHERE t.infohash = h.infohash))",
+        );
+    }
     if q.hide_dead {
         qb.push(" AND NOT coalesce(expires_at > ")
             .push_bind(now)

@@ -44,6 +44,8 @@ pub mod features {
     /// `StatsHealth.dht` / `StatsResponse.dht` are filled. Not in `ALL` (it depends on the
     /// configuration).
     pub const DHT: &str = "dht";
+    /// The empty query hides DHT-only torrents no seed check found peers for (D76).
+    pub const BROWSE_CHECKED_DHT: &str = "browse_checked_dht";
     pub const ALL: &[&str] = &[
         FILTERS,
         FACET_SET,
@@ -53,6 +55,7 @@ pub mod features {
         GRAPHS,
         ADULT_FILTER,
         ORIGIN,
+        BROWSE_CHECKED_DHT,
     ];
 }
 

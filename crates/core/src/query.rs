@@ -124,6 +124,16 @@ impl SearchQuery {
         out
     }
 
+    /// The empty query's browse rule (D76): with no text (no words, no media token) and no
+    /// source filter, DHT-only torrents are listed only once a seed check found peers
+    /// (seeders, or DHT peers for a torrent without trackers, > 0). Fresh unchecked DHT
+    /// torrents would otherwise flood the newest-first list. Any sort; Nostr results and any
+    /// torrent with a Nostr event are unaffected; a text search or an explicit source filter
+    /// (`origins` = `dht` alone) returns every DHT result.
+    pub fn browse_hides_unchecked_dht(&self) -> bool {
+        self.text.trim().is_empty() && self.origin_filter().is_empty()
+    }
+
     /// Adult documents are left out of this query (D52).
     pub fn hides_adult(&self) -> bool {
         !self.include_adult && !self.categories.contains(&Category::Porn)

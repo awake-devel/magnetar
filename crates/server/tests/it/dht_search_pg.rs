@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use common::*;
 use magnetar_core::model::*;
-use magnetar_core::query::{SearchPage, SearchQuery};
+use magnetar_core::query::{SearchPage, SearchQuery, Sort};
 use magnetar_core::store::Store;
 use magnetar_server::PgStore;
 use magnetar_server::search_index::{self, SearchIndex, load};
@@ -358,4 +358,140 @@ async fn fallback_reaches_dht_rows_through_the_index() {
         assert!(plan.contains("dht_torrents_search_tsv"), "{text}: {plan}");
         assert!(!plan.contains("Seq Scan on dht_torrents"), "{text}: {plan}");
     }
+}
+
+fn live(n: u64, seeders: Option<u32>, dht: Option<u32>) -> Liveness {
+    Liveness {
+        infohash: ih(n),
+        seeders,
+        leechers: None,
+        completed: None,
+        dht_peers_est: dht,
+        source: LivenessSource::Udp,
+        trackers_ok: 1,
+        trackers_failed: 0,
+        checked_at: NOW - 10,
+        expires_at: NOW + 3600,
+    }
+}
+
+fn keys_of(p: &SearchPage) -> Vec<String> {
+    let mut k: Vec<String> = p.hits.iter().map(|h| h.infohash.clone()).collect();
+    k.sort();
+    k
+}
+
+/// D76: the empty query lists a DHT-only torrent only once a seed check found peers; Nostr
+/// results, torrents known from both, text searches and the explicit DHT chip are unchanged.
+/// Both search paths, any sort, the facets of the browse sheet, the index following a check.
+#[tokio::test]
+async fn empty_query_lists_dht_only_torrents_once_seeded() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    // 1: Nostr, never checked. 2: Nostr + DHT, never checked. 3: DHT only, never checked.
+    // 4: DHT only, checked dead. 5: DHT only, tracker seeders 4. 6: DHT only, DHT peers 2.
+    // 7: DHT only, never checked (checked later in the test).
+    put(s, torrent(1, 1, NOW - 50, 1, "debian netinst")).await;
+    put(s, torrent(2, 2, NOW - 40, 2, "debian live")).await;
+    for (n, t) in [
+        (2, "debian.live.dht"),
+        (3, "debian.fresh.dht"),
+        (4, "debian.dead.dht"),
+        (5, "debian.seeded.dht"),
+        (6, "debian.dhtpeers.dht"),
+        (7, "debian.later.dht"),
+    ] {
+        dht_row(s, n, t, &[&format!("{t}/disc.iso")], "application").await;
+    }
+    s.put_liveness(&live(4, Some(0), Some(0))).await.unwrap();
+    s.put_liveness(&live(5, Some(4), None)).await.unwrap();
+    s.put_liveness(&live(6, None, Some(2))).await.unwrap();
+    let ix = index_for(s).await;
+    let pg = PgStore::from_pool(s.pool().clone());
+    let set = |v: &[u64]| -> Vec<String> {
+        let mut k: Vec<String> = v.iter().map(|n| ih(*n)).collect();
+        k.sort();
+        k
+    };
+    let browse = q("", 0);
+    assert!(browse.browse_hides_unchecked_dht());
+    for sort in [Sort::Relevance, Sort::Date, Sort::Size, Sort::Seeders] {
+        let mut b = browse.clone();
+        b.sort = sort;
+        for (path, p) in [
+            ("index", s.search(&b, NOW).await.unwrap()),
+            ("sql", pg.search(&b, NOW).await.unwrap()),
+        ] {
+            assert_eq!(keys_of(&p), set(&[1, 2, 5, 6]), "{path} {sort:?}");
+            assert_eq!(p.total, 4, "{path} {sort:?}");
+        }
+    }
+    // Other filters keep the rule (still the empty query).
+    let mut cat = browse.clone();
+    cat.categories = vec![Category::Application];
+    for p in [
+        s.search(&cat, NOW).await.unwrap(),
+        pg.search(&cat, NOW).await.unwrap(),
+    ] {
+        // (The fallback also matches 2 by its DHT row's category, a D73 difference.)
+        let k = keys_of(&p);
+        assert!(k.contains(&ih(5)) && k.contains(&ih(6)), "{k:?}");
+        assert!([3, 4, 7].iter().all(|n| !k.contains(&ih(*n))), "{k:?}");
+    }
+    // Any text, and the explicit DHT chip, return every DHT result.
+    for p in [
+        s.search(&q("debian", 0), NOW).await.unwrap(),
+        pg.search(&q("debian", 0), NOW).await.unwrap(),
+    ] {
+        assert_eq!(keys_of(&p), set(&[1, 2, 3, 4, 5, 6, 7]));
+    }
+    let mut chip = browse.clone();
+    chip.origins = vec!["dht".into()];
+    assert!(!chip.browse_hides_unchecked_dht());
+    for p in [
+        s.search(&chip, NOW).await.unwrap(),
+        pg.search(&chip, NOW).await.unwrap(),
+    ] {
+        assert_eq!(keys_of(&p), set(&[2, 3, 4, 5, 6, 7]));
+    }
+    let mut both = browse.clone();
+    both.origins = vec!["dht".into(), "nostr".into()];
+    assert!(
+        both.browse_hides_unchecked_dht(),
+        "both chips = no source filter"
+    );
+    // The browse sheet's facets follow the list; Stats breakdowns count the whole catalogue.
+    let facet = s.facets(&browse, "origin", 10, NOW).await.unwrap().unwrap();
+    assert_eq!(facet.total, 4);
+    let counts: BTreeMap<String, u64> = facet
+        .counts
+        .iter()
+        .map(|c| (c.value.clone(), c.count))
+        .collect();
+    assert_eq!(
+        counts,
+        [("dht".to_string(), 3), ("nostr".to_string(), 2)]
+            .into_iter()
+            .collect()
+    );
+    let (total, _) = s
+        .facet_tallies(&browse, &["origin".to_string()], NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(total, 7, "breakdowns are not the browse list");
+    // A seed check that finds peers brings a DHT-only torrent into the list.
+    s.put_liveness(&live(7, None, Some(1))).await.unwrap();
+    while search_index::apply_changes(s.pool(), &ix.idx)
+        .await
+        .unwrap()
+        > 0
+    {}
+    for p in [
+        s.search(&browse, NOW).await.unwrap(),
+        pg.search(&browse, NOW).await.unwrap(),
+    ] {
+        assert_eq!(keys_of(&p), set(&[1, 2, 5, 6, 7]));
+    }
+    drop(ix);
 }

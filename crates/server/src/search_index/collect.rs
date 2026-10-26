@@ -46,6 +46,9 @@ pub struct Filter {
     pub attrs: Vec<AttrFilter>,
     /// Leave out adult documents (D52).
     pub hide_adult: bool,
+    /// Leave out DHT-only documents without a seed check that found peers (D76: the empty
+    /// query's browse list, `SearchQuery::browse_hides_unchecked_dht`).
+    pub hide_unchecked_dht: bool,
     pub now: i64,
 }
 
@@ -73,6 +76,9 @@ struct Columns {
     media_rating: I64Col,
     year: I64Col,
     adult: U64Col,
+    /// `f_origin` and the ordinal of `nostr` in this segment (D76). `None` ordinal = no
+    /// document of the segment has a Nostr event. Loaded only for `hide_unchecked_dht`.
+    origin: Option<(StrColumn, Option<u64>)>,
     /// One per `Filter::attrs`, same order: the column and the term ordinals wanted in this
     /// segment (a value the segment never saw has no ordinal: nothing there matches it).
     attrs: Vec<(Option<StrColumn>, Vec<u64>)>,
@@ -95,6 +101,16 @@ impl Columns {
             wanted.sort_unstable();
             attrs.push((col, wanted));
         }
+        let origin = match f.hide_unchecked_dht {
+            true => match ff.str(&super::schema::facet_field_name("origin"))? {
+                Some(c) => {
+                    let nostr = c.dictionary().term_ord("nostr")?;
+                    Some((c, nostr))
+                }
+                None => None,
+            },
+            false => None,
+        };
         let i = |name: &str| -> tantivy::Result<I64Col> {
             Ok(ff.i64(name)?.first_or_default_col(NONE))
         };
@@ -111,6 +127,7 @@ impl Columns {
             media_rating: i("media_rating")?,
             year: i("year")?,
             adult: u("adult")?,
+            origin,
             attrs,
         })
     }
@@ -160,6 +177,9 @@ impl Columns {
         if f.hide_adult && self.adult.get_val(doc) != 0 {
             return false;
         }
+        if f.hide_unchecked_dht && self.unchecked_dht_only(doc) {
+            return false;
+        }
         if f.categories != 0 && f.categories & (1 << self.category.get_val(doc).min(63)) == 0 {
             return false;
         }
@@ -202,6 +222,18 @@ impl Columns {
             }
         }
         true
+    }
+
+    /// A DHT-only document (no Nostr event) whose seed checks never found a peer (unknown or 0).
+    fn unchecked_dht_only(&self, doc: DocId) -> bool {
+        let Some((col, nostr)) = &self.origin else {
+            return false;
+        };
+        let dht_only = match nostr {
+            Some(n) => !col.ords().values_for_doc(doc).any(|o| o == *n),
+            None => true,
+        };
+        dht_only && self.best_peers.get_val(doc) <= 0
     }
 
     /// Sort key: higher is better. Unknown sizes/peers sort last in both directions; ties go
