@@ -171,6 +171,46 @@ async fn breakdowns_cross_filter() {
     let lang = &set.breakdowns[2];
     assert_eq!(lang.total, 6, "own filter left out");
     assert!(lang.counts.iter().any(|c| c.value == "fr" && c.count == 3));
+    // Categories and years are no attribute filters, still left out of their own counts.
+    let video = BreakdownRequest {
+        query: SearchQuery {
+            categories: vec![Category::Video],
+            min_year: Some(2023),
+            max_year: Some(2023),
+            ..q()
+        },
+        fields: vec!["category".into(), "resolution".into(), "year".into()],
+        top: 10,
+    };
+    let set = stats::breakdown(s, &svc, &video, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(set.total, 4);
+    let names: Vec<&str> = set.breakdowns.iter().map(|b| b.field.as_str()).collect();
+    assert_eq!(names, ["category", "resolution", "year"], "asked order");
+    assert_eq!(
+        counts(&set.breakdowns[0]),
+        vec![("video", 4)],
+        "year still applies"
+    );
+    assert_eq!(set.breakdowns[1].total, 4);
+    assert_eq!(counts(&set.breakdowns[2]), vec![("2023", 4)]);
+    let any_year = BreakdownRequest {
+        query: SearchQuery {
+            categories: vec![Category::Video],
+            ..q()
+        },
+        ..video
+    };
+    let set = stats::breakdown(s, &svc, &any_year, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        set.breakdowns[0].total, 6,
+        "category counted without its filter"
+    );
     assert!(
         stats::breakdown(
             s,

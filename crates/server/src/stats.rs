@@ -220,24 +220,58 @@ pub async fn breakdown(
     q.sort = Default::default();
     q.descending = true;
     let key = serde_json::to_string(&(&q, &fields, top)).expect("json");
-    let facets: Vec<String> = fields.iter().map(|(_, f)| f.to_string()).collect();
     if !store.index_ready() {
         return Ok(None);
     }
     let set = svc
         .breakdowns
         .get_or(key, || async {
+            // The attribute filters are left out of their own counts by the collector (D44);
+            // categories and years are plain range filters there, so those two fields are
+            // counted in a pass of their own without their filter.
+            let (main, own): (Vec<_>, Vec<_>) = fields
+                .iter()
+                .cloned()
+                .partition(|(_, facet)| !matches!(*facet, "category" | "year"));
+            let names: Vec<String> = main.iter().map(|(_, f)| f.to_string()).collect();
             // Only if the index went away since the check above.
-            let (total, tallies) = store
-                .facet_tallies(&q, &facets, now)
-                .await?
-                .ok_or_else(|| Error::Other("search index not ready".into()))?;
+            let gone = || Error::Other("search index not ready".into());
+            let own_passes = own.iter().map(|(_, facet)| {
+                let mut q2 = q.clone();
+                if *facet == "category" {
+                    q2.categories.clear();
+                } else {
+                    q2.min_year = None;
+                    q2.max_year = None;
+                }
+                async move {
+                    let (_, mut t) = store
+                        .facet_tallies(&q2, &[facet.to_string()], now)
+                        .await?
+                        .ok_or_else(gone)?;
+                    Ok::<_, Error>(t.pop().unwrap_or_default())
+                }
+            });
+            // The passes run side by side on the blocking pool.
+            let (first, own_tallies) = futures::future::try_join(
+                async { store.facet_tallies(&q, &names, now).await?.ok_or_else(gone) },
+                futures::future::try_join_all(own_passes),
+            )
+            .await?;
+            let (total, tallies) = first;
+            let mut out: Vec<(String, FacetTally)> =
+                main.into_iter().map(|(n, _)| n).zip(tallies).collect();
+            out.extend(own.into_iter().map(|(n, _)| n).zip(own_tallies));
             Ok(BreakdownSet {
                 total,
+                // In the order asked for.
                 breakdowns: fields
                     .iter()
-                    .zip(tallies)
-                    .map(|((name, _), t)| to_breakdown(name, t, top))
+                    .filter_map(|(name, _)| {
+                        let i = out.iter().position(|(n, _)| n == name)?;
+                        let (n, t) = out.swap_remove(i);
+                        Some(to_breakdown(&n, t, top))
+                    })
                     .collect(),
                 computed_at: now,
             })
