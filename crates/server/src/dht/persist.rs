@@ -64,6 +64,22 @@ pub struct PersistOutcome {
     pub failed: u64,
 }
 
+/// A loggable description of a persist error that cannot carry a bound value (a torrent name):
+/// the SQLSTATE for database errors, the error kind otherwise.
+pub fn error_class(e: &sqlx::Error) -> String {
+    match e {
+        sqlx::Error::Database(d) => format!(
+            "database error {}",
+            d.code().as_deref().unwrap_or("(no SQLSTATE)")
+        ),
+        sqlx::Error::PoolTimedOut => "pool timed out".into(),
+        sqlx::Error::PoolClosed => "pool closed".into(),
+        sqlx::Error::Io(e) => format!("io: {}", e.kind()),
+        sqlx::Error::Encode(_) => "encode error".into(),
+        _ => "other sqlx error".into(),
+    }
+}
+
 fn via_text(v: Via) -> &'static str {
     match v {
         Via::Sample => "sample",

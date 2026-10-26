@@ -605,7 +605,9 @@ async fn persist_flush(p: &Pipeline, pool: &PgPool, batch: &mut Vec<FetchResult>
         Err(e) => {
             // The hashes keep their dht_seen lease: the retry loop brings them back.
             if get(&p.c.persist_errors).is_multiple_of(100) {
-                tracing::warn!("DHT persist: {e}");
+                // Only the error class: a database message could quote a bound value, and
+                // these statements carry torrent names (D53: names never reach the logs).
+                tracing::warn!("DHT persist: {}", persist::error_class(&e));
             }
             add(&p.c.persist_errors, 1);
         }

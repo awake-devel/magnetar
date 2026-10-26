@@ -42,6 +42,9 @@ enum Behave {
     AsksFirst,
     /// Keeps sending `have` messages (discard budget).
     HaveFlood,
+    /// Keeps sending 60 KiB `extended` messages of an extension we never negotiated (they
+    /// count against the same discard budget).
+    ExtFlood,
 }
 
 /// A deterministic bencoded info dict: keys sorted, as BEP 3 requires.
@@ -137,6 +140,16 @@ async fn serve(mut s: TcpStream, raw: Vec<u8>, hash: [u8; 20], behave: Behave) {
                     return;
                 }
             }
+            return;
+        }
+        Behave::ExtFlood => {
+            let junk = vec![b'x'; 60 * 1024];
+            for _ in 0..200 {
+                if s.write_all(&wire::extended(7, &junk)).await.is_err() {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
             return;
         }
         Behave::HaveFlood => {
@@ -342,6 +355,7 @@ async fn hostile_peers_fail_cleanly() {
         (Behave::HugeOther, PeerError::Protocol),
         (Behave::HugeExtended, PeerError::Protocol),
         (Behave::HaveFlood, PeerError::Protocol),
+        (Behave::ExtFlood, PeerError::Protocol),
     ];
     let f = fetcher();
     for (behave, want) in cases {
@@ -544,4 +558,42 @@ async fn open_connections_are_capped() {
     }
     assert!(peak.load(Ordering::SeqCst) <= 3, "{peak:?}");
     assert!(peak.load(Ordering::SeqCst) >= 1);
+}
+
+#[tokio::test]
+async fn value_bombs_are_refused_before_decoding() {
+    // 300 000 empty lists (2 bytes each, ~32× that as a decoded tree): above the value limit
+    // for a 1 MiB metadata_max (131 072), so the verified dict is `too_complex`, not decoded.
+    let bomb = Value::List((0..300_000).map(|_| Value::List(vec![])).collect());
+    let raw = bencode::encode(&dict(vec![
+        ("length", Value::Int(1)),
+        ("name", b("bomb")),
+        ("x", bomb),
+    ]));
+    assert!(raw.len() < 1 << 20);
+    let h = sha1(&raw);
+    let p = peer(raw.clone(), h, Behave::Good).await;
+    let out = fetcher().fetch(h, &[p]).await.unwrap();
+    assert!(
+        matches!(
+            out,
+            Outcome::Invalid(magnetar_core::metainfo::InfoError::TooComplex)
+        ),
+        "{out:?}"
+    );
+    // The same dict with a value count under the limit decodes normally.
+    let ok = bencode::encode(&dict(vec![
+        ("length", Value::Int(1)),
+        ("name", b("fine")),
+        (
+            "x",
+            Value::List((0..1000).map(|_| Value::List(vec![])).collect()),
+        ),
+    ]));
+    let h = sha1(&ok);
+    let p = peer(ok.clone(), h, Behave::Good).await;
+    assert!(matches!(
+        fetcher().fetch(h, &[p]).await.unwrap(),
+        Outcome::Ok(_)
+    ));
 }

@@ -624,14 +624,14 @@ impl Dht {
         all
     }
 
-    /// Set the sampler's share of the QPS budget (clamped to 0–1; 0 pauses sampling, the
-    /// rest of the node keeps running).
     /// Halve the KRPC query rate until `until` (router health probe, D66). Extends an active
     /// brake, never shortens it.
     pub fn brake_until(&self, until: Instant) {
         self.inner.state.lock().unwrap().brake.engage_until(until);
     }
 
+    /// Set the sampler's share of the QPS budget (clamped to 0–1; 0 pauses sampling, the
+    /// rest of the node keeps running).
     pub fn set_sample_share(&self, share: f64) {
         let mut s = self.inner.state.lock().unwrap();
         let share = if share.is_nan() {

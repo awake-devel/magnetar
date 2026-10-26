@@ -510,8 +510,10 @@ test):
 - **Seen filter keys**: Bloom bit positions come from SipHash under per-process random keys,
   so a node cannot pick a look-alike infohash that shadows a real one (D63).
 - **Metadata decode memory**: a 16 MiB info dict with a million tiny paths decodes to a
-  `Value` tree several times its size. Decoding runs under a semaphore (4 at once) and the
-  in-flight budget of §4 step 7 reserves `4 × metadata_size` per decode. Info dicts with
+  `Value` tree tens of times its size (2-byte values, ≥ 32 B each decoded). Decoding runs under
+  a semaphore (4 at once); before it runs, the verified bytes are scanned without allocating
+  to count values: more than `metadata_max / 8` = `invalid` (`too_complex`), else the decode
+  reserves `3 × size + 64 B × values` from a decode budget of its own (D67). Info dicts with
   duplicate keys at any level are `invalid` (§4 step 6).
 
 ## 4. Metadata fetch (D56, stage 2)
@@ -571,10 +573,10 @@ We never accept inbound TCP: we never announce, so no peer has a reason to conne
 
 **As built (stage 2, D64)**, refinements of the steps above: our extended handshake is sent
 only after the peer's handshake showed the BEP 10 bit; a `request` from the peer is answered
-with `reject` (BEP 9 MUST, ≤ 64 per session); other messages are skipped within 4 MiB per peer
-and an `extended` message above 64 KiB ends the peer; decode memory (3 × size per decode)
-comes from a budget of its own, so downloads holding the 256 MiB in-flight budget cannot
-starve the decodes; an announced hash is fetched from the announcer only. After step 6 the
+with `reject` (BEP 9 MUST, ≤ 64 per session); other messages, and `extended` messages we do
+not use, are skipped within 4 MiB per peer and an `extended` message above 64 KiB ends the
+peer; decode memory (priced per dict, D67) comes from a budget of its own, so downloads
+holding the 256 MiB in-flight budget cannot starve the decodes; an announced hash is fetched from the announcer only. After step 6 the
 order is (§7.1): **screen** (D65) → store or block. Stage 2 has no classifier: rows are stored
 with `category = other`, `classifier_version = 0`, which stage 3 re-classifies.
 
@@ -972,9 +974,42 @@ connection rate is below 25/s (≈ 5 600 of the 13 890 started sessions ended wi
 recorded outcome, most of them in this state — not measured precisely). This run predates
 D66 (commit "router-measured TCP bounds"), which raised the default to 150 attempts/s with
 ≤ 350 open connections after a benchmark of the user's router (knee ~200 attempts/s,
-docs/research/router-bench.md); the fetch rate at the new defaults is **not measured here**.
+docs/research/router-bench.md); the run at the new defaults follows.
 Replacing slot reservation with a polled token bucket (a dropped attempt then costs nothing)
 remains open for stage 8 tuning.
+
+**Live run at the D66 defaults** (same setup, scratch database `dht_stage2_live3`, 450 s,
+150 TCP attempts/s, ≤ 350 open, health probe on; a 202 s run before it on `dht_stage2_live2`
+was stopped from outside the process and is only used as a cross-check: 100 verified/min,
+25.8 %):
+
+| | run 1 (25/s, above) | run 3 (D66 defaults) |
+|---|---|---|
+| unique infohashes / sampling paused | 11 175 / 497 s of 540 | 13 312 / 73 s of 450 |
+| hashes collected / with peers | 4 138 / 3 176 | 3 774 / 2 799 (74 %) |
+| metadata verified (per minute) | 522 (58) | **716 (95.5)**, 7 hybrid |
+| success rate (verified / finished fetches) | 17.9 % | **25.9 %** |
+| mean time of a successful fetch | 16.4 s | **2.1 s** |
+| TCP attempts (per s) / established | 13 890 (25.7, at the cap) / 1 674 | 13 658 (30, cap 150) / 2 363 |
+| hash-level `timeout` | 1 187 | 94 |
+| KRPC queries/s (answered) | 134 (51 %) | 120 (50 %) |
+| bandwidth in / out | 0.73 / 0.12 Mbit/s | 1.00 / 0.11 Mbit/s |
+| CPU / peak RSS | 2.0 % of a core / 67.5 MB | 1.8 % / 64.2 MB |
+| verified metadata | 25.1 MB | 40.3 MB (≈ 56 KB per info dict) |
+| health probe | — | 90 probes, 6 failed, baseline 15.3 ms, last median 17.5 ms; brake engaged 3× |
+
+**Reading (D66).** The connection pace no longer binds: attempts ran at 30/s against a cap of
+150, successful fetches take 2 s instead of 16 s and hash-budget timeouts fell from 1 187 to 94.
+The pipeline is still attempt-starved (3 774 of 13 312 queued hashes reached collection,
+28 %), but the limit is now **peer collection**: ~17 KRPC queries per hash through iterative
+lookups (the sampling node answered with peers for only 328 hashes), at 120 q/s. Raising the
+share of hashes that get peers from the sampling node, or `MAGNETAR_DHT_QPS` towards the
+router's measured 300 q/s knee, is stage 8 tuning. All three probe brakes fired 25–35 s
+after the start, **before a baseline existed** (≥ 12 successful probes), on the "3 of 6
+failed" rule; whether the start-up burst (bootstrap + 128 fetchers opening at once) really
+saturated the router or a probe target dropped a few SYNs is **not established**. Its cost:
+KRPC and TCP attempt rates halved for the first ~5.5 min (120 q/s average instead of ~160).
+No brake fired after the baseline was set.
 
 **Not verified in stage 2.** Storage of real DHT names (deliberately: no blocklist yet, D65);
 the Tantivy index and app-side visibility of DHT rows (stage 5 readers); uTP-only peers

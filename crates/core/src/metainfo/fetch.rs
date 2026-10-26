@@ -5,8 +5,9 @@
 //! every 16 KiB block requested at once → blocks checked and assembled → hash of the raw bytes
 //! (whole peer 10 s). Per hash: ≤ 12 peers, ≤ 4 at once, 30 s. Global: ≤ 150 connection attempts/s and ≤ 350 open
 //! connections (router benchmark, D66),
-//! 256 MiB of metadata in flight, 4 decodes at once (each reserving 3 × its size more from a
-//! decode budget of its own).
+//! 256 MiB of metadata in flight, 4 decodes at once, each priced before it runs (3 × its size
+//! plus 64 B per bencode value, counted without allocating) and reserved from a decode budget
+//! of its own (3 × `metadata_max` × 4); above `metadata_max / 8` values it is `too_complex`.
 //!
 //! Verification (BEP 52 "the encoded form as found", never a decode-encode round trip):
 //! `sha1(raw) == hash` → v1 (hybrid when it also carries `meta version` 2); else
@@ -34,6 +35,7 @@ use super::info::{InfoError, InfoSummary, parse_info};
 use super::wire::{self, ExtHandshake, MetadataMsg, WireError};
 use crate::dht::addr::AddrFilter;
 use crate::dht::limiter::Pace;
+use crate::liveness::bencode;
 
 /// Largest `extended` message we read (a `data` message is ~50 B of dict + 16 KiB; extended
 /// handshakes are well under 1 KiB in practice).
@@ -44,6 +46,24 @@ const DISCARD_BUDGET: u64 = 4 * 1024 * 1024;
 const MAX_REJECTS_SENT: usize = 64;
 /// Budget accounting unit (the semaphore counts KiB so 256 MiB fits its u32 permits).
 const UNIT: usize = 1024;
+/// Bytes one decoded bencode value may cost (`Value` is 32 B, a dict entry 56 B, `Vec` growth
+/// up to 2×), used to price a decode before it runs.
+const VALUE_COST: usize = 64;
+/// Decode cost of the raw bytes themselves: the input, the copied strings, the names.
+const RAW_COST: usize = 3;
+
+/// Most values a decode may build: `metadata_max / 8` (2 M at 16 MiB, ~300 k files), at least
+/// 64 k. Above it the dict is `invalid` (`too_complex`) without being decoded.
+pub fn max_values(metadata_max: usize) -> usize {
+    (metadata_max / 8).max(64 * 1024)
+}
+
+/// Bytes a decode of `raw_len` bytes holding `values` values may take.
+fn decode_cost(raw_len: usize, values: usize) -> usize {
+    raw_len
+        .saturating_mul(RAW_COST)
+        .saturating_add(values.saturating_mul(VALUE_COST))
+}
 
 #[derive(Clone, Debug)]
 pub struct FetchConfig {
@@ -285,6 +305,8 @@ struct Inner {
     /// `budget` so downloads holding the whole budget cannot starve the decodes that would
     /// release it.
     decode_budget: Semaphore,
+    /// Permits `decode_budget` was created with.
+    decode_units: usize,
     connects: Mutex<Pace>,
     /// Open TCP connections.
     conns: Semaphore,
@@ -334,6 +356,14 @@ pub fn verify_and_parse(
 ) -> Option<(Identity, Result<InfoSummary, InfoError>)> {
     let m = match_hash(info_hash, raw)?;
     let parsed = parse_info(raw);
+    Some(identify(m, raw, parsed))
+}
+
+fn identify(
+    m: Match,
+    raw: &[u8],
+    parsed: Result<InfoSummary, InfoError>,
+) -> (Identity, Result<InfoSummary, InfoError>) {
     let id = match (m, &parsed) {
         (Match::Sha1, Ok(s)) if s.meta_version == Some(2) && s.has_pieces => Identity::V1 {
             v2: Some(sha2::Sha256::digest(raw).into()),
@@ -343,18 +373,19 @@ pub fn verify_and_parse(
         (Match::TruncatedSha256 { v1, v2 }, Ok(s)) if s.has_pieces => Identity::Hybrid { v1, v2 },
         (Match::TruncatedSha256 { .. }, _) => Identity::V2Only,
     };
-    Some((id, parsed))
+    (id, parsed)
 }
 
 impl Fetcher {
     pub fn new(mut cfg: FetchConfig) -> Self {
         // A single fetch must always fit the in-flight budget.
-        cfg.inflight_max = cfg.inflight_max.max(UNIT);
+        // Whole units, so a fetch of `metadata_max` bytes (rounded up to a unit) always fits.
+        cfg.inflight_max = (cfg.inflight_max.max(UNIT) / UNIT) * UNIT;
         cfg.metadata_max = cfg.metadata_max.clamp(1, cfg.inflight_max);
         let units = u32::try_from(cfg.inflight_max / UNIT).unwrap_or(u32::MAX >> 3);
-        let decode_units = (cfg.metadata_max.div_ceil(UNIT) * 3)
+        let decode_units = (cfg.metadata_max.div_ceil(UNIT) * RAW_COST)
             .saturating_mul(cfg.decode_parallel.max(1))
-            .min(Semaphore::MAX_PERMITS);
+            .clamp(1, Semaphore::MAX_PERMITS);
         let now = Instant::now();
         Self {
             inner: Arc::new(Inner {
@@ -363,6 +394,7 @@ impl Fetcher {
                 budget: Semaphore::new(units as usize),
                 decode: Semaphore::new(cfg.decode_parallel.max(1)),
                 decode_budget: Semaphore::new(decode_units),
+                decode_units,
                 connects: Mutex::new(Pace::new(cfg.connects_per_sec.max(1), now)),
                 conns: Semaphore::new(cfg.max_connections.clamp(1, Semaphore::MAX_PERMITS)),
                 braked_until: Mutex::new(None),
@@ -599,10 +631,11 @@ impl Fetcher {
             wr.write_all(&ours).await?;
             add(&c.tcp_bytes_out, ours.len() as u64);
             loop {
-                if let Msg::Extended(p) = read_msg(&mut rd, &mut discard, &c.tcp_bytes_in).await?
-                    && p.first() == Some(&wire::EXT_HANDSHAKE)
-                {
-                    return wire::parse_ext_handshake(&p[1..]).map_err(|_| PeerError::Protocol);
+                if let Msg::Extended(p) = read_msg(&mut rd, &mut discard, &c.tcp_bytes_in).await? {
+                    if p.first() == Some(&wire::EXT_HANDSHAKE) {
+                        return wire::parse_ext_handshake(&p[1..]).map_err(|_| PeerError::Protocol);
+                    }
+                    charge(&mut discard, p.len())?;
                 }
             }
         })
@@ -642,7 +675,10 @@ impl Fetcher {
                 continue;
             };
             if p.first() != Some(&wire::OUR_UT_METADATA) {
-                continue; // another extension (ut_pex, a repeated handshake, …)
+                // Another extension (ut_pex, a repeated handshake, …): skipped, but within the
+                // same per-peer budget as other messages.
+                charge(&mut discard, p.len())?;
+                continue;
             }
             match wire::parse_metadata_msg(&p[1..]).map_err(|_| PeerError::Protocol)? {
                 MetadataMsg::Data {
@@ -677,33 +713,65 @@ impl Fetcher {
                     wr.write_all(&r).await?;
                     add(&c.tcp_bytes_out, r.len() as u64);
                 }
-                MetadataMsg::Unknown => {}
+                MetadataMsg::Unknown => charge(&mut discard, p.len())?,
             }
         }
         drop(rd);
         drop(wr);
 
-        // Verify + parse off the async threads, 4 at once, each holding 4 × its size.
+        // Verify, price, then parse off the async threads, `decode_parallel` at once. The hash
+        // and the value count allocate nothing; the decode reserves its priced cost (raw bytes
+        // × 3 + 64 B per value) from the decode budget, capped at the whole budget so the
+        // largest allowed dict still runs (alone).
         let _decode = self
             .inner
             .decode
             .acquire()
             .await
             .map_err(|_| PeerError::Closed)?;
+        let limit = max_values(cfg.metadata_max);
+        let (raw, m, values) = tokio::task::spawn_blocking(move || {
+            let m = match_hash(&info_hash, &raw);
+            let n = m.as_ref().map_or(0, |_| bencode::count_values(&raw, limit));
+            (raw, m, n)
+        })
+        .await
+        .map_err(|_| PeerError::Closed)?;
+        let m = m.ok_or(PeerError::HashMismatch)?;
+        if values > limit {
+            let id = match m {
+                Match::Sha1 => Identity::V1 { v2: None },
+                Match::TruncatedSha256 { v1, v2 } => Identity::Hybrid { v1, v2 },
+            };
+            return Ok((size, id, Err(InfoError::TooComplex)));
+        }
+        let cost_units = decode_cost(size, values)
+            .div_ceil(UNIT)
+            .min(self.inner.decode_units);
         let _extra = self
             .inner
             .decode_budget
-            .acquire_many(units.saturating_mul(3))
+            .acquire_many(u32::try_from(cost_units).unwrap_or(u32::MAX))
             .await
             .map_err(|_| PeerError::Closed)?;
-        let res = tokio::task::spawn_blocking(move || verify_and_parse(&info_hash, &raw))
-            .await
-            .map_err(|_| PeerError::Closed)?;
-        match res {
-            Some((id, parsed)) => Ok((size, id, parsed)),
-            None => Err(PeerError::HashMismatch),
-        }
+        let (id, parsed) = tokio::task::spawn_blocking(move || {
+            let parsed = parse_info(&raw);
+            identify(m, &raw, parsed)
+        })
+        .await
+        .map_err(|_| PeerError::Closed)?;
+        Ok((size, id, parsed))
     }
+}
+
+/// Take `n` bytes of skipped traffic from the per-peer budget; past it the peer is dropped.
+fn charge(discard: &mut u64, n: usize) -> Result<(), PeerError> {
+    let n = n as u64;
+    if n > *discard {
+        return Err(PeerError::Protocol);
+    }
+    *discard -= n;
+    Ok(())
 }
 
 enum Msg {
@@ -777,6 +845,38 @@ mod tests {
         let t2: [u8; 32] = sha2::Sha256::digest(v2).into();
         let (id, _) = verify_and_parse(&t2[..20].try_into().unwrap(), v2).unwrap();
         assert_eq!(id, Identity::V2Only);
+    }
+
+    #[test]
+    fn decode_pricing() {
+        use crate::liveness::bencode::{Value, count_values};
+        // The per-value price covers the tree's node size.
+        assert!(std::mem::size_of::<Value>() * 2 <= VALUE_COST);
+        assert!(std::mem::size_of::<(Vec<u8>, Value)>() <= VALUE_COST);
+        // dict, 2 keys, int, string = 5
+        assert_eq!(count_values(b"d1:ai1e1:b2:xye", 100), 5);
+        assert_eq!(count_values(b"llelelee", 100), 4);
+        // stops past the limit
+        assert_eq!(count_values(&b"le".repeat(1000), 10), 11);
+        // malformed input ends the count, never panics
+        assert_eq!(count_values(b"99999999999999999999999:x", 10), 1);
+        assert_eq!(count_values(b"i12", 10), 1);
+        assert_eq!(max_values(16 << 20), 2 << 20);
+        assert_eq!(max_values(1 << 10), 64 * 1024);
+        assert_eq!(decode_cost(10, 2), 30 + 128);
+    }
+
+    #[test]
+    fn metadata_max_always_fits_the_budget() {
+        let f = Fetcher::new(FetchConfig {
+            inflight_max: 1500,
+            metadata_max: 1 << 20,
+            ..FetchConfig::default()
+        });
+        // 1500 B of budget is one whole KiB unit: a 1024 B fetch fits, a 1025 B one is
+        // oversize instead of waiting forever for a second unit.
+        assert_eq!(f.config().metadata_max, 1024);
+        assert_eq!(f.inner.budget.available_permits(), 1);
     }
 
     #[test]

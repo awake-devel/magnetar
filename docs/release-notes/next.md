@@ -116,13 +116,21 @@ must be updated together to get all of it, but each side keeps working with an o
 - **Nothing found on the DHT is stored or shown yet**: the illegal-content blocklist (next
   stage) must check every name first, and until it exists the server drops the verified
   metadata and keeps only the hash in its queue (fail closed).
-- New settings: `MAGNETAR_DHT_FETCH_CONCURRENCY` (128 aggressive / 16 polite) and
-  `MAGNETAR_DHT_METADATA_MAX` (16 MiB). The `dht` report adds fetch counts, verified
-  metadata per minute, success rate and bandwidth.
-- Live measurement from the home connection (9 min, no port opened): 58 torrents' metadata
-  verified per minute, 18 % of fetch attempts succeeded (most DHT peers no longer accept
-  connections), 0.7 Mbit/s down, 2 % of a core, 68 MB RAM. Tested against a real BitTorrent
+- New settings: `MAGNETAR_DHT_FETCH_CONCURRENCY` (128 aggressive / 16 polite),
+  `MAGNETAR_DHT_METADATA_MAX` (16 MiB), `MAGNETAR_DHT_TCP_RATE` (150 new connections/s) and
+  `MAGNETAR_DHT_TCP_MAX` (350 open) — limits measured on the home router (D66) — and
+  `MAGNETAR_DHT_PROBE`: a TCP connect to 1.1.1.1 / 9.9.9.9 every 5 s that halves the crawler's
+  rates for 5 min when the router starts to struggle (`off` disables it). The `dht` report adds
+  fetch counts, verified metadata per minute, success rate, bandwidth and the probe.
+- Live measurement from the home connection (7.5 min, no port opened, D66 limits): 95 torrents'
+  metadata verified per minute (58 at the first, 25 connections/s limit), 26 % of fetch
+  attempts succeeded (18 % before; most DHT peers no longer accept
+  connections), 1 Mbit/s down, 2 % of a core, 64 MB RAM. Tested against a real BitTorrent
   client (librqbit) and 16 kinds of broken or hostile peers.
+- Review fixes (D67): metadata built to blow up memory when decoded (millions of tiny values)
+  is refused before decoding; peers that flood unused extension messages are dropped like
+  other floods; the content screen now sees every whole file path of v2 file trees; database
+  errors in the crawler log only their error code, never a message that could quote a name.
 
 ## Older servers and offline mode
 

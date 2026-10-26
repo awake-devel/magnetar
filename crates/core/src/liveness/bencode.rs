@@ -72,6 +72,49 @@ pub fn decode_prefix(input: &[u8]) -> Result<(Value, usize), String> {
     Ok((v, p.pos))
 }
 
+/// Number of values (dict keys included) a decode of `input` would build, counted without
+/// allocating; stops once it passes `max` (returns `max + 1`). Malformed input ends the count
+/// early (the real decode rejects it). Used to price a decode before running it: the `Value`
+/// tree costs tens of bytes per value, so 2-byte values (`le`, `0:`) amplify memory ~30×.
+pub fn count_values(input: &[u8], max: usize) -> usize {
+    let mut pos = 0usize;
+    let mut n = 0usize;
+    while pos < input.len() && n <= max {
+        match input[pos] {
+            b'i' => {
+                n += 1;
+                match input[pos..].iter().position(|&b| b == b'e') {
+                    Some(r) => pos += r + 1,
+                    None => break,
+                }
+            }
+            b'l' | b'd' => {
+                n += 1;
+                pos += 1;
+            }
+            b'e' => pos += 1,
+            b'0'..=b'9' => {
+                n += 1;
+                let Some(colon) = input[pos..].iter().take(21).position(|&b| b == b':') else {
+                    break;
+                };
+                let Some(len) = std::str::from_utf8(&input[pos..pos + colon])
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                else {
+                    break;
+                };
+                match (pos + colon + 1).checked_add(len) {
+                    Some(end) => pos = end,
+                    None => break,
+                }
+            }
+            _ => break,
+        }
+    }
+    n.min(max.saturating_add(1))
+}
+
 pub fn encode(v: &Value) -> Vec<u8> {
     let mut out = Vec::new();
     encode_into(v, &mut out);

@@ -56,6 +56,8 @@ pub enum InfoError {
     BadFiles,
     /// Total size 0 (only padding or empty files).
     Empty,
+    /// More bencode values than a decode may build (memory amplification, docs/DHT.md §3.8).
+    TooComplex,
 }
 
 impl InfoError {
@@ -67,6 +69,7 @@ impl InfoError {
             InfoError::NoName => "no_name",
             InfoError::BadFiles => "bad_files",
             InfoError::Empty => "empty",
+            InfoError::TooComplex => "too_complex",
         }
     }
 }
@@ -217,9 +220,10 @@ pub fn parse_info(raw: &[u8]) -> Result<InfoSummary, InfoError> {
         return Err(InfoError::BadFiles);
     }
     if let Some(t) = tree.filter(|_| v.get(b"files").is_some() || v.get(b"length").is_some()) {
-        // Hybrid: the v1 list is displayed, the v2 keys still go to the blocklist.
+        // Hybrid: the v1 list is displayed, the v2 keys still go to the blocklist. A tree that
+        // does not walk is an invalid hybrid (the screen must see every name, not a prefix).
         let mut ignored = Vec::new();
-        let _ = walk_tree(t, &mut Vec::new(), &mut ignored, &mut all_names, 0);
+        walk_tree(t, &mut Vec::new(), &mut ignored, &mut all_names, 0)?;
     }
     let total_size = files
         .iter()
@@ -270,6 +274,8 @@ fn walk_tree<'a>(
                 .and_then(|l| u64::try_from(l).ok())
                 .ok_or(InfoError::BadFiles)?;
             let attr = child.get(b"attr").and_then(Value::as_bytes);
+            // The whole path too, as stored for v1 files (a screen rule may span elements).
+            names.push(join(prefix, false).unwrap_or_default());
             if !is_padding(attr, prefix.first().copied(), prefix.last().copied()) {
                 files.push(InfoFile {
                     path: join(prefix, false).unwrap_or_default(),
@@ -394,6 +400,13 @@ mod tests {
                 size: 1024
             }]
         );
+        // The whole path reaches the screen too, not only its elements.
+        assert!(s.all_names.iter().any(|n| n == "dir1/dir2/fileA.txt"));
+        // A hybrid whose tree does not walk is invalid (the screen must see every name).
+        assert_eq!(
+            parse_info(b"d9:file treed1:ad0:d6:lengthi-1eeee6:lengthi5e4:name1:a6:pieces0:e"),
+            Err(InfoError::BadFiles)
+        );
         // root must not be a file
         assert_eq!(
             parse_info(b"d9:file treed0:d6:lengthi1eee4:name1:ae"),
@@ -405,6 +418,7 @@ mod tests {
         #[test]
         fn arbitrary_bytes_never_panic(b in proptest::collection::vec(any::<u8>(), 0..400)) {
             let _ = parse_info(&b);
+            prop_assert!(bencode::count_values(&b, 64) <= 65);
         }
 
         #[test]
