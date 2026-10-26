@@ -151,7 +151,9 @@ enum Decision {
 
 async fn due(pool: &PgPool, retry_before: i64, limit: usize) -> anyhow::Result<Vec<String>> {
     Ok(sqlx::query_scalar(
-        "SELECT DISTINCT t.infohash FROM torrents t
+        // Every infohash, Nostr or DHT (D50: a torrent_infohashes row exists while it has
+        // events or a DHT row), so DHT names are matched too (D68).
+        "SELECT t.infohash FROM torrent_infohashes t
          WHERE NOT EXISTS (
              SELECT 1 FROM enrich_checked c WHERE c.infohash = t.infohash
                AND c.matcher_version >= $1 AND NOT (c.pending_title AND c.checked_at <= $2))
@@ -166,7 +168,9 @@ async fn due(pool: &PgPool, retry_before: i64, limit: usize) -> anyhow::Result<V
 
 async fn load_groups(pool: &PgPool, infohashes: &[String]) -> anyhow::Result<Vec<Group>> {
     let rows: Vec<EventRow> = sqlx::query_as(
-        "SELECT infohash, title, description, files, external_ids, category FROM torrents
+        // Nostr events first (canonical order), the DHT row (trust -1) last: a DHT-only
+        // infohash is matched on its verified name and files (D68).
+        "SELECT infohash, title, description, files, external_ids, category FROM torrent_rows
          WHERE infohash = ANY($1) ORDER BY infohash, trust DESC, created_at ASC, event_id ASC",
     )
     .bind(infohashes)
@@ -1404,7 +1408,7 @@ pub struct CoverageRow {
 
 pub async fn coverage(pool: &PgPool) -> anyhow::Result<Vec<CoverageRow>> {
     sqlx::query_as(
-        "WITH canon AS (SELECT DISTINCT ON (infohash) infohash, category FROM torrents
+        "WITH canon AS (SELECT DISTINCT ON (infohash) infohash, category FROM torrent_rows
                         ORDER BY infohash, trust DESC, created_at ASC, event_id ASC)
          SELECT c.category, CASE WHEN tm.confidence < $1 THEN tm.method || '<' || $1::text
                                  ELSE tm.method END AS method, count(*) AS infohashes

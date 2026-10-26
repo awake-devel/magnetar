@@ -102,12 +102,13 @@ pub async fn backfill(
             break;
         };
         report.scanned += page.len() as u64;
-        // The first event of each infohash that needs parsing, as at ingest.
+        // The first event of each infohash that needs parsing, as at ingest; the DHT row
+        // (verified name and files, D68) when the infohash has no Nostr event.
         let rows: Vec<EventRow> = sqlx::query_as(
             "SELECT DISTINCT ON (t.infohash) t.infohash, t.title, t.category, t.files
-             FROM torrents t LEFT JOIN torrent_attrs a ON a.infohash = t.infohash
+             FROM torrent_rows t LEFT JOIN torrent_attrs a ON a.infohash = t.infohash
              WHERE t.infohash = ANY($1) AND (a.infohash IS NULL OR a.parser_version < $2 OR $3)
-             ORDER BY t.infohash, t.created_at, t.event_id",
+             ORDER BY t.infohash, t.origin = 'dht', t.created_at, t.event_id",
         )
         .bind(&page)
         .bind(PARSER_VERSION)

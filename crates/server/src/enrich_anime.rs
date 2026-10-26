@@ -991,6 +991,8 @@ async fn upsert_media_retry(
 }
 
 /// Match the next `limit` anime torrents not yet tried with this dataset + matcher version.
+/// Nostr events and DHT rows classified `anime` alike (`torrent_rows`, D68); a Nostr event
+/// wins the infohash when both exist (the DHT row sorts last with trust -1).
 pub async fn match_pending(
     pool: &PgPool,
     ix: &Arc<AnimeIndex>,
@@ -1001,7 +1003,7 @@ pub async fn match_pending(
     let excluded: Vec<String> = EXCLUDED_PATHS.iter().map(|s| s.to_string()).collect();
     let rows = sqlx::query_as::<_, PendingRow>(
         "SELECT DISTINCT ON (t.infohash) t.infohash, t.title, t.description, t.files, t.external_ids
-         FROM torrents t
+         FROM torrent_rows t
          WHERE t.category = 'anime' AND NOT (t.category_path && $1::text[])
            AND NOT EXISTS (SELECT 1 FROM anime_attempts a WHERE a.infohash = t.infohash
                            AND a.dataset = $2 AND a.matcher_version = $3)

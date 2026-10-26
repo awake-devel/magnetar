@@ -943,3 +943,81 @@ async fn pairs_agree_by_title_in_any_order() {
         .unwrap();
     assert_eq!(rows, 4);
 }
+
+/// D68: a DHT-only torrent (no Nostr event) is matched by its verified name, and its release
+/// attributes come from the backfill (`torrent_rows`).
+#[tokio::test]
+async fn dht_only_torrents_are_enriched_and_parsed() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    let pool = s.pool();
+    let dir = fixture_dir();
+    let icfg = imdb::ImdbConfig {
+        dir: dir.clone(),
+        akas: false,
+        base_url: "http://127.0.0.1:9".into(),
+        min_titles: 1,
+    };
+    let ecfg = EnrichConfig {
+        imdb: Some(icfg.clone()),
+        refresh: std::time::Duration::from_secs(3600),
+        fuzzy: true,
+    };
+    imdb::import(
+        pool,
+        &icfg,
+        &[
+            fetched(imdb::BASICS),
+            fetched(imdb::RATINGS),
+            fetched(imdb::EPISODE),
+        ],
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO dht_torrents (infohash, title, files, file_count, files_text, total_size,
+             category, metadata_size, first_seen, fetched_at, discovered_via, classifier_version)
+         VALUES ($1, 'Fargo.1996.1080p.BluRay.x264-GRP',
+                 '[{\"path\":\"Fargo.1996.1080p.BluRay.x264-GRP.mkv\",\"size\":8000000000}]',
+                 1, 'Fargo.1996.1080p.BluRay.x264-GRP.mkv', 8000000000, 'video', 1000, $2, $2,
+                 'sample', 1)",
+    )
+    .bind(ih(77))
+    .bind(NOW)
+    .execute(pool)
+    .await
+    .unwrap();
+    let r = enrich::drain(s, &ecfg).await.unwrap();
+    assert_eq!(r.checked, 1, "{r:?}");
+    let (imdb_id, method): (Option<String>, String) = sqlx::query_as(
+        "SELECT m.imdb, tm.method FROM torrent_media tm JOIN media m ON m.id = tm.media_id
+         WHERE tm.infohash = $1",
+    )
+    .bind(ih(77))
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        imdb_id.as_deref(),
+        Some("tt0116282"),
+        "Fargo (1996), the film"
+    );
+    assert_eq!(method, "offline_title");
+    // Release attributes: the DHT writer stores them; the backfill re-parses DHT rows too.
+    sqlx::query("DELETE FROM torrent_attrs WHERE infohash = $1")
+        .bind(ih(77))
+        .execute(pool)
+        .await
+        .unwrap();
+    magnetar_server::attrs::backfill(pool, false, None)
+        .await
+        .unwrap();
+    let res: Option<String> =
+        sqlx::query_scalar("SELECT attrs->>'resolution' FROM torrent_attrs WHERE infohash = $1")
+            .bind(ih(77))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(res.as_deref(), Some("1080p"));
+    let _ = std::fs::remove_dir_all(dir);
+}
