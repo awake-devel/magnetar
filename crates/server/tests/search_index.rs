@@ -338,6 +338,11 @@ async fn text_matching() {
         titles(&s.search(&q("rabbit"), NOW).await.unwrap()),
         vec!["Unrelated"]
     );
+    let page = s.search(&q("rabbit"), NOW).await.unwrap();
+    assert_eq!(
+        page.hits[0].matched_file, None,
+        "a description hit names no file"
+    );
     // File names, matched file reported.
     let page = s.search(&q("s01e02"), NOW).await.unwrap();
     assert_eq!(titles(&page), vec!["Pack"]);

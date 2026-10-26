@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use magnetar_core::enrich::MIN_DISPLAY_CONFIDENCE;
 use magnetar_core::enrich::ids::MediaRef;
 use magnetar_core::error::Result;
-use magnetar_core::model::{Category, TorrentFile};
+use magnetar_core::model::Category;
 use sqlx::types::Json;
 use sqlx::{FromRow, PgPool};
 
@@ -275,7 +275,10 @@ pub async fn resolve_media(pool: &PgPool, r: &MediaRef) -> Result<Option<i64>> {
         .map_err(db)
 }
 
-/// File lists of the given events, for the "matched in file" line.
+/// Paths looked at per hit for the "matched in file" line (packs list up to 5000 files).
+pub const MATCHED_FILE_PATHS: i32 = 1000;
+
+/// The first `MATCHED_FILE_PATHS` file paths of the given events.
 pub async fn event_files(
     pool: &PgPool,
     event_ids: &[String],
@@ -283,14 +286,14 @@ pub async fn event_files(
     if event_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let rows: Vec<(String, Json<Vec<TorrentFile>>)> =
-        sqlx::query_as("SELECT event_id, files FROM torrents WHERE event_id = ANY($1)")
-            .bind(event_ids)
-            .fetch_all(pool)
-            .await
-            .map_err(db)?;
-    Ok(rows
-        .into_iter()
-        .map(|(id, f)| (id, f.0.into_iter().map(|f| f.path).collect()))
-        .collect())
+    let rows: Vec<(String, Json<Vec<String>>)> = sqlx::query_as(
+        "SELECT event_id, jsonb_path_query_array(files, ('$[0 to ' || $2 || '].path')::jsonpath)
+         FROM torrents WHERE event_id = ANY($1)",
+    )
+    .bind(event_ids)
+    .bind(MATCHED_FILE_PATHS - 1)
+    .fetch_all(pool)
+    .await
+    .map_err(db)?;
+    Ok(rows.into_iter().map(|(id, f)| (id, f.0)).collect())
 }

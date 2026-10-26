@@ -16,6 +16,7 @@ pub mod load;
 pub mod query;
 pub mod schema;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,6 +30,11 @@ use magnetar_core::model::{MediaKind, TorrentSummary, npub};
 use magnetar_core::query::{SearchPage, SearchQuery, Sort};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use tantivy::DocSet;
+use tantivy::SegmentMeta;
+use tantivy::index::SegmentId;
+use tantivy::merge_policy::{LogMergePolicy, MergeCandidate, MergePolicy};
+use tantivy::query::{EnableScoring, Query};
 use tantivy::schema::{Field, Value};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
 use tokio::sync::watch;
@@ -53,6 +59,63 @@ pub const MAX_FACET_VALUES: usize = 200;
 
 pub(crate) fn ix(e: impl std::fmt::Display) -> Error {
     Error::Other(format!("search index: {e}"))
+}
+
+/// Segments aim at this share of the index (at least `MIN_SEGMENT_DOCS`), so a query over
+/// every document fans out over ~16 segments on the search threads instead of a few huge ones:
+/// at 3.2 M documents Tantivy's default policy left segments of 1.04 M, 995 k and 684 k docs,
+/// and the biggest one bounded the latency of every broad query.
+pub const SEGMENTS_TARGET: u32 = 16;
+pub const MIN_SEGMENT_DOCS: u32 = 200_000;
+
+/// `LogMergePolicy`, with merges split so that no merged segment exceeds the cap.
+#[derive(Debug, Default)]
+struct CappedMergePolicy {
+    inner: LogMergePolicy,
+}
+
+impl MergePolicy for CappedMergePolicy {
+    fn compute_merge_candidates(&self, segments: &[SegmentMeta]) -> Vec<MergeCandidate> {
+        let total: u32 = segments.iter().map(|s| s.num_docs()).sum();
+        let cap = (total / SEGMENTS_TARGET).max(MIN_SEGMENT_DOCS);
+        let docs: HashMap<SegmentId, u32> =
+            segments.iter().map(|s| (s.id(), s.num_docs())).collect();
+        let mut inner = self.inner.clone();
+        inner.set_max_docs_before_merge(cap as usize);
+        let mut out = Vec::new();
+        for MergeCandidate(ids) in inner.compute_merge_candidates(segments) {
+            if ids.len() == 1 {
+                // Rewriting one segment to drop its deleted documents.
+                out.push(MergeCandidate(ids));
+                continue;
+            }
+            let mut group: Vec<SegmentId> = Vec::new();
+            let mut sum = 0u32;
+            for id in ids {
+                let n = docs.get(&id).copied().unwrap_or(0);
+                if !group.is_empty() && sum + n > cap {
+                    if group.len() > 1 {
+                        out.push(MergeCandidate(std::mem::take(&mut group)));
+                    }
+                    group.clear();
+                    sum = 0;
+                }
+                group.push(id);
+                sum += n;
+            }
+            if group.len() > 1 {
+                out.push(MergeCandidate(group));
+            }
+        }
+        out
+    }
+}
+
+/// Back to the last commit. Tantivy replaces the writer, merge policy included.
+fn rollback(w: &mut IndexWriter<TantivyDocument>) -> Result<()> {
+    w.rollback().map_err(ix)?;
+    w.set_merge_policy(Box::new(CappedMergePolicy::default()));
+    Ok(())
 }
 
 /// Commit payload: what the index is, and how far a full build got.
@@ -99,8 +162,9 @@ pub struct IndexQuery {
 
 pub struct IndexHit {
     pub summary: TorrentSummary,
-    /// Every word matched the title (else the hit came from file names or the description).
-    pub title_matched: bool,
+    /// Not every word is in the title, and some word matched a file name: worth looking for
+    /// the matching file (`matched_file`).
+    pub file_matched: bool,
 }
 
 pub struct IndexResult {
@@ -178,16 +242,17 @@ impl SearchIndex {
         let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
         // Queries fan out over segments; leave a core or two for Postgres and the API.
         index
-            .set_multithread_executor(cpus.saturating_sub(2).clamp(1, 8))
+            .set_multithread_executor(cpus.saturating_sub(2).clamp(1, 16))
             .map_err(ix)?;
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
             .try_into()
             .map_err(ix)?;
-        let writer = index
+        let writer: IndexWriter<TantivyDocument> = index
             .writer_with_num_threads(cpus.clamp(1, 4), WRITER_MEMORY)
             .map_err(ix)?;
+        writer.set_merge_policy(Box::new(CappedMergePolicy::default()));
         let ready = payload.complete;
         Ok(SearchIndex {
             dir: dir.to_path_buf(),
@@ -233,7 +298,7 @@ impl SearchIndex {
         let p = self.payload.lock().unwrap().clone();
         let mut w = self.writer.lock().unwrap();
         // A failed attempt in this process may have left documents after its last commit.
-        w.rollback().map_err(ix)?;
+        rollback(&mut w)?;
         let cursor = match &p.cursor {
             Some(c) if !p.complete => c.clone(),
             _ => {
@@ -303,7 +368,7 @@ impl SearchIndex {
         }
         if res.is_err() {
             // Half a batch must not ride along with the next commit; the batch is retried.
-            let _ = w.rollback();
+            let _ = rollback(&mut w);
         }
         res
     }
@@ -321,7 +386,9 @@ impl SearchIndex {
     /// Run one query. Blocking (CPU-bound: call through `spawn_blocking`).
     pub fn search(&self, q: &IndexQuery) -> Result<IndexResult> {
         let searcher = self.reader.searcher();
-        let query = query::build(&self.fields, &q.words);
+        let query = query::build(&self.fields, &q.words, &|t| {
+            searcher.doc_freq(t).unwrap_or(0)
+        });
         let collector = TopFiltered {
             filter: q.filter.clone(),
             sort: q.sort,
@@ -329,6 +396,15 @@ impl SearchIndex {
             k: q.offset + q.limit,
         };
         let (total, top) = searcher.search(&*query, &collector).map_err(ix)?;
+        // Which hits matched a word in their file names (most text hits match in the title, and
+        // many of the others only in the description): one seek per hit.
+        let files = (!q.words.is_empty())
+            .then(|| {
+                query::files_any(&self.fields, &q.words)
+                    .weight(EnableScoring::disabled_from_searcher(&searcher))
+            })
+            .transpose()
+            .map_err(ix)?;
         let mut hits = Vec::with_capacity(q.limit);
         for r in top.into_iter().skip(q.offset).take(q.limit) {
             let doc: TantivyDocument = searcher.doc(r.addr).map_err(ix)?;
@@ -338,10 +414,17 @@ impl SearchIndex {
                 0.0
             };
             let (summary, titles) = self.summary(&doc, rank, &q.filter);
-            let title_matched = q.words.is_empty() || query::all_match(&q.words, &titles);
+            let file_matched = match &files {
+                Some(w) if !query::all_match(&q.words, &titles) => {
+                    let seg = searcher.segment_reader(r.addr.segment_ord);
+                    let mut sc = w.scorer(seg, 1.0).map_err(ix)?;
+                    sc.seek(r.addr.doc_id) == r.addr.doc_id
+                }
+                _ => false,
+            };
             hits.push(IndexHit {
                 summary,
-                title_matched,
+                file_matched,
             });
         }
         Ok(IndexResult { hits, total })
@@ -358,7 +441,9 @@ impl SearchIndex {
             return Ok(None);
         };
         let searcher = self.reader.searcher();
-        let query = query::build(&self.fields, &q.words);
+        let query = query::build(&self.fields, &q.words, &|t| {
+            searcher.doc_freq(t).unwrap_or(0)
+        });
         let collector = FacetCounts {
             filter: q.filter.clone(),
             field: self.fields.schema.get_field_name(field).to_string(),
@@ -545,26 +630,31 @@ pub async fn search(
     let need: Vec<String> = res
         .hits
         .iter()
-        .filter(|h| !h.title_matched)
+        .filter(|h| h.file_matched)
         .map(|h| h.summary.event_id.clone())
         .collect();
     let files = load::event_files(pool, &need).await?;
-    let hits = res
-        .hits
-        .into_iter()
-        .map(|h| {
-            let mut s = h.summary;
-            if !h.title_matched {
-                s.matched_file = files
-                    .get(&s.event_id)
-                    .and_then(|f| query::best_file(&words, f.iter().map(String::as_str)));
-            }
-            s
-        })
-        .collect();
+    let total = res.total;
+    // Tokenising up to MATCHED_FILE_PATHS paths per hit is CPU work: off the runtime.
+    let hits = tokio::task::spawn_blocking(move || {
+        res.hits
+            .into_iter()
+            .map(|h| {
+                let mut s = h.summary;
+                if h.file_matched {
+                    s.matched_file = files
+                        .get(&s.event_id)
+                        .and_then(|f| query::best_file(&words, f.iter().map(String::as_str)));
+                }
+                s
+            })
+            .collect()
+    })
+    .await
+    .map_err(join_err)?;
     Ok(SearchPage {
         hits,
-        total: res.total,
+        total,
         ..empty
     })
 }

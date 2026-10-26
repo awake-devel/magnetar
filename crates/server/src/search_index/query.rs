@@ -24,6 +24,9 @@ const BOOST_DESCRIPTION: f32 = 0.6;
 /// Prefix and fuzzy matches score a constant (times these), below a real BM25 term hit.
 const BOOST_PREFIX: f32 = 1.0;
 const BOOST_FUZZY: f32 = 0.5;
+/// A word found as is in at least this many titles is taken as typed: no fuzzy expansion
+/// (`complete`, `french`: expanding them costs tens of ms at 3 M documents and only adds noise).
+pub const FUZZY_MAX_DF: u64 = 50;
 
 /// Words as the index sees them: split on non-alphanumerics, lowercased, accents folded.
 pub fn tokens(text: &str) -> Vec<String> {
@@ -64,8 +67,15 @@ fn boosted(q: impl Query, boost: f32) -> Box<dyn Query> {
     Box::new(BoostQuery::new(Box::new(q), boost))
 }
 
-/// Ways one word may match one field: exact (BM25), prefix, fuzzy.
-fn variants(field: Field, word: &str, last: bool, boost: f32, out: &mut Vec<Box<dyn Query>>) {
+/// Ways one word may match one field: exact (BM25), prefix, and fuzzy when `fuzzy`.
+fn variants(
+    field: Field,
+    word: &str,
+    last: bool,
+    fuzzy: bool,
+    boost: f32,
+    out: &mut Vec<Box<dyn Query>>,
+) {
     out.push(boosted(
         TermQuery::new(term(field, word), IndexRecordOption::WithFreqs),
         boost,
@@ -77,7 +87,7 @@ fn variants(field: Field, word: &str, last: bool, boost: f32, out: &mut Vec<Box<
         ));
     }
     let d = fuzzy_distance(word);
-    if d > 0 {
+    if fuzzy && d > 0 {
         let t = term(field, word);
         let q = if last {
             FuzzyTermQuery::new_prefix(t, d, true)
@@ -94,8 +104,10 @@ fn union(qs: Vec<Box<dyn Query>>) -> Box<dyn Query> {
     ))
 }
 
-/// The query for analysed words; `AllQuery` when there are none (browse).
-pub fn build(f: &Fields, words: &[String]) -> Box<dyn Query> {
+/// The query for analysed words; `AllQuery` when there are none (browse). `title_df` gives the
+/// number of documents whose title holds a word as is (fuzzy matching is skipped for common
+/// words, see `FUZZY_MAX_DF`).
+pub fn build(f: &Fields, words: &[String], title_df: &dyn Fn(&Term) -> u64) -> Box<dyn Query> {
     if words.is_empty() {
         return Box::new(AllQuery);
     }
@@ -104,10 +116,12 @@ pub fn build(f: &Fields, words: &[String]) -> Box<dyn Query> {
     let mut title_all = Vec::with_capacity(n);
     for (i, w) in words.iter().enumerate() {
         let last = i + 1 == n;
+        let fuzzy = fuzzy_distance(w) > 0 && title_df(&term(f.title, w)) < FUZZY_MAX_DF;
         let mut title = Vec::new();
-        variants(f.title, w, last, BOOST_TITLE, &mut title);
+        variants(f.title, w, last, fuzzy, BOOST_TITLE, &mut title);
         let mut any = title.iter().map(|q| q.box_clone()).collect::<Vec<_>>();
-        variants(f.files, w, last, BOOST_FILES, &mut any);
+        // File names: exact and prefix only; typos are matched against titles.
+        variants(f.files, w, last, false, BOOST_FILES, &mut any);
         // Descriptions are long and mostly boilerplate: exact words (and a long last-word
         // prefix) only, no fuzzy expansion over their large term dictionary.
         any.push(boosted(
@@ -129,6 +143,16 @@ pub fn build(f: &Fields, words: &[String]) -> Box<dyn Query> {
     ));
     must.push((Occur::Should, bonus));
     Box::new(BooleanQuery::new(must))
+}
+
+/// Documents where some word matches a file name (as `build` matches files).
+pub fn files_any(f: &Fields, words: &[String]) -> BooleanQuery {
+    let n = words.len();
+    let mut any = Vec::new();
+    for (i, w) in words.iter().enumerate() {
+        variants(f.files, w, i + 1 == n, false, BOOST_FILES, &mut any);
+    }
+    BooleanQuery::new(any.into_iter().map(|q| (Occur::Should, q)).collect())
 }
 
 /// Optimal string alignment distance (adjacent transpositions cost 1, like the index's fuzzy
