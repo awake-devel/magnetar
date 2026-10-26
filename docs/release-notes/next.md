@@ -83,6 +83,10 @@ must be updated together to get all of it, but each side keeps working with an o
   included, with a switch to show it.
 - A hard blocklist for illegal content will drop such torrents from the DHT and from Nostr
   alike, keeping only their infohash so they are never fetched again; it cannot be turned off.
+- Design review: the blocklist will check every name a torrent carries (including the ones
+  apps hide, such as padding files) and, for Nostr torrents, the description and hashtags too;
+  torrents whose metadata repeats a field are refused. Adult content is hidden when either the
+  publisher or the DHT classifier says so.
 
 ## Older servers and offline mode
 

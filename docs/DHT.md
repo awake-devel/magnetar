@@ -113,9 +113,9 @@ CREATE TABLE dht_seen (
     first_seen      bigint NOT NULL,
     last_seen       bigint NOT NULL,
     via             smallint NOT NULL,       -- 0 sample, 1 announce, 2 get_peers
-    status          smallint NOT NULL,       -- 0 queued, 2 failed, 3 invalid, 4 private, 5 v2_only, 6 oversize, 7 skipped_known
+    status          smallint NOT NULL,       -- 0 queued, 2 failed, 3 invalid, 4 private, 5 v2_only, 6 oversize, 7 skipped_known, 8 alias
     attempts        smallint NOT NULL DEFAULT 0,
-    next_attempt_at bigint,                  -- NULL = never retry
+    next_attempt_at bigint,                  -- NULL = never retry; a queued row holds a 1 h lease (§3.7)
     last_error      text                     -- short code: no_peers, connect, no_ut_metadata, reject, timeout, hash_mismatch, …
 );
 CREATE INDEX dht_seen_retry ON dht_seen (next_attempt_at) WHERE next_attempt_at IS NOT NULL;
@@ -126,6 +126,11 @@ CREATE TABLE blocked_infohashes (
     blocked_at   bigint NOT NULL,
     rule_version smallint NOT NULL,
     origin       text NOT NULL CHECK (origin IN ('dht','nostr','sweep'))
+);
+-- Nostr events rejected by D53 (id only), so NIP-77 does not fetch them again on every sync.
+CREATE TABLE blocked_events (
+    id         text COLLATE "C" PRIMARY KEY,
+    blocked_at bigint NOT NULL
 );
 
 -- Counters, schedule, stats and the index log, as torrent_counts_ins / liveness_schedule_ins do
@@ -144,7 +149,12 @@ BEGIN
         UPDATE meta SET value = value + fresh WHERE key = 'infohash_count';
         PERFORM stats_bump('torrents_added', fresh);
     END IF;
-    PERFORM stats_bump('dht_torrents_added', (SELECT count(*) FROM new_rows));
+    -- A batch whose rows all hit ON CONFLICT DO NOTHING still fires this statement trigger
+    -- with an empty transition table: no zero rows in stats_series.
+    SELECT count(*) INTO fresh FROM new_rows;
+    IF fresh > 0 THEN
+        PERFORM stats_bump('dht_torrents_added', fresh);
+    END IF;
     RETURN NULL;
 END $$;
 CREATE TRIGGER dht_counts_ins AFTER INSERT ON dht_torrents
@@ -203,9 +213,15 @@ INSERT INTO meta (key, value) VALUES ('dht_blocklist_version', 0) ON CONFLICT (k
 ```
 
 The stage that writes it runs `backend-design:review-migration`-style checks: `ADD COLUMN …
-DEFAULT false` is metadata-only; the view and empty tables take no time; `CREATE OR REPLACE
-torrent_counts_del` takes a brief lock on `torrents`' trigger. Down-migration is not provided
-(sqlx migrations are forward-only in this repo).
+DEFAULT false` with a constant default is metadata-only (production runs `postgres:18`,
+`compose.yml`), but it still takes an `ACCESS EXCLUSIVE` lock on `torrent_infohashes` (501 675
+rows), so it waits behind any open reader of that table and blocks everyone queued after it;
+migrations run at `serve` start before the loops, and the migration sets `SET LOCAL
+lock_timeout = '10s'` so a stray session (a manual `psql`, a dump) fails the start loudly
+instead of stalling it. The view and empty tables take no time; `CREATE OR REPLACE FUNCTION
+torrent_counts_del` replaces the function body only (no table lock; the trigger on `torrents`
+picks up the new body on its next statement). Down-migration is not provided (sqlx migrations
+are forward-only in this repo).
 
 **Why `dht_seen.infohash` is `bytea`**: it is the crawler's private, possibly tens-of-millions-row
 table (20 B key vs 41 B text). Every table shared with the rest of the server stays lowercase
@@ -221,8 +237,13 @@ statement trigger, after the insert; `torrents` has no such FK either. The child
 One transaction per batch (≤ 500 rows or 1 s): `INSERT INTO dht_torrents … ON CONFLICT
 (infohash) DO NOTHING` → `INSERT INTO torrent_attrs … ON CONFLICT DO NOTHING` (release
 attributes parsed from the DHT name + files with `core::release`, first writer wins as for
-Nostr, D44) → `DELETE FROM dht_seen WHERE infohash = ANY(…)`. The blocklist (§7) runs
-**before** the batch is built; a blocked hash never reaches this code path.
+Nostr, D44) → `DELETE FROM dht_seen WHERE infohash = ANY(…)` over the hashes the fetches were
+**triaged under** (the sighted hashes). Sighted and stored hash differ for a hybrid torrent
+sighted under its truncated v2 hash (§4 step 5), which is stored under its SHA-1: that sighted
+row is not deleted but set to status 8 `alias` with `next_attempt_at = NULL`. Deleting by the
+stored hash would leave it `queued` forever; deleting it would let the truncated hash, absent
+from `torrent_infohashes`, be fetched again every time it is sampled. The blocklist (§7) runs **before** the batch is
+built; a blocked hash never reaches this code path.
 
 ### 2.5 Readers that switch from `torrents` to `torrent_rows` (stage 5)
 
@@ -234,6 +255,10 @@ Nostr, D44) → `DELETE FROM dht_seen WHERE infohash = ANY(…)`. The blocklist 
 | `enrich/mod.rs` `due`, `load_groups`, `coverage` | IMDb/TMDB matching by name works on DHT names (D40 already uses the largest video file) |
 | `enrich_anime.rs` pending query | anime by name (`category = 'anime'`, §6) |
 | `attrs.rs` backfill | re-parse DHT names when `PARSER_VERSION` moves |
+| `stats.rs::recompute_published` | not a switch but a fix: it counts `liveness_schedule.born` per day, which DHT rows now also fill. It must join `torrent_infohashes` and keep `events > 0`, or every DHT discovery shows up as a "published" torrent on its `first_seen` day (D47's chart means Nostr publications). For a hash known from both sources, `born` can be the DHT `first_seen` when that is earlier (the schedule trigger keeps the minimum); accepted |
+
+Readers that look a row up **by `event_id`** stay on `torrents`: DHT rows have `event_id = ''` in
+the view, and an empty id from a client must never resolve to an arbitrary DHT row.
 
 Stay on `torrents` (Nostr-only): trust/publisher stats, `pow_bits`, comments, `known_torrent_event`,
 `publishers()`, overrides trigger, WoT/relay graphs, the stats backfill from `events.received_at`,
@@ -308,13 +333,18 @@ Both modes honour every rule of §3.4 (interval, per-IP rate, honest ids, no fak
 
 ### 3.3 Node ids and virtual nodes (D54)
 
-- **BEP 42**: id prefix = first 21 bits of `crc32c((ip & 0x030f3fff) | (r << 29))` over the
-  big-endian 8-byte value, last id byte = random with low 3 bits = `r`, `r ∈ [0, 7]` (BEP 42,
-  "Node ID restriction"; the five test vectors become unit tests). The BEP explicitly allows
-  "more than one node ID per external IP" through `r`, so **at most 8 honest ids exist per IPv4
-  address**; `MAGNETAR_DHT_NODES` is capped at 8 for that reason. With 4 nodes we pick the 4 `r`
-  values whose prefixes are farthest apart, so the passive nodes cover distant parts of the
-  keyspace.
+- **BEP 42**: id prefix = first 21 bits of `crc32c((ip & 0x030f3fff) | (r << 29))`, last id
+  byte = random with low 3 bits = `r`, `r ∈ [0, 7]` (BEP 42, "Node ID restriction"; the five
+  test vectors become unit tests). **For IPv4 the CRC runs over the 4 big-endian bytes** of that
+  32-bit value. The BEP's prose says to "store the result in a big endian 64 bit integer and
+  hash those 8 bytes", but its reference code hashes `num_octets` (4 for IPv4, 8 for IPv6) and
+  its test vectors only match 4 bytes: recomputed 2026-10-26 (review), all five vectors match
+  with 4 bytes (`124.31.75.21`, r 1 → `5fbfb8` masked) and none with 8 (`9bf040`). Follow the
+  code and vectors, not the prose. The BEP allows "more than one node ID per external IP"
+  through `r`: there are **8 valid prefixes per IPv4 address** (the other 139 bits are free), so
+  a ninth virtual node would share a prefix (and keyspace region) with another one;
+  `MAGNETAR_DHT_NODES` is capped at 8 for that reason. With 4 nodes we pick the 4 `r` values
+  whose prefixes are farthest apart, so the passive nodes cover distant parts of the keyspace.
 - External IP: UPnP `GetExternalIPAddress` when available, else a vote over the BEP 42 `ip` field
   of responses (≥ 8 agreeing responders from ≥ 4 distinct /16s). Ids are regenerated only when
   the external IP changes; ids, the external IP and the port are persisted in `settings`
@@ -403,13 +433,48 @@ samples / announces / get_peers ──► seen filter (2 × Bloom) ──► bat
   → drop (Nostr or already stored; `MAGNETAR_DHT_FETCH_KNOWN=true` would fetch Nostr-only ones
   to verify their file lists, off by default); in `dht_seen` with `next_attempt_at` in the future
   or NULL → drop, except an `announce` with a peer may retry a `failed` row whose last attempt is
-  > 10 min old; otherwise insert/refresh `dht_seen` and enqueue.
+  > 10 min old; otherwise insert/refresh `dht_seen` as `queued` with `next_attempt_at = now +
+  1 h` (a lease) and enqueue. The lease is what makes the overflow and crash cases below
+  recover: a `queued` row whose fetch never ran comes due again in the retry loop. A
+  `queued` row with `next_attempt_at = NULL` would be dropped by triage forever.
 - **Fetch queue**: in memory, bounded 100 k, three priorities (2 announce-with-peer, 1 sampled,
   0 incoming get_peers and retries); overflow drops the lowest-priority oldest entry (the hash
   stays `queued` in `dht_seen` and is retried by the slow retry loop).
 - **Retry loop**: every minute, ≤ 1000 `dht_seen` rows with `next_attempt_at <= now` re-enter at
   priority 0. Backoff after a failed fetch: 1 h, 6 h, 24 h, then `next_attempt_at = NULL` (4
-  attempts). `invalid`, `private`, `v2_only`, `oversize` are final.
+  attempts). `invalid`, `private`, `v2_only`, `oversize`, `alias` are final.
+
+### 3.8 Hostile input and memory bounds (review, 2026-10-26)
+
+Every byte from the network is attacker-controlled. Rules for stages 1, 2 and 4, each covered
+by a unit test (and, for the decoders, a `proptest`/fuzz-style "arbitrary bytes never panic"
+test):
+
+- **No panics on wire data**: no indexing, slicing, `unwrap` or arithmetic on lengths from the
+  wire without a check (`checked_*`/`get`). Compact `nodes` must be a multiple of 26 bytes,
+  `values` entries exactly 6, `samples` a multiple of 20 (BEP 51: "N × 20 bytes"), ids and
+  infohashes exactly 20, `t` 1–8 bytes, ports ≠ 0; anything else drops the message, not the
+  node. At most 20 `samples` and 16 `nodes` entries are used per response, ≤ 50 `values`.
+- **UDP datagrams** are read into a 2 KiB buffer; longer ones (truncated read) are dropped.
+  `core::liveness::bencode` already bounds nesting (64) and string lengths against the input.
+- **No traffic to non-global addresses** (SSRF): a hostile node can return `nodes`/`values`
+  pointing at `127.0.0.1:5432` (Postgres), the router's admin page or other LAN hosts, and the
+  sampler or the metadata fetcher would then spray them. Before any UDP send or TCP connect,
+  addresses in 0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.0.0/24, 192.168/16,
+  198.18/15, 224/4, 240/4 and our own external address are dropped (the bootstrap routers are
+  resolved names and pass the same check). Counted in stats, never logged per address.
+- **Reflection**: our responses are at most a few hundred bytes larger than the query; the
+  response caps of §3.4 rule 4 (300/s, 5/s per IP) bound what a spoofed-source flood can
+  reflect.
+- **Bounded maps**, all with a hard cap and drop-on-full: outstanding transactions (cap
+  `QPS × 4 s × 2`, oldest expired first), per-remote-IP limiter buckets (LRU, 65 536 IPs, idle
+  buckets are full and can be forgotten), external-IP votes (64 entries), the peer store
+  (100 k), the pool, the triage channel (bounded `mpsc`, 10 000 hashes; full → the sighting is
+  dropped and counted), the fetch queue (100 k), the persist channel (2 batches).
+- **Metadata decode memory**: a 16 MiB info dict with a million tiny paths decodes to a
+  `Value` tree several times its size. Decoding runs under a semaphore (4 at once) and the
+  in-flight budget of §4 step 7 reserves `4 × metadata_size` per decode. Info dicts with
+  duplicate keys at any level are `invalid` (§4 step 6).
 
 ## 4. Metadata fetch (D56, stage 2)
 
@@ -442,12 +507,19 @@ mapping is UNVERIFIED (dht-crawling.md §6.2), and the wire format is ~150 LOC).
    20 bytes"): if the dict also has `pieces` it is **hybrid** → stored under its v1 hash
    `sha1(bytes)` with `infohash_v2 = sha256` hex (BEP 52 "Upgrade Path"); a pure v2 dict (no
    `pieces`) has no v1 identity, which the whole data model (`InfoHash` = v1 hex) needs → status
-   `v2_only`, not stored (counted). Any other mismatch → that peer fails.
+   `v2_only`, not stored (counted). Any other mismatch → that peer fails. A hybrid's SHA-1
+   was never triaged, so before it is stored it goes through the same checks as a sighting
+   (`blocked_infohashes`, `torrent_infohashes`); a block records **both** hashes, and the
+   sighted truncated hash is kept as `alias` (§2.4).
 6. **Info dict**: `private = 1` → status `private`, not stored (BEP 27: such a torrent "MUST ONLY"
    use its private tracker; a magnet without it is useless). Name: `name.utf-8` if valid UTF-8,
    else `name` (lossy UTF-8). Files: `files[].path(.utf-8)` or single `length`, or v2 `file tree`
    for hybrids; BEP 47 padding files (`attr` contains `p`, or `.pad/` paths) dropped. Empty name
-   or total size 0 → `invalid`.
+   or total size 0 → `invalid`. A dict with **duplicate keys** at any level → `invalid`: our
+   lenient decoder returns the first value for a key, while other clients may show a later one,
+   so a creator could put a harmless `name` first and the real one second; the bytes still hash
+   to the infohash. Dropped from display (padding files, the non-preferred of `name` /
+   `name.utf-8`) is not dropped from the blocklist input (§7.2).
 7. **Bounds**: connect 3 s, handshake + extended handshake 5 s, whole peer 10 s; global
    in-flight bytes budget 256 MiB (a fetch reserves `metadata_size` before requesting); global
    new-TCP-connection rate ≤ 25/s (home router conntrack, dht-crawling.md §5); TCP only for now.
@@ -476,6 +548,18 @@ user's "mixed equally, not hidden by min_trust".
   event is below `min_trust` but the DHT row lets the document pass, the result still shows the
   canonical event — the same precedent as a locally trusted second publisher (docs/SEARCH.md
   "Differences from the SQL search").
+- **SQL fallback** (`search.rs::push_hits_cte`, D11) is row-level and needs the same rule
+  written out, or it would hide every DHT row (`trust = -1` fails `t.trust >= min_trust` for
+  any threshold, 0 included): the eligibility predicate becomes `(t.origin = 'dht' OR t.trust
+  >= $min OR <trusted override>)`; `publisher_count` counts `DISTINCT pubkey FILTER (WHERE
+  origin = 'nostr')` (the DHT row's `''` is not a publisher); the pg_trgm typo arm (`$text <%
+  lower(t.title)`) is guarded by `t.origin = 'nostr'`. That guard matters for speed:
+  `dht_torrents` has no trigram index, and an unguarded `OR` arm would make the planner scan
+  every DHT row on each fallback query; with the constant `origin` of each `UNION ALL` branch
+  the guard folds to `false` in the DHT branch and only the GIN `search_tsv` index is used
+  there (stage 5 checks this with `EXPLAIN` on a test database). One accepted difference: the
+  fallback filters rows before picking the canonical one, so when every Nostr event is below
+  `min_trust` it shows the DHT row, where the index shows the Nostr event.
 - **Index** (`SCHEMA_VERSION` 3): facet `f_origin` (`nostr`, `dht`, both values when both), stored
   `origin`. `SearchQuery.origins: Vec<String>` (serde default, any-of; empty = all) — an optional
   filter chip, not a default.
@@ -514,8 +598,13 @@ re-classifies; the anime refinement of step 2 runs in the server, which already 
    legal content).
 
 **Hidden by default, for every origin.** `SearchQuery.include_adult: bool` (serde default
-`false`): without it, documents whose canonical category is `porn` are excluded — unless the
-query explicitly selects the `porn` category (choosing it is consent). Applied identically by the
+`false`): without it, **adult** documents are excluded — unless the query explicitly selects
+the `porn` category (choosing it is consent). A document is adult when its canonical category
+is `porn` **or** it has a DHT row classified `porn` (index: a stored/fast `adult` flag; SQL
+fallback: an `EXISTS` on `dht_torrents`). The canonical category alone would let a Nostr event
+filed under `video` un-hide a torrent the classifier tagged from its own files; the opposite
+direction (a Nostr publisher filing a non-adult hash under `porn`) only hides that hash, as
+the canonical-category rule already would. Applied identically by the
 index collector, the SQL fallback and the phone's SQLite search; saved searches carry it.
 
 This also hides the **36 809 Nostr infohashes** categorised `porn` by their publishers (§1)
@@ -534,19 +623,40 @@ App: Settings → "Show adult content" (off), stored with the app's search prefe
 - **Nostr ingest** (`core::ingest`, so the phone applies it too): a kind 2003 whose title, file
   names or infohash matches is rejected with the new `Rejection::Blocked` (relay `OK false
   "blocked: content policy"`); the raw event is not stored; the server records the infohash with
-  origin `nostr`. A later event for a blocked infohash is rejected by `put_torrent`.
+  origin `nostr`. A later event for a blocked infohash is rejected by `put_torrent`. The
+  **hard** tier also runs over the description and hashtags (shown in the app, so a harmless
+  title cannot carry such text past it); the context tier stays on title + files, where the
+  production false-positive count was measured. The rejected event id is remembered (id only,
+  `blocked_events(id, blocked_at)`), so NIP-77 reconciliation does not fetch and reject the
+  same event on every sync.
 - **Sweep**: when `meta.dht_blocklist_version` < the built-in version, `serve` scans
-  `torrent_rows` (title + files_text, chunks of 2000), deletes matching `events` (cascading
+  `torrent_rows` (title + files_text with both tiers, description for the hard tier, chunks of
+  2000), deletes matching `events` (cascading
   `torrents`; their comments are deleted too) and `dht_torrents`, and records the hashes with
-  origin `sweep`. The search index follows through the `search_changes` triggers.
+  origin `sweep`. The search index follows through the `search_changes` triggers. Deleting is
+  not erasing: the old text stays in dead Postgres tuples (heap and TOAST) until vacuum and in
+  Tantivy segments until they are merged. A sweep that removed anything therefore runs `VACUUM`
+  on `events`, `torrents` and `dht_torrents` and forces an index merge with garbage collection
+  of the old segment files (WAL, backups and dumps are out of reach and documented as such).
 - No setting, env var or API turns any of this off. `MAGNETAR_BLOCKLIST_FILE` can only **add**
   terms. If the built-in list or that file fails to load, the crawler and ingest refuse to start
   (fail closed).
-- Logs and stats carry counts and infohashes only, never names.
+- Logs and stats carry counts and infohashes only, never names. That includes the code that
+  runs **before** the blocklist decision: the fetcher, the info-dict parser, `core::classify`
+  and `core::release` must not log names or paths at any level (a `debug!` with the name in the
+  fetcher would leak exactly what is about to be blocked); a test with a capturing `tracing`
+  subscriber feeds a blocked fixture through the whole pipeline at `TRACE` and asserts the
+  fixture's terms never appear. The `dht --dry-run` report likewise shows names only of
+  torrents that passed the blocklist.
+- Order on the DHT path: verify hash → parse info dict → classify (pure, needed by the context
+  tier) → blocklist → only then anything that writes, logs a name or leaves the process.
 
 ### 7.2 Matching
 
-Input: name + every file path. Normalisation: Unicode lowercase, Latin diacritics folded,
+Input: **every** name and path variant in the info dict, not only the ones displayed: `name`
+and `name.utf-8`, every `path` and `path.utf-8`, v2 `file tree` keys, padding-file paths
+included (for Nostr: title, file names, and for the hard tier description and hashtags).
+Normalisation: Unicode lowercase, Latin diacritics folded,
 everything not a letter/digit → space, plus a second variant with common digit/symbol
 substitutions undone (0→o, 1→i, 3→e, 4→a, 5→s, @→a). Tokens and token 2-/3-grams are hashed
 (`sha256("magnetar-blocklist-v1:" + ngram)`) and looked up in two sets:
@@ -568,7 +678,9 @@ categories make it likely). Those terms go to the context tier.
 that is **not committed** (the repo carries no readable list of such terms). Initial source:
 bitmagnet's `keywords.banned` (credited in the file header), its regex entries rewritten as token
 sequences, the two short terms moved to the context tier. Limits (documented, UNVERIFIED recall):
-hashed n-grams cannot match words glued together without separators; public CSAM hash lists
+hashed n-grams cannot match words glued together without separators; context terms only
+fire when the classifier (or the Nostr category) says adult, so a torrent the classifier misses
+is checked against the hard tier only; public CSAM hash lists
 (IWF etc.) cover files, not torrent names, and are not available to us.
 
 ## 8. Ops: configuration (D58)
@@ -660,11 +772,11 @@ blocked names anywhere; nothing from the DHT is published to Nostr.
 | Stage | Builds | Verifies |
 |---|---|---|
 | 0 | this document, D49–D58 | production counts, librqbit-dht API, BEP texts, router UPnP (read-only) |
-| 1 | `core::dht` KRPC, BEP 42 ids, routing, pool, sampler, limiter, responder, peer store | BEP 5/42/51 vectors, fake-socket sampler, a bounded live polite run |
-| 2 | `core::metainfo` BEP 3/10/9 fetcher, v1/hybrid/v2 verification | fake-peer tests (reject, short piece, wrong hash, hybrid, private), bounded live fetch of sampled hashes |
-| 3 | `core::classify`, `core::blocklist`, `Rejection::Blocked`, `scripts/blocklist-hash.sh` | accuracy sample, blocklist vectors (hashed), Nostr ingest rejection |
-| 4 | migration §2.3, `server::dht` daemon (triage, queue, persist, retry), `dht` CLI, config | Postgres tests, triggers, counts, bounded live aggressive run without UPnP |
-| 5 | `torrent_rows` readers, index `SCHEMA_VERSION` 3 (origin, eligible_trust, include_adult), API/ffi types, sweep | search/filters/detail tests on both paths |
+| 1 | `core::dht` KRPC, BEP 42 ids, routing, pool, sampler, limiter, responder, peer store | BEP 5/42/51 vectors (BEP 42 over 4 bytes), arbitrary-bytes no-panic decoders, address filter, map caps (§3.8), fake-socket sampler, a bounded live polite run |
+| 2 | `core::metainfo` BEP 3/10/9 fetcher, v1/hybrid/v2 verification | fake-peer tests (reject, short piece, wrong hash, hybrid, private, duplicate keys, LAN/loopback peer refused), bounded live fetch of sampled hashes |
+| 3 | `core::classify`, `core::blocklist`, `Rejection::Blocked`, `scripts/blocklist-hash.sh` | accuracy sample, blocklist vectors (hashed, every name/path variant), Nostr ingest rejection (description/hashtags too), no-name-in-logs test at `TRACE` |
+| 4 | migration §2.3, `server::dht` daemon (triage, queue, persist, retry), `dht` CLI, config | Postgres tests, triggers, counts, queued lease, hybrid alias, bounded live aggressive run without UPnP |
+| 5 | `torrent_rows` readers, index `SCHEMA_VERSION` 3 (origin, eligible_trust, include_adult), API/ffi types, sweep | search/filters/detail tests on both paths (DHT rows pass `min_trust` in the SQL fallback too, `EXPLAIN` shows no seq scan of `dht_torrents`), `recompute_published` Nostr-only, sweep vacuum + merge |
 | 6 | UPnP, `docker/compose.dht.yml`, stats/health | fake gateway tests, stats API |
 | 7 | app: badge, filter chip, adult switch, crawler card | Gradle build + unit tests |
 | 8 | live tuning on the laptop | rates, hit rate, resources, disk per torrent |

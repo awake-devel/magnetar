@@ -110,7 +110,7 @@ crawler stages land, and this table is updated as they do.
 |---|---|---|
 | `MAGNETAR_DHT` | `off` | `off`, `polite` (BEP 51 sampling only, read-only node) or `aggressive` (sampling + passive listening on open UDP ports, UPnP). Crawling shows the host's IP in swarms: opt in deliberately |
 | `MAGNETAR_DHT_PORT` | `6891` | first UDP port (aggressive); virtual node *i* uses `PORT + i` |
-| `MAGNETAR_DHT_NODES` | `4` aggressive, `1` polite | 1–8 (BEP 42 allows 8 node ids per IPv4 address) |
+| `MAGNETAR_DHT_NODES` | `4` aggressive, `1` polite | 1–8 (BEP 42 gives 8 valid node-id prefixes per IPv4 address) |
 | `MAGNETAR_DHT_QPS` | `200` / `50` | outbound DHT queries per second, all kinds |
 | `MAGNETAR_DHT_POOL` | `1000000` / `200000` | nodes kept for sampling (~100 B each) |
 | `MAGNETAR_DHT_FETCH_CONCURRENCY` | `128` / `16` | metadata fetches in flight |
