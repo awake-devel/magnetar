@@ -946,3 +946,229 @@ async fn run_due_checks_and_stores() {
         0
     );
 }
+
+// ---------------------------------------------------------------- Scraper (D45)
+
+fn items_of(hashes: &[[u8; 20]], trackers: &[String]) -> Vec<(String, Vec<String>)> {
+    hashes
+        .iter()
+        .map(|h| (hex::encode(h), trackers.to_vec()))
+        .collect()
+}
+
+#[tokio::test]
+async fn scraper_keeps_connection_ids_and_rate_limits() {
+    let (udp_a, log) = fake_udp_tracker(UdpBehavior {
+        cap: 75,
+        ..Default::default()
+    })
+    .await;
+    let scraper = liveness::Scraper::new(LivenessConfig {
+        tracker_rps: 10.0,
+        ..cfg()
+    });
+    let hashes: Vec<[u8; 20]> = (0..150u8).map(|i| h(i.wrapping_add(1))).collect();
+    let items = items_of(&hashes, std::slice::from_ref(&udp_a));
+    let start = std::time::Instant::now();
+    let (out, report) = scraper.check(&items, 1).await;
+    let (out2, report2) = scraper.check(&items, 2).await;
+    // 3 packets per batch, 10 per second: the 6th leaves 0.5 s after the 1st.
+    assert!(
+        start.elapsed() >= Duration::from_millis(480),
+        "rate limited"
+    );
+    assert_eq!(
+        log.connects.load(Ordering::SeqCst),
+        1,
+        "id kept across batches"
+    );
+    assert_eq!(log.scrapes.load(Ordering::SeqCst), 6);
+    assert_eq!(log.max_hashes.load(Ordering::SeqCst), 74, "full packets");
+    assert_eq!((report.tracker_requests, report2.tracker_requests), (3, 3));
+    assert_eq!((report.hashes, report.alive, report.unknown), (150, 150, 0));
+    assert!(out.iter().chain(&out2).all(|l| l.seeders.is_some()));
+    assert_eq!(scraper.state().0, 1);
+}
+
+#[tokio::test]
+async fn scraper_backs_off_a_failing_tracker() {
+    let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dead_t = format!("udp://{}", silent.local_addr().unwrap());
+    let scraper = liveness::Scraper::new(LivenessConfig {
+        tracker_timeout: Duration::from_millis(100),
+        ..cfg()
+    });
+    let items = items_of(&[h(1), h(2)], &[dead_t]);
+    let (out, r1) = scraper.check(&items, 1).await;
+    assert_eq!((r1.tracker_failures, r1.trackers_backed_off), (1, 0));
+    assert!(out.iter().all(|l| l.source == LivenessSource::None));
+    // Second batch: not asked at all while backing off, the hashes count as unanswered.
+    let start = std::time::Instant::now();
+    let (out, r2) = scraper.check(&items, 2).await;
+    assert!(start.elapsed() < Duration::from_millis(100));
+    assert_eq!((r2.tracker_requests, r2.trackers_backed_off), (0, 1));
+    assert!(out.iter().all(|l| l.trackers_failed == 1));
+    assert_eq!(scraper.state().1, 1);
+}
+
+#[tokio::test]
+async fn fallback_trackers_only_count_seeders() {
+    let (udp_a, log) = fake_udp_tracker(UdpBehavior {
+        cap: 75,
+        ..Default::default()
+    })
+    .await;
+    let (udp_own, _) = fake_udp_tracker(UdpBehavior {
+        cap: 75,
+        ..Default::default()
+    })
+    .await;
+    let cfg = LivenessConfig {
+        fallback_trackers: vec![udp_a.clone()],
+        ..cfg()
+    };
+    // h(0): 0 seeders on the fake, h(9): 9 seeders.
+    let mut items = items_of(&[h(0), h(9)], &[]);
+    // Its own tracker answering 0 is an answer: dead.
+    items.push((hex::encode([0u8; 20]), vec![udp_own]));
+    let out = liveness::check_batch(&items, &cfg, 1).await;
+    assert_eq!(out[0].source, LivenessSource::None, "zero from a fallback");
+    assert_eq!((out[0].seeders, out[0].trackers_ok), (None, 0));
+    assert_eq!(out[1].seeders, Some(9));
+    assert_eq!(out[1].source, LivenessSource::Udp);
+    assert_eq!(out[2].seeders, Some(0));
+    assert!(out[2].is_dead(1));
+    assert_eq!(log.max_hashes.load(Ordering::SeqCst), 2);
+}
+
+/// One fake DHT node that answers every get_peers with one peer; counts the queries.
+async fn fake_dht_node() -> (SocketAddr, Arc<AtomicUsize>) {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    let queries = Arc::new(AtomicUsize::new(0));
+    let q = queries.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        loop {
+            let (n, src) = sock.recv_from(&mut buf).await.unwrap();
+            let msg = bencode::decode(&buf[..n]).unwrap();
+            q.fetch_add(1, Ordering::SeqCst);
+            let reply = Value::Dict(vec![
+                (b"t".to_vec(), msg.get(b"t").unwrap().clone()),
+                (b"y".to_vec(), bytes(b"r")),
+                (
+                    b"r".to_vec(),
+                    Value::Dict(vec![
+                        (b"id".to_vec(), bytes(&[0x55; 20])),
+                        (
+                            b"values".to_vec(),
+                            Value::List(vec![bytes(&[10, 9, 0, 1, 0x1a, 0xe1])]),
+                        ),
+                    ]),
+                ),
+            ]);
+            sock.send_to(&bencode::encode(&reply), src).await.unwrap();
+        }
+    });
+    (addr, queries)
+}
+
+#[tokio::test]
+async fn dht_only_for_unanswered_and_nodes_are_cached() {
+    let (udp_a, _) = fake_udp_tracker(UdpBehavior {
+        cap: 75,
+        ..Default::default()
+    })
+    .await;
+    let (node, queries) = fake_dht_node().await;
+    let scraper = liveness::Scraper::with_dht_nodes(
+        LivenessConfig {
+            use_dht: true,
+            dht_budget: Duration::from_secs(2),
+            dht_concurrency: 4,
+            ..cfg()
+        },
+        dht::NodeCache::with_bootstrap(64, vec![node]),
+    );
+    let mut items = items_of(&[h(5)], &[udp_a]);
+    items.extend(items_of(&[h(6), h(7)], &[]));
+    let (out, report) = scraper.check(&items, 1).await;
+    assert_eq!(out[0].source, LivenessSource::Udp);
+    for l in &out[1..] {
+        assert_eq!(l.source, LivenessSource::DhtValues);
+        assert_eq!(l.dht_peers_est, Some(1));
+    }
+    assert_eq!((report.dht_walks, report.dht_answered), (2, 2));
+    assert_eq!(queries.load(Ordering::SeqCst), 2, "one query per walk");
+    assert_eq!(scraper.state().2, 1, "the answering node is cached");
+}
+
+#[test]
+fn next_check_schedule() {
+    use liveness::{
+        DEAD_STREAK_LONG, Streaks, TTL_DEAD_LONG, TTL_ERROR_MAX, TTL_NEW, TTL_OLD, TTL_RECENT,
+        next_check,
+    };
+    let now = 1_800_000_000;
+    let day = 86400;
+    let res = |seeders: Option<u32>, source| magnetar_core::model::Liveness {
+        infohash: hex::encode(h(1)),
+        seeders,
+        leechers: seeders,
+        completed: None,
+        dht_peers_est: None,
+        source,
+        trackers_ok: 1,
+        trackers_failed: 0,
+        checked_at: now,
+        expires_at: now,
+    };
+    let alive = res(Some(3), LivenessSource::Udp);
+    let dead = res(Some(0), LivenessSource::Udp);
+    let none = res(None, LivenessSource::None);
+    let s0 = Streaks::default();
+    let at = |l, born, prev, hot| next_check(l, born, prev, hot, now, 0.0);
+
+    // By age.
+    assert_eq!(at(&alive, now - 3 * day, s0, false).0, now + TTL_NEW);
+    assert_eq!(at(&alive, now - 30 * day, s0, false).0, now + TTL_RECENT);
+    assert_eq!(at(&alive, now - 400 * day, s0, false).0, now + TTL_OLD);
+    // Hot: never longer than TTL_NEW.
+    assert_eq!(at(&alive, now - 400 * day, s0, true).0, now + TTL_NEW);
+    // Dead: by age until the streak is long, then weekly; alive resets it.
+    let (t, s) = at(&dead, now - 400 * day, s0, false);
+    assert_eq!((t, s.dead), (now + TTL_OLD, 1));
+    let long = Streaks {
+        dead: DEAD_STREAK_LONG - 1,
+        error: 0,
+    };
+    let (t, s) = at(&dead, now - 400 * day, long, false);
+    assert_eq!((t, s.dead), (now + TTL_DEAD_LONG, DEAD_STREAK_LONG));
+    assert_eq!(at(&alive, now, s, false).1, s0);
+    // No answer: 1 h, doubling, capped at a day; streaks of the last answer kept.
+    let mut prev = long;
+    let mut ttls = Vec::new();
+    for _ in 0..7 {
+        let (t, s) = at(&none, now, prev, false);
+        ttls.push(t - now);
+        prev = s;
+    }
+    assert_eq!(
+        ttls,
+        [
+            3600,
+            7200,
+            14400,
+            28800,
+            57600,
+            TTL_ERROR_MAX,
+            TTL_ERROR_MAX
+        ]
+    );
+    assert_eq!(prev.dead, long.dead);
+    assert_eq!(at(&alive, now, prev, false).1, s0);
+    // Jitter: ±10 %.
+    let lo = next_check(&alive, now - 400 * day, s0, false, now, -1.0).0 - now;
+    let hi = next_check(&alive, now - 400 * day, s0, false, now, 1.0).0 - now;
+    assert_eq!((lo, hi), (TTL_OLD * 9 / 10, TTL_OLD * 11 / 10));
+}

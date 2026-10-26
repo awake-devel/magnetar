@@ -426,6 +426,44 @@ pub struct FfiStats {
     pub last_sync: Option<i64>,
 }
 
+/// The server's seed-check backlog (D45), for the Status screen.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiLivenessStats {
+    pub enabled: bool,
+    pub torrents: u64,
+    pub never_checked: u64,
+    pub due_now: u64,
+    pub checked_24h: u64,
+    pub checks_per_hour: u64,
+    pub alive: u64,
+    pub dead: u64,
+    pub unknown: u64,
+    pub trackers: u64,
+    pub trackers_backed_off: u64,
+    pub dht_nodes: u64,
+    /// Unix time the last batch ended, its size and duration.
+    pub last_batch_at: Option<i64>,
+    pub last_batch_size: u64,
+    pub last_batch_ms: u64,
+}
+
+/// One point of a torrent's seeders/leechers history (D45).
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiLivenessPoint {
+    pub at: i64,
+    pub seeders: Option<u32>,
+    pub leechers: Option<u32>,
+    pub peers_est: Option<u32>,
+}
+
+/// Oldest point first; hold each value until the next point (step line).
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiLivenessHistory {
+    pub infohash: String,
+    pub points: Vec<FfiLivenessPoint>,
+    pub keep_days: u32,
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiRelay {
     pub url: String,
@@ -967,6 +1005,32 @@ impl Magnetar {
     /// Ok(false) when the server is unreachable or unhealthy. `GET /health` needs no token, so a
     /// healthy server is also asked one authenticated question: a rejected token is an error
     /// (`Server{401}`), not "reachable".
+    /// The server's seed-check backlog (D45). None: offline, unreachable, or a server older
+    /// than D45 (the Status screen then leaves the card out).
+    pub async fn server_liveness(&self) -> Option<FfiLivenessStats> {
+        let api = self.inner.api()?;
+        self.run(move |_| async move { Ok(api.stats().await?.liveness) })
+            .await
+            .ok()
+            .flatten()
+            .map(Into::into)
+    }
+
+    /// Seeders/leechers of one torrent over the last `days` (server only, D45). None: no
+    /// server, an unknown infohash, or a server older than D45.
+    pub async fn liveness_history(
+        &self,
+        infohash: String,
+        days: u32,
+    ) -> Result<Option<FfiLivenessHistory>, FfiError> {
+        let ih = norm_infohash(&infohash)?;
+        let Some(api) = self.inner.api() else {
+            return Ok(None);
+        };
+        self.run(move |_| async move { Ok(api.liveness_history(&ih, days).await?.map(Into::into)) })
+            .await
+    }
+
     pub async fn server_health(&self) -> Result<bool, FfiError> {
         let Some(api) = self.inner.api() else {
             return Ok(false);

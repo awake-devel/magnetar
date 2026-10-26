@@ -9,6 +9,7 @@ use tokio::sync::watch;
 
 use crate::api::{self, AppState};
 use crate::config::Config;
+use crate::liveness::{self, LivenessService};
 use crate::search_index::{self, SearchIndex};
 use crate::store::PgStore;
 use crate::tmdb::{self, Tmdb, TmdbConfig};
@@ -122,7 +123,10 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
     let state = AppState::new(store.clone(), &token)
         .with_shutdown(stop_rx.clone())
         .with_downloader(downloader.clone())
-        .with_tmdb(tmdb.clone());
+        .with_tmdb(tmdb.clone())
+        .with_liveness(Arc::new(LivenessService::new(liveness::liveness_config(
+            &cfg,
+        ))));
     let cfg = Arc::new(cfg);
     let mut daemons = vec![
         tokio::spawn(daemons::crawler_loop(
@@ -131,9 +135,11 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
             state.crawler.clone(),
             stop_rx.clone(),
         )),
-        tokio::spawn(daemons::liveness_loop(
+        tokio::spawn(liveness::liveness_loop(
             store.clone(),
             state.liveness.clone(),
+            cfg.liveness_batch_size(),
+            cfg.liveness_interval(),
             stop_rx.clone(),
         )),
         tokio::spawn(daemons::trust_loop(store.clone(), stop_rx.clone())),

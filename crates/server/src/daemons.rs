@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 
 use magnetar_core::api::CrawlerStatus;
 use magnetar_core::crawler::{self, CrawlConfig, CrawlReport};
-use magnetar_core::liveness::{self, LivenessConfig};
 use magnetar_core::notify::{self, NtfyConfig};
 use magnetar_core::store::{Store, keys};
 use magnetar_core::{model, trust};
@@ -15,8 +14,6 @@ use tokio::sync::watch;
 use crate::config::Config;
 use crate::store::PgStore;
 
-pub const LIVENESS_INTERVAL: Duration = Duration::from_secs(5 * 60);
-pub const LIVENESS_BATCH: usize = 500;
 pub const TRUST_POLL: Duration = Duration::from_secs(60);
 pub const TRUST_MAX_AGE: Duration = Duration::from_secs(6 * 3600);
 
@@ -212,35 +209,6 @@ pub async fn crawler_loop(
         let pause = pause_after(interval, &res);
         status.lock().unwrap().next_run = Some(magnetar_core::now() + pause.as_secs() as i64);
         if stopped_after(pause, &mut shutdown).await {
-            return;
-        }
-    }
-}
-
-pub async fn liveness_loop(
-    store: Arc<PgStore>,
-    lcfg: Arc<LivenessConfig>,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    loop {
-        let enabled = store
-            .get_setting(keys::LIVENESS_ENABLED)
-            .await
-            .ok()
-            .flatten()
-            .is_none_or(|v| v.trim().trim_matches('"') != "false");
-        if enabled {
-            let run = liveness::run_due(&*store, &lcfg, magnetar_core::now(), LIVENESS_BATCH);
-            tokio::select! {
-                res = run => match res {
-                    Ok(n) if n > 0 => tracing::info!("liveness: checked {n}"),
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!("liveness: {e}"),
-                },
-                _ = stop_requested(&mut shutdown) => return,
-            }
-        }
-        if stopped_after(LIVENESS_INTERVAL, &mut shutdown).await {
             return;
         }
     }

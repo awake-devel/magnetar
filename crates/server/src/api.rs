@@ -14,7 +14,7 @@ use magnetar_core::api::*;
 use magnetar_core::downloads::Downloader;
 use magnetar_core::error::Error;
 use magnetar_core::ingest::{self, IngestOutcome};
-use magnetar_core::liveness::{self, LivenessConfig};
+use magnetar_core::liveness;
 use magnetar_core::model::*;
 use magnetar_core::query::{SearchPage, SearchQuery, Sort};
 use magnetar_core::store::{DEFAULT_TRUST_THRESHOLD, Store, keys};
@@ -24,6 +24,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
+use crate::liveness::{LivenessService, PRIO_SEARCH, PRIO_VIEWED};
 use crate::store::{PgStore, json_u8};
 use crate::tmdb::Tmdb;
 
@@ -43,7 +44,9 @@ pub struct AppState {
     pub token: Arc<str>,
     pub downloader: Option<Arc<Downloader>>,
     pub crawler: Arc<Mutex<CrawlerStatus>>,
-    pub liveness: Arc<LivenessConfig>,
+    /// Seed checker state (D45): forced checks use its config, searches and detail views
+    /// boost what they show.
+    pub liveness: Arc<LivenessService>,
     /// Flips to true on shutdown; long-lived WebSocket sessions watch it.
     pub shutdown: watch::Receiver<bool>,
     /// TMDB decoration (D42); None when `MAGNETAR_TMDB_TOKEN` is unset.
@@ -77,6 +80,11 @@ impl AppState {
 
     pub fn with_tmdb(mut self, t: Option<Arc<Tmdb>>) -> Self {
         self.tmdb = t;
+        self
+    }
+
+    pub fn with_liveness(mut self, l: Arc<LivenessService>) -> Self {
+        self.liveness = l;
         self
     }
 }
@@ -187,6 +195,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/torrents/{infohash}/liveness",
             post(refresh_liveness),
+        )
+        .route(
+            "/api/v1/torrents/{infohash}/liveness-history",
+            get(liveness_history),
         )
         .route("/api/v1/media/{id}/torrents", get(media_torrents))
         .route("/api/v1/facets", get(facets).post(facet_set))
@@ -340,7 +352,7 @@ async fn search_get(
     RawQuery(raw): RawQuery,
 ) -> ApiResult<Json<SearchPage>> {
     let q = parse_search_query(raw.as_deref())?;
-    Ok(Json(st.store.search(&q, magnetar_core::now()).await?))
+    search_and_boost(&st, &q).await
 }
 
 async fn search_post(
@@ -348,7 +360,15 @@ async fn search_post(
     body: Result<Json<SearchQuery>, JsonRejection>,
 ) -> ApiResult<Json<SearchPage>> {
     let Json(q) = body?;
-    Ok(Json(st.store.search(&q, magnetar_core::now()).await?))
+    search_and_boost(&st, &q).await
+}
+
+/// Search; what the page shows is checked sooner (D45).
+async fn search_and_boost(st: &AppState, q: &SearchQuery) -> ApiResult<Json<SearchPage>> {
+    let page = st.store.search(q, magnetar_core::now()).await?;
+    st.liveness
+        .boost(page.hits.iter().map(|h| h.infohash.as_str()), PRIO_SEARCH);
+    Ok(Json(page))
 }
 
 /// Torrents linked to one media row (D40): the search query string applies (sort, limit, …);
@@ -471,6 +491,7 @@ async fn torrent(
         .torrent_detail(&ih, now)
         .await?
         .ok_or_else(|| ApiError::not_found("unknown infohash"))?;
+    st.liveness.boost([ih.as_str()], PRIO_VIEWED);
     // Cached TMDB fields only; anything missing is fetched in the background (D42).
     if let (Some(t), Some(m)) = (&st.tmdb, d.media.as_mut()) {
         t.decorate(m, now).await;
@@ -530,13 +551,35 @@ async fn refresh_liveness(
         .await?
         .ok_or_else(|| ApiError::not_found("unknown infohash"))?;
     let now = magnetar_core::now();
-    let l = liveness::check_batch(&[(ih.clone(), trackers)], &st.liveness, now)
+    // One-shot: a user waiting should not queue behind the checker's rate limits.
+    let l = liveness::check_batch(&[(ih.clone(), trackers)], st.liveness.config(), now)
         .await
         .into_iter()
         .find(|l| l.infohash == ih)
         .ok_or_else(|| ApiError::new(StatusCode::BAD_GATEWAY, "upstream", "no liveness result"))?;
-    st.store.put_liveness(&l).await?;
-    Ok(Json(l))
+    crate::liveness::put_one(st.store.pool(), &l, crate::liveness::Expiry::Scheduled).await?;
+    // What is stored now: the next due time as `expires_at`, or the previous answer when this
+    // check got none (D45).
+    Ok(Json(st.store.get_liveness(&ih).await?.unwrap_or(l)))
+}
+
+/// `GET /api/v1/torrents/{infohash}/liveness-history?days=N` (D45, default and max 90).
+async fn liveness_history(
+    State(st): State<AppState>,
+    Path(infohash): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> ApiResult<Json<LivenessHistory>> {
+    let ih = infohash_param(&infohash)?;
+    let mut days = crate::liveness::HISTORY_KEEP_DAYS;
+    for (k, v) in url::form_urlencoded::parse(raw.as_deref().unwrap_or_default().as_bytes()) {
+        if k == "days" {
+            days = parse_num(&k, &v)?;
+        }
+    }
+    crate::liveness::history(st.store.pool(), &ih, days, magnetar_core::now())
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("unknown infohash"))
 }
 
 /// One NIP-01 style verdict per event (shared with the relay endpoint).
@@ -603,10 +646,18 @@ async fn stats(State(st): State<AppState>) -> ApiResult<Json<StatsResponse>> {
     let store = st.store.stats().await?;
     let crawler = st.crawler.lock().unwrap().clone();
     let search_index = st.store.search_index_status().await;
+    let liveness = match st.liveness.stats(&st.store, magnetar_core::now()).await {
+        Ok(l) => Some(l),
+        Err(e) => {
+            tracing::warn!("stats: liveness: {e}");
+            None
+        }
+    };
     Ok(Json(StatsResponse {
         store,
         crawler,
         search_index,
+        liveness,
     }))
 }
 

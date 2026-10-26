@@ -37,36 +37,45 @@ pub async fn scrape(
     tracker: &str,
     hashes: &[[u8; 20]],
 ) -> crate::Result<Vec<Option<ScrapeStats>>> {
-    if hashes.is_empty() {
+    let mut out = Vec::with_capacity(hashes.len());
+    for chunk in hashes.chunks(HTTP_SCRAPE_BATCH) {
+        out.extend(scrape_chunk(client, tracker, chunk).await?);
+    }
+    Ok(out)
+}
+
+/// One scrape request (callers keep `chunk` within [`HTTP_SCRAPE_BATCH`]).
+pub async fn scrape_chunk(
+    client: &reqwest::Client,
+    tracker: &str,
+    chunk: &[[u8; 20]],
+) -> crate::Result<Vec<Option<ScrapeStats>>> {
+    if chunk.is_empty() {
         return Ok(Vec::new());
     }
     let base = scrape_url(tracker)
         .ok_or_else(|| Error::Invalid(format!("tracker does not support scrape: {tracker}")))?;
-    let mut out = Vec::with_capacity(hashes.len());
-    for chunk in hashes.chunks(HTTP_SCRAPE_BATCH) {
-        let mut url = base.clone();
-        let mut sep = if base.contains('?') { '&' } else { '?' };
-        for h in chunk {
-            url.push(sep);
-            url.push_str("info_hash=");
-            url.extend(percent_encode(h, INFO_HASH_SET));
-            sep = '&';
-        }
-        let resp = client.get(&url).send().await?;
-        let status = resp.status();
-        let body = resp.bytes().await?;
-        if !status.is_success() {
-            return Err(Error::Server {
-                status: status.as_u16(),
-                msg: format!(
-                    "{tracker}: {}",
-                    String::from_utf8_lossy(&body[..body.len().min(200)])
-                ),
-            });
-        }
-        out.extend(parse_response(tracker, &body, chunk)?);
+    let mut url = base.clone();
+    let mut sep = if base.contains('?') { '&' } else { '?' };
+    for h in chunk {
+        url.push(sep);
+        url.push_str("info_hash=");
+        url.extend(percent_encode(h, INFO_HASH_SET));
+        sep = '&';
     }
-    Ok(out)
+    let resp = client.get(&url).send().await?;
+    let status = resp.status();
+    let body = resp.bytes().await?;
+    if !status.is_success() {
+        return Err(Error::Server {
+            status: status.as_u16(),
+            msg: format!(
+                "{tracker}: {}",
+                String::from_utf8_lossy(&body[..body.len().min(200)])
+            ),
+        });
+    }
+    parse_response(tracker, &body, chunk)
 }
 
 /// `files` maps raw hash → stats. A hash missing from a successful answer is unknown to the

@@ -1320,50 +1320,16 @@ impl Store for PgStore {
     }
 
     async fn liveness_due(&self, now: i64, limit: usize) -> Result<Vec<(String, Vec<String>)>> {
-        sqlx::query_as(
-            "WITH due AS (
-                SELECT t.infohash, max(t.created_at) AS newest FROM torrents t
-                LEFT JOIN liveness l ON l.infohash = t.infohash
-                WHERE l.infohash IS NULL OR l.expires_at <= $1
-                GROUP BY t.infohash ORDER BY newest DESC LIMIT $2)
-             SELECT d.infohash,
-                    coalesce((SELECT array_agg(DISTINCT u) FROM torrents t2, unnest(t2.trackers) AS u
-                              WHERE t2.infohash = d.infohash), '{}') AS trackers
-             FROM due d ORDER BY d.newest DESC",
-        )
-        .bind(now)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db)
+        // The scheduler's lanes and due order (D45).
+        Ok(crate::liveness::due(&self.pool, now, limit)
+            .await?
+            .into_iter()
+            .map(|r| (r.infohash, r.trackers))
+            .collect())
     }
 
     async fn put_liveness(&self, l: &Liveness) -> Result<()> {
-        let opt = |v: Option<u32>| v.map(|v| i32::try_from(v).unwrap_or(i32::MAX));
-        sqlx::query(
-            "INSERT INTO liveness (infohash, seeders, leechers, completed, dht_peers_est, source,
-                trackers_ok, trackers_failed, checked_at, expires_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-             ON CONFLICT (infohash) DO UPDATE SET seeders = EXCLUDED.seeders,
-               leechers = EXCLUDED.leechers, completed = EXCLUDED.completed,
-               dht_peers_est = EXCLUDED.dht_peers_est, source = EXCLUDED.source,
-               trackers_ok = EXCLUDED.trackers_ok, trackers_failed = EXCLUDED.trackers_failed,
-               checked_at = EXCLUDED.checked_at, expires_at = EXCLUDED.expires_at",
-        )
-        .bind(&l.infohash)
-        .bind(opt(l.seeders))
-        .bind(opt(l.leechers))
-        .bind(opt(l.completed))
-        .bind(opt(l.dht_peers_est))
-        .bind(liveness_source_str(l.source))
-        .bind(i32::from(l.trackers_ok))
-        .bind(i32::from(l.trackers_failed))
-        .bind(l.checked_at)
-        .bind(l.expires_at)
-        .execute(&self.pool)
-        .await
-        .map_err(db)?;
-        Ok(())
+        crate::liveness::put_one(&self.pool, l, crate::liveness::Expiry::AsGiven).await
     }
 
     async fn get_liveness(&self, infohash: &str) -> Result<Option<Liveness>> {

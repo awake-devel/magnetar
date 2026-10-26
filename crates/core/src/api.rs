@@ -27,7 +27,9 @@ pub mod features {
     pub const FACET_SET: &str = "facet_set";
     /// `GET|POST /api/v1/media/{id}/releases` (D44).
     pub const MEDIA_RELEASES: &str = "media_releases";
-    pub const ALL: &[&str] = &[FILTERS, FACET_SET, MEDIA_RELEASES];
+    /// `GET /api/v1/torrents/{infohash}/liveness-history` (D45).
+    pub const LIVENESS_HISTORY: &str = "liveness_history";
+    pub const ALL: &[&str] = &[FILTERS, FACET_SET, MEDIA_RELEASES, LIVENESS_HISTORY];
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -80,6 +82,58 @@ pub struct StatsResponse {
     /// The server's search index (D43); None from older servers or when it is disabled.
     #[serde(default)]
     pub search_index: Option<SearchIndexStatus>,
+    /// The seed-check backlog (D45); None from older servers.
+    #[serde(default)]
+    pub liveness: Option<LivenessStats>,
+}
+
+/// Seed checks (liveness) on the server (D45). Counts are distinct infohashes.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct LivenessStats {
+    /// False while the `liveness.enabled` setting turns the checker off.
+    pub enabled: bool,
+    pub torrents: u64,
+    pub never_checked: u64,
+    /// Due now (never checked included).
+    pub due_now: u64,
+    /// Checked (answered or not) in the last 24 h / the last hour.
+    pub checked_24h: u64,
+    pub checks_per_hour: u64,
+    /// Latest result: someone seeds / answered with nobody seeding / no tracker or DHT answer.
+    pub alive: u64,
+    pub dead: u64,
+    pub unknown: u64,
+    /// Trackers the checker knows, of which backing off after failures; DHT nodes cached.
+    pub trackers: u64,
+    pub trackers_backed_off: u64,
+    pub dht_nodes: u64,
+    pub last_batch: Option<crate::liveness::BatchReport>,
+    /// Unix time the last batch ended.
+    pub last_batch_at: Option<i64>,
+}
+
+/// One history point: what a check found (D45). None = that source did not answer.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct LivenessPoint {
+    pub at: i64,
+    pub seeders: Option<u32>,
+    pub leechers: Option<u32>,
+    /// DHT estimate (BEP 33), when the DHT was asked.
+    #[serde(default)]
+    pub peers_est: Option<u32>,
+}
+
+/// `GET /api/v1/torrents/{infohash}/liveness-history` (D45): oldest point first. Points are
+/// at least ~6 h apart and an unchanged value is repeated only weekly, so a chart should hold
+/// each value until the next point (step line).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct LivenessHistory {
+    pub infohash: InfoHash,
+    pub points: Vec<LivenessPoint>,
+    /// How far back the server keeps points.
+    pub keep_days: u32,
 }
 
 /// State of the server's Tantivy search index (D43).
@@ -318,6 +372,22 @@ impl ApiClient {
     pub async fn refresh_liveness(&self, infohash: &str) -> crate::Result<Liveness> {
         let path = format!("/api/v1/torrents/{}/liveness", encode(infohash));
         self.json(self.req(Method::POST, &path)).await
+    }
+    /// Seeders/leechers over the last `days` (D45). None: unknown infohash, or a server older
+    /// than D45 (both answer 404).
+    pub async fn liveness_history(
+        &self,
+        infohash: &str,
+        days: u32,
+    ) -> crate::Result<Option<LivenessHistory>> {
+        let path = format!(
+            "/api/v1/torrents/{}/liveness-history?days={days}",
+            encode(infohash)
+        );
+        match self.json(self.req(Method::GET, &path)).await {
+            Err(crate::Error::Server { status: 404, .. }) => Ok(None),
+            r => r.map(Some),
+        }
     }
     /// Posts in chunks of `MAX_BATCH` and concatenates the results.
     pub async fn post_batch(&self, events: &[RawEvent]) -> crate::Result<BatchResponse> {

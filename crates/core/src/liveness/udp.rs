@@ -1,8 +1,10 @@
 //! BEP 15 UDP tracker scrape.
 //!
-//! One socket per call (connected to the tracker, so foreign datagrams are filtered by the kernel),
-//! one connect, then `ceil(N/74)` scrapes reusing the connection id for at most 60 s. Responses are
-//! positional; trackers silently truncate at 75 entries, so a missing tail entry is `None`.
+//! A [`UdpTracker`] owns one socket connected to the tracker (so foreign datagrams are filtered
+//! by the kernel), keeps the resolved address for [`DNS_MAX_AGE`] and reuses the connection id
+//! for at most 60 s, also across calls: a long-lived checker (the server, D45) sends one connect
+//! per minute per tracker instead of one per batch. Responses are positional; trackers silently
+//! truncate at 75 entries, so a missing tail entry is `None`.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -19,6 +21,8 @@ const ACT_SCRAPE: u32 = 2;
 const ACT_ERROR: u32 = 3;
 /// BEP 15 lets a client use a connection id for one minute.
 const CONN_ID_MAX_AGE: Duration = Duration::from_secs(60);
+/// A tracker's address is looked up again after this (or after any failure).
+pub const DNS_MAX_AGE: Duration = Duration::from_secs(3600);
 /// Attempts per request: the first send plus one retry.
 const ATTEMPTS: usize = 2;
 
@@ -38,23 +42,73 @@ pub async fn scrape(
     if hashes.is_empty() {
         return Ok(Vec::new());
     }
-    let addr = resolve(tracker, timeout).await?;
-    let bind: SocketAddr = if addr.is_ipv4() {
-        ([0u8; 4], 0).into()
-    } else {
-        ([0u16; 8], 0).into()
-    };
-    let sock = UdpSocket::bind(bind).await.map_err(net(tracker))?;
-    sock.connect(addr).await.map_err(net(tracker))?;
-
-    let mut conn: Option<(u64, Instant)> = None;
+    let mut t = UdpTracker::new(tracker);
     let mut out = Vec::with_capacity(hashes.len());
     for chunk in hashes.chunks(UDP_SCRAPE_BATCH) {
-        let conn_id = match conn {
+        out.extend(t.scrape_chunk(chunk, timeout).await?);
+    }
+    Ok(out)
+}
+
+/// One udp:// tracker: socket, address and connection id kept between scrapes.
+pub struct UdpTracker {
+    url: String,
+    sock: Option<(UdpSocket, Instant)>,
+    conn: Option<(u64, Instant)>,
+}
+
+impl UdpTracker {
+    pub fn new(url: &str) -> Self {
+        Self {
+            url: url.to_string(),
+            sock: None,
+            conn: None,
+        }
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// One scrape request for at most [`UDP_SCRAPE_BATCH`] hashes (a longer chunk is cut by
+    /// the tracker: its tail comes back `None`). On any error the socket and connection id are
+    /// dropped, so the next call starts over with a fresh lookup and connect.
+    pub async fn scrape_chunk(
+        &mut self,
+        chunk: &[[u8; 20]],
+        timeout: Duration,
+    ) -> Result<Vec<Option<ScrapeStats>>> {
+        if chunk.is_empty() {
+            return Ok(Vec::new());
+        }
+        let res = self.try_scrape(chunk, timeout).await;
+        if res.is_err() {
+            self.sock = None;
+            self.conn = None;
+        }
+        res
+    }
+
+    async fn try_scrape(
+        &mut self,
+        chunk: &[[u8; 20]],
+        timeout: Duration,
+    ) -> Result<Vec<Option<ScrapeStats>>> {
+        if self
+            .sock
+            .as_ref()
+            .is_none_or(|(_, at)| at.elapsed() >= DNS_MAX_AGE)
+        {
+            self.sock = Some((open(&self.url, timeout).await?, Instant::now()));
+            self.conn = None;
+        }
+        let sock = &self.sock.as_ref().expect("just opened").0;
+        let conn_id = match self.conn {
             Some((id, at)) if at.elapsed() < CONN_ID_MAX_AGE => id,
             _ => {
-                let id = connect(&sock, tracker, timeout).await?;
-                conn = Some((id, Instant::now()));
+                let at = Instant::now();
+                let id = connect(sock, &self.url, timeout).await?;
+                self.conn = Some((id, at));
                 id
             }
         };
@@ -66,20 +120,34 @@ pub async fn scrape(
         for h in chunk {
             req.extend_from_slice(h);
         }
-        let resp = request(&sock, tracker, &req, tid, ACT_SCRAPE, timeout).await?;
+        let resp = request(sock, &self.url, &req, tid, ACT_SCRAPE, timeout).await?;
         let answered = (resp.len() - 8) / 12;
-        out.extend((0..chunk.len()).map(|i| {
-            (i < answered).then(|| {
-                let o = 8 + 12 * i;
-                ScrapeStats {
-                    seeders: be32(&resp[o..]),
-                    completed: be32(&resp[o + 4..]),
-                    leechers: be32(&resp[o + 8..]),
-                }
+        Ok((0..chunk.len())
+            .map(|i| {
+                (i < answered).then(|| {
+                    let o = 8 + 12 * i;
+                    ScrapeStats {
+                        seeders: be32(&resp[o..]),
+                        completed: be32(&resp[o + 4..]),
+                        leechers: be32(&resp[o + 8..]),
+                    }
+                })
             })
-        }));
+            .collect())
     }
-    Ok(out)
+}
+
+/// Resolve and connect a fresh socket to the tracker.
+async fn open(tracker: &str, timeout: Duration) -> Result<UdpSocket> {
+    let addr = resolve(tracker, timeout).await?;
+    let bind: SocketAddr = if addr.is_ipv4() {
+        ([0u8; 4], 0).into()
+    } else {
+        ([0u16; 8], 0).into()
+    };
+    let sock = UdpSocket::bind(bind).await.map_err(net(tracker))?;
+    sock.connect(addr).await.map_err(net(tracker))?;
+    Ok(sock)
 }
 
 /// `udp://host:port[/path]` → socket address, IPv4 preferred.

@@ -311,12 +311,12 @@ async fn search_liveness_filters() {
     let got = titles(&s.search(&f, NOW).await.unwrap());
     assert_eq!(got.last().map(String::as_str), Some("unknown"));
 
-    // liveness_due: missing or expired, newest torrents first, with trackers.
+    // liveness_due: never checked (newest first) before expired ones (D45), with trackers.
     let due = s.liveness_due(NOW, 10).await.unwrap();
     let due_ih: Vec<_> = due.iter().map(|(h, _)| h.clone()).collect();
-    assert_eq!(due_ih, vec![ih(2), ih(4)]);
+    assert_eq!(due_ih, vec![ih(4), ih(2)]);
     assert_eq!(
-        due[0].1,
+        due[1].1,
         vec!["udp://tracker.opentrackr.org:1337/announce".to_string()]
     );
     assert_eq!(s.liveness_due(NOW, 1).await.unwrap().len(), 1);

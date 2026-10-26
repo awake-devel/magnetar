@@ -158,6 +158,33 @@ pub struct Config {
     /// Where the search index lives (default <state dir>/search-index).
     #[arg(long, env = "MAGNETAR_SEARCH_INDEX_DIR")]
     pub search_index_dir: Option<PathBuf>,
+    /// Infohashes per seed-check batch (D45).
+    #[arg(
+        long,
+        env = "MAGNETAR_LIVENESS_BATCH",
+        default_value_t = 2000,
+        value_parser = clap::value_parser!(u64).range(1..=50_000)
+    )]
+    pub liveness_batch: u64,
+    /// Pause after a batch that emptied the queue (back to back while a full batch is due).
+    #[arg(long, env = "MAGNETAR_LIVENESS_INTERVAL_SECS", default_value_t = 60)]
+    pub liveness_interval_secs: u64,
+    /// Scrape requests per second per tracker (74 hashes per UDP packet, 50 per HTTP GET).
+    #[arg(long, env = "MAGNETAR_LIVENESS_TRACKER_RPS", default_value_t = 1.0)]
+    pub liveness_tracker_rps: f64,
+    /// Trackers scraped at the same time.
+    #[arg(
+        long,
+        env = "MAGNETAR_LIVENESS_TRACKER_CONCURRENCY",
+        default_value_t = 16
+    )]
+    pub liveness_tracker_concurrency: usize,
+    /// DHT fallback for infohashes no tracker answered.
+    #[arg(long, env = "MAGNETAR_LIVENESS_DHT", default_value_t = true, action = clap::ArgAction::Set)]
+    pub liveness_dht: bool,
+    /// DHT walks at the same time.
+    #[arg(long, env = "MAGNETAR_LIVENESS_DHT_CONCURRENCY", default_value_t = 16)]
+    pub liveness_dht_concurrency: usize,
 }
 
 impl Config {
@@ -174,6 +201,15 @@ impl Config {
     pub fn crawl_interval(&self) -> Option<Duration> {
         (self.crawl_interval_secs > 0)
             .then(|| Duration::from_secs(self.crawl_interval_secs).max(MIN_CRAWL_INTERVAL))
+    }
+
+    pub fn liveness_batch_size(&self) -> usize {
+        self.liveness_batch as usize
+    }
+
+    /// Idle pause of the seed checker, at least 5 s.
+    pub fn liveness_interval(&self) -> Duration {
+        Duration::from_secs(self.liveness_interval_secs.max(5))
     }
 
     pub fn seed_relays(&self) -> Vec<String> {

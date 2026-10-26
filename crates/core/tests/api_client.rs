@@ -44,6 +44,27 @@ fn summary() -> TorrentSummary {
     }
 }
 
+fn history() -> LivenessHistory {
+    LivenessHistory {
+        infohash: IH.into(),
+        points: vec![
+            LivenessPoint {
+                at: 100,
+                seeders: Some(3),
+                leechers: Some(1),
+                peers_est: None,
+            },
+            LivenessPoint {
+                at: 22_000,
+                seeders: Some(5),
+                leechers: None,
+                peers_est: Some(9),
+            },
+        ],
+        keep_days: 90,
+    }
+}
+
 fn liveness() -> Liveness {
     Liveness {
         infohash: IH.into(),
@@ -195,6 +216,9 @@ async fn server() -> api_support::FakeHttp {
                 })
             }
             ("GET", p) if p == format!("/api/v1/torrents/{IH}") => j(&detail()),
+            ("GET", p) if p == format!("/api/v1/torrents/{IH}/liveness-history?days=30") => {
+                j(&history())
+            }
             ("GET", p) if p.starts_with("/api/v1/torrents/") => (
                 404,
                 r#"{"error":"not_found","message":"no such torrent"}"#.into(),
@@ -213,6 +237,10 @@ async fn server() -> api_support::FakeHttp {
                     ..Default::default()
                 },
                 search_index: None,
+                liveness: Some(LivenessStats {
+                    never_checked: 7,
+                    ..Default::default()
+                }),
             }),
             ("GET", "/api/v1/relays") => j(&vec![relay_info()]),
             ("PUT", "/api/v1/relays") => {
@@ -324,6 +352,13 @@ async fn read_endpoints() {
     assert_eq!(api.refresh_liveness(IH).await.unwrap(), liveness());
     let st = api.stats().await.unwrap();
     assert_eq!((st.store.torrents, st.crawler.running), (5, true));
+    assert_eq!(st.liveness.map(|l| l.never_checked), Some(7));
+    assert_eq!(api.liveness_history(IH, 30).await.unwrap(), Some(history()));
+    // Unknown infohash and servers older than D45 both answer 404.
+    assert_eq!(
+        api.liveness_history(&"f".repeat(40), 30).await.unwrap(),
+        None
+    );
     assert_eq!(api.relays().await.unwrap(), vec![relay_info()]);
     assert_eq!(api.trust(&pk()).await.unwrap(), trust_score());
     assert_eq!(api.trust_settings().await.unwrap().threshold, 20);
@@ -331,7 +366,7 @@ async fn read_endpoints() {
     assert_eq!(api.downloads().await.unwrap(), vec![download()]);
 
     let reqs = srv.requests();
-    assert_eq!(reqs.len(), 11);
+    assert_eq!(reqs.len(), 13);
     for r in &reqs {
         assert_eq!(r.header("authorization"), Some("Bearer t0k"), "{}", r.path);
     }

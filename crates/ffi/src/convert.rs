@@ -1,7 +1,7 @@
 //! core <-> Ffi type conversions and error mapping.
 
 use magnetar_core::Error;
-use magnetar_core::api::{FacetSet, MediaReleases};
+use magnetar_core::api::{FacetSet, LivenessHistory, LivenessStats, MediaReleases};
 use magnetar_core::model::*;
 use magnetar_core::query::{SearchPage, SearchQuery, Sort};
 use magnetar_core::release::{self, ReleaseAttrs};
@@ -569,6 +569,47 @@ impl From<&FfiConfig> for StoredConfig {
             seed_relays: c.seed_relays.clone(),
             download_dir: c.download_dir.clone(),
             state_dir: c.state_dir.clone(),
+        }
+    }
+}
+
+impl From<LivenessStats> for FfiLivenessStats {
+    fn from(s: LivenessStats) -> Self {
+        Self {
+            enabled: s.enabled,
+            torrents: s.torrents,
+            never_checked: s.never_checked,
+            due_now: s.due_now,
+            checked_24h: s.checked_24h,
+            checks_per_hour: s.checks_per_hour,
+            alive: s.alive,
+            dead: s.dead,
+            unknown: s.unknown,
+            trackers: s.trackers,
+            trackers_backed_off: s.trackers_backed_off,
+            dht_nodes: s.dht_nodes,
+            last_batch_at: s.last_batch_at,
+            last_batch_size: s.last_batch.as_ref().map_or(0, |b| b.hashes),
+            last_batch_ms: s.last_batch.as_ref().map_or(0, |b| b.ms),
+        }
+    }
+}
+
+impl From<LivenessHistory> for FfiLivenessHistory {
+    fn from(h: LivenessHistory) -> Self {
+        Self {
+            infohash: h.infohash,
+            points: h
+                .points
+                .into_iter()
+                .map(|p| FfiLivenessPoint {
+                    at: p.at,
+                    seeders: p.seeders,
+                    leechers: p.leechers,
+                    peers_est: p.peers_est,
+                })
+                .collect(),
+            keep_days: h.keep_days,
         }
     }
 }

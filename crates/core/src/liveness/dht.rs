@@ -3,9 +3,14 @@
 //! A single IPv4 socket with a random node id walks towards the infohash: each `get_peers` answer
 //! adds closer nodes, `values` peers and the `BFsd`/`BFpe` bloom filters. Queries carry BEP 43
 //! `ro=1` and we never answer queries, so we stay out of other nodes' routing tables.
+//!
+//! A long-lived checker keeps a [`NodeCache`] of nodes that answered earlier walks and starts
+//! each walk from the cached nodes closest to the target (D45): walks are a few hops shorter and
+//! the public bootstrap routers are only asked while the cache is nearly empty.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
@@ -92,6 +97,12 @@ pub struct DhtScrape {
 /// `peers_est`/`total_est` also include the `values` IPs (BEP 33's advice for nodes without BF).
 pub async fn scrape(infohash: &[u8; 20], budget: std::time::Duration) -> crate::Result<DhtScrape> {
     let deadline = Instant::now() + budget;
+    let bootstrap = resolve_bootstrap().await?;
+    let seeds = bootstrap.into_iter().map(|a| (a, None)).collect();
+    Ok(walk(seeds, infohash, deadline).await?.0)
+}
+
+async fn resolve_bootstrap() -> Result<Vec<SocketAddr>> {
     let lookups = BOOTSTRAP.iter().map(|host| async move {
         let found = tokio::time::timeout(Duration::from_secs(3), tokio::net::lookup_host(*host));
         match found.await {
@@ -107,7 +118,7 @@ pub async fn scrape(infohash: &[u8; 20], budget: std::time::Duration) -> crate::
     if bootstrap.is_empty() {
         return Err(Error::Network("DHT: no bootstrap node resolved".into()));
     }
-    walk(&bootstrap, infohash, deadline).await
+    Ok(bootstrap)
 }
 
 /// Same walk from explicit bootstrap addresses (IPv4), e.g. a cached node list or a test node.
@@ -116,7 +127,108 @@ pub async fn scrape_from(
     infohash: &[u8; 20],
     budget: Duration,
 ) -> Result<DhtScrape> {
-    walk(bootstrap, infohash, Instant::now() + budget).await
+    let seeds = bootstrap.iter().map(|a| (*a, None)).collect();
+    Ok(walk(seeds, infohash, Instant::now() + budget).await?.0)
+}
+
+/// Nodes a walk starts from when the cache has them.
+const CACHE_SEEDS: usize = 24;
+/// Below this many cached nodes a walk also asks the bootstrap routers.
+const CACHE_MIN: usize = 64;
+
+/// Nodes that answered earlier walks, by address, with their id and when they last answered.
+/// Bounded: the longest-silent entries go first. Nodes that time out are dropped.
+pub struct NodeCache {
+    cap: usize,
+    nodes: Mutex<HashMap<SocketAddr, ([u8; 20], Instant)>>,
+    bootstrap: Vec<SocketAddr>,
+}
+
+impl NodeCache {
+    pub fn new(cap: usize) -> Self {
+        Self::with_bootstrap(cap, Vec::new())
+    }
+
+    /// A cache that falls back to these addresses instead of resolving [`BOOTSTRAP`] (tests).
+    pub fn with_bootstrap(cap: usize, bootstrap: Vec<SocketAddr>) -> Self {
+        Self {
+            cap: cap.max(CACHE_SEEDS),
+            nodes: Mutex::new(HashMap::new()),
+            bootstrap,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.nodes.lock().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The `k` cached nodes closest (XOR) to `target`.
+    fn closest(&self, target: &[u8; 20], k: usize) -> Vec<(SocketAddr, [u8; 20])> {
+        let nodes = self.nodes.lock().unwrap();
+        let mut all: Vec<([u8; 20], SocketAddr, [u8; 20])> = nodes
+            .iter()
+            .map(|(a, (id, _))| (std::array::from_fn(|i| id[i] ^ target[i]), *a, *id))
+            .collect();
+        if all.len() > k {
+            all.select_nth_unstable(k - 1);
+            all.truncate(k);
+        }
+        all.into_iter().map(|(_, a, id)| (a, id)).collect()
+    }
+
+    fn update(&self, answered: &[(SocketAddr, [u8; 20])], failed: &[SocketAddr]) {
+        let now = Instant::now();
+        let mut nodes = self.nodes.lock().unwrap();
+        for a in failed {
+            nodes.remove(a);
+        }
+        for (a, id) in answered {
+            nodes.insert(*a, (*id, now));
+        }
+        if nodes.len() > self.cap {
+            let mut by_age: Vec<(Instant, SocketAddr)> =
+                nodes.iter().map(|(a, (_, at))| (*at, *a)).collect();
+            let excess = nodes.len() - self.cap;
+            by_age.select_nth_unstable(excess - 1);
+            for (_, a) in &by_age[..excess] {
+                nodes.remove(a);
+            }
+        }
+    }
+}
+
+/// DHT scrape starting from the cached nodes closest to `infohash` (plus the bootstrap routers
+/// while the cache is small); every node that answered goes back into the cache.
+pub async fn scrape_cached(
+    cache: &NodeCache,
+    infohash: &[u8; 20],
+    budget: Duration,
+) -> Result<DhtScrape> {
+    let deadline = Instant::now() + budget;
+    let mut seeds: Vec<(SocketAddr, Option<[u8; 20]>)> = cache
+        .closest(infohash, CACHE_SEEDS)
+        .into_iter()
+        .map(|(a, id)| (a, Some(id)))
+        .collect();
+    if seeds.len() < CACHE_MIN.min(cache.cap) {
+        let bootstrap = if cache.bootstrap.is_empty() {
+            resolve_bootstrap().await
+        } else {
+            Ok(cache.bootstrap.clone())
+        };
+        match bootstrap {
+            Ok(b) => seeds.extend(b.into_iter().map(|a| (a, None))),
+            Err(e) if seeds.is_empty() => return Err(e),
+            Err(_) => {}
+        }
+    }
+    let (scrape, answered, failed) = walk(seeds, infohash, deadline).await?;
+    cache.update(&answered, &failed);
+    Ok(scrape)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -257,11 +369,13 @@ impl Walk {
     }
 }
 
+/// Walk from `seeds` (address, id if known). Also returns the nodes that answered (with their
+/// ids) and those that timed out, for the [`NodeCache`].
 async fn walk(
-    bootstrap: &[SocketAddr],
+    seeds: Vec<(SocketAddr, Option<[u8; 20]>)>,
     infohash: &[u8; 20],
     deadline: Instant,
-) -> Result<DhtScrape> {
+) -> Result<(DhtScrape, Vec<(SocketAddr, [u8; 20])>, Vec<SocketAddr>)> {
     let sock = UdpSocket::bind(SocketAddr::from(([0u8; 4], 0)))
         .await
         .map_err(|e| Error::Network(format!("DHT bind: {e}")))?;
@@ -269,14 +383,14 @@ async fn walk(
     let mut next_tid: u16 = rand::random();
     let mut w = Walk {
         target: *infohash,
-        nodes: bootstrap
-            .iter()
-            .filter(|a| a.is_ipv4())
-            .map(|a| {
+        nodes: seeds
+            .into_iter()
+            .filter(|(a, _)| a.is_ipv4())
+            .map(|(a, id)| {
                 (
-                    *a,
+                    a,
                     Node {
-                        id: None,
+                        id,
                         state: State::New,
                     },
                 )
@@ -350,7 +464,16 @@ async fn walk(
     if w.answered == 0 {
         return Err(Error::Timeout("DHT: no node answered".into()));
     }
-    Ok(w.result())
+    let mut answered = Vec::new();
+    let mut failed = Vec::new();
+    for (a, n) in &w.nodes {
+        match (n.state, n.id) {
+            (State::Answered, Some(id)) => answered.push((*a, id)),
+            (State::Failed, _) => failed.push(*a),
+            _ => {}
+        }
+    }
+    Ok((w.result(), answered, failed))
 }
 
 fn get_peers(my_id: &[u8; 20], infohash: &[u8; 20], tid: &[u8; 2]) -> Vec<u8> {
