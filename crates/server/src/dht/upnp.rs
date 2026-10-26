@@ -67,6 +67,10 @@ pub struct UpnpConfig {
     /// Whole discovery budget, and per answer.
     pub search_timeout: Duration,
     pub description: String,
+    /// Extra addresses trusted for the gateway's description and control URLs. igd-next
+    /// only trusts the SSDP responder's own address, and never a loopback one; tests add
+    /// 127.0.0.1 here for their fake gateway. Empty in production.
+    pub trusted_ips: Vec<IpAddr>,
 }
 
 impl UpnpConfig {
@@ -84,6 +88,7 @@ impl UpnpConfig {
             renew_every: RENEW_EVERY,
             search_timeout: Duration::from_secs(5),
             description: DESCRIPTION.into(),
+            trusted_ips: Vec::new(),
         }
     }
 }
@@ -165,11 +170,12 @@ mod igd {
         }
     }
 
-    async fn search(to: SocketAddr, timeout: Duration) -> Result<Gw, String> {
+    async fn search(to: SocketAddr, cfg: &UpnpConfig) -> Result<Gw, String> {
         let mut o = SearchOptions::default();
         o.broadcast_address = to;
-        o.timeout = Some(timeout);
-        o.single_search_timeout = Some(timeout);
+        o.timeout = Some(cfg.search_timeout);
+        o.single_search_timeout = Some(cfg.search_timeout);
+        o.allowed_gateway_ips = cfg.trusted_ips.clone();
         search_gateway(o).await.map_err(|e| e.to_string())
     }
 
@@ -177,7 +183,7 @@ mod igd {
     pub async fn discover(cfg: &UpnpConfig) -> Result<Gw, String> {
         let mut last = String::from("no gateway configured or found");
         if let Some(g) = cfg.gateway {
-            match search(g, cfg.search_timeout).await {
+            match search(g, cfg).await {
                 Ok(gw) => return Ok(gw),
                 Err(e) => last = format!("unicast M-SEARCH to {g}: {e}"),
             }
@@ -186,7 +192,7 @@ mod igd {
             let m: SocketAddr = "239.255.255.250:1900"
                 .parse()
                 .expect("SSDP multicast address");
-            match search(m, cfg.search_timeout).await {
+            match search(m, cfg).await {
                 Ok(gw) => return Ok(gw),
                 Err(e) => last = format!("{last}; multicast M-SEARCH: {e}"),
             }
