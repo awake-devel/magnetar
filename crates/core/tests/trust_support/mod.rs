@@ -64,6 +64,9 @@ pub fn summary(infohash: &str, title: &str, created_at: i64) -> TorrentSummary {
         media_year: None,
         media_kind: None,
         matched_file: None,
+        media_id: None,
+        media_rating: None,
+        attrs: None,
     }
 }
 

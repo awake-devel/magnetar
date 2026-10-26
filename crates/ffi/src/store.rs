@@ -10,6 +10,7 @@ use std::sync::{Mutex, MutexGuard};
 use magnetar_core::error::{Error, Result};
 use magnetar_core::model::*;
 use magnetar_core::query::{SearchPage, SearchQuery, Sort, fts5_match};
+use magnetar_core::release::{self, PARSER_VERSION, ReleaseAttrs};
 use magnetar_core::store::{DEFAULT_TRUST_THRESHOLD, Store, keys};
 use magnetar_core::sync::SyncSource;
 use magnetar_core::{magnet, trust, wot};
@@ -21,6 +22,8 @@ use crate::schema;
 /// Longest relay backoff (ARCHITECTURE.md §4: max 24 h).
 pub const MAX_BACKOFF_SECS: i64 = 24 * 3600;
 const BACKOFF_BASE_SECS: i64 = 60;
+/// Infohashes parsed per `backfill_attrs` call (one lock for the read, one for the write).
+pub const ATTRS_CHUNK: usize = 500;
 const REPLACEABLE_KINDS: &[u16] = &[
     KIND_PROFILE,
     KIND_CONTACTS,
@@ -281,9 +284,55 @@ impl SqliteStore {
             params![t.infohash, magnetar_core::now()],
         )
         .db()?;
+        // Release attributes (D44): the first event of an infohash names them, as on the server.
+        let attrs = release::parse_release(&t.title, &t.files, t.category);
+        put_attrs(&tx, &t.infohash, &attrs)?;
         insert_sync_id(&tx, raw)?;
         tx.commit().db()?;
         Ok(true)
+    }
+
+    /// Parse the release attributes of up to `limit` infohashes that have none or an older
+    /// parser's (D44). Returns how many were written; call until 0. The parsing runs without
+    /// the connection lock.
+    pub fn backfill_attrs(&self, limit: usize) -> Result<usize> {
+        let rows: Vec<(String, String, String, String)> = {
+            let conn = self.conn();
+            let mut st = conn
+                .prepare(
+                    "SELECT t.infohash, t.title, t.category, t.files FROM torrents t
+                     LEFT JOIN torrent_attrs a ON a.infohash = t.infohash
+                     WHERE (a.infohash IS NULL OR a.parser_version < ?1)
+                       AND t.rowid = (SELECT MIN(t2.rowid) FROM torrents t2
+                                      WHERE t2.infohash = t.infohash)
+                     LIMIT ?2",
+                )
+                .db()?;
+            st.query_map(params![PARSER_VERSION, limit as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .db()?
+            .collect::<rusqlite::Result<_>>()
+            .db()?
+        };
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let parsed: Vec<(String, ReleaseAttrs)> = rows
+            .into_iter()
+            .map(|(ih, title, cat, files)| {
+                let files: Vec<TorrentFile> = from_json(&files);
+                let cat = cat.parse().unwrap_or(Category::Other);
+                (ih, release::parse_release(&title, &files, cat))
+            })
+            .collect();
+        let mut conn = self.conn();
+        let tx = conn.transaction().db()?;
+        for (ih, a) in &parsed {
+            put_attrs(&tx, ih, a)?;
+        }
+        tx.commit().db()?;
+        Ok(parsed.len())
     }
 
     pub fn put_comment_sync(&self, c: &Comment, raw: &RawEvent) -> Result<bool> {
@@ -682,7 +731,8 @@ impl SqliteStore {
                 COALESCE(f.pinned, 0), COALESCE(f.hidden, 0),
                 (SELECT COUNT(DISTINCT t.pubkey) FROM torrents t
                     WHERE t.infohash = c.infohash AND {eligible}) AS pubs,
-                {LIVENESS_COLS}, {best} AS best, mc.title, mc.year, mc.kind
+                {LIVENESS_COLS}, {best} AS best, mc.title, mc.year, mc.kind,
+                a.attrs, mc.media_id, json_extract(mc.json, '$.rating') AS rating
              FROM canon c "
         ));
         if matcher.is_some() {
@@ -692,6 +742,7 @@ impl SqliteStore {
             "LEFT JOIN liveness l ON l.infohash = c.infohash
              LEFT JOIN torrent_flags f ON f.infohash = c.infohash
              LEFT JOIN media_cache mc ON mc.infohash = c.infohash
+             LEFT JOIN torrent_attrs a ON a.infohash = c.infohash
              WHERE c.rn = 1",
         );
 
@@ -762,6 +813,7 @@ impl SqliteStore {
             let (cond, v) = crate::media::token_condition(t);
             push(&mut sql, &mut args, &format!(" AND {cond}"), v);
         }
+        push_attr_filters(&mut sql, &mut args, q);
 
         let total: i64 = conn
             .query_row(
@@ -777,6 +829,7 @@ impl SqliteStore {
             Sort::Date => format!("c.created_at {dir}"),
             Sort::Size => format!("c.total_size IS NULL, c.total_size {dir}, c.created_at DESC"),
             Sort::Seeders => format!("best IS NULL, best {dir}, c.created_at DESC"),
+            Sort::Rating => format!("rating IS NULL, rating {dir}, c.created_at DESC"),
         };
         sql.push_str(&format!(" ORDER BY {order}, c.infohash"));
         args.push(Value::Integer(q.effective_limit() as i64));
@@ -813,6 +866,11 @@ impl SqliteStore {
                     media_year: r.get(27)?,
                     media_kind: r.get::<_, Option<String>>(28)?.and_then(|k| k.parse().ok()),
                     matched_file: None,
+                    attrs: r
+                        .get::<_, Option<String>>(29)?
+                        .and_then(|j| serde_json::from_str(&j).ok()),
+                    media_id: r.get(30)?,
+                    media_rating: r.get::<_, Option<f64>>(31)?.map(|r| r as f32),
                 })
             })
             .db()?
@@ -924,6 +982,15 @@ impl SqliteStore {
         )
         .db()?;
         let media = crate::media::cached_media(&conn, infohash, now)?;
+        let attrs: Option<ReleaseAttrs> = conn
+            .query_row(
+                "SELECT attrs FROM torrent_attrs WHERE infohash = ?1",
+                [infohash],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .db()?
+            .and_then(|j| serde_json::from_str(&j).ok());
         drop(conn);
 
         let publishers: HashSet<&str> = rows
@@ -965,6 +1032,9 @@ impl SqliteStore {
             media_year: media.as_ref().and_then(|m| m.year),
             media_kind: media.as_ref().map(|m| m.kind),
             matched_file: None,
+            media_id: media.as_ref().map(|m| m.media_id),
+            media_rating: media.as_ref().and_then(|m| m.rating),
+            attrs,
         };
         let events = rows
             .iter()
@@ -1657,6 +1727,19 @@ fn insert_event(tx: &Transaction, raw: &RawEvent) -> Result<()> {
     Ok(())
 }
 
+/// Insert an infohash's attributes, or replace an older parser's.
+fn put_attrs(tx: &Transaction, infohash: &str, a: &ReleaseAttrs) -> Result<()> {
+    tx.execute(
+        "INSERT INTO torrent_attrs(infohash, parser_version, attrs) VALUES (?1, ?2, ?3)
+         ON CONFLICT(infohash) DO UPDATE SET parser_version = excluded.parser_version,
+             attrs = excluded.attrs
+         WHERE torrent_attrs.parser_version < excluded.parser_version",
+        params![infohash, PARSER_VERSION, json(a)],
+    )
+    .db()?;
+    Ok(())
+}
+
 fn insert_sync_id(tx: &Transaction, raw: &RawEvent) -> Result<()> {
     tx.execute(
         "INSERT OR IGNORE INTO sync_ids(id, created_at, kind) VALUES (?1, ?2, ?3)",
@@ -1789,6 +1872,66 @@ fn db_bytes(conn: &Connection) -> Result<u64> {
     Ok((pages.max(0) * size.max(0)) as u64)
 }
 
+/// The D44 filters of `q` on the local cache (aliases: `a` = torrent_attrs, `mc` =
+/// media_cache, `c` = canonical torrent), same meaning as the server's. Genre, kind and rating
+/// only know the media cached from server details, so the app offers them only online.
+fn push_attr_filters(sql: &mut String, args: &mut Vec<Value>, q: &SearchQuery) {
+    let list = |args: &mut Vec<Value>, values: &[String]| -> String {
+        values
+            .iter()
+            .map(|v| {
+                args.push(Value::Text(v.clone()));
+                format!("?{}", args.len())
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    for (name, values) in q.attr_filters() {
+        // JSON paths come from this match, never from input.
+        let cond = match name {
+            "language" | "subtitles" | "hdr" | "audio" => {
+                let path = match name {
+                    "language" => "languages",
+                    other => other,
+                };
+                format!(
+                    "EXISTS (SELECT 1 FROM json_each(a.attrs, '$.{path}') WHERE value IN ({}))",
+                    list(args, &values)
+                )
+            }
+            "resolution" | "source" | "codec" => {
+                let path = if name == "codec" { "video_codec" } else { name };
+                format!(
+                    "json_extract(a.attrs, '$.{path}') IN ({})",
+                    list(args, &values)
+                )
+            }
+            "genre" => format!(
+                "EXISTS (SELECT 1 FROM json_each(mc.json, '$.genres') WHERE lower(value) IN ({}))",
+                list(args, &values)
+            ),
+            _ => format!("mc.kind IN ({})", list(args, &values)),
+        };
+        sql.push_str(&format!(" AND {cond}"));
+    }
+    if let Some(r) = q.min_rating {
+        args.push(Value::Real(f64::from(r) - 0.05));
+        sql.push_str(&format!(
+            " AND json_extract(mc.json, '$.rating') >= ?{}",
+            args.len()
+        ));
+    }
+    if q.min_year.is_some() || q.max_year.is_some() {
+        args.push(Value::Integer(q.min_year.map_or(i64::MIN, i64::from)));
+        let lo = args.len();
+        args.push(Value::Integer(q.max_year.map_or(i64::MAX, i64::from)));
+        let hi = args.len();
+        sql.push_str(&format!(
+            " AND COALESCE(mc.year, json_extract(a.attrs, '$.year')) BETWEEN ?{lo} AND ?{hi}"
+        ));
+    }
+}
+
 /// Delete up to `want` evictable torrent events. Returns how many were removed.
 fn evict_batch(conn: &mut Connection, want: u64) -> Result<u64> {
     let tx = conn.transaction().db()?;
@@ -1837,6 +1980,11 @@ fn evict_batch(conn: &mut Connection, want: u64) -> Result<u64> {
     tx.execute(
         "DELETE FROM torrent_flags WHERE pinned = 0 AND hidden = 0
             AND infohash NOT IN (SELECT infohash FROM torrents)",
+        [],
+    )
+    .db()?;
+    tx.execute(
+        "DELETE FROM torrent_attrs WHERE infohash NOT IN (SELECT infohash FROM torrents)",
         [],
     )
     .db()?;

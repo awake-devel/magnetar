@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::query::SearchQuery;
+use crate::release::ReleaseAttrs;
 
 /// 64 lowercase hex chars (event id or pubkey).
 pub type Hex32 = String;
@@ -353,6 +354,15 @@ pub struct TorrentSummary {
     /// The file name the search text matched when the title did not (D43); search hits only.
     #[serde(default)]
     pub matched_file: Option<String>,
+    /// The media row behind `media_title` (D40): opens the title's release list (D44).
+    #[serde(default)]
+    pub media_id: Option<i64>,
+    /// IMDb-style rating of the linked media (D44, sort by rating).
+    #[serde(default)]
+    pub media_rating: Option<f32>,
+    /// Release attributes parsed from the name and files (D44); None from older servers.
+    #[serde(default)]
+    pub attrs: Option<ReleaseAttrs>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

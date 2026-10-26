@@ -11,6 +11,23 @@ pub struct Health {
     pub status: String,
     pub version: String,
     pub db: bool,
+    /// What this server supports beyond the base API (`features::*`); older servers send none,
+    /// so a client hides what needs them.
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+/// `Health::features` values.
+pub mod features {
+    /// The release/media filters of `SearchQuery` (languages, resolutions, …, genres,
+    /// min_rating, years) and `Sort::Rating` (D44).
+    pub const FILTERS: &str = "filters";
+    /// `POST /api/v1/facets` (several disjunctive facets at once, D44). Still 503 while the
+    /// search index builds.
+    pub const FACET_SET: &str = "facet_set";
+    /// `GET|POST /api/v1/media/{id}/releases` (D44).
+    pub const MEDIA_RELEASES: &str = "media_releases";
+    pub const ALL: &[&str] = &[FILTERS, FACET_SET, MEDIA_RELEASES];
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -102,6 +119,40 @@ pub struct FacetsResponse {
     pub total: u64,
     /// Most frequent first (ties by value).
     pub counts: Vec<FacetCount>,
+}
+
+/// `POST /api/v1/facets` body (D44): counts of several facets over one search.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct FacetsRequest {
+    pub query: SearchQuery,
+    /// Facet names (`category`, `language`, `resolution`, …; docs/FILTERS.md).
+    pub fields: Vec<String>,
+    /// Values per facet, default 20, at most 200.
+    pub size: u32,
+}
+
+/// Counts of several facets. Each facet's counts apply every filter of the query except its
+/// own (so the other values of a filtered field still show what they would give).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct FacetSet {
+    /// Results of the query with every filter.
+    pub total: u64,
+    pub facets: Vec<FacetsResponse>,
+}
+
+/// Releases of one movie/series (`GET /api/v1/media/{id}/releases`, D44), grouped by
+/// season/episode, then resolution, then language.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct MediaReleases {
+    #[serde(default)]
+    pub media: Option<MediaInfo>,
+    /// Releases found (all of them, also beyond `MAX_RELEASES`).
+    pub total: u64,
+    /// More than `MAX_RELEASES` releases: the least seeded were left out.
+    #[serde(default)]
+    pub truncated: bool,
+    pub groups: Vec<crate::release::ReleaseGroup>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -300,6 +351,21 @@ impl ApiClient {
         ];
         self.json(self.req(Method::GET, "/api/v1/facets").query(&query))
             .await
+    }
+    /// Disjunctive counts of several facets over a full query (D44, `features::FACET_SET`).
+    pub async fn facet_set(&self, r: &FacetsRequest) -> crate::Result<FacetSet> {
+        self.json(self.req(Method::POST, "/api/v1/facets").json(r))
+            .await
+    }
+    /// Releases of one media grouped by season/episode, quality and language (D44); `q`
+    /// filters them (text, languages, resolutions, …).
+    pub async fn media_releases(
+        &self,
+        media_id: i64,
+        q: &SearchQuery,
+    ) -> crate::Result<MediaReleases> {
+        let path = format!("/api/v1/media/{media_id}/releases");
+        self.json(self.req(Method::POST, &path).json(q)).await
     }
     pub async fn relays(&self) -> crate::Result<Vec<RelayInfo>> {
         self.json(self.req(Method::GET, "/api/v1/relays")).await

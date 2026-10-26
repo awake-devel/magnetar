@@ -1,6 +1,7 @@
 //! magnetar-server library: PgStore, API, relay endpoint, daemons.
 
 pub mod api;
+pub mod attrs;
 pub mod config;
 pub mod daemons;
 pub mod discovery;

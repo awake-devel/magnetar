@@ -1375,6 +1375,23 @@ pub async fn media_for_infohash(
     Ok(row.map(Into::into))
 }
 
+/// One media row as `MediaInfo` (the per-title view, D44): no torrent, so no season/episode,
+/// method "" and confidence 1.
+pub async fn media_by_id(pool: &PgPool, id: i64) -> magnetar_core::Result<Option<MediaInfo>> {
+    let row: Option<MediaRow> = sqlx::query_as(
+        "SELECT m.id, m.kind, m.imdb, m.tmdb_movie, m.tmdb_tv, m.mal, m.anilist, m.title,
+                m.original_title, m.year, m.end_year, m.genres, m.rating, m.votes, m.runtime_min,
+                NULL::integer AS season, NULL::integer AS episode, ''::text AS method,
+                1::real AS confidence
+         FROM media m WHERE m.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(crate::store::db)?;
+    Ok(row.map(Into::into))
+}
+
 /// `AND t.infohash IN (…)` for a media search token (D40).
 pub(crate) fn push_media_filter(qb: &mut QueryBuilder<Postgres>, r: &MediaRef) {
     qb.push(

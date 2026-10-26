@@ -1,6 +1,11 @@
 //! One-pass collectors over the matching documents: every filter of `SearchQuery` is applied
 //! on fast columns, then the hit is counted and kept if it is in the top `offset + limit` for
 //! the sort. Counting comes for free, so totals are exact on the index path.
+//!
+//! Facet counts (D44) are disjunctive: a facet's counts apply every filter except its own, so
+//! the app can show how many results each other language/resolution/… would give. One pass
+//! serves all requested facets: a document failing no attribute filter counts for every facet,
+//! one failing exactly one filter counts only for that filter's facet.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
@@ -11,6 +16,13 @@ use tantivy::columnar::{ColumnValues, StrColumn};
 use tantivy::{DocAddress, DocId, Score, SegmentOrdinal, SegmentReader};
 
 use super::schema::NONE;
+
+/// Any-of filter on one keyword fast field (`f_language`, `f_resolution`, …; D44).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AttrFilter {
+    pub field: String,
+    pub values: Vec<String>,
+}
 
 /// The per-query filters, resolved (threshold known, categories as a bit mask).
 #[derive(Clone, Debug, Default)]
@@ -25,6 +37,13 @@ pub struct Filter {
     pub hide_dead: bool,
     pub min_seeders: Option<i64>,
     pub media_id: Option<i64>,
+    /// Rating × 10; unrated fails.
+    pub min_rating: Option<i64>,
+    /// Media year, else parsed year; unknown fails a bound.
+    pub min_year: Option<i64>,
+    pub max_year: Option<i64>,
+    /// AND over fields, any value within one (D44).
+    pub attrs: Vec<AttrFilter>,
     pub now: i64,
 }
 
@@ -34,6 +53,7 @@ pub enum SortBy {
     Date,
     Size,
     Seeders,
+    Rating,
 }
 
 type I64Col = Arc<dyn ColumnValues<i64>>;
@@ -48,11 +68,30 @@ struct Columns {
     best_peers: I64Col,
     expires_at: I64Col,
     media_id: I64Col,
+    media_rating: I64Col,
+    year: I64Col,
+    /// One per `Filter::attrs`, same order: the column and the term ordinals wanted in this
+    /// segment (a value the segment never saw has no ordinal: nothing there matches it).
+    attrs: Vec<(Option<StrColumn>, Vec<u64>)>,
 }
 
 impl Columns {
-    fn load(seg: &SegmentReader) -> tantivy::Result<Self> {
+    fn load(seg: &SegmentReader, f: &Filter) -> tantivy::Result<Self> {
         let ff = seg.fast_fields();
+        let mut attrs = Vec::with_capacity(f.attrs.len());
+        for a in &f.attrs {
+            let col = ff.str(&a.field)?;
+            let mut wanted = Vec::new();
+            if let Some(c) = &col {
+                for v in &a.values {
+                    if let Some(ord) = c.dictionary().term_ord(v)? {
+                        wanted.push(ord);
+                    }
+                }
+            }
+            wanted.sort_unstable();
+            attrs.push((col, wanted));
+        }
         let i = |name: &str| -> tantivy::Result<I64Col> {
             Ok(ff.i64(name)?.first_or_default_col(NONE))
         };
@@ -66,12 +105,50 @@ impl Columns {
             best_peers: i("best_peers")?,
             expires_at: i("expires_at")?,
             media_id: i("media_id")?,
+            media_rating: i("media_rating")?,
+            year: i("year")?,
+            attrs,
         })
     }
 
-    /// ARCHITECTURE.md §5 semantics: unknown size fails a size bound; `hide_dead` drops only
-    /// fresh zero-peer results; `min_seeders` counts unknown as 0.
+    /// Whether the document has one of the wanted values of attribute filter `k`.
+    fn attr_passes(&self, k: usize, doc: DocId) -> bool {
+        let (col, wanted) = &self.attrs[k];
+        match col {
+            Some(c) if !wanted.is_empty() => c
+                .ords()
+                .values_for_doc(doc)
+                .any(|o| wanted.binary_search(&o).is_ok()),
+            _ => false,
+        }
+    }
+
+    /// Attribute filters the document fails: how many, and the first one (for facets).
+    fn attr_failures(&self, doc: DocId) -> (usize, usize) {
+        let mut n = 0;
+        let mut first = 0;
+        for k in 0..self.attrs.len() {
+            if !self.attr_passes(k, doc) {
+                if n == 0 {
+                    first = k;
+                }
+                n += 1;
+                if n > 1 {
+                    break;
+                }
+            }
+        }
+        (n, first)
+    }
+
+    /// Every filter, attribute filters included.
     fn passes(&self, f: &Filter, doc: DocId) -> bool {
+        self.base_passes(f, doc) && (0..self.attrs.len()).all(|k| self.attr_passes(k, doc))
+    }
+
+    /// ARCHITECTURE.md §5 semantics: unknown size fails a size bound; `hide_dead` drops only
+    /// fresh zero-peer results; `min_seeders` counts unknown as 0. Not the attribute filters.
+    fn base_passes(&self, f: &Filter, doc: DocId) -> bool {
         // Some event passes (its trust, or its publisher is trusted locally), as in Postgres.
         if f.min_trust > 0 && self.eligible_trust.get_val(doc) < f.min_trust {
             return false;
@@ -105,6 +182,18 @@ impl Columns {
         {
             return false;
         }
+        if let Some(r) = f.min_rating {
+            let v = self.media_rating.get_val(doc);
+            if v == NONE || v < r {
+                return false;
+            }
+        }
+        if f.min_year.is_some() || f.max_year.is_some() {
+            let y = self.year.get_val(doc);
+            if y == NONE || f.min_year.is_some_and(|m| y < m) || f.max_year.is_some_and(|m| y > m) {
+                return false;
+            }
+        }
         true
     }
 
@@ -119,6 +208,7 @@ impl Columns {
             SortBy::Date => Key(dir(created), 0),
             SortBy::Size => Key(known(self.total_size.get_val(doc)), created),
             SortBy::Seeders => Key(known(self.best_peers.get_val(doc)), created),
+            SortBy::Rating => Key(known(self.media_rating.get_val(doc)), created),
         }
     }
 }
@@ -237,7 +327,7 @@ impl Collector for TopFiltered {
         reader: &SegmentReader,
     ) -> tantivy::Result<TopSegment> {
         Ok(TopSegment {
-            cols: Columns::load(reader)?,
+            cols: Columns::load(reader, &self.filter)?,
             filter: self.filter.clone(),
             sort: self.sort,
             descending: self.descending,
@@ -264,54 +354,92 @@ impl Collector for TopFiltered {
     }
 }
 
-/// Value counts of one keyword fast field over the filtered hits.
+/// One requested facet: its keyword fast field, and which `Filter::attrs` entry filters on
+/// it (left out of its own counts).
+#[derive(Clone, Debug)]
+pub struct FacetField {
+    pub field: String,
+    pub filter: Option<usize>,
+}
+
+/// Value counts of several keyword fast fields over the filtered hits, disjunctively.
 pub struct FacetCounts {
     pub filter: Filter,
-    pub field: String,
+    pub fields: Vec<FacetField>,
 }
+
+/// Documents passing every filter, and per facet: documents counted, value → count.
+pub type FacetFruit = (u64, Vec<(u64, HashMap<String, u64>)>);
 
 pub struct FacetSegment {
     cols: Columns,
     filter: Filter,
-    column: Option<StrColumn>,
-    counts: Vec<u64>,
-    total: u64,
+    fields: Vec<FacetField>,
+    columns: Vec<Option<StrColumn>>,
+    counts: Vec<Vec<u64>>,
+    totals: Vec<u64>,
+    all: u64,
 }
 
-impl SegmentCollector for FacetSegment {
-    type Fruit = (u64, HashMap<String, u64>);
-
-    fn collect(&mut self, doc: DocId, _score: Score) {
-        if !self.cols.passes(&self.filter, doc) {
-            return;
-        }
-        self.total += 1;
-        if let Some(c) = &self.column {
+impl FacetSegment {
+    fn count(&mut self, i: usize, doc: DocId) {
+        self.totals[i] += 1;
+        if let Some(c) = &self.columns[i] {
             for ord in c.ords().values_for_doc(doc) {
-                if let Some(n) = self.counts.get_mut(ord as usize) {
+                if let Some(n) = self.counts[i].get_mut(ord as usize) {
                     *n += 1;
                 }
             }
         }
     }
+}
 
-    fn harvest(self) -> Self::Fruit {
-        let mut out = HashMap::new();
-        if let Some(c) = &self.column {
-            let mut s = String::new();
-            for (ord, n) in self.counts.iter().enumerate().filter(|(_, n)| **n > 0) {
-                s.clear();
-                if c.ord_to_str(ord as u64, &mut s).unwrap_or(false) {
-                    out.insert(s.clone(), *n);
+impl SegmentCollector for FacetSegment {
+    type Fruit = FacetFruit;
+
+    fn collect(&mut self, doc: DocId, _score: Score) {
+        if !self.cols.base_passes(&self.filter, doc) {
+            return;
+        }
+        match self.cols.attr_failures(doc) {
+            (0, _) => {
+                self.all += 1;
+                for i in 0..self.fields.len() {
+                    self.count(i, doc);
                 }
             }
+            (1, k) => {
+                for i in 0..self.fields.len() {
+                    if self.fields[i].filter == Some(k) {
+                        self.count(i, doc);
+                    }
+                }
+            }
+            _ => {}
         }
-        (self.total, out)
+    }
+
+    fn harvest(self) -> Self::Fruit {
+        let mut out = Vec::with_capacity(self.fields.len());
+        for (i, col) in self.columns.iter().enumerate() {
+            let mut m = HashMap::new();
+            if let Some(c) = col {
+                let mut s = String::new();
+                for (ord, n) in self.counts[i].iter().enumerate().filter(|(_, n)| **n > 0) {
+                    s.clear();
+                    if c.ord_to_str(ord as u64, &mut s).unwrap_or(false) {
+                        m.insert(s.clone(), *n);
+                    }
+                }
+            }
+            out.push((self.totals[i], m));
+        }
+        (self.all, out)
     }
 }
 
 impl Collector for FacetCounts {
-    type Fruit = (u64, HashMap<String, u64>);
+    type Fruit = FacetFruit;
     type Child = FacetSegment;
 
     fn for_segment(
@@ -319,14 +447,21 @@ impl Collector for FacetCounts {
         _: SegmentOrdinal,
         reader: &SegmentReader,
     ) -> tantivy::Result<FacetSegment> {
-        let column = reader.fast_fields().str(&self.field)?;
-        let terms = column.as_ref().map_or(0, |c| c.num_terms());
+        let mut columns = Vec::with_capacity(self.fields.len());
+        let mut counts = Vec::with_capacity(self.fields.len());
+        for f in &self.fields {
+            let column = reader.fast_fields().str(&f.field)?;
+            counts.push(vec![0; column.as_ref().map_or(0, |c| c.num_terms())]);
+            columns.push(column);
+        }
         Ok(FacetSegment {
-            cols: Columns::load(reader)?,
+            cols: Columns::load(reader, &self.filter)?,
             filter: self.filter.clone(),
-            column,
-            counts: vec![0; terms],
-            total: 0,
+            fields: self.fields.clone(),
+            columns,
+            counts,
+            totals: vec![0; self.fields.len()],
+            all: 0,
         })
     }
 
@@ -335,15 +470,18 @@ impl Collector for FacetCounts {
     }
 
     fn merge_fruits(&self, fruits: Vec<Self::Fruit>) -> tantivy::Result<Self::Fruit> {
-        let mut total = 0;
-        let mut out: HashMap<String, u64> = HashMap::new();
-        for (n, m) in fruits {
-            total += n;
-            for (k, v) in m {
-                *out.entry(k).or_default() += v;
+        let mut all = 0;
+        let mut out = vec![(0, HashMap::new()); self.fields.len()];
+        for (n_all, fruit) in fruits {
+            all += n_all;
+            for (i, (n, m)) in fruit.into_iter().enumerate() {
+                out[i].0 += n;
+                for (k, v) in m {
+                    *out[i].1.entry(k).or_default() += v;
+                }
             }
         }
-        Ok((total, out))
+        Ok((all, out))
     }
 }
 

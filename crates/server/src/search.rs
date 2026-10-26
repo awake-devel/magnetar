@@ -6,6 +6,8 @@ use magnetar_core::enrich::MIN_DISPLAY_CONFIDENCE;
 use magnetar_core::enrich::ids::split_media_token;
 use magnetar_core::model::{Liveness, TorrentSummary, npub};
 use magnetar_core::query::{MIN_PREFIX_CHARS, SearchQuery, Sort, pg_tsquery};
+use magnetar_core::release::ReleaseAttrs;
+use sqlx::types::Json;
 use sqlx::{FromRow, Postgres, QueryBuilder};
 
 #[derive(FromRow)]
@@ -30,6 +32,9 @@ pub(crate) struct HitRow {
     media_title: Option<String>,
     media_year: Option<i32>,
     media_kind: Option<String>,
+    media_id: Option<i64>,
+    media_rating: Option<f32>,
+    attrs: Option<Json<ReleaseAttrs>>,
 }
 
 impl HitRow {
@@ -65,6 +70,9 @@ impl HitRow {
             media_year: self.media_year,
             media_kind: self.media_kind.and_then(|k| k.parse().ok()),
             matched_file: None,
+            media_id: self.media_id,
+            media_rating: self.media_rating,
+            attrs: self.attrs.map(|a| a.0),
         }
     }
 }
@@ -129,6 +137,7 @@ fn push_hits_cte(qb: &mut QueryBuilder<Postgres>, q: &SearchQuery, min_trust: u8
     if let Some(m) = &media {
         crate::enrich::push_media_filter(qb, m);
     }
+    push_attr_filters(qb, q);
     if let Some(tsq) = &tsq {
         qb.push(" AND (t.search_tsv @@ to_tsquery('simple', ")
             .push_bind(tsq.clone())
@@ -155,6 +164,67 @@ fn push_hits_cte(qb: &mut QueryBuilder<Postgres>, q: &SearchQuery, min_trust: u8
          FROM canon c JOIN grp g ON g.infohash = c.infohash \
          LEFT JOIN liveness l ON l.infohash = c.infohash) ",
     );
+}
+
+/// The release/media filters of D44 on event row `t` (same meaning as the index's collector).
+fn push_attr_filters(qb: &mut QueryBuilder<Postgres>, q: &SearchQuery) {
+    let filters = q.attr_filters();
+    let (media, attrs): (Vec<_>, Vec<_>) = filters
+        .into_iter()
+        .partition(|(name, _)| matches!(*name, "genre" | "media_kind"));
+    if !attrs.is_empty() {
+        qb.push(" AND EXISTS (SELECT 1 FROM torrent_attrs a WHERE a.infohash = t.infohash");
+        for (name, values) in attrs {
+            // Column names come from this match, never from input.
+            let (col, array) = match name {
+                "language" => ("languages", true),
+                "subtitles" => ("subtitles", true),
+                "hdr" => ("hdr", true),
+                "audio" => ("audio", true),
+                "resolution" => ("resolution", false),
+                "source" => ("source", false),
+                _ => ("video_codec", false),
+            };
+            if array {
+                qb.push(format!(" AND a.{col} && ")).push_bind(values);
+            } else {
+                qb.push(format!(" AND a.{col} = ANY("))
+                    .push_bind(values)
+                    .push(")");
+            }
+        }
+        qb.push(")");
+    }
+    if !media.is_empty() || q.min_rating.is_some() {
+        qb.push(
+            " AND EXISTS (SELECT 1 FROM torrent_media tm JOIN media m ON m.id = tm.media_id \
+             WHERE tm.infohash = t.infohash AND tm.confidence >= ",
+        )
+        .push_bind(MIN_DISPLAY_CONFIDENCE);
+        for (name, values) in media {
+            if name == "genre" {
+                qb.push(" AND ARRAY(SELECT lower(g) FROM unnest(m.genres) g) && ")
+                    .push_bind(values);
+            } else {
+                qb.push(" AND m.kind = ANY(").push_bind(values).push(")");
+            }
+        }
+        if let Some(r) = q.min_rating {
+            qb.push(" AND m.rating >= ").push_bind(r - 0.05);
+        }
+        qb.push(")");
+    }
+    if q.min_year.is_some() || q.max_year.is_some() {
+        qb.push(
+            " AND coalesce((SELECT m.year FROM torrent_media tm JOIN media m ON m.id = tm.media_id \
+             WHERE tm.infohash = t.infohash AND tm.confidence >= ",
+        )
+        .push_bind(MIN_DISPLAY_CONFIDENCE)
+        .push("), (SELECT a.year FROM torrent_attrs a WHERE a.infohash = t.infohash)) BETWEEN ")
+        .push_bind(q.min_year.unwrap_or(i32::MIN))
+        .push(" AND ")
+        .push_bind(q.max_year.unwrap_or(i32::MAX));
+    }
 }
 
 /// `WHERE ...` on `hits` (liveness filters).
@@ -188,11 +258,15 @@ pub(crate) fn hits_query(q: &SearchQuery, now: i64, min_trust: u8) -> QueryBuild
     let mut qb = QueryBuilder::new("");
     push_hits_cte(&mut qb, q, min_trust);
     qb.push(
-        "SELECT h.*, m.title AS media_title, m.year AS media_year, m.kind AS media_kind \
+        "SELECT h.*, m.title AS media_title, m.year AS media_year, m.kind AS media_kind, \
+         m.id AS media_id, m.rating AS media_rating, a.attrs \
          FROM hits h LEFT JOIN torrent_media tm ON tm.infohash = h.infohash AND tm.confidence >= ",
     )
     .push_bind(MIN_DISPLAY_CONFIDENCE)
-    .push(" LEFT JOIN media m ON m.id = tm.media_id");
+    .push(
+        " LEFT JOIN media m ON m.id = tm.media_id \
+         LEFT JOIN torrent_attrs a ON a.infohash = h.infohash",
+    );
     push_hit_filters(&mut qb, q, now);
     let dir = if q.descending { "DESC" } else { "ASC" };
     let order = match q.effective_sort() {
@@ -201,6 +275,7 @@ pub(crate) fn hits_query(q: &SearchQuery, now: i64, min_trust: u8) -> QueryBuild
         Sort::Date => format!("h.created_at {dir}"),
         Sort::Size => format!("h.total_size {dir} NULLS LAST, h.created_at DESC"),
         Sort::Seeders => format!("h.best_peers {dir} NULLS LAST, h.created_at DESC"),
+        Sort::Rating => format!("m.rating {dir} NULLS LAST, h.created_at DESC"),
     };
     qb.push(" ORDER BY ")
         .push(order)

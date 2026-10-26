@@ -917,6 +917,7 @@ fn synthetic_docs(n: u64) -> Vec<IndexDoc> {
                 best_peers: (seeded > 0).then(|| (next() % 500) as u32),
                 expires_at: (seeded > 0).then_some(NOW + 3600),
                 media: None,
+                attrs: Some(magnetar_core::release::parse_release(&title, &[], cat)),
             }
         })
         .collect()

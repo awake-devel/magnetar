@@ -20,6 +20,7 @@ pub mod pow;
 pub mod query;
 pub mod relay;
 pub mod relayurl;
+pub mod release;
 pub mod store;
 pub mod sync;
 pub mod trust;

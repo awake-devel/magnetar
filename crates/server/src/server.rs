@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::search_index::{self, SearchIndex};
 use crate::store::PgStore;
 use crate::tmdb::{self, Tmdb, TmdbConfig};
-use crate::{daemons, discovery, enrich, enrich_anime};
+use crate::{attrs, daemons, discovery, enrich, enrich_anime};
 
 /// Grace period for daemons after the HTTP server stopped.
 const DAEMON_GRACE: Duration = Duration::from_secs(10);
@@ -147,6 +147,7 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
             cfg.clone(),
             stop_rx.clone(),
         )),
+        tokio::spawn(attrs::backfill_loop(store.pool().clone(), stop_rx.clone())),
         tokio::spawn(enrich_anime::anime_loop(
             store.pool().clone(),
             cfg.clone(),

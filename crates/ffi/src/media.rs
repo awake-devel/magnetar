@@ -183,6 +183,27 @@ impl SqliteStore {
         cached_media(&self.conn(), infohash, now)
     }
 
+    /// A cached media row by id (any torrent linked to it), without the per-torrent
+    /// season/episode: the offline title page (D44).
+    pub fn media_by_id(&self, media_id: i64, now: i64) -> Result<Option<MediaInfo>> {
+        let conn = self.conn();
+        let ih: Option<String> = conn
+            .query_row(
+                "SELECT infohash FROM media_cache WHERE media_id = ?1 ORDER BY fetched_at DESC LIMIT 1",
+                [media_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .db()?;
+        let Some(ih) = ih else { return Ok(None) };
+        Ok(cached_media(&conn, &ih, now)?.map(|mut m| {
+            m.season = None;
+            m.episode = None;
+            m.episode_title = None;
+            m
+        }))
+    }
+
     /// Enforce [`TMDB_MAX_AGE_SECS`] at rest: blank the TMDB fields of stale `media_cache` rows
     /// and drop stale poster rows. Returns the poster files to delete (the caller owns them).
     pub fn expire_tmdb(&self, now: i64) -> Result<(u64, Vec<String>)> {

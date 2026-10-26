@@ -51,6 +51,12 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Parse the release attributes (D44) of every torrent without current ones, print a report.
+    Attrs {
+        /// Re-parse every torrent, also those already parsed by this version.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Args, Debug, Clone)]

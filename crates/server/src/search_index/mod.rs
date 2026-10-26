@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use magnetar_core::api::{FacetCount, FacetsResponse, SearchIndexStatus};
+use magnetar_core::api::{FacetCount, FacetSet, FacetsResponse, SearchIndexStatus};
 use magnetar_core::enrich::ids::split_media_token;
 use magnetar_core::error::{Error, Result};
 use magnetar_core::model::{MediaKind, TorrentSummary, npub};
@@ -39,7 +39,7 @@ use tantivy::schema::{Field, Value};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
 use tokio::sync::watch;
 
-use self::collect::{FacetCounts, Filter, SortBy, TopFiltered};
+use self::collect::{AttrFilter, FacetCounts, FacetField, Filter, SortBy, TopFiltered};
 use self::schema::{Fields, IndexDoc, NONE, SCHEMA_VERSION, TOKENIZER, analyzer};
 use crate::daemons::stop_requested;
 
@@ -507,34 +507,62 @@ impl SearchIndex {
         Ok(IndexResult { hits, total })
     }
 
-    /// Value counts of facet `name` over the hits of `q` (limit/offset/sort ignored). Blocking.
+    /// Value counts of facets `names` over the hits of `q` (limit/offset/sort ignored), each
+    /// without its own filter (D44). Ok(None) when a name is unknown. Blocking.
+    pub fn facet_set(
+        &self,
+        q: &IndexQuery,
+        names: &[String],
+        size: usize,
+    ) -> Result<Option<FacetSet>> {
+        let mut fields = Vec::with_capacity(names.len());
+        for name in names {
+            let Some(field) = self.fields.facet(name) else {
+                return Ok(None);
+            };
+            let field = self.fields.schema.get_field_name(field).to_string();
+            let filter = q.filter.attrs.iter().position(|a| a.field == field);
+            fields.push(FacetField { field, filter });
+        }
+        let searcher = self.reader.searcher();
+        let query = self.query(&searcher, &q.words);
+        let collector = FacetCounts {
+            filter: q.filter.clone(),
+            fields,
+        };
+        let (total, per_facet) = searcher.search(&*query, &collector).map_err(ix)?;
+        let facets = names
+            .iter()
+            .zip(per_facet)
+            .map(|(name, (n, counts))| {
+                let mut counts: Vec<FacetCount> = counts
+                    .into_iter()
+                    .map(|(value, count)| FacetCount { value, count })
+                    .collect();
+                counts.sort_unstable_by(|a, b| {
+                    b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value))
+                });
+                counts.truncate(size.clamp(1, MAX_FACET_VALUES));
+                FacetsResponse {
+                    field: name.clone(),
+                    total: n,
+                    counts,
+                }
+            })
+            .collect();
+        Ok(Some(FacetSet { total, facets }))
+    }
+
+    /// Value counts of one facet (`facet_set` with one name). Blocking.
     pub fn facets(
         &self,
         q: &IndexQuery,
         name: &str,
         size: usize,
     ) -> Result<Option<FacetsResponse>> {
-        let Some(field) = self.fields.facet(name) else {
-            return Ok(None);
-        };
-        let searcher = self.reader.searcher();
-        let query = self.query(&searcher, &q.words);
-        let collector = FacetCounts {
-            filter: q.filter.clone(),
-            field: self.fields.schema.get_field_name(field).to_string(),
-        };
-        let (total, counts) = searcher.search(&*query, &collector).map_err(ix)?;
-        let mut counts: Vec<FacetCount> = counts
-            .into_iter()
-            .map(|(value, count)| FacetCount { value, count })
-            .collect();
-        counts.sort_unstable_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
-        counts.truncate(size.clamp(1, MAX_FACET_VALUES));
-        Ok(Some(FacetsResponse {
-            field: name.to_string(),
-            total,
-            counts,
-        }))
+        Ok(self
+            .facet_set(q, &[name.to_string()], size)?
+            .and_then(|mut s| s.facets.pop()))
     }
 
     /// Stored fields → summary, plus all titles joined (for the title-match check).
@@ -592,6 +620,11 @@ impl SearchIndex {
             media_year: i32::try_from(int(f.media_year)).ok().filter(|y| *y >= 0),
             media_kind: text(f.media_kind).and_then(|k| k.parse::<MediaKind>().ok()),
             matched_file: None,
+            media_id: Some(int(f.media_id)).filter(|id| *id != NONE),
+            media_rating: Some(int(f.media_rating))
+                .filter(|r| *r != NONE)
+                .map(|r| r as f32 / 10.0),
+            attrs: text(f.attrs).and_then(|j| serde_json::from_str(&j).ok()),
         };
         (summary, titles.join(" "))
     }
@@ -639,6 +672,7 @@ pub fn index_query(
         Sort::Relevance | Sort::Date => SortBy::Date,
         Sort::Size => SortBy::Size,
         Sort::Seeders => SortBy::Seeders,
+        Sort::Rating => SortBy::Rating,
     };
     let to_i64 = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
     IndexQuery {
@@ -656,6 +690,17 @@ pub fn index_query(
             hide_dead: q.hide_dead,
             min_seeders: q.min_seeders.map(i64::from),
             media_id,
+            min_rating: q.min_rating.map(|r| (r * 10.0).round() as i64),
+            min_year: q.min_year.map(i64::from),
+            max_year: q.max_year.map(i64::from),
+            attrs: q
+                .attr_filters()
+                .into_iter()
+                .map(|(name, values)| AttrFilter {
+                    field: schema::facet_field_name(name),
+                    values,
+                })
+                .collect(),
             now,
         },
         sort,
@@ -734,26 +779,32 @@ pub async fn search(
     })
 }
 
-/// Facet counts through the index; Ok(None) for an unknown facet name.
-pub async fn facets(
+/// Facet counts through the index (D44: several at once, disjunctive); Ok(None) for an
+/// unknown facet name.
+pub async fn facet_set(
     pool: &PgPool,
     idx: &Arc<SearchIndex>,
     q: &SearchQuery,
-    name: &str,
+    names: &[String],
     size: usize,
     min_trust: u8,
     now: i64,
-) -> Result<Option<FacetsResponse>> {
+) -> Result<Option<FacetSet>> {
     let Some((text, media_id)) = media_filter(pool, &q.text).await? else {
-        return Ok(Some(FacetsResponse {
-            field: name.to_string(),
-            ..Default::default()
-        }));
+        // A media token naming nothing: every facet is empty.
+        let facets = names
+            .iter()
+            .map(|n| FacetsResponse {
+                field: n.clone(),
+                ..Default::default()
+            })
+            .collect();
+        return Ok(Some(FacetSet { total: 0, facets }));
     };
     let iq = index_query(q, &text, min_trust, media_id, now);
     let idx = idx.clone();
-    let name = name.to_string();
-    tokio::task::spawn_blocking(move || idx.facets(&iq, &name, size))
+    let names = names.to_vec();
+    tokio::task::spawn_blocking(move || idx.facet_set(&iq, &names, size))
         .await
         .map_err(join_err)?
 }

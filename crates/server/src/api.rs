@@ -189,7 +189,11 @@ pub fn router(state: AppState) -> Router {
             post(refresh_liveness),
         )
         .route("/api/v1/media/{id}/torrents", get(media_torrents))
-        .route("/api/v1/facets", get(facets))
+        .route("/api/v1/facets", get(facets).post(facet_set))
+        .route(
+            "/api/v1/media/{id}/releases",
+            get(media_releases_get).post(media_releases_post),
+        )
         .route("/api/v1/events/batch", post(batch))
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/relays", get(relays).put(set_relay))
@@ -228,6 +232,10 @@ async fn health(State(st): State<AppState>) -> Json<Health> {
         status: "ok".into(),
         version: magnetar_core::VERSION.into(),
         db: st.store.ping().await,
+        features: magnetar_core::api::features::ALL
+            .iter()
+            .map(|f| f.to_string())
+            .collect(),
     })
 }
 
@@ -243,6 +251,15 @@ fn parse_num<T: std::str::FromStr>(k: &str, v: &str) -> Result<T, ApiError> {
     v.trim()
         .parse()
         .map_err(|_| ApiError::bad_request(format!("bad value for {k}: {v:?}")))
+}
+
+/// Comma-separated, repeatable list parameter (`lang=fr,en&lang=ja`), lowercased, deduplicated.
+fn push_list(list: &mut Vec<String>, v: &str) {
+    for x in v.split(',').map(|x| x.trim().to_lowercase()) {
+        if !x.is_empty() && !list.contains(&x) {
+            list.push(x);
+        }
+    }
 }
 
 /// Query-string form of `SearchQuery` (ARCHITECTURE.md §6). `desc` defaults to true.
@@ -277,12 +294,35 @@ pub fn parse_search_query(raw: Option<&str>) -> ApiResult<SearchQuery> {
                     "date" => Sort::Date,
                     "size" => Sort::Size,
                     "seeders" => Sort::Seeders,
+                    "rating" => Sort::Rating,
                     other => return Err(ApiError::bad_request(format!("bad sort {other:?}"))),
                 }
             }
             "desc" => q.descending = parse_bool(&v)?,
             "limit" => q.limit = parse_num(&k, &v)?,
             "offset" => q.offset = parse_num(&k, &v)?,
+            // D44 release/media filters.
+            "lang" => push_list(&mut q.languages, &v),
+            "sub" => push_list(&mut q.subtitles, &v),
+            "res" => push_list(&mut q.resolutions, &v),
+            "source" => push_list(&mut q.sources, &v),
+            "codec" => push_list(&mut q.video_codecs, &v),
+            "hdr" => push_list(&mut q.hdr, &v),
+            "audio" => push_list(&mut q.audio, &v),
+            "genre" => push_list(&mut q.genres, &v),
+            "kind" => {
+                for k in v.split(',').map(str::trim).filter(|k| !k.is_empty()) {
+                    let k: MediaKind = k
+                        .parse()
+                        .map_err(|e: Error| ApiError::bad_request(e.to_string()))?;
+                    if !q.media_kinds.contains(&k) {
+                        q.media_kinds.push(k);
+                    }
+                }
+            }
+            "min_rating" => q.min_rating = Some(parse_num(&k, &v)?),
+            "min_year" => q.min_year = Some(parse_num(&k, &v)?),
+            "max_year" => q.max_year = Some(parse_num(&k, &v)?),
             _ => {}
         }
     }
@@ -338,13 +378,67 @@ async fn facets(
         .facets(&q, &field, size, magnetar_core::now())
         .await?
         .map(Json)
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "search_index_unavailable",
-                "the search index is disabled or still building",
-            )
-        })
+        .ok_or_else(index_unavailable)
+}
+
+fn index_unavailable() -> ApiError {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "search_index_unavailable",
+        "the search index is disabled or still building",
+    )
+}
+
+/// `POST /api/v1/facets` with `FacetsRequest` (D44): several facets over a full `SearchQuery`,
+/// each counted without its own filter. 503 until the search index is built.
+async fn facet_set(
+    State(st): State<AppState>,
+    body: Result<Json<FacetsRequest>, JsonRejection>,
+) -> ApiResult<Json<FacetSet>> {
+    let Json(r) = body?;
+    let size = match r.size {
+        0 => 20,
+        n => n as usize,
+    };
+    st.store
+        .facet_set(&r.query, &r.fields, size, magnetar_core::now())
+        .await?
+        .map(Json)
+        .ok_or_else(index_unavailable)
+}
+
+/// `GET /api/v1/media/{id}/releases?<search parameters>` (D44): the releases of one
+/// movie/series grouped by season/episode, resolution and language, with seeders.
+async fn media_releases_get(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    RawQuery(raw): RawQuery,
+) -> ApiResult<Json<MediaReleases>> {
+    let q = parse_search_query(raw.as_deref())?;
+    media_releases(&st, id, q).await
+}
+
+async fn media_releases_post(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    body: Result<Json<SearchQuery>, JsonRejection>,
+) -> ApiResult<Json<MediaReleases>> {
+    let Json(q) = body?;
+    media_releases(&st, id, q).await
+}
+
+async fn media_releases(st: &AppState, id: i64, q: SearchQuery) -> ApiResult<Json<MediaReleases>> {
+    let now = magnetar_core::now();
+    let mut r = st
+        .store
+        .media_releases(id, &q, now)
+        .await?
+        .ok_or_else(|| ApiError::not_found("unknown media"))?;
+    // Cached TMDB fields only (poster, overview), as for a torrent detail (D42).
+    if let (Some(t), Some(m)) = (&st.tmdb, r.media.as_mut()) {
+        t.decorate(m, now).await;
+    }
+    Ok(Json(r))
 }
 
 fn infohash_param(s: &str) -> ApiResult<String> {

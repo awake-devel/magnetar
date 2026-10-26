@@ -3,7 +3,7 @@
 use rusqlite::Connection;
 
 /// Migration N (1-based) brings `user_version` from N-1 to N. Append only.
-const MIGRATIONS: &[&str] = &[V1, V2, V3];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
 
 const V1: &str = r#"
 CREATE TABLE events(
@@ -207,6 +207,17 @@ CREATE TABLE IF NOT EXISTS poster_cache(
     bytes INTEGER NOT NULL,
     fetched_at INTEGER NOT NULL,
     last_access INTEGER NOT NULL
+);
+"#;
+
+/// Release attributes per infohash (D44), parsed on the phone with the server's parser
+/// (`core::release`): written by `put_torrent`, filled for older rows by
+/// `SqliteStore::backfill_attrs` (also after a `PARSER_VERSION` change).
+const V4: &str = r#"
+CREATE TABLE IF NOT EXISTS torrent_attrs(
+    infohash TEXT PRIMARY KEY,
+    parser_version INTEGER NOT NULL,
+    attrs TEXT NOT NULL
 );
 "#;
 

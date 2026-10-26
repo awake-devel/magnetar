@@ -27,22 +27,12 @@ fn config() -> FfiConfig {
 }
 
 fn query(text: &str) -> FfiSearchQuery {
-    FfiSearchQuery {
+    magnetar_core::query::SearchQuery {
         text: text.into(),
-        categories: vec![],
-        min_size: None,
-        max_size: None,
-        since: None,
-        until: None,
-        min_seeders: None,
-        hide_dead: false,
-        min_trust: None,
-        sort: FfiSort::Relevance,
         descending: true,
-        limit: 0,
-        offset: 0,
-        include_hidden: false,
+        ..Default::default()
     }
+    .into()
 }
 
 fn open(dir: &TempDir, cfg: FfiConfig) -> Arc<Magnetar> {

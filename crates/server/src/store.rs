@@ -7,12 +7,12 @@ use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use magnetar_core::api::{FacetsResponse, SearchIndexStatus};
+use magnetar_core::api::{FacetSet, FacetsResponse, MediaReleases, SearchIndexStatus};
 use magnetar_core::error::{Error, Result};
 use magnetar_core::model::*;
-use magnetar_core::query::{SearchPage, SearchQuery};
+use magnetar_core::query::{SearchPage, SearchQuery, Sort};
 use magnetar_core::store::{DEFAULT_TRUST_THRESHOLD, Store, keys};
-use magnetar_core::{magnet, trust, wot};
+use magnetar_core::{magnet, release, trust, wot};
 use sqlx::postgres::{PgConnection, PgPoolOptions};
 use sqlx::types::Json;
 use sqlx::{FromRow, PgPool, Postgres, QueryBuilder};
@@ -352,15 +352,23 @@ impl PgStore {
         Some(st)
     }
 
-    /// Facet value counts over a search's results (D43). Err(Invalid) for an unknown facet;
-    /// Ok(None) while the index is not ready.
-    pub async fn facets(
+    /// Facet value counts over a search's results (D43, several at once since D44, each
+    /// without its own filter). Err(Invalid) for an unknown facet; Ok(None) while the index is
+    /// not ready.
+    pub async fn facet_set(
         &self,
         q: &SearchQuery,
-        field: &str,
+        fields: &[String],
         size: usize,
         now: i64,
-    ) -> Result<Option<FacetsResponse>> {
+    ) -> Result<Option<FacetSet>> {
+        if let Some(bad) = fields.iter().find(|f| {
+            !search_index::schema::FACETS
+                .iter()
+                .any(|d| d.name == f.as_str())
+        }) {
+            return Err(Error::Invalid(format!("unknown facet {bad:?}")));
+        }
         let Some(idx) = self.ready_index() else {
             return Ok(None);
         };
@@ -368,10 +376,63 @@ impl PgStore {
             Some(t) => t,
             None => self.threshold().await?,
         };
-        search_index::facets(&self.pool, idx, q, field, size, min_trust, now)
+        search_index::facet_set(&self.pool, idx, q, fields, size, min_trust, now)
             .await?
             .map(Some)
-            .ok_or_else(|| Error::Invalid(format!("unknown facet {field:?}")))
+            .ok_or_else(|| Error::Invalid("unknown facet".into()))
+    }
+
+    /// One facet (`GET /api/v1/facets?field=…`).
+    pub async fn facets(
+        &self,
+        q: &SearchQuery,
+        field: &str,
+        size: usize,
+        now: i64,
+    ) -> Result<Option<FacetsResponse>> {
+        Ok(self
+            .facet_set(q, &[field.to_string()], size, now)
+            .await?
+            .and_then(|mut s| s.facets.pop()))
+    }
+
+    /// Releases of one media grouped for the per-title view (D44): every linked torrent
+    /// passing `q`'s filters, best seeded first, at most `release::MAX_RELEASES`.
+    pub async fn media_releases(
+        &self,
+        media_id: i64,
+        q: &SearchQuery,
+        now: i64,
+    ) -> Result<Option<MediaReleases>> {
+        let Some(media) = crate::enrich::media_by_id(&self.pool, media_id).await? else {
+            return Ok(None);
+        };
+        let mut page_q = q.clone();
+        page_q.text = format!("media:{media_id} {}", q.text);
+        page_q.sort = Sort::Seeders;
+        page_q.descending = true;
+        page_q.limit = magnetar_core::query::MAX_LIMIT;
+        let mut hits = Vec::new();
+        let mut total = 0;
+        while hits.len() < release::MAX_RELEASES {
+            page_q.offset = hits.len() as u32;
+            let page = self.search(&page_q, now).await?;
+            total = page.total;
+            let n = page.hits.len();
+            hits.extend(page.hits);
+            if n < page_q.limit as usize {
+                break;
+            }
+        }
+        hits.truncate(release::MAX_RELEASES);
+        let by_episode = media.kind != MediaKind::Movie;
+        let truncated = total > hits.len() as u64;
+        Ok(Some(MediaReleases {
+            media: Some(media),
+            total: total.max(hits.len() as u64),
+            truncated,
+            groups: release::group_releases(hits, by_episode),
+        }))
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -662,6 +723,21 @@ impl Store for PgStore {
         .bind(i16::from(t.pow_bits))
         .bind(t.pow_committed.map(i16::from))
         .bind(i16::from(trust))
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        // Release attributes (D44), parsed once per infohash: its first event names them (same
+        // files; titles of other publishers differ little). Microseconds of work.
+        let attrs = release::parse_release(&clean(&t.title), &files, t.category);
+        sqlx::query(
+            "INSERT INTO torrent_attrs (infohash, parser_version, attrs) VALUES ($1, $2, $3)
+             ON CONFLICT (infohash) DO UPDATE
+                 SET parser_version = EXCLUDED.parser_version, attrs = EXCLUDED.attrs
+                 WHERE torrent_attrs.parser_version < EXCLUDED.parser_version",
+        )
+        .bind(&t.infohash)
+        .bind(release::PARSER_VERSION)
+        .bind(Json(&attrs))
         .execute(&mut *tx)
         .await
         .map_err(db)?;
@@ -1164,6 +1240,12 @@ impl Store for PgStore {
         publishers.dedup();
         let total_size = canon.total_size.and_then(|s| u64::try_from(s).ok());
         let media = crate::enrich::media_for_infohash(&self.pool, infohash).await?;
+        let attrs: Option<Json<release::ReleaseAttrs>> =
+            sqlx::query_scalar("SELECT attrs FROM torrent_attrs WHERE infohash = $1")
+                .bind(infohash)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db)?;
         let summary = TorrentSummary {
             infohash: infohash.to_string(),
             event_id: canon.event_id.clone(),
@@ -1188,6 +1270,9 @@ impl Store for PgStore {
             media_year: media.as_ref().and_then(|m| m.year),
             media_kind: media.as_ref().map(|m| m.kind),
             matched_file: None,
+            media_id: media.as_ref().map(|m| m.media_id),
+            media_rating: media.as_ref().and_then(|m| m.rating),
+            attrs: attrs.map(|a| a.0),
         };
         let events = rows
             .iter()

@@ -7,6 +7,7 @@ use magnetar_core::enrich::MIN_DISPLAY_CONFIDENCE;
 use magnetar_core::enrich::ids::MediaRef;
 use magnetar_core::error::Result;
 use magnetar_core::model::Category;
+use magnetar_core::release::ReleaseAttrs;
 use sqlx::types::Json;
 use sqlx::{FromRow, PgPool};
 
@@ -100,6 +101,14 @@ pub async fn load_docs(pool: &PgPool, infohashes: &[String]) -> Result<Vec<Index
     .fetch_all(pool)
     .await
     .map_err(db)?;
+    let attrs: Vec<(String, Json<ReleaseAttrs>)> =
+        sqlx::query_as("SELECT infohash, attrs FROM torrent_attrs WHERE infohash = ANY($1)")
+            .bind(infohashes)
+            .fetch_all(pool)
+            .await
+            .map_err(db)?;
+    let mut attrs: HashMap<String, ReleaseAttrs> =
+        attrs.into_iter().map(|(ih, a)| (ih, a.0)).collect();
     let mut live: HashMap<String, LiveRow> =
         live.into_iter().map(|l| (l.infohash.clone(), l)).collect();
     let mut media: HashMap<String, MediaRow> =
@@ -157,6 +166,7 @@ pub async fn load_docs(pool: &PgPool, infohashes: &[String]) -> Result<Vec<Index
             best_peers,
             expires_at: l.map(|l| l.expires_at),
             media: m,
+            attrs: attrs.remove(&r.infohash),
             infohash: r.infohash,
         });
     }

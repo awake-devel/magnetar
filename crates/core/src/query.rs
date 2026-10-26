@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Category, TorrentSummary};
+use crate::model::{Category, MediaKind, TorrentSummary};
 
 pub const DEFAULT_LIMIT: u32 = 50;
 pub const MAX_LIMIT: u32 = 200;
@@ -25,6 +25,71 @@ pub struct SearchQuery {
     pub limit: u32,
     pub offset: u32,
     pub include_hidden: bool,
+    // Release and media filters (D44). Within one field any value matches; fields combine
+    // with AND. Values are the lowercase codes of `release::ReleaseAttrs` (docs/FILTERS.md).
+    // Older servers ignore these fields, so the app only offers them when the server says it
+    // has them (`Health::features`).
+    /// Audio languages ("fr", "fr-ca", "en", "original", "multi", …).
+    pub languages: Vec<String>,
+    pub subtitles: Vec<String>,
+    /// "2160p", "1080p", …, "sd".
+    pub resolutions: Vec<String>,
+    /// "remux", "bluray", "web-dl", …
+    pub sources: Vec<String>,
+    /// "h265", "h264", "av1", …
+    pub video_codecs: Vec<String>,
+    /// "dv", "hdr10+", "hdr10", "hlg".
+    pub hdr: Vec<String>,
+    /// Audio codecs ("truehd", "atmos", "eac3", …).
+    pub audio: Vec<String>,
+    /// Genres of the linked media, lowercase ("drama", "comedy", …).
+    pub genres: Vec<String>,
+    pub media_kinds: Vec<MediaKind>,
+    /// Minimum IMDb-style rating (0–10) of the linked media; unrated never passes.
+    pub min_rating: Option<f32>,
+    /// Year range: the linked media's year, else the year in the name.
+    pub min_year: Option<i32>,
+    pub max_year: Option<i32>,
+}
+
+impl SearchQuery {
+    /// The release/media filters set (D44) as (facet name, lowercase values), the facet each
+    /// one filters on in the search index.
+    pub fn attr_filters(&self) -> Vec<(&'static str, Vec<String>)> {
+        let lower = |v: &[String]| -> Vec<String> {
+            v.iter()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        let mut out = vec![
+            ("language", lower(&self.languages)),
+            ("subtitles", lower(&self.subtitles)),
+            ("resolution", lower(&self.resolutions)),
+            ("source", lower(&self.sources)),
+            ("codec", lower(&self.video_codecs)),
+            ("hdr", lower(&self.hdr)),
+            ("audio", lower(&self.audio)),
+            ("genre", lower(&self.genres)),
+            (
+                "media_kind",
+                self.media_kinds
+                    .iter()
+                    .map(|k| k.as_str().to_string())
+                    .collect(),
+            ),
+        ];
+        out.retain(|(_, v)| !v.is_empty());
+        out
+    }
+
+    /// Any D44 filter set (release attributes, genre, rating, year).
+    pub fn has_attr_filters(&self) -> bool {
+        !self.attr_filters().is_empty()
+            || self.min_rating.is_some()
+            || self.min_year.is_some()
+            || self.max_year.is_some()
+    }
 }
 
 impl SearchQuery {
@@ -54,6 +119,8 @@ pub enum Sort {
     Date,
     Size,
     Seeders,
+    /// Rating of the linked media (D44), unrated last. Older servers reject it.
+    Rating,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

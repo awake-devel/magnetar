@@ -70,6 +70,8 @@ pub enum FfiSort {
     Date,
     Size,
     Seeders,
+    /// Rating of the linked media (D44); servers without `features::FILTERS` reject it.
+    Rating,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -89,6 +91,65 @@ pub struct FfiSearchQuery {
     pub limit: u32,
     pub offset: u32,
     pub include_hidden: bool,
+    /// Release/media filters (D44, `core::query::SearchQuery`): any value within a field,
+    /// all fields together. Codes as in docs/FILTERS.md.
+    #[uniffi(default)]
+    pub languages: Vec<String>,
+    #[uniffi(default)]
+    pub subtitles: Vec<String>,
+    #[uniffi(default)]
+    pub resolutions: Vec<String>,
+    #[uniffi(default)]
+    pub sources: Vec<String>,
+    #[uniffi(default)]
+    pub video_codecs: Vec<String>,
+    #[uniffi(default)]
+    pub hdr: Vec<String>,
+    #[uniffi(default)]
+    pub audio: Vec<String>,
+    #[uniffi(default)]
+    pub genres: Vec<String>,
+    #[uniffi(default)]
+    pub media_kinds: Vec<FfiMediaKind>,
+    #[uniffi(default)]
+    pub min_rating: Option<f32>,
+    #[uniffi(default)]
+    pub min_year: Option<i32>,
+    #[uniffi(default)]
+    pub max_year: Option<i32>,
+}
+
+/// `core::release::ReleaseAttrs` (D44): what the name and files say about a release.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiReleaseAttrs {
+    pub resolution: Option<String>,
+    pub source: Option<String>,
+    pub video_codec: Option<String>,
+    pub hdr: Vec<String>,
+    pub bit_depth: Option<u8>,
+    pub audio: Vec<String>,
+    pub channels: Option<String>,
+    pub languages: Vec<String>,
+    pub subtitles: Vec<String>,
+    /// French scene tags as written ("multi", "vff", "vostfr", …).
+    pub french: Vec<String>,
+    pub group: Option<String>,
+    pub season: Option<i32>,
+    pub season_end: Option<i32>,
+    pub episode: Option<i32>,
+    pub episode_end: Option<i32>,
+    pub complete: bool,
+    pub year: Option<i32>,
+    pub editions: Vec<String>,
+    pub bitrate: Option<String>,
+    pub sample_rate: Option<String>,
+    pub formats: Vec<String>,
+    /// Language group ("multi-vff", "vostfr", "en", …) and its label ("MULTi (VFF)").
+    pub language_key: String,
+    pub language_label: String,
+    /// Short labels for a result row: "2160p", "WEB-DL", "H.265/HEVC", "Dolby Vision",
+    /// "MULTi (VFF)", "DD+ (E-AC-3) 5.1", …
+    pub badges: Vec<String>,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -119,6 +180,57 @@ pub struct FfiTorrentSummary {
     pub media_kind: Option<FfiMediaKind>,
     /// The file name the search matched when the title did not (server index, D43).
     pub matched_file: Option<String>,
+    /// Media row behind `media_title`: opens the title page (`media_releases`, D44).
+    pub media_id: Option<i64>,
+    pub media_rating: Option<f32>,
+    pub attrs: Option<FfiReleaseAttrs>,
+}
+
+/// One facet value with its count (D44) and display label.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiFacetCount {
+    pub value: String,
+    pub label: String,
+    pub count: u64,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiFacet {
+    pub field: String,
+    /// Results this facet's counts are taken over (every filter but its own).
+    pub total: u64,
+    pub counts: Vec<FfiFacetCount>,
+}
+
+/// Counts for the filter sheet (`Magnetar::facets`, D44).
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiFacetSet {
+    pub total: u64,
+    pub facets: Vec<FfiFacet>,
+}
+
+/// One group of the title page: season/episode (series), resolution, language.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiReleaseGroup {
+    pub season: Option<i32>,
+    pub episode: Option<i32>,
+    pub resolution: Option<String>,
+    pub language: String,
+    pub language_label: String,
+    pub releases: Vec<FfiTorrentSummary>,
+}
+
+/// The title page (`Magnetar::media_releases`, D44).
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiMediaReleases {
+    pub media: Option<FfiMediaInfo>,
+    pub total: u64,
+    pub truncated: bool,
+    pub groups: Vec<FfiReleaseGroup>,
+    /// "server" | "local"
+    pub source: String,
+    /// Set when the server was asked and failed (the groups come from the local cache).
+    pub server_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -385,6 +497,21 @@ impl Magnetar {
             .map(|d| d.join("posters"))
             .unwrap_or_else(|| "posters".into());
         let inner = Arc::new(Inner::new(store, config.clone()).with_poster_dir(posters));
+        // Release attributes of rows cached before D44 or by an older parser, in chunks off the
+        // caller's thread.
+        let backfill = inner.store.clone();
+        runtime.spawn_blocking(move || {
+            loop {
+                match backfill.backfill_attrs(store::ATTRS_CHUNK) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("release attributes: {e}");
+                        break;
+                    }
+                }
+            }
+        });
         let this = Magnetar {
             inner,
             handle: runtime.handle().clone(),
@@ -502,6 +629,103 @@ impl Magnetar {
             Ok(convert::page(p, server_error))
         })
         .await
+    }
+
+    /// Counts for the filter sheet (D44): `fields` are facet names ("language", "resolution",
+    /// "source", "codec", "hdr", "audio", "genre", "media_kind", …), each counted over `query`
+    /// without its own filter. Server only: `Invalid` offline, `Server{503}` while its index
+    /// builds, `Server{404|405}` from servers without `features::FACET_SET`.
+    pub async fn facets(
+        &self,
+        query: FfiSearchQuery,
+        fields: Vec<String>,
+    ) -> Result<FfiFacetSet, FfiError> {
+        let q = self.inner.query(query);
+        let api = self.inner.require_api()?;
+        self.run(move |_| async move {
+            let r = magnetar_core::api::FacetsRequest {
+                query: q,
+                fields,
+                size: 50,
+            };
+            Ok(api.facet_set(&r).await?.into())
+        })
+        .await
+    }
+
+    /// The title page (D44): the releases of one media grouped by season/episode, resolution
+    /// and language, best seeded first; `query`'s filters apply. Server first; offline (or a
+    /// server without `features::MEDIA_RELEASES`), the cached torrents linked to it.
+    pub async fn media_releases(
+        &self,
+        media_id: i64,
+        query: FfiSearchQuery,
+    ) -> Result<FfiMediaReleases, FfiError> {
+        let q = self.inner.query(query);
+        self.run(move |inner| async move {
+            let mut server_error = None;
+            if let Some(api) = inner.api() {
+                match api.media_releases(media_id, &q).await {
+                    Ok(mut r) => {
+                        for g in &mut r.groups {
+                            let mut page = magnetar_core::query::SearchPage {
+                                hits: std::mem::take(&mut g.releases),
+                                ..Default::default()
+                            };
+                            inner.overlay_flags(&mut page, q.include_hidden)?;
+                            g.releases = page.hits;
+                        }
+                        r.groups.retain(|g| !g.releases.is_empty());
+                        return Ok(convert::releases(r, "server", None));
+                    }
+                    Err(e) => server_error = Some(e.to_string()),
+                }
+            }
+            let now = magnetar_core::now();
+            let mut lq = q.clone();
+            lq.text = format!("media:{media_id} {}", q.text);
+            lq.sort = magnetar_core::query::Sort::Seeders;
+            lq.descending = true;
+            lq.limit = magnetar_core::query::MAX_LIMIT;
+            let mut hits = Vec::new();
+            let mut total = 0;
+            while hits.len() < magnetar_core::release::MAX_RELEASES {
+                lq.offset = hits.len() as u32;
+                let page = inner.store.search_sync(&lq, now)?;
+                total = page.total;
+                let n = page.hits.len();
+                hits.extend(page.hits);
+                if n < lq.limit as usize {
+                    break;
+                }
+            }
+            let media = inner.store.media_by_id(media_id, now)?;
+            let by_episode = match &media {
+                Some(m) => m.kind != magnetar_core::model::MediaKind::Movie,
+                None => hits
+                    .iter()
+                    .any(|h| h.attrs.as_ref().is_some_and(|a| a.season.is_some())),
+            };
+            let truncated = total > hits.len() as u64;
+            let r = magnetar_core::api::MediaReleases {
+                media,
+                total,
+                truncated,
+                groups: magnetar_core::release::group_releases(hits, by_episode),
+            };
+            Ok(convert::releases(r, "local", server_error))
+        })
+        .await
+    }
+
+    /// What the configured server supports (`core::api::features`, D44). None: no server
+    /// configured or it did not answer (searches then use the local cache); an empty list:
+    /// a server older than D44. The app hides the filters the answer lacks.
+    pub async fn server_features(&self) -> Option<Vec<String>> {
+        let api = self.inner.api()?;
+        self.run(move |_| async move { Ok(api.health().await?.features) })
+            .await
+            .ok()
     }
 
     pub async fn crawl_once(&self, max_seconds: u32) -> Result<FfiCrawlReport, FfiError> {
@@ -866,6 +1090,37 @@ pub fn pubkey_decode(input: String) -> Result<String, FfiError> {
 #[uniffi::export]
 pub fn build_magnet(infohash: String, name: Option<String>, trackers: Vec<String>) -> String {
     magnet::build_magnet(infohash.trim(), name.as_deref(), &trackers, None)
+}
+
+/// Display label of a filter value (D44): `facet_label("language", "fr-ca")` = "French
+/// (Québec)", `facet_label("source", "web-dl")` = "WEB-DL".
+#[uniffi::export]
+pub fn facet_label(field: String, value: String) -> String {
+    magnetar_core::release::facet_label(&field, &value)
+}
+
+/// The values offered for a filter when no counts are available (offline, index building):
+/// "language", "subtitles", "resolution", "source", "codec", "hdr", "audio", "media_kind".
+#[uniffi::export]
+pub fn filter_options(field: String) -> Vec<String> {
+    use magnetar_core::release as r;
+    let list: &[&str] = match field.as_str() {
+        "language" => &[
+            "fr", "fr-fr", "fr-ca", "original", "multi", "en", "ja", "es", "es-419", "de", "it",
+            "pt", "pt-br", "ko", "zh", "ru", "hi",
+        ],
+        "subtitles" => &[
+            "fr", "en", "multi", "es", "de", "it", "pt", "ja", "zh", "ru",
+        ],
+        "resolution" => r::RESOLUTIONS,
+        "source" => r::SOURCES,
+        "codec" => r::VIDEO_CODECS,
+        "hdr" => r::HDR_FORMATS,
+        "audio" => r::AUDIO_CODECS,
+        "media_kind" => &["movie", "series", "anime"],
+        _ => &[],
+    };
+    list.iter().map(|s| s.to_string()).collect()
 }
 
 #[uniffi::export]

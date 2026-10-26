@@ -1,8 +1,10 @@
 //! core <-> Ffi type conversions and error mapping.
 
 use magnetar_core::Error;
+use magnetar_core::api::{FacetSet, MediaReleases};
 use magnetar_core::model::*;
 use magnetar_core::query::{SearchPage, SearchQuery, Sort};
+use magnetar_core::release::{self, ReleaseAttrs};
 use serde::{Deserialize, Serialize};
 
 use crate::*;
@@ -64,6 +66,7 @@ impl From<FfiSort> for Sort {
             FfiSort::Date => Sort::Date,
             FfiSort::Size => Sort::Size,
             FfiSort::Seeders => Sort::Seeders,
+            FfiSort::Rating => Sort::Rating,
         }
     }
 }
@@ -75,6 +78,7 @@ impl From<Sort> for FfiSort {
             Sort::Date => FfiSort::Date,
             Sort::Size => FfiSort::Size,
             Sort::Seeders => FfiSort::Seeders,
+            Sort::Rating => FfiSort::Rating,
         }
     }
 }
@@ -96,6 +100,18 @@ impl From<FfiSearchQuery> for SearchQuery {
             limit: q.limit,
             offset: q.offset,
             include_hidden: q.include_hidden,
+            languages: q.languages,
+            subtitles: q.subtitles,
+            resolutions: q.resolutions,
+            sources: q.sources,
+            video_codecs: q.video_codecs,
+            hdr: q.hdr,
+            audio: q.audio,
+            genres: q.genres,
+            media_kinds: q.media_kinds.into_iter().map(Into::into).collect(),
+            min_rating: q.min_rating,
+            min_year: q.min_year,
+            max_year: q.max_year,
         }
     }
 }
@@ -117,6 +133,18 @@ impl From<SearchQuery> for FfiSearchQuery {
             limit: q.limit,
             offset: q.offset,
             include_hidden: q.include_hidden,
+            languages: q.languages,
+            subtitles: q.subtitles,
+            resolutions: q.resolutions,
+            sources: q.sources,
+            video_codecs: q.video_codecs,
+            hdr: q.hdr,
+            audio: q.audio,
+            genres: q.genres,
+            media_kinds: q.media_kinds.into_iter().map(Into::into).collect(),
+            min_rating: q.min_rating,
+            min_year: q.min_year,
+            max_year: q.max_year,
         }
     }
 }
@@ -147,7 +175,137 @@ impl From<TorrentSummary> for FfiTorrentSummary {
             media_year: t.media_year,
             media_kind: t.media_kind.map(Into::into),
             matched_file: t.matched_file,
+            media_id: t.media_id,
+            media_rating: t.media_rating,
+            attrs: t.attrs.map(Into::into),
         }
+    }
+}
+
+impl From<FfiMediaKind> for MediaKind {
+    fn from(k: FfiMediaKind) -> Self {
+        match k {
+            FfiMediaKind::Movie => MediaKind::Movie,
+            FfiMediaKind::Series => MediaKind::Series,
+            FfiMediaKind::Anime => MediaKind::Anime,
+        }
+    }
+}
+
+/// Short labels for a result row (`FfiReleaseAttrs::badges`).
+pub fn badges(a: &ReleaseAttrs) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(r) = &a.resolution {
+        out.push(r.clone());
+    }
+    if let Some(s) = &a.source {
+        out.push(release::facet_label("source", s));
+    }
+    if let Some(c) = &a.video_codec {
+        out.push(release::facet_label("codec", c));
+    }
+    if let Some(h) = a.hdr.first() {
+        out.push(release::facet_label("hdr", h));
+    }
+    let key = a.language_key();
+    if key != "unknown" {
+        out.push(release::language_label(&key));
+    }
+    if let Some(c) = a.audio.first() {
+        let mut l = release::facet_label("audio", c);
+        if let Some(ch) = &a.channels {
+            l = format!("{l} {ch}");
+        }
+        out.push(l);
+    }
+    for f in &a.formats {
+        out.push(f.to_uppercase());
+    }
+    if let Some(b) = a.bit_depth.filter(|b| *b >= 16) {
+        out.push(format!("{b} bit"));
+    }
+    if let Some(b) = &a.bitrate {
+        out.push(format!("{b} kbps"));
+    }
+    out
+}
+
+impl From<ReleaseAttrs> for FfiReleaseAttrs {
+    fn from(a: ReleaseAttrs) -> Self {
+        let key = a.language_key();
+        FfiReleaseAttrs {
+            badges: badges(&a),
+            language_label: release::language_label(&key),
+            language_key: key,
+            resolution: a.resolution,
+            source: a.source,
+            video_codec: a.video_codec,
+            hdr: a.hdr,
+            bit_depth: a.bit_depth,
+            audio: a.audio,
+            channels: a.channels,
+            languages: a.languages,
+            subtitles: a.subtitles,
+            french: a.french,
+            group: a.group,
+            season: a.season,
+            season_end: a.season_end,
+            episode: a.episode,
+            episode_end: a.episode_end,
+            complete: a.complete,
+            year: a.year,
+            editions: a.editions,
+            bitrate: a.bitrate,
+            sample_rate: a.sample_rate,
+            formats: a.formats,
+        }
+    }
+}
+
+impl From<FacetSet> for FfiFacetSet {
+    fn from(s: FacetSet) -> Self {
+        FfiFacetSet {
+            total: s.total,
+            facets: s
+                .facets
+                .into_iter()
+                .map(|f| FfiFacet {
+                    counts: f
+                        .counts
+                        .into_iter()
+                        .map(|c| FfiFacetCount {
+                            label: release::facet_label(&f.field, &c.value),
+                            value: c.value,
+                            count: c.count,
+                        })
+                        .collect(),
+                    field: f.field,
+                    total: f.total,
+                })
+                .collect(),
+        }
+    }
+}
+
+pub fn releases(r: MediaReleases, source: &str, server_error: Option<String>) -> FfiMediaReleases {
+    FfiMediaReleases {
+        media: r.media.map(Into::into),
+        total: r.total,
+        truncated: r.truncated,
+        groups: r
+            .groups
+            .into_iter()
+            .map(|g| FfiReleaseGroup {
+                season: g.season,
+                episode: g.episode,
+                resolution: g.resolution,
+                language: g.language,
+                language_label: g.language_label,
+                releases: g.releases.into_iter().map(Into::into).collect(),
+            })
+            .collect(),
+        source: source.into(),
+        server_error,
     }
 }
 

@@ -38,6 +38,9 @@ fn summary() -> TorrentSummary {
         media_year: Some(2008),
         media_kind: Some(MediaKind::Movie),
         matched_file: None,
+        media_id: None,
+        media_rating: None,
+        attrs: None,
     }
 }
 
@@ -180,6 +183,7 @@ async fn server() -> api_support::FakeHttp {
                 status: "ok".into(),
                 version: "0.1.0".into(),
                 db: true,
+                features: vec![],
             }),
             ("POST", "/api/v1/search") => {
                 let q: SearchQuery = serde_json::from_slice(&req.body).unwrap();

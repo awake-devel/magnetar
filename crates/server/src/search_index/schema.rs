@@ -2,11 +2,12 @@
 //!
 //! Text fields share one analyzer (split on anything but letters/digits, lowercase, ASCII
 //! folding: `Été` == `ete`); no stop words, no stemming. Numbers are stored and fast (filters and
-//! sorts read the fast columns). `FACETS` lists the keyword fields the facet API can count;
-//! adding one (STAGE 2: language, resolution, …) means a new entry here and a `SCHEMA_VERSION`
+//! sorts read the fast columns). `FACETS` lists the keyword fields the facet API counts and the
+//! release/media filters of D44 test; adding one means a new entry here and a `SCHEMA_VERSION`
 //! bump, which rebuilds the index on the next start.
 
 use magnetar_core::model::{Category, MediaKind};
+use magnetar_core::release::ReleaseAttrs;
 use tantivy::schema::{
     FAST, Field, IndexRecordOption, NumericOptions, STORED, STRING, Schema, TextFieldIndexing,
     TextOptions,
@@ -17,7 +18,9 @@ use tantivy::tokenizer::{
 use tantivy::{TantivyDocument, Term};
 
 /// Bump on any change to fields, analyzer or document contents: the index is rebuilt.
-pub const SCHEMA_VERSION: u32 = 1;
+/// 2: release attributes (D44): `attrs`, `year`, the attribute facets, `year` facet = media
+/// year else parsed year.
+pub const SCHEMA_VERSION: u32 = 2;
 pub const TOKENIZER: &str = "magnetar";
 /// Descriptions are indexed up to this many characters (lower weight, mostly boilerplate).
 pub const DESCRIPTION_CHARS: i32 = 2000;
@@ -37,7 +40,7 @@ pub fn analyzer() -> TextAnalyzer {
         .build()
 }
 
-/// A keyword field the facet API counts (and later filters) on.
+/// A keyword field the facet API counts and the D44 filters test.
 pub struct FacetDef {
     pub name: &'static str,
     pub values: fn(&IndexDoc) -> Vec<String>,
@@ -78,15 +81,66 @@ pub const FACETS: &[FacetDef] = &[
     },
     FacetDef {
         name: "year",
-        values: |d| {
-            d.media
-                .iter()
-                .filter_map(|m| m.year)
-                .map(|y| y.to_string())
-                .collect()
-        },
+        values: |d| d.year().map(|y| y.to_string()).into_iter().collect(),
+    },
+    // Release attributes (D44), lowercase codes of `ReleaseAttrs`.
+    FacetDef {
+        name: "language",
+        values: |d| attr_list(d, |a| &a.languages),
+    },
+    FacetDef {
+        name: "subtitles",
+        values: |d| attr_list(d, |a| &a.subtitles),
+    },
+    FacetDef {
+        name: "resolution",
+        values: |d| attr_one(d, |a| &a.resolution),
+    },
+    FacetDef {
+        name: "source",
+        values: |d| attr_one(d, |a| &a.source),
+    },
+    FacetDef {
+        name: "codec",
+        values: |d| attr_one(d, |a| &a.video_codec),
+    },
+    FacetDef {
+        name: "hdr",
+        values: |d| attr_list(d, |a| &a.hdr),
+    },
+    FacetDef {
+        name: "audio",
+        values: |d| attr_list(d, |a| &a.audio),
+    },
+    FacetDef {
+        name: "channels",
+        values: |d| attr_one(d, |a| &a.channels),
+    },
+    FacetDef {
+        name: "edition",
+        values: |d| attr_list(d, |a| &a.editions),
+    },
+    FacetDef {
+        name: "format",
+        values: |d| attr_list(d, |a| &a.formats),
+    },
+    FacetDef {
+        name: "group",
+        values: |d| attr_one(d, |a| &a.group),
     },
 ];
+
+fn attr_list(d: &IndexDoc, f: fn(&ReleaseAttrs) -> &Vec<String>) -> Vec<String> {
+    d.attrs.as_ref().map(|a| f(a).clone()).unwrap_or_default()
+}
+
+fn attr_one(d: &IndexDoc, f: fn(&ReleaseAttrs) -> &Option<String>) -> Vec<String> {
+    d.attrs
+        .as_ref()
+        .and_then(|a| f(a).clone())
+        .into_iter()
+        .collect()
+}
 
 pub fn media_kind_str(k: MediaKind) -> &'static str {
     match k {
@@ -146,6 +200,18 @@ pub struct IndexDoc {
     pub best_peers: Option<u32>,
     pub expires_at: Option<i64>,
     pub media: Option<DocMedia>,
+    /// Parsed release attributes (`torrent_attrs`, D44); None before the backfill reached it.
+    pub attrs: Option<ReleaseAttrs>,
+}
+
+impl IndexDoc {
+    /// The linked media's year, else the year in the release name (D44 year filter).
+    pub fn year(&self) -> Option<i32> {
+        self.media
+            .as_ref()
+            .and_then(|m| m.year)
+            .or_else(|| self.attrs.as_ref().and_then(|a| a.year))
+    }
 }
 
 #[derive(Clone)]
@@ -179,6 +245,10 @@ pub struct Fields {
     pub media_year: Field,
     /// IMDb-style rating × 10 (NONE when unknown).
     pub media_rating: Field,
+    /// Media year, else parsed year (NONE when unknown).
+    pub year: Field,
+    /// `ReleaseAttrs` as JSON (stored).
+    pub attrs: Field,
     /// One keyword field per `FACETS` entry, same order.
     pub facets: Vec<Field>,
 }
@@ -225,7 +295,9 @@ impl Fields {
         let expires_at = b.add_i64_field("expires_at", num.clone());
         let media_id = b.add_i64_field("media_id", num.clone());
         let media_year = b.add_i64_field("media_year", num.clone());
-        let media_rating = b.add_i64_field("media_rating", num);
+        let media_rating = b.add_i64_field("media_rating", num.clone());
+        let year = b.add_i64_field("year", num);
+        let attrs = b.add_text_field("attrs", STORED);
         let facets = FACETS
             .iter()
             .map(|f| b.add_text_field(&facet_field_name(f.name), STRING | FAST))
@@ -257,6 +329,8 @@ impl Fields {
             media_id,
             media_year,
             media_rating,
+            year,
+            attrs,
             facets,
         }
     }
@@ -335,6 +409,12 @@ impl Fields {
                 doc.add_i64(self.media_year, NONE);
                 doc.add_i64(self.media_rating, NONE);
             }
+        }
+        doc.add_i64(self.year, d.year().map_or(NONE, i64::from));
+        if let Some(a) = &d.attrs
+            && let Ok(j) = serde_json::to_string(a)
+        {
+            doc.add_text(self.attrs, j);
         }
         for (def, field) in FACETS.iter().zip(&self.facets) {
             for v in (def.values)(d) {
