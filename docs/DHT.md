@@ -350,7 +350,9 @@ Both modes honour every rule of §3.4 (interval, per-IP rate, honest ids, no fak
   `MAGNETAR_DHT_NODES` is capped at 8 for that reason. With 4 nodes we pick the 4 `r` values
   whose prefixes are farthest apart, so the passive nodes cover distant parts of the keyspace.
 - External IP: UPnP `GetExternalIPAddress` when available, else a vote over the BEP 42 `ip` field
-  of responses (≥ 8 agreeing responders from ≥ 4 distinct /16s). Ids are regenerated only when
+  of responses (≥ 8 agreeing responders from ≥ 4 distinct /16s; once an address is known, a
+  new one must also have more responders than the known one in the same 10-minute window, D63).
+  Ids are regenerated only when
   the external IP changes; ids, the external IP and the port are persisted in `settings`
   (`dht.identity`, JSON). Until an IP is known the node uses a random id and `ro=1`.
 - Each virtual node is a separate UDP socket on its own port: queries carry no recipient id, so
@@ -458,7 +460,10 @@ samples / announces / get_peers ──► seen filter (2 × Bloom) ──► bat
 - **Stage 1 consumer**: peer collection (64 workers aggressive, 8 polite,
   `MAGNETAR_DHT_PEER_LOOKUPS`): announcer, else `get_peers` to the sampling node, else an
   iterative lookup (≤ 10 s, stops at 12 peers). No peer at all → `failed` / `no_peers` with the
-  backoff below. Hashes with peers keep their lease until stage 2's fetcher consumes them.
+  backoff below. Hashes with peers keep their lease until stage 2's fetcher consumes them: in
+  stage 1 alone that lease expires every hour and the retry loop collects their peers again
+  (≤ 1000 rows a minute, lowest priority), indefinitely — harmless while the stage 1 build is
+  only run for measurements, wasteful if `serve` ran it for days.
 - **Retry loop**: every minute, ≤ 1000 `dht_seen` rows with `next_attempt_at <= now` re-enter at
   priority 0. Backoff after a failed fetch: 1 h, 6 h, 24 h, then `next_attempt_at = NULL` (4
   attempts). `invalid`, `private`, `v2_only`, `oversize`, `alias` are final. Measured size:
@@ -486,11 +491,15 @@ test):
 - **Reflection**: our responses are at most a few hundred bytes larger than the query; the
   response caps of §3.4 rule 4 (300/s, 5/s per IP) bound what a spoofed-source flood can
   reflect.
-- **Bounded maps**, all with a hard cap and drop-on-full: outstanding transactions (cap
-  `QPS × 4 s × 2`, oldest expired first), per-remote-IP limiter buckets (LRU, 65 536 IPs, idle
-  buckets are full and can be forgotten), external-IP votes (64 entries), the peer store
-  (100 k), the pool, the triage channel (bounded `mpsc`, 10 000 hashes; full → the sighting is
-  dropped and counted), the fetch queue (100 k), the persist channel (2 batches).
+- **Bounded maps**, all with a hard cap: outstanding transactions (cap `QPS × 4 s × 2`; full →
+  the query is refused as `busy`; a cancelled or timed-out query removes its own entry),
+  per-remote-IP limiter buckets (65 536 IPs; when full, buckets that have refilled are
+  forgotten, else the new IP is refused), external-IP votes (64 candidates, the weakest evicted
+  for a new one, restarted every 10 min, D63), the peer store (100 k), the pool, the triage
+  channel (bounded `mpsc`, 10 000 hashes; full → the sighting is dropped and counted), the
+  fetch queue (100 k).
+- **Seen filter keys**: Bloom bit positions come from SipHash under per-process random keys,
+  so a node cannot pick a look-alike infohash that shadows a real one (D63).
 - **Metadata decode memory**: a 16 MiB info dict with a million tiny paths decodes to a
   `Value` tree several times its size. Decoding runs under a semaphore (4 at once) and the
   in-flight budget of §4 step 7 reserves `4 × metadata_size` per decode. Info dicts with
@@ -865,3 +874,18 @@ real expired leases, the brake on a real conntrack limit); why only ~5 % of hash
 from the node that sampled them (a node behind NAT that stopped answering, or a lookup ran
 first because the per-IP bucket was spent — not measured); whether 64 collectors use the full
 budget (run 3 averaged 164 of 200 q/s, waiting on 4 s timeouts).
+
+**Review (2026-10-26, commit "STAGE discovery: review fixes").** Fixed: (1) the external-IP
+vote kept at most 64 candidates and never forgot one, so after enough junk `ip` claims a real
+address change (a home IP renewed by the ISP) could never be voted in, and stale claims added up
+forever — now a windowed vote with eviction and a majority rule (D63, three unit tests);
+(2) the seen filter's "keyed" positions were the hash XOR a key, so two infohashes sharing their
+first 16 bytes always collided — now SipHash (D63, unit test); (3) a failed crawler start under
+`serve` (bootstrap names not resolvable yet at boot, port still taken, database error) left the
+crawler off until the next restart — now retried after 30 s doubling to 15 min; (4) an empty
+port list started one virtual node with no socket, and the first query panicked indexing the
+socket list (regression test); (5) the `/proc/self/stat` parser sliced past the end on a
+malformed line. Not changed, noted: a triage batch that fails on a database error is lost until
+the Bloom generation rotates (its hashes are already marked seen); a lookup that ends while its
+queries wait for a pace slot wastes those slots (part of the 164-of-200 q/s gap); the stage 1
+hourly re-collection described in §3.7.

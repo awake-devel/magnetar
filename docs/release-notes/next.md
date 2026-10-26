@@ -88,7 +88,7 @@ must be updated together to get all of it, but each side keeps working with an o
   torrents whose metadata repeats a field are refused. Adult content is hidden when either the
   publisher or the DHT classifier says so.
 
-### DHT crawler: discovery (stage 1; docs/DHT.md §13, D59–D62)
+### DHT crawler: discovery (stage 1; docs/DHT.md §13, D59–D63)
 
 - New `magnetar-server dht [--seconds N] [--mode polite|aggressive] [--dry-run]`: runs the DHT
   crawler for a bounded time and prints a JSON report (hashes found per minute, peers per hash,
@@ -102,6 +102,10 @@ must be updated together to get all of it, but each side keeps working with an o
   hanging behind another session).
 - Live measurement from the home connection (270 s, no port opened): 534 hashes/min given peers,
   77 % of them with at least one peer, 1.6 % of a core, 47 MB RAM.
+- Review fixes (D63): the server's view of its own public IP now follows an ISP address change
+  instead of possibly sticking to the old one; another DHT node can no longer hide a torrent by
+  announcing a look-alike hash first; if the crawler cannot start (no network yet at boot), `serve`
+  retries it after 30 s, then up to every 15 min, instead of leaving it off.
 
 ## Older servers and offline mode
 

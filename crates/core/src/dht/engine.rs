@@ -286,6 +286,65 @@ struct Vote {
     prefixes: HashSet<u16>,
 }
 
+/// Candidates tracked at once by the external-address vote.
+const VOTE_CANDIDATES: usize = 64;
+/// Responders counted per candidate.
+const VOTE_RESPONDERS_CAP: usize = 64;
+/// The vote restarts this often, so stale or junk `ip` claims never add up over a long run.
+const VOTE_WINDOW: Duration = Duration::from_secs(600);
+
+/// BEP 42 external address vote over the `ip` field of answers (attacker-controlled).
+///
+/// A candidate wins with ≥ `need_responders` distinct responders from ≥ `need_prefixes` /16s
+/// **and**, once an address is known, more responders than that address got in the same window
+/// (a real change stops the votes for the old address). A full table evicts the weakest other
+/// candidate, so junk claims cannot lock a real change out; [`Votes::clear`] restarts the window.
+#[derive(Default)]
+struct Votes {
+    by_ip: HashMap<Ipv4Addr, Vote>,
+}
+
+impl Votes {
+    /// Record that `responder` saw us as `seen_as`; returns the address to switch to, if any.
+    fn record(
+        &mut self,
+        seen_as: Ipv4Addr,
+        responder: Ipv4Addr,
+        current: Option<Ipv4Addr>,
+        need_responders: usize,
+        need_prefixes: usize,
+    ) -> Option<Ipv4Addr> {
+        if !self.by_ip.contains_key(&seen_as) && self.by_ip.len() >= VOTE_CANDIDATES {
+            let weakest = self
+                .by_ip
+                .iter()
+                .filter(|(ip, _)| Some(**ip) != current)
+                .min_by_key(|(_, v)| v.responders.len())
+                .map(|(ip, _)| *ip)?;
+            self.by_ip.remove(&weakest);
+        }
+        let v = self.by_ip.entry(seen_as).or_default();
+        if v.responders.len() < VOTE_RESPONDERS_CAP && v.responders.insert(responder) {
+            let o = responder.octets();
+            v.prefixes.insert(u16::from_be_bytes([o[0], o[1]]));
+        }
+        if Some(seen_as) == current {
+            return None;
+        }
+        let n = v.responders.len();
+        let incumbent = current
+            .and_then(|ip| self.by_ip.get(&ip))
+            .map_or(0, |c| c.responders.len());
+        let v = &self.by_ip[&seen_as];
+        (n >= need_responders && v.prefixes.len() >= need_prefixes && n > incumbent)
+            .then_some(seen_as)
+    }
+
+    fn clear(&mut self) {
+        self.by_ip.clear();
+    }
+}
+
 struct State {
     nodes: Vec<VNode>,
     pool: Pool,
@@ -299,7 +358,8 @@ struct State {
     resp_ip: PerIp,
     filter: AddrFilter,
     external_ip: Option<Ipv4Addr>,
-    votes: HashMap<Ipv4Addr, Vote>,
+    votes: Votes,
+    votes_since: Instant,
     secrets: [[u8; 16]; 2],
     rr: usize,
     /// Share of the QPS budget the sampler may use, 0–1 (D62: the server lowers it while the
@@ -367,8 +427,13 @@ impl Drop for PendingGuard<'_> {
 
 impl Dht {
     /// Bind the sockets and start the node. Returns the handle and the stream of sightings.
-    pub async fn start(cfg: EngineConfig) -> std::io::Result<(Dht, mpsc::Receiver<Sighting>)> {
-        let n = cfg.ports.len().clamp(1, 8);
+    pub async fn start(mut cfg: EngineConfig) -> std::io::Result<(Dht, mpsc::Receiver<Sighting>)> {
+        // At least one socket (an empty port list means one ephemeral port): every virtual node
+        // owns a socket, indexed like `nodes`.
+        if cfg.ports.is_empty() {
+            cfg.ports.push(0);
+        }
+        let n = cfg.ports.len().min(8);
         let mut sockets = Vec::with_capacity(n);
         let mut local_ports = Vec::with_capacity(n);
         for &port in cfg.ports.iter().take(n) {
@@ -413,7 +478,8 @@ impl Dht {
             resp_ip: PerIp::new(cfg.response_per_ip, cfg.response_per_ip, IP_BUCKETS_CAP),
             filter,
             external_ip,
-            votes: HashMap::new(),
+            votes: Votes::default(),
+            votes_since: now,
             secrets: [rand::random(), rand::random()],
             rr: 0,
             sample_share: 1.0,
@@ -835,26 +901,26 @@ impl Dht {
         s.filter.allows(a) && !(a.ip().is_loopback() && self.inner.local_ports.contains(&a.port()))
     }
 
-    /// BEP 42 external IP vote: ≥ `vote_responders` responders from ≥ `vote_prefixes` /16s.
+    /// BEP 42 external IP vote (see [`Votes`]).
     fn vote(&self, s: &mut State, seen_as: Ipv4Addr, responder: Ipv4Addr, now: Instant) {
         let usable = super::addr::is_global(seen_as)
             || (self.inner.cfg.allow_loopback && seen_as.is_loopback());
-        if !usable || Some(seen_as) == s.external_ip {
+        if !usable {
             return;
         }
-        if !s.votes.contains_key(&seen_as) && s.votes.len() >= 64 {
-            return;
+        if now.saturating_duration_since(s.votes_since) >= VOTE_WINDOW {
+            s.votes.clear();
+            s.votes_since = now;
         }
-        let v = s.votes.entry(seen_as).or_default();
-        if v.responders.len() < 64 {
-            v.responders.insert(responder);
-            let o = responder.octets();
-            v.prefixes.insert(u16::from_be_bytes([o[0], o[1]]));
-        }
-        if v.responders.len() >= self.inner.cfg.vote_responders
-            && v.prefixes.len() >= self.inner.cfg.vote_prefixes
-        {
-            self.set_external(s, seen_as, now);
+        let current = s.external_ip;
+        if let Some(ip) = s.votes.record(
+            seen_as,
+            responder,
+            current,
+            self.inner.cfg.vote_responders,
+            self.inner.cfg.vote_prefixes,
+        ) {
+            self.set_external(s, ip, now);
         }
     }
 
@@ -870,6 +936,7 @@ impl Dht {
         }
         s.external_ip = Some(ip);
         s.votes.clear();
+        s.votes_since = now;
         bump(&self.inner.c.ip_changes);
         tracing::info!("DHT: external address voted, BEP 42 ids derived");
     }
@@ -1216,5 +1283,89 @@ impl Dht {
             r.answered,
             r.queried
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(s: &str) -> Ipv4Addr {
+        s.parse().unwrap()
+    }
+
+    /// Distinct responders, one per /16.
+    fn responder(i: u16) -> Ipv4Addr {
+        let [a, b] = i.to_be_bytes();
+        Ipv4Addr::new(20 + a, b, 0, 1)
+    }
+
+    #[test]
+    fn vote_needs_responders_and_prefixes() {
+        let mut v = Votes::default();
+        let me = ip("81.2.3.4");
+        for i in 0..7 {
+            assert_eq!(v.record(me, responder(i), None, 8, 4), None);
+        }
+        assert_eq!(v.record(me, responder(7), None, 8, 4), Some(me));
+        // The same responder again does not count twice.
+        let mut v = Votes::default();
+        for _ in 0..20 {
+            assert_eq!(v.record(me, responder(0), None, 8, 4), None);
+        }
+    }
+
+    /// Junk claims fill the table but never lock a real address out (the old table refused
+    /// every new candidate once 64 were held, forever).
+    #[test]
+    fn junk_claims_cannot_block_the_vote() {
+        let mut v = Votes::default();
+        for i in 0..200u32 {
+            let junk = Ipv4Addr::from(0x0b00_0000 + i);
+            assert_eq!(v.record(junk, responder(i as u16), None, 8, 4), None);
+        }
+        assert!(v.by_ip.len() <= VOTE_CANDIDATES);
+        let me = ip("81.2.3.4");
+        let won = (0..8).find_map(|i| v.record(me, responder(1000 + i), None, 8, 4));
+        assert_eq!(won, Some(me));
+    }
+
+    /// Once an address is known, a minority claim cannot flip it; after a real change (a new
+    /// window with votes only for the new address) it does.
+    #[test]
+    fn known_address_needs_a_majority_to_change() {
+        let mut v = Votes::default();
+        let me = ip("81.2.3.4");
+        let other = ip("92.5.6.7");
+        for i in 0..30 {
+            assert_eq!(v.record(me, responder(i), Some(me), 8, 4), None);
+        }
+        for i in 100..120 {
+            assert_eq!(v.record(other, responder(i), Some(me), 8, 4), None);
+        }
+        v.clear();
+        let won = (200..208).find_map(|i| v.record(other, responder(i), Some(me), 8, 4));
+        assert_eq!(won, Some(other));
+    }
+
+    /// An empty port list used to start one virtual node with no socket: the first query
+    /// indexed past the socket list and panicked.
+    #[tokio::test]
+    async fn empty_port_list_gets_one_ephemeral_socket() {
+        let mut cfg = EngineConfig::new(Mode::Polite);
+        cfg.ports.clear();
+        cfg.bind = Ipv4Addr::LOCALHOST;
+        cfg.allow_loopback = true;
+        cfg.sample = false;
+        cfg.query_timeout = Duration::from_millis(200);
+        let (d, _rx) = Dht::start(cfg).await.unwrap();
+        assert_eq!(d.virtual_nodes(), 1);
+        assert_eq!(d.local_ports().len(), 1);
+        let to = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9);
+        assert_eq!(
+            d.query(d.next_node(), to, Query::Ping).await.err(),
+            Some(QueryError::Timeout)
+        );
+        d.shutdown().await;
     }
 }

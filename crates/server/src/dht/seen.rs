@@ -1,8 +1,12 @@
 //! Seen filter in front of Postgres triage (docs/DHT.md §3.7): two Bloom generations, rotated
 //! every 6 h (the BEP 51 maximum interval), so a hash re-sampled after that is triaged again and
-//! failed fetches can retry. A false positive only skips one sighting. Bit positions are keyed
-//! with a per-process random key, so nobody can pick infohashes that collide on purpose.
+//! failed fetches can retry. A false positive only skips one sighting. Bit positions come from
+//! two SipHash-1-3 values under per-process random keys (`std`'s `RandomState`), so nobody can
+//! pick infohashes that collide on purpose (an earlier XOR-keyed version mapped any two hashes
+//! sharing their first 16 bytes to the same bits, letting a node shadow a real hash by
+//! announcing a look-alike first).
 
+use std::hash::{BuildHasher, RandomState};
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -18,7 +22,7 @@ pub struct SeenFilter {
     cur: usize,
     rotated: Instant,
     every: Duration,
-    key: (u64, u64),
+    key: (RandomState, RandomState),
     pub inserted: u64,
     pub skipped: u64,
 }
@@ -33,15 +37,15 @@ impl SeenFilter {
             cur: 0,
             rotated: Instant::now(),
             every,
-            key: (rand::random(), rand::random::<u64>() | 1),
+            key: (RandomState::new(), RandomState::new()),
             inserted: 0,
             skipped: 0,
         }
     }
 
     fn positions(&self, h: &[u8; 20]) -> impl Iterator<Item = u64> + use<> {
-        let a = u64::from_le_bytes(h[0..8].try_into().expect("8 bytes")) ^ self.key.0;
-        let b = (u64::from_le_bytes(h[8..16].try_into().expect("8 bytes")) ^ self.key.1) | 1;
+        let a = self.key.0.hash_one(h);
+        let b = self.key.1.hash_one(h) | 1;
         let bits = self.bits;
         (0..u64::from(self.k)).map(move |i| a.wrapping_add(i.wrapping_mul(b)) % bits)
     }
@@ -92,6 +96,24 @@ mod tests {
         // After two rotations it is forgotten.
         let t2 = t1 + Duration::from_secs(10);
         assert!(f.check_and_insert(&a, t2));
+    }
+
+    /// Hashes that differ only in their last 4 bytes are independent (they used to collide).
+    #[test]
+    fn look_alike_hashes_do_not_collide() {
+        let mut f = SeenFilter::new(1 << 20, 7, ROTATE_EVERY);
+        let t = Instant::now();
+        let a: [u8; 20] = rand::random();
+        assert!(f.check_and_insert(&a, t));
+        let mut shadowed = 0;
+        for i in 0..1000u32 {
+            let mut b = a;
+            b[16..].copy_from_slice(&(i + 1).to_le_bytes());
+            if b != a && !f.check_and_insert(&b, t) {
+                shadowed += 1;
+            }
+        }
+        assert!(shadowed < 5, "{shadowed} look-alikes taken as seen");
     }
 
     #[test]

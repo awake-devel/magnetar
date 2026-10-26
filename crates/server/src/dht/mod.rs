@@ -253,7 +253,7 @@ fn proc_status_kb(field: &str) -> Option<f64> {
 /// USER_HZ on every mainstream architecture).
 fn proc_cpu_seconds() -> Option<f64> {
     let s = std::fs::read_to_string("/proc/self/stat").ok()?;
-    let rest = &s[s.rfind(')')? + 2..];
+    let rest = s.get(s.rfind(')')? + 2..)?;
     let f: Vec<&str> = rest.split_whitespace().collect();
     let ut: f64 = f.get(11)?.parse().ok()?;
     let st: f64 = f.get(12)?.parse().ok()?;
@@ -634,19 +634,54 @@ pub async fn run(
     Ok(rep)
 }
 
+/// Wait before restarting the crawler after its `n`-th consecutive failure (30 s doubling,
+/// capped at 15 min).
+fn restart_delay(n: u32) -> Duration {
+    Duration::from_secs(30u64.saturating_mul(1 << n.min(5)).min(900))
+}
+
 /// `serve` daemon: runs while `MAGNETAR_DHT` ≠ off; errors are logged, never fatal to `serve`.
-pub async fn dht_loop(pool: PgPool, cfg: Arc<Config>, stop: watch::Receiver<bool>) {
+/// A start that fails (no bootstrap router resolved yet, a UDP port still taken, a database
+/// error) is retried with a backoff instead of leaving the crawler off until the next restart.
+pub async fn dht_loop(pool: PgPool, cfg: Arc<Config>, mut stop: watch::Receiver<bool>) {
     let Some(opts) = DhtOptions::from_config(&cfg, cfg.dht) else {
         return;
     };
-    if let Err(e) = run(Some(pool), opts, stop, None, |_| {}).await {
-        tracing::error!("DHT crawler stopped: {e:#}");
+    let mut failures = 0u32;
+    loop {
+        let started = Instant::now();
+        match run(Some(pool.clone()), opts.clone(), stop.clone(), None, |_| {}).await {
+            Ok(_) => return, // stopped on request
+            Err(e) => {
+                if started.elapsed() > Duration::from_secs(3600) {
+                    failures = 0;
+                }
+                let wait = restart_delay(failures);
+                failures = failures.saturating_add(1);
+                tracing::error!(
+                    "DHT crawler stopped: {e:#}; restarting in {} s",
+                    wait.as_secs()
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = stop_requested(&mut stop) => return,
+                }
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::next_share;
+    use super::{next_share, restart_delay};
+    use std::time::Duration;
+
+    #[test]
+    fn restart_backs_off_to_a_cap() {
+        let d: Vec<u64> = (0..8).map(|n| restart_delay(n).as_secs()).collect();
+        assert_eq!(d, [30, 60, 120, 240, 480, 900, 900, 900]);
+        assert_eq!(restart_delay(u32::MAX), Duration::from_secs(900));
+    }
 
     #[test]
     fn backpressure_hysteresis() {
