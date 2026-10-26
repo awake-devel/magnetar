@@ -9,7 +9,7 @@ series grouped by season/episode, quality and language.
 | What | Where |
 |---|---|
 | Parser (no dependencies, server and phone) | `crates/core/src/release.rs` (`PARSER_VERSION`) |
-| Hand-checked sample + regression test | `crates/core/tests/data/release_sample.tsv`, `crates/core/tests/release_sample.rs` |
+| Hand-checked sample + regression test | `crates/core/tests/data/release_sample.tsv`, `crates/core/tests/it/release_sample.rs` |
 | Try names by hand | `printf 'video\tSome.Title.2024.MULTi.1080p.WEB.x264-GRP\n' \| cargo run -q -p magnetar-core --example release_attrs` (`category<TAB>title[<TAB>files JSON]` per line, JSON out) |
 | Postgres table | `torrent_attrs` (migration `20261029000000_release_attrs.sql`) |
 | Backfill, `magnetar-server attrs` | `crates/server/src/attrs.rs` |
@@ -200,7 +200,7 @@ infohashes; read-only `COPY … TO STDOUT` from production), release build:
 | Coverage | audio language 65.7 %, subtitles 17.1 %, resolution 66.9 %, source 61.3 %, video codec 59.0 %, audio codec 40.0 %, group 60.1 %, year 46.4 % of infohashes |
 | Most frequent languages | fr 166 409, original 115 967, ja 95 417, multi 79 081, fr-fr 19 277, en 14 189, fr-ca 7 280, it 1 370, zh 1 275 |
 | Index build (schema 2) | 467 400 documents in 29.8 s; 387 MiB on disk (the attribute facets and the stored `attrs` add about a fifth) |
-| Queries (`tests/search_bench.rs`, 43 queries × 25 runs, D43's set plus 6 filtered ones) | all: p50 8.0 ms, p95 22.4 ms, max 42.7 ms; the filtered ones (`lang fr-ca`, `fr + 1080p + h265`, `fr subs "one piece"`, `remux + dv + atmos`, `drama, rating ≥ 7, 2010–2020`, rating sort over "french"): p50 2.9–16.1 ms, max 21.6 ms |
+| Queries (`tests/it/search_bench.rs`, 43 queries × 25 runs, D43's set plus 6 filtered ones) | all: p50 8.0 ms, p95 22.4 ms, max 42.7 ms; the filtered ones (`lang fr-ca`, `fr + 1080p + h265`, `fr subs "one piece"`, `remux + dv + atmos`, `drama, rating ≥ 7, 2010–2020`, rating sort over "french"): p50 2.9–16.1 ms, max 21.6 ms |
 | Filter sheet counts (9 facets in one pass) | over every document (empty query, no filter): p50 47.9 ms, max 65.2 ms; "french" + fr-ca + 1080p: p50 11.4 ms |
 | Throughput | 8 concurrent clients, 344 queries in 1.98 s (174 q/s) |
 | Update | a changed torrent is searchable 212 ms after its commit (plus up to 1 s of polling) |
@@ -243,7 +243,7 @@ except three that need knowledge the name lacks or a rule too risky to add: Chin
 from groups that do not mark it (2 titles, parsed `ja`), `[WIN x64 EN]` (software UI
 language), and a date in a leading bracket (`[2025.12.24] …`). The sample without the adult
 titles (290 rows, files kept where they change the result) is the regression test
-`crates/core/tests/release_sample.rs`: after the fixes every field is ≥ 99 % (languages 99.0 %,
+`crates/core/tests/it/release_sample.rs`: after the fixes every field is ≥ 99 % (languages 99.0 %,
 year 99.7 %, the rest 100 %) and 286 / 290 titles are right in every field. The floors in the
 test (98–99 % per field) make a parser change that breaks titles fail with the list of what
 changed. These after-fix numbers are measured on the sample the fixes came from, so they are an

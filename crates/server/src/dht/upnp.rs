@@ -15,7 +15,7 @@
 //! mapping a port nobody listens on would only open a hole (D72).
 //!
 //! Test seam: `UpnpConfig::gateway` takes any `host:port`, so tests point the M-SEARCH at an
-//! in-process fake gateway on 127.0.0.1 (`tests/dht_upnp.rs`) and no router is touched.
+//! in-process fake gateway on 127.0.0.1 (`tests/it/dht_upnp.rs`) and no router is touched.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex};

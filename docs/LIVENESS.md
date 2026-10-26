@@ -158,5 +158,5 @@ the DHT traffic), `MAGNETAR_LIVENESS_TRACKER_RPS=0.5`.
 
 Result writes go through the `liveness` table, whose statement triggers append to the
 search change log (D43), so seeders sorts and filters follow within about a second of a
-batch's commit (`tests/liveness_pg.rs`). A check without an answer writes nothing there, so
+batch's commit (`tests/it/liveness_pg.rs`). A check without an answer writes nothing there, so
 it re-indexes nothing.

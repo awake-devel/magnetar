@@ -137,7 +137,7 @@ client turns into "no graph".
 ## Performance
 
 Production copy (501 522 infohashes, `scripts/bench-search-db.sh 1` plus the trust and relay
-tables), empty cache, release build, `tests/stats_bench.rs` (10 runs, p50 / max):
+tables), empty cache, release build, `tests/it/stats_bench.rs` (10 runs, p50 / max):
 
 | Endpoint | p50 | max |
 |---|---|---|
@@ -165,5 +165,5 @@ On the phone, the layout (force-directed, O(n²) per step, at most 400 steps) ru
 
 ```
 MAGNETAR_BENCH_DATABASE_URL=postgres://magnetar:magnetar@127.0.0.1:54329/mag_night_stats \
-  cargo test --release -p magnetar-server --test stats_bench -- --ignored --nocapture
+  cargo test --release -p magnetar-server --test it stats_bench:: -- --ignored --nocapture
 ```

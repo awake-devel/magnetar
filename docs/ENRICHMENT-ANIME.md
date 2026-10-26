@@ -204,7 +204,7 @@ The parser comparison (matcher version 1) uses the same matcher for every row (s
   - cour selection by episode;
   - scoring across all title candidates instead of taking the first hit.
 
-**End to end** (`cargo test --release -p magnetar-server --test enrich_anime e2e -- --ignored`
+**End to end** (`cargo test --release -p magnetar-server --test it enrich_anime::e2e -- --ignored`
 with `MAGNETAR_ANIME_E2E=<dir>`). Real datasets (2026-43, Fribb `08dc828d`) are imported through
 the server code into a test schema, and the production rows are inserted as torrents:
 

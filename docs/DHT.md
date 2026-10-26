@@ -873,11 +873,11 @@ New dependency: `proptest` 1.12.0 (MIT/Apache-2.0), dev only. CRC32C is in-house
 BEP 43 `ro`, the five BEP 42 vectors (4-byte CRC) and the 8-byte prose counter-check, strict
 lengths/caps; three proptest suites (arbitrary bytes, KRPC-shaped garbage, mutated valid
 messages) never panic; address filter; limiter, pool (prefix index exact top-k), routing,
-peer store caps. Fake DHT (`core/tests/dht_fake_network.rs`, 1–12 in-process nodes on distinct
+peer store caps. Fake DHT (`core/tests/it/dht_fake_network.rs`, 1–12 in-process nodes on distinct
 127.0.x.y addresses): sampling of every announced hash, BEP 42 vote, peers from the sampling
 node and through a lookup, passive capture, honest peer store, forged token refused, polite
 read-only, 207 hostile datagrams, cancelled queries release their transactions, sampler pause
-and throttle. Postgres (`server/tests/dht_pg.rs`): triggers (counts, schedule, search_changes),
+and throttle. Postgres (`server/tests/it/dht_pg.rs`): triggers (counts, schedule, search_changes),
 the view, the Nostr delete keeping DHT-held hashes, triage (blocked/known/duplicates/lease),
 backoff 1 h/6 h/24 h/final and the announce exception, the retry loop settling known and
 blocked rows, identity/contacts round trip, and the whole pipeline against a 10-node fake DHT
@@ -947,16 +947,16 @@ Protocol refinements are D64; the fail-closed storage rule is D65.
 **Tests.** Unit: wire layout against the BEP 9/10 example messages, info dict parser (padding
 files, `name.utf-8`, duplicate keys at any depth, v2 `file tree`, sizes overflowing, NUL),
 v1 / hybrid / v2-only verification, proptest "arbitrary bytes never panic" on every decoder.
-Fake peers (`core/tests/metainfo_fetch.rs`, 127.0.0.1): a good multi-block peer, and reject,
+Fake peers (`core/tests/it/metainfo_fetch.rs`, 127.0.0.1): a good multi-block peer, and reject,
 short block, wrong bytes (hash mismatch), oversize claim, zero/negative size, size off by ±1,
 wrong `total_size`, no extension bit (we then send nothing after the handshake), wrong
 infohash, no `ut_metadata`, silent peer, 4 GiB length prefix, 1 MiB extended message, `have`
 flood, garbage stream, a peer asking us for metadata (answered with `reject`), private,
 hybrid sighted by its truncated v2 hash, pure v2, duplicate keys, LAN/loopback refused in
 production config, the 12-peer cap and the hash budget — every hostile case ends in < 5 s with
-its error code. **Real client** (`core/tests/metainfo_librqbit.rs`): an in-process librqbit
+its error code. **Real client** (`core/tests/it/metainfo_librqbit.rs`): an in-process librqbit
 9.0.1 session seeds a generated 402-file torrent (25 732-byte info dict, 2 metadata blocks) on
-127.0.0.1; the fetcher verifies it in ~3 ms. Postgres (`server/tests/dht_fetch_pg.rs`):
+127.0.0.1; the fetcher verifies it in ~3 ms. Postgres (`server/tests/it/dht_fetch_pg.rs`):
 storage with its triggers (infohash row with `dht`, seed-check schedule, search log, SQL
 `search_tsv` match, release attributes), duplicates, the screen blocking on a padding path with
 no trace of the name anywhere, no screen → nothing stored and the row re-queued, hybrid alias,
@@ -1060,7 +1060,7 @@ for adult, hard-only texts, explicit vs ordinary age markers, strict loading tha
 a line, `Debug` without terms; classifier byte classes, games, anime, adult (weak pairs, the
 film *xXx*, `.ass` subtitles, adult words with audio bytes), version 2 rules (JAV codes vs
 years/serials/`WEB-DL`, CJK words, adult archives, `Game of Thrones … .rar`, doujinshi).
-Postgres (`server/tests/dht_classify_pg.rs`): Nostr ingest blocks on title, file name
+Postgres (`server/tests/it/dht_classify_pg.rs`): Nostr ingest blocks on title, file name
 (substitution variant), description and hashtag; the context tier only for a `porn` category or
 an adult name; a later harmless event for a blocked hash is rejected; 6 hashes + 6 event ids
 kept and no text in `events`; a Nostr block deletes a DHT row of the hash; stage 2 rows
@@ -1178,7 +1178,7 @@ stays canonical when one exists; a DHT-only result has empty `event_id`/`pubkey`
 A blocked publisher hides its events, not the DHT row. Adult DHT rows stay hidden by default
 (D52); the Source chip (`origins`) is an optional filter, never a default.
 
-**Tests.** `server/tests/dht_search_pg.rs`: both search paths agree at `min_trust` 0; at 20 and
+**Tests.** `server/tests/it/dht_search_pg.rs`: both search paths agree at `min_trust` 0; at 20 and
 100 DHT rows still pass (and only they at 100); blocked publisher + DHT row → DHT-only result
 and detail; Source chips on both paths (`dht`, `nostr`, both, bogus); disjunctive `origin`
 facet; DHT titles and file names searchable, `matched_file` from the DHT files; the index
@@ -1186,7 +1186,7 @@ follows DHT inserts/deletes through `search_changes`; detail (DHT-only, both, No
 published-per-day counts without the DHT-only hash; the fallback plan reaches `dht_torrents`
 through `dht_torrents_search_tsv` with seq scans disabled (the trigram arm folds away).
 `search_index.rs::adult_hidden_by_default_on_both_paths` now records the accepted fallback
-difference (category filter on any row, DHT rows included). `server/tests/dht_upnp.rs`: an
+difference (category filter on any row, DHT rows included). `server/tests/it/dht_upnp.rs`: an
 in-process fake IGD (SSDP over UDP, device/service XML and SOAP over HTTP on 127.0.0.1, no
 multicast): UDP and TCP mapped through unicast discovery with our LAN address and a 1 h lease;
 725 → lease 0; 718 → `partial` with the error; the loop maps, then removes everything on

@@ -154,10 +154,10 @@ prefetch off, so every request came from the lazy detail path.
   that migration, `crates/server/tests/common/contract_media.sql` (TEST-ONLY mirror of the
   contract tables) is created before migrating in tests; it is skipped automatically once a
   migration that creates `media` is present.
-- Tests: `crates/server/tests/tmdb.rs` (fake TMDB in-process: find/details/season/poster, 429 +
+- Tests: `crates/server/tests/it/tmdb.rs` (fake TMDB in-process: find/details/season/poster, 429 +
   `Retry-After`, negative cache, purge, lazy detail decoration, poster ETag/304, other
   prefetch selection, hidden low-confidence links, v3 key absent from errors, migration guard),
-  `crates/ffi/tests/media.rs` (offline cache, posters, local `imdb:` search, TMDB expiry,
+  `crates/ffi/tests/it/media.rs` (offline cache, posters, local `imdb:` search, TMDB expiry,
   offline releases under the trust threshold; `media_against_server` is `#[ignore]` and needs a
   live server).
 
@@ -184,5 +184,5 @@ the exact resolutions:
 4. `MediaInfo.episode_title` (additive, `#[serde(default)]`) is the one field this branch adds
    to imdb's `core::model::MediaInfo`. Add it after `poster` in imdb's struct and
    `episode_title: None` to imdb's two literals (`crates/server/src/enrich/mod.rs`, `From<MediaRow>`;
-   `crates/core/tests/api_client.rs`). Old clients and servers ignore/default it.
+   `crates/core/tests/it/api_client.rs`). Old clients and servers ignore/default it.
 5. Decision numbers: D42 here; `docs/CONFIG.md` rows were appended at the end of the table.

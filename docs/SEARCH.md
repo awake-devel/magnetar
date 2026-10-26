@@ -95,7 +95,7 @@ lowest id (D6). Fields:
   file-only and description-only hits; ties go to the newest.
 - Adult documents are left out unless `include_adult` is set or `categories` selects `porn`
   (D52; query string `adult=1`; the SQL fallback tests the canonical category plus an `EXISTS`
-  on `dht_torrents`, so both paths agree, tested in `tests/search_index.rs`).
+  on `dht_torrents`, so both paths agree, tested in `tests/it/search_index.rs`).
 - Filters (`categories`, size range, `since`/`until`, `min_trust` incl. local trust overrides,
   `hide_dead`, `min_seeders`, media tokens such as `imdb:tt…` resolved to a media id through
   Postgres) and sorts (relevance, date, size, seeders, both directions, unknown last) run in one
@@ -142,7 +142,7 @@ Data: `scripts/bench-search-db.sh 7` copied the production database (466 870 eve
 infohashes, 34 525 liveness rows, 131 003 media links; read-only `COPY … TO STDOUT`) into
 `mag_night_bench` and inflated it ×7 with derived infohashes and release-name variations of every
 title (resolution, codec, language, source, group, year), shifted dates and sizes: 3 268 090
-events, **3 236 660 infohashes**, 18 GB in Postgres. Measured with `tests/search_bench.rs`
+events, **3 236 660 infohashes**, 18 GB in Postgres. Measured with `tests/it/search_bench.rs`
 (`--release`), times taken around `PgStore::search` (index query + media token lookup +
 matched-file query: what the API handler waits for), 25 runs per query after one warm-up run.
 
@@ -193,9 +193,9 @@ cargo build --release -p magnetar-server
 scripts/bench-search-db.sh 7          # ~35 min, prints MAGNETAR_BENCH_DATABASE_URL
 MAGNETAR_BENCH_DATABASE_URL=postgres://magnetar:magnetar@127.0.0.1:54329/mag_night_bench \
 MAGNETAR_BENCH_INDEX_DIR=$PWD/target/bench-index \
-  cargo test --release -p magnetar-server --test search_bench -- --ignored --nocapture
+  cargo test --release -p magnetar-server --test it search_bench:: -- --ignored --nocapture
 ```
 
-`tests/search_index.rs::latency_bounds_in_memory` runs the same query mix over 20 000 synthetic
+`tests/it/search_index.rs::latency_bounds_in_memory` runs the same query mix over 20 000 synthetic
 documents in every `cargo test` (bound 1.5 s per query in debug builds, 150 ms in release: it
 only catches pathologies such as an unbounded prefix expansion).
