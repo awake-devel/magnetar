@@ -10,6 +10,7 @@ series grouped by season/episode, quality and language.
 |---|---|
 | Parser (no dependencies, server and phone) | `crates/core/src/release.rs` (`PARSER_VERSION`) |
 | Hand-checked sample + regression test | `crates/core/tests/data/release_sample.tsv`, `crates/core/tests/release_sample.rs` |
+| Try names by hand | `printf 'video\tSome.Title.2024.MULTi.1080p.WEB.x264-GRP\n' \| cargo run -q -p magnetar-core --example release_attrs` (`category<TAB>title[<TAB>files JSON]` per line, JSON out) |
 | Postgres table | `torrent_attrs` (migration `20261029000000_release_attrs.sql`) |
 | Backfill, `magnetar-server attrs` | `crates/server/src/attrs.rs` |
 | Index facets/filters | `crates/server/src/search_index/{schema,collect}.rs` (`SCHEMA_VERSION` 2) |
