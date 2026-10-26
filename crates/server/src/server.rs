@@ -18,7 +18,7 @@ use crate::{attrs, daemons, discovery, enrich, enrich_anime, stats};
 /// Grace period for daemons after the HTTP server stopped.
 const DAEMON_GRACE: Duration = Duration::from_secs(10);
 
-async fn shutdown_signal() {
+pub async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -161,6 +161,13 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
             stop_rx.clone(),
         )),
     ];
+    if cfg.dht != crate::config::DhtMode::Off {
+        daemons.push(tokio::spawn(crate::dht::dht_loop(
+            store.pool().clone(),
+            cfg.clone(),
+            stop_rx.clone(),
+        )));
+    }
     daemons.push(start_search_index(&store, &cfg, stop_rx.clone()).await);
     if let Some(t) = &tmdb {
         daemons.extend(t.spawn_workers(stop_rx.clone()));

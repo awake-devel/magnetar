@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use clap::Parser;
-use magnetar_server::config::{Cli, Command};
-use magnetar_server::{attrs, daemons, enrich, enrich_anime, liveness, selftest, server};
+use magnetar_server::config::{Cli, Command, DhtMode};
+use magnetar_server::{attrs, daemons, dht, enrich, enrich_anime, liveness, selftest, server};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -39,6 +39,40 @@ async fn main() -> anyhow::Result<()> {
             .await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             daemons::notify_saved_searches(&store, &cli.config).await;
+            Ok(())
+        }
+        Command::Dht {
+            seconds,
+            mode,
+            dry_run,
+        } => {
+            let mode = mode.unwrap_or(match cli.config.dht {
+                DhtMode::Off => DhtMode::Polite,
+                m => m,
+            });
+            let Some(mut opts) = dht::DhtOptions::from_config(&cli.config, mode) else {
+                anyhow::bail!("--mode off: nothing to run");
+            };
+            opts.dry_run = dry_run;
+            let pool = if dry_run {
+                None
+            } else {
+                Some(server::open_store(&cli.config).await?.pool().clone())
+            };
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+            tokio::spawn(async move {
+                server::shutdown_signal().await;
+                let _ = stop_tx.send(true);
+            });
+            let report = dht::run(
+                pool,
+                opts,
+                stop_rx,
+                Some(Duration::from_secs(seconds)),
+                |_| {},
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
         Command::Selftest => selftest::run(&cli.config).await,

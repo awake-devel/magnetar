@@ -4,6 +4,7 @@ pub mod api;
 pub mod attrs;
 pub mod config;
 pub mod daemons;
+pub mod dht;
 pub mod discovery;
 pub mod enrich;
 pub mod enrich_anime;

@@ -57,12 +57,35 @@ pub enum Command {
         #[arg(long, default_value_t = 2000)]
         limit: usize,
     },
+    /// Run the DHT crawler for a bounded time and print a JSON report (docs/DHT.md §8, D58).
+    Dht {
+        /// Wall-clock budget in seconds.
+        #[arg(long, default_value_t = 300)]
+        seconds: u64,
+        /// Mode for this run (default: `MAGNETAR_DHT`, or `polite` when that is `off`).
+        #[arg(long, value_enum)]
+        mode: Option<DhtMode>,
+        /// No database at all: dedupe in memory only, nothing written (live tests).
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Parse the release attributes (D44) of every torrent without current ones, print a report.
     Attrs {
         /// Re-parse every torrent, also those already parsed by this version.
         #[arg(long)]
         force: bool,
     },
+}
+
+/// `MAGNETAR_DHT` (D49): off by default, crawling exposes the host's IP in swarms.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DhtMode {
+    #[default]
+    Off,
+    /// BEP 51 sampling only, read-only node (BEP 43), one virtual node.
+    Polite,
+    /// Sampling + passive capture as a full BEP 5 node on open UDP ports.
+    Aggressive,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -191,6 +214,28 @@ pub struct Config {
     /// DHT walks at the same time.
     #[arg(long, env = "MAGNETAR_LIVENESS_DHT_CONCURRENCY", default_value_t = 32)]
     pub liveness_dht_concurrency: usize,
+    /// Native DHT crawler (docs/DHT.md): off, polite or aggressive.
+    #[arg(long, env = "MAGNETAR_DHT", value_enum, default_value = "off")]
+    pub dht: DhtMode,
+    /// First UDP port; virtual node i listens on PORT + i (aggressive; polite is ephemeral).
+    #[arg(long, env = "MAGNETAR_DHT_PORT", default_value_t = 6891, value_parser = clap::value_parser!(u16).range(1..=65527))]
+    pub dht_port: u16,
+    /// Virtual nodes, 1–8 (default 4 aggressive, 1 polite).
+    #[arg(long, env = "MAGNETAR_DHT_NODES", value_parser = clap::value_parser!(u8).range(1..=8))]
+    pub dht_nodes: Option<u8>,
+    /// Outbound KRPC queries per second, all kinds (default 200 aggressive, 50 polite).
+    #[arg(long, env = "MAGNETAR_DHT_QPS", value_parser = clap::value_parser!(u32).range(1..=5000))]
+    pub dht_qps: Option<u32>,
+    /// Crawl pool size in nodes (default 1000000 aggressive, 200000 polite).
+    #[arg(long, env = "MAGNETAR_DHT_POOL", value_parser = clap::value_parser!(u64).range(1000..=20_000_000))]
+    pub dht_pool: Option<u64>,
+    /// Also queue infohashes already known from Nostr (to verify their file lists).
+    #[arg(long, env = "MAGNETAR_DHT_FETCH_KNOWN", default_value_t = false, action = clap::ArgAction::Set)]
+    pub dht_fetch_known: bool,
+    /// Peer collections (get_peers to the sampling node, then a lookup) running at once
+    /// (default 16 aggressive, 4 polite).
+    #[arg(long, env = "MAGNETAR_DHT_PEER_LOOKUPS", value_parser = clap::value_parser!(u32).range(1..=512))]
+    pub dht_peer_lookups: Option<u32>,
 }
 
 impl Config {
@@ -296,6 +341,46 @@ mod tests {
         assert_eq!(cli.config.db_pool, crate::store::DEFAULT_MAX_CONNECTIONS);
         assert!(Cli::try_parse_from(["magnetar-server", "--db-pool", "0", "serve"]).is_err());
         assert!(Cli::try_parse_from(["magnetar-server", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn parses_dht_options() {
+        let cli = Cli::try_parse_from([
+            "magnetar-server",
+            "--dht",
+            "aggressive",
+            "--dht-nodes",
+            "2",
+            "dht",
+            "--seconds",
+            "60",
+            "--mode",
+            "polite",
+            "--dry-run",
+        ])
+        .unwrap();
+        assert_eq!(cli.config.dht, DhtMode::Aggressive);
+        assert_eq!(cli.config.dht_nodes, Some(2));
+        assert!(matches!(
+            cli.command,
+            Command::Dht {
+                seconds: 60,
+                mode: Some(DhtMode::Polite),
+                dry_run: true
+            }
+        ));
+        let default = Cli::try_parse_from(["magnetar-server", "serve"]).unwrap();
+        assert_eq!(default.config.dht, DhtMode::Off);
+        for bad in [
+            ["--dht-nodes", "9"],
+            ["--dht-nodes", "0"],
+            ["--dht", "loud"],
+        ] {
+            let mut args = vec!["magnetar-server"];
+            args.extend(bad);
+            args.push("serve");
+            assert!(Cli::try_parse_from(args).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
