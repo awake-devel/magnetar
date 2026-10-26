@@ -82,6 +82,7 @@ services:
 | Postgres (events, torrents, trust, settings) | volume `<project>_db-data` → `/var/lib/postgresql` | yes, with `pg_dump` (below) |
 | Downloads | `/data/downloads` in volume `<project>_magnetar-data`, or `MAGNETAR_DATA` | your call |
 | librqbit session (resumes downloads) | `/data/state/magnetar/downloads` (`XDG_STATE_HOME=/data/state`) | no, it is rebuilt |
+| Search index (D43, docs/SEARCH.md) | `/data/state/magnetar/search-index` | no, rebuilt from Postgres in the background when missing (searches use Postgres meanwhile) |
 | Tailscale node state | volume `<project>_tailscale-state` | no, re-auth instead |
 
 `<project>` is the directory name unless you pass `-p` or set `COMPOSE_PROJECT_NAME`.

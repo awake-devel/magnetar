@@ -25,7 +25,7 @@ fix one of them in the same change.
 | D8 | Pagination: `until = min(created_at)` (inclusive, dedup), strictly decreasing, stop on a page with 0 new events; never trust "page < limit" | nostr-nips.md §1.7 |
 | D9 | Cursors per (relay, kind): `newest_seen` (forward, overlap 1 h) + `backfill_until` (history not finished) | nostr-nips.md §1.7 |
 | D10 | Relay discovery: seed list ∪ NIP-65 lists of publishers ∪ kind-3 legacy maps ∪ tag hints ∪ NIP-66 monitors (D35); own normalizer; oversized lists (>50 r) penalised and not used | wot-relays.md §3, §5 |
-| D11 | Postgres search: generated `tsvector` (`simple` on title/files with separator regexp, `english` on description) + `pg_trgm` `<%` word_similarity fallback | rust-crates.md §9 |
+| D11 | Postgres search (**the fallback since D43**: index disabled or still building): generated `tsvector` (`simple` on title/files with separator regexp, `english` on description) + `pg_trgm` `<%` word_similarity fallback | rust-crates.md §9 |
 | D12 | SQLite search: FTS5 external content, `unicode61 remove_diacritics 2 separators '._-[]()'`, sanitized query tokens | rust-crates.md §5 |
 | D13 | NIP-77: own relay side (axum WS + `negentropy` 0.5.2), own initiator on phone; frame limit 60 000; max 500 000 items per NEG-OPEN | negentropy.md §1, §5 |
 | D14 | Phone → server sync is **Up-only**; `sync_ids` table never pruned; rows marked synced only on `OK true` (incl. `duplicate:`) | negentropy.md §7 |
@@ -59,6 +59,7 @@ fix one of them in the same change.
 | D40 | Metadata enrichment, IMDb part (server only, docs/ENRICHMENT.md): shared tables `media` (lazily created, one row per identified title, unique external ids) + `torrent_media` (one link per infohash: method `itag`/`desc_link`/`offline_title`/`api_search`/`manual`, confidence, `matcher_version`). (a) Strong IDs first, every category, confidence 1.0 (0.9 when a description holds conflicting links of one kind; the first link wins): NIP-35 `i` tags and description links to IMDb/TMDB/TVDB/MAL/AniList/AniDB; a TMDB/MAL-only id gets a torrent-titled media row for D41/D42 to fill; only `i` tags and a description's main link (IMDb, else earliest) choose a row; other links are adopted (added where free, or their IMDb-less row merged) only through agreed pairs (`enrich_id_pairs`: one IMDb id ever, and deliberate or matching titles), and an id seen next to two IMDb ids is a template that is removed and relinked; `anime` rows with an anime id are D41's (linked as is, never merged or refreshed from IMDb). (b) Otherwise, `video` only: `parse-torrent-title` =2.0.2 on the name, then the largest video file (DHT input), exact normalised-title lookup in the IMDb non-commercial datasets (basics + ratings + packed episodes, optional akas), ranked type > year (series run counts as exact) > votes; prefix and pg_trgm fallbacks capped below 0.6. Links under 0.5 are stored but never shown (`MIN_DISPLAY_CONFIDENCE`). (c) Anime is left to D41 except strong IDs; `manual` is never overwritten. (d) Datasets: conditional GET, streamed COPY into UNLOGGED staging tables, atomic swap, refresh every `MAGNETAR_IMDB_REFRESH_HOURS`. (e) Nothing enriched is published to Nostr (IMDb non-commercial terms) and the phone never talks to IMDb/TMDB. Search token `imdb:tt…` / `tmdb:movie:N` / `mal:N` / `media:N`; `GET /api/v1/media/{id}/torrents` | metadata-enrichment.md; measured in docs/ENRICHMENT.md §4 |
 | D41 | Offline anime identification (server only, `MAGNETAR_ANIME_DB`, default on): anime-offline-database (**cedya77** continuation, manami-project archived 2026-07-04; weekly `<year>-<week>` release, `.jsonl.zst`, ODbL 1.0 + DbCL 1.0) + Fribb `anime-list-full.json` (no licence file: used locally only, opt-out `MAGNETAR_ANIME_FRIBB_URL=none`), conditional GET weekly, validated (≥ 10 000 entries) and imported into private `anime_*` tables. Names parsed with `parse-torrent-title` 2.0.2 **and** `anitomy-ng` 1.0.10 (both titles kept: ptt alone 78.2 % on the AniDB/AniList holdout vs 93.5 % combined) plus alternative titles in brackets / after `\|`; MAL/AniList/AniDB `i` tags and description links first; exact normalised title/synonym (plus `title year`, AOD's remake naming), then the Fribb season remap (and synthetic `x 2nd season` keys, absolute-episode and year remap); a release year no version fits, or an explicit later season with no entry, drops the match below the floor. Results → `media` (kind `anime`, one row per MAL entry; shared IMDb/TMDB/TVDB ids only on the series' first entry, existing rows adopted, ids never moved) and `torrent_media` (`itag`/`desc_link`/`offline_title`, confidence ≥ 0.6, `manual` never touched). Never republished | docs/ENRICHMENT-ANIME.md, metadata-enrichment.md §4.2 |
 | D42 | TMDB decoration (server only, docs/ENRICHMENT-TMDB.md): only for media already identified (D40/D41), **by ID** — `/find/{imdb}?external_source=imdb_id` once (result kept, misses retried after 30 d), then one `/movie|tv/{id}?append_to_response=translations` for all `MAGNETAR_TMDB_LANGS`, `/tv/{id}/season/{n}` per language for episode names. Cached in `media_extra` (source `tmdb`/`tmdb_find`/`tmdb_season:N`/`tmdb_image`), refreshed after 90 d, **purged after 180 d** (terms §1.C). Lazy: the detail path returns what is cached and queues the fetch (2 workers, 15-min dedupe); prefetch ≤ `MAGNETAR_TMDB_PREFETCH_PER_HOUR` recent matches. Token bucket `MAGNETAR_TMDB_RPS` (burst 5) over API + images; 429/5xx retried 3× honouring `Retry-After`. Posters: `w342`, content-addressed files, `GET /api/v1/media/{id}/poster` (bearer, `ETag`, `private, max-age=7d`), never a redirect to TMDB. The phone never contacts TMDB and holds no key; it caches the server's `MediaInfo` (SQLite V3 `media_cache`) and posters (`poster_cache`, 30 MB LRU), TMDB fields at most 90 d after the server sent them. Only displayed links (confidence ≥ 0.5, D40) are decorated. TMDB logo + exact §3 notice in Settings. Nothing is republished | TMDB API terms (§1.C, §3) read 2026-10-25; metadata-enrichment.md §2, §5 |
+| D43 | **Search = embedded Tantivy index** (server only, `tantivy` =0.27.0 MIT, docs/SEARCH.md; user decision 2026-10-25), Postgres stays the source of truth and the SQL search of D11 the fallback until the first build completes (or with `MAGNETAR_SEARCH_INDEX=false`). One document per infohash from its events minus blocked publishers' (D6 canonical), in `MAGNETAR_SEARCH_INDEX_DIR` (`<state dir>/search-index`); rebuilt when missing, unreadable, from another database (`settings.search.index_id`) or another `SCHEMA_VERSION`; the full build walks `torrent_infohashes`, documents loaded 4 × 2000 at a time and indexed on blocking threads, commits every 200 k with its cursor in the commit payload (restart resumes). **Updates:** statement-level triggers on `torrents`, `liveness`, `torrent_media`, `media` (only kind/title/year/rating/genres changes) and `local_overrides` append infohashes to the append-only `search_changes`; the index loop re-indexes ≤ 5000 log rows per commit about every second and deletes exactly the ids it read (chosen over a dirty set with a primary key: writers would wait on each other's row locks and could deadlock across tables; over `updated_at` polling: every write path, raw SQL in the enrichers included, would have to set it). **Query:** analyzer = split on non-alphanumerics + lowercase + ASCII folding, no stop words, no stemming; AND of words over title (BM25 ×3) / files (×1.5) / description (first 2000 chars, ×0.6); last word also prefix from 3 letters; fuzzy on titles only, distance 1 from 5 letters / 2 from 8, never for words with digits nor for words already in ≥ 50 titles; +10 000 when every word is in the title (title hits always above file-only ones); one collector applies all `SearchQuery` filters/sorts on fast columns and counts exactly; merge policy caps segments at 1/16 of the index (≥ 200 k docs) so broad queries use the search threads (CPUs − 2, ≤ 16). `matched_file` (serde default) for hits that matched a file name and not every word in the title. `SearchPage.total_is_lower_bound` (serde default false): the SQL fallback stops counting at 1000, app shows "1,000+". `GET /api/v1/facets` (keyword facets: category, category_path, media_kind, genre, year; STAGE 2 adds parsed attributes as `FACETS` entries + a schema bump), 503 until ready; index status in `/api/v1/stats`. Differences from the SQL search: date/size/category bounds test the canonical event, not any event. Also: stats and the crawler's publisher ranking read trigger-kept `torrent_infohashes`/`publisher_counts`/`meta.infohash_count` instead of scanning `torrents`. App: 250 ms debounce, newest query wins, local cache shown while the server answers, grey (not red) badge for unknown trust | 3.24 M infohashes (production ×7, `scripts/bench-search-db.sh`, `tests/search_bench.rs`, 2026-10-26): build 269 s, 2.2 GB, 37 queries × 25: p50 21.8 ms, p95 39.0 ms, max 81.2 ms (SQL search on the same data: 0.7–138 s); an update is searchable 0.2–0.35 s after its commit + ≤ 1 s poll |
 
 ---
 
@@ -72,7 +73,7 @@ crates/server/             magnetar-server (bin + lib) — Postgres, axum API, r
 crates/ffi/                magnetar-ffi    (cdylib + lib) — SQLite store + uniffi API for Android
 crates/uniffi-bindgen/     uniffi-bindgen  (bin)
 android/                   Gradle project, app module `app`, package `app.magnetar`
-scripts/                   build-android.sh, build-linux.sh, test.sh, release.sh
+scripts/                   build-android.sh, build-linux.sh, test.sh, release.sh, bench-search-db.sh (D43)
 .github/workflows/         ci.yml, docker.yml, release.yml (D39)
 Dockerfile, compose.yml    server image + Postgres (D37); .env.example
 docs/research/             research notes + fixtures (real relay events)
@@ -257,6 +258,7 @@ pub struct TorrentSummary {
     #[serde(default)] pub media_title: Option<String>,     // D40, only links ≥ MIN_DISPLAY_CONFIDENCE
     #[serde(default)] pub media_year: Option<i32>,
     #[serde(default)] pub media_kind: Option<MediaKind>,
+    #[serde(default)] pub matched_file: Option<String>,    // D43: search hit matched only in this file
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TorrentDetail {
@@ -377,12 +379,15 @@ pub struct SearchQuery {
 #[serde(rename_all = "snake_case")]
 pub enum Sort { #[default] Relevance, Date, Size, Seeders }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct SearchPage { pub hits: Vec<TorrentSummary>, pub total: u64, pub source: String /* "server" | "local" */ }
+pub struct SearchPage { pub hits: Vec<TorrentSummary>, pub total: u64, pub source: String /* "server" | "local" */,
+                        #[serde(default)] pub total_is_lower_bound: bool /* D43: "1,000+" */ }
 ```
 Semantics (both stores): results are **grouped by infohash** (canonical event); blocked publishers are
 always excluded; `hide_dead` drops rows whose liveness is fresh and `best_peers()==0`; unknown is kept;
 `min_seeders` treats unknown as 0 except when it is None; `sort=seeders` puts unknown last.
 `core::query::fts5_match(text) -> Option<String>` and `pg_tsquery(text)` sanitize text (D11, D12).
+The server answers from its Tantivy index once built (D43, docs/SEARCH.md); the SQL search of
+D11 is the fallback, whose count stops at 1000 (`total_is_lower_bound`).
 
 ---
 
@@ -400,7 +405,8 @@ Auth: `Authorization: Bearer <MAGNETAR_API_TOKEN>` on everything except `GET /he
 | `GET /api/v1/media/{id}/torrents` | search query string (`sort`, `limit`, `q`, …) | `SearchPage` of the torrents linked to one media row (D40) |
 | `POST /api/v1/torrents/{infohash}/liveness` | | `Liveness` (forces a check now) |
 | `POST /api/v1/events/batch` | `{"events":[RawEvent...]}` (≤ 500) | `{"results":[{"id":..,"accepted":bool,"duplicate":bool,"message":".."}]}` |
-| `GET /api/v1/stats` | | `StoreStats` + `{"crawler":{"running":bool,"last_run":i64,"last_report":CrawlReport,"passes":u64,"last_error":str,"next_run":i64}}` |
+| `GET /api/v1/stats` | | `StoreStats` + `{"crawler":{"running":bool,"last_run":i64,"last_report":CrawlReport,"passes":u64,"last_error":str,"next_run":i64},"search_index":SearchIndexStatus|null}` (D43) |
+| `GET /api/v1/facets` | `field` (`category`, `category_path`, `media_kind`, `genre`, `year`), `size`, + the search query string | `FacetsResponse {field, total, counts:[{value,count}]}`; 503 `search_index_unavailable` until the index is built (D43) |
 | `GET /api/v1/relays` / `PUT /api/v1/relays` | `{"url","enabled"}` | `[RelayInfo]` |
 | `GET /api/v1/trust/{pubkey}` | | `TrustScore` |
 | `GET/PUT /api/v1/settings/trust` | `{"root": npub-or-hex or null, "threshold": u8}` | same |
@@ -530,12 +536,14 @@ serve), `MAGNETAR_ROOT_NPUB`, `MAGNETAR_NTFY_URL`, `MAGNETAR_NTFY_TOPIC`, `MAGNE
 `MAGNETAR_CRAWL_INTERVAL_SECS` (default 900, 0 = continuous, D32), `MAGNETAR_CRAWL_MAX_RELAYS` (30),
 `MAGNETAR_CRAWL_EXPLORE_RELAYS` (10), `MAGNETAR_SEED_RELAYS` (comma), `MAGNETAR_NIP66` (default true),
 `MAGNETAR_NIP66_MONITORS` (comma), `MAGNETAR_NIP66_TRUSTED` (comma), `MAGNETAR_IMDB` (default true),
-`MAGNETAR_IMDB_AKAS` (false), `MAGNETAR_DATASET_DIR` (`<state dir>/datasets`), `MAGNETAR_IMDB_REFRESH_HOURS` (168), `MAGNETAR_DB_POOL` (10, D37), `RUST_LOG`.
+`MAGNETAR_IMDB_AKAS` (false), `MAGNETAR_DATASET_DIR` (`<state dir>/datasets`), `MAGNETAR_IMDB_REFRESH_HOURS` (168), `MAGNETAR_DB_POOL` (10, D37),
+`MAGNETAR_SEARCH_INDEX` (true), `MAGNETAR_SEARCH_INDEX_DIR` (`<state dir>/search-index`, D43), `RUST_LOG`.
 `magnetar-server enrich [--reimport] [--rematch]` refreshes the datasets, links everything due and prints a JSON report (D40).
 `serve` runs: API + relay endpoint, crawler loop, liveness loop (batch of due infohashes every 5 min),
 trust recompute (on graph_version change, else every 6 h), saved-search notifier (after a crawl, at most every 15 min), NIP-66
 relay discovery (startup, then every 6 h; D35), enrichment (new torrents within a minute, dataset refresh check
-after the first drain, then every `MAGNETAR_IMDB_REFRESH_HOURS`; D40).
+after the first drain, then every `MAGNETAR_IMDB_REFRESH_HOURS`; D40), search index (build at the first start,
+then the change log every second; D43).
 sqlx pool size `MAGNETAR_DB_POOL` (D37; the old cap of 5 was the Termux phantom-process budget, D39). `selftest` checks DB, DNS, TLS (fetch NIP-11 of a seed relay), UDP.
 
 Seed relays (nostr-nips.md §4.5): `wss://nostr.oxtr.dev, wss://relay.nostr.net, wss://nos.lol,
@@ -551,7 +559,10 @@ Phone crawl is bounded: max 8 relays, `max_seconds` budget, forward cursors firs
   cases, magnet, pow, bencode, UDP/HTTP scrape against in-process fake trackers, Bloom256 test vector
   (estimate ≈ 1224.93), trust formula table, negentropy sync against an in-process relay.
 - `server`: integration tests against Postgres (`MAGNETAR_TEST_DATABASE_URL`): ingest fixtures, search
-  filters/sorts, relay REQ, NIP-77 with nostr-sdk `Client::sync` as oracle, batch POST, auth.
+  filters/sorts, relay REQ, NIP-77 with nostr-sdk `Client::sync` as oracle, batch POST, auth; the
+  search index (`tests/search_index.rs`: parity with the SQL search, text matching, updates within
+  seconds, rebuild/resume, facets, a loose latency bound) and its 3 M benchmark
+  (`tests/search_bench.rs`, `#[ignore]`, database from `scripts/bench-search-db.sh`, D43).
 - `ffi`: SqliteStore search parity with PgStore on the fixture set; cleanup never deletes unsynced rows;
   sync to a live in-process server.
 - Network tests against real relays/trackers are `#[ignore]` (run with `--ignored`).

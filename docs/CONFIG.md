@@ -34,6 +34,8 @@ magnetar-server --version
 | `MAGNETAR_NIP66` | `true` | NIP-66 relay discovery with `serve`: at startup, then every 6 h, new relays from monitor events are added with source `nip66` (ARCHITECTURE.md D35) |
 | `MAGNETAR_NIP66_MONITORS` | `wss://relaypag.es, wss://monitorlizard.nostr1.com, wss://relay.nostr.watch, wss://nos.lol, wss://relay.damus.io` | comma-separated relays queried for kind 10166/30166 monitor events |
 | `MAGNETAR_NIP66_TRUSTED` | built-in list of 12 monitor pubkeys (`nip66::DEFAULT_TRUSTED_MONITORS`) | comma-separated hex pubkeys of trusted NIP-66 monitors. They get their own request and page budget, and only relays they report escape the cap of 100 new relays per run from other announced monitors (ARCHITECTURE.md D36) |
+| `MAGNETAR_SEARCH_INDEX` | `true` | Embedded Tantivy search index (ARCHITECTURE.md D43, docs/SEARCH.md). Built in the background at the first start (~465 k infohashes: about 40 s on a laptop; searches use Postgres meanwhile), then kept current within ~1–2 s through a change log written by database triggers. `false` = every search runs in Postgres (slow on large indexes) and the change log is emptied hourly; an existing index directory is removed, since it would go stale |
+| `MAGNETAR_SEARCH_INDEX_DIR` | `<state dir>/search-index` (`$XDG_STATE_HOME/magnetar/search-index` or `~/.local/state/magnetar/search-index`; image: `/data/state/magnetar/search-index`) | Index files (derived data: delete the directory to force a rebuild). About 0.7 KiB per infohash on disk (~320 MB for 465 k); the server needs exclusive use of it (one `serve` per directory) |
 | `RUST_LOG` | `info` | tracing `EnvFilter` syntax, e.g. `info,magnetar_core=debug` |
 | `MAGNETAR_IMDB` | `true` | Offline IMDb identification (D40, docs/ENRICHMENT.md): downloads the IMDb non-commercial datasets (~293 MB: title.basics, title.ratings, title.episode) and imports them (~585 MB in Postgres). `false` keeps strong-ID linking (i tags, description links) and skips all downloads |
 | `MAGNETAR_IMDB_AKAS` | `false` | Also import `title.akas` (+519 MB download, +~300 MB in Postgres, import ~4.5 min instead of ~1.5): localised titles, +2.8 points correct on French YGG releases |
@@ -49,7 +51,10 @@ magnetar-server --version
 | `MAGNETAR_TMDB_PREFETCH_PER_HOUR` | `60` | Background prefetch of media matched in the last 7 days without fresh TMDB data, most releases first (checked every 10 min). `0` = only when a detail is opened |
 
 `GET /api/v1/stats` reports the crawler under `crawler`: `running`, `last_run` (unix end time of
-the last pass), `last_report`, `passes` since start, `last_error` and `next_run` (while pausing).
+the last pass), `last_report`, `passes` since start, `last_error` and `next_run` (while pausing),
+and the search index under `search_index` (null when disabled): `state` (`building` | `ready` |
+`error`), `docs`, `build_done`/`build_total`, `build_secs`, `last_commit`, `pending` changes,
+`lag_secs` (age of the oldest pending change), `bytes` on disk, `error`.
 
 librqbit keeps its session and DHT state in `<state dir>/downloads`, where the state dir is
 `$XDG_STATE_HOME/magnetar` (default `~/.local/state/magnetar`). The image keeps it under
