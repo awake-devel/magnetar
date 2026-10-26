@@ -589,6 +589,103 @@ async fn rebuilds_when_stale_and_resumes_a_partial_build() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Copy the files of an index directory (a backup of it).
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        if e.file_type().unwrap().is_file() {
+            std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn open_rebuilds_damaged_or_out_of_step_indexes_and_never_wipes_other_dirs() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    for n in 1..=5 {
+        put(s, torrent(n, n, NOW - n as i64, n, &format!("release {n}"))).await;
+    }
+    let dir = temp_index_dir();
+    let backup = temp_index_dir();
+    {
+        let idx = SearchIndex::open_for(s.pool(), dir.clone()).await.unwrap();
+        search_index::build(s.pool(), &idx).await.unwrap();
+        while search_index::apply_changes(s.pool(), &idx).await.unwrap() > 0 {}
+    }
+    // In step with the log: ready at once, also after more changes were applied.
+    let idx = SearchIndex::open_for(s.pool(), dir.clone()).await.unwrap();
+    assert!(idx.is_ready());
+    put(s, torrent(6, 1, NOW, 6, "release 6")).await;
+    while search_index::apply_changes(s.pool(), &idx).await.unwrap() > 0 {}
+    drop(idx);
+    copy_dir(&dir, &backup);
+    let idx = SearchIndex::open_for(s.pool(), dir.clone()).await.unwrap();
+    assert!(idx.is_ready());
+    put(s, torrent(7, 1, NOW, 7, "release 7")).await;
+    while search_index::apply_changes(s.pool(), &idx).await.unwrap() > 0 {}
+    drop(idx);
+
+    // The older copy misses release 7, whose log row is gone: rebuilt.
+    let idx = SearchIndex::open_for(s.pool(), backup.clone())
+        .await
+        .unwrap();
+    assert!(
+        !idx.is_ready(),
+        "an index behind the acknowledged log is rebuilt"
+    );
+    search_index::build(s.pool(), &idx).await.unwrap();
+    assert_eq!(idx.num_docs(), 7);
+    drop(idx);
+    let idx = SearchIndex::open_for(s.pool(), backup.clone())
+        .await
+        .unwrap();
+    assert!(idx.is_ready(), "a fresh build starts in step");
+    drop(idx);
+
+    // The database went back (restored from an older dump): its log is behind the index.
+    sqlx::query("SELECT setval('search_changes_id_seq', 1)")
+        .execute(s.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE meta SET value = 0 WHERE key = 'search_applied'")
+        .execute(s.pool())
+        .await
+        .unwrap();
+    let idx = SearchIndex::open_for(s.pool(), dir.clone()).await.unwrap();
+    assert!(!idx.is_ready(), "an index ahead of the log is rebuilt");
+    search_index::build(s.pool(), &idx).await.unwrap();
+    drop(idx);
+
+    // A segment file lost: the reader cannot open it, the index is rebuilt.
+    let seg = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|x| x == "idx"))
+        .expect("a segment file");
+    std::fs::remove_file(seg).unwrap();
+    let idx = SearchIndex::open_for(s.pool(), dir.clone()).await.unwrap();
+    assert!(!idx.is_ready(), "a damaged index is rebuilt");
+    search_index::build(s.pool(), &idx).await.unwrap();
+    assert_eq!(idx.num_docs(), 7);
+    drop(idx);
+
+    // A directory that holds something else is left alone.
+    let other = temp_index_dir();
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("notes.txt"), b"mine").unwrap();
+    assert!(
+        SearchIndex::open_for(s.pool(), other.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read(other.join("notes.txt")).unwrap(), b"mine");
+    for d in [&dir, &backup, &other] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
 #[tokio::test]
 async fn facets_stats_and_api() {
     let Some(db) = test_db().await else { return };

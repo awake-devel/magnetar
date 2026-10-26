@@ -58,7 +58,7 @@ async fn start_search_index(
     let dir = cfg.search_index_dir();
     if !cfg.search_index {
         // Nobody follows the change log now, so an index left there would go stale.
-        if dir.join("meta.json").exists() {
+        if search_index::is_index_dir(&dir) {
             tracing::info!("search index off: removing {}", dir.display());
             let _ = tokio::fs::remove_dir_all(&dir).await;
         }
@@ -66,11 +66,7 @@ async fn start_search_index(
     }
     let store = store.clone();
     tokio::spawn(async move {
-        let opened = match search_index::load::database_id(store.pool()).await {
-            Ok(id) => SearchIndex::open_async(dir.clone(), id).await,
-            Err(e) => Err(e),
-        };
-        match opened {
+        match SearchIndex::open_for(store.pool(), dir.clone()).await {
             Ok(idx) => {
                 tracing::info!(
                     "search index in {} ({})",

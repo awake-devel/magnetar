@@ -127,6 +127,9 @@ struct Payload {
     complete: bool,
     /// Last infohash of the last committed build chunk (build incomplete).
     cursor: Option<String>,
+    /// Highest `search_changes` id whose change the index holds (at a fresh build: the
+    /// `meta.search_applied` of its start). Compared with the database on open (`open_for`).
+    applied: i64,
 }
 
 #[derive(Default)]
@@ -183,36 +186,58 @@ fn dir_bytes(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Files Tantivy keeps in an index directory: only a directory holding one of them (or an
+/// empty one) is ever wiped, so a mistyped `MAGNETAR_SEARCH_INDEX_DIR` cannot delete user data.
+const INDEX_MARKERS: &[&str] = &["meta.json", ".managed.json"];
+
+pub fn is_index_dir(dir: &Path) -> bool {
+    INDEX_MARKERS.iter().any(|m| dir.join(m).exists())
+}
+
+/// Make `dir` an empty directory: created when missing, emptied when it holds an index.
+fn clear_dir(dir: &Path) -> Result<()> {
+    if dir.exists() {
+        let empty = std::fs::read_dir(dir).map_err(ix)?.next().is_none();
+        if !empty {
+            if !is_index_dir(dir) {
+                return Err(ix(format!(
+                    "{} is not empty and holds no search index: not deleting it",
+                    dir.display()
+                )));
+            }
+            std::fs::remove_dir_all(dir).map_err(ix)?;
+        }
+    }
+    std::fs::create_dir_all(dir).map_err(ix)
+}
+
 impl SearchIndex {
     /// Open the index in `dir`, or start an empty one (to be built) when there is none, it
     /// cannot be read, or it belongs to another schema version or database. Blocking.
     pub fn open(dir: &Path, db_id: &str) -> Result<Self> {
         let fields = Fields::new();
-        let existing = match Self::open_existing(dir, &fields, db_id) {
-            Ok(x) => x,
-            Err(e) => {
-                tracing::warn!("search index in {}: {e}; rebuilding", dir.display());
-                None
-            }
-        };
-        let (index, payload) = match existing {
-            Some(x) => x,
-            None => {
-                if dir.exists() {
-                    std::fs::remove_dir_all(dir).map_err(ix)?;
+        match Self::open_existing(dir, &fields, db_id) {
+            Ok(Some((index, payload))) => {
+                match Self::with_index(dir, fields.clone(), index, payload) {
+                    Ok(idx) => return Ok(idx),
+                    // Another process holds the writer lock: its index, not ours to wipe.
+                    Err(e @ tantivy::TantivyError::LockFailure(..)) => return Err(ix(e)),
+                    Err(e) => {
+                        tracing::warn!("search index in {}: {e}; rebuilding", dir.display())
+                    }
                 }
-                std::fs::create_dir_all(dir).map_err(ix)?;
-                let index = Index::create_in_dir(dir, fields.schema.clone()).map_err(ix)?;
-                let p = Payload {
-                    schema: SCHEMA_VERSION,
-                    db_id: db_id.to_string(),
-                    complete: false,
-                    cursor: None,
-                };
-                (index, p)
             }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("search index in {}: {e}; rebuilding", dir.display()),
+        }
+        clear_dir(dir)?;
+        let index = Index::create_in_dir(dir, fields.schema.clone()).map_err(ix)?;
+        let p = Payload {
+            schema: SCHEMA_VERSION,
+            db_id: db_id.to_string(),
+            ..Payload::default()
         };
-        Self::with_index(dir, fields, index, payload)
+        Self::with_index(dir, fields, index, p).map_err(ix)
     }
 
     fn open_existing(dir: &Path, fields: &Fields, db_id: &str) -> Result<Option<(Index, Payload)>> {
@@ -237,21 +262,24 @@ impl SearchIndex {
         Ok(Some((index, p)))
     }
 
-    fn with_index(dir: &Path, fields: Fields, mut index: Index, payload: Payload) -> Result<Self> {
+    /// Writer first (it takes the directory lock), then the reader, which opens every segment
+    /// and so fails on missing or damaged files.
+    fn with_index(
+        dir: &Path,
+        fields: Fields,
+        mut index: Index,
+        payload: Payload,
+    ) -> tantivy::Result<Self> {
         index.tokenizers().register(TOKENIZER, analyzer());
         let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
         // Queries fan out over segments; leave a core or two for Postgres and the API.
-        index
-            .set_multithread_executor(cpus.saturating_sub(2).clamp(1, 16))
-            .map_err(ix)?;
+        index.set_multithread_executor(cpus.saturating_sub(2).clamp(1, 16))?;
+        let writer: IndexWriter<TantivyDocument> =
+            index.writer_with_num_threads(cpus.clamp(1, 4), WRITER_MEMORY)?;
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
-            .try_into()
-            .map_err(ix)?;
-        let writer: IndexWriter<TantivyDocument> = index
-            .writer_with_num_threads(cpus.clamp(1, 4), WRITER_MEMORY)
-            .map_err(ix)?;
+            .try_into()?;
         writer.set_merge_policy(Box::new(CappedMergePolicy::default()));
         let ready = payload.complete;
         Ok(SearchIndex {
@@ -270,6 +298,16 @@ impl SearchIndex {
         tokio::task::spawn_blocking(move || Self::open(&dir, &db_id).map(Arc::new))
             .await
             .map_err(ix)?
+    }
+
+    /// `open_async` for the database behind `pool`, checked against its change log
+    /// (`rebuild_if_out_of_step`). What `serve` uses.
+    pub async fn open_for(pool: &PgPool, dir: PathBuf) -> Result<Arc<Self>> {
+        let id = load::database_id(pool).await?;
+        let idx = Self::open_async(dir, id).await?;
+        let (acked, last_id) = load::log_position(pool).await?;
+        idx.rebuild_if_out_of_step(acked, last_id);
+        Ok(idx)
     }
 
     pub fn is_ready(&self) -> bool {
@@ -351,9 +389,9 @@ impl SearchIndex {
         Ok(())
     }
 
-    /// Replace the documents of `infohashes` with `docs` (absent = deleted) in one commit.
-    /// Blocking.
-    pub fn replace(&self, infohashes: &[String], docs: Vec<IndexDoc>) -> Result<()> {
+    /// Replace the documents of `infohashes` with `docs` (absent = deleted) in one commit that
+    /// records `applied`, the highest change log id they cover. Blocking.
+    pub fn replace(&self, infohashes: &[String], docs: Vec<IndexDoc>, applied: i64) -> Result<()> {
         let mut w = self.writer.lock().unwrap();
         for ih in infohashes {
             w.delete_term(self.fields.infohash_term(ih));
@@ -363,14 +401,45 @@ impl SearchIndex {
             .try_for_each(|d| w.add_document(self.fields.document(d)).map(drop))
             .map_err(ix);
         if res.is_ok() {
-            let p = self.payload.lock().unwrap().clone();
+            let mut p = self.payload.lock().unwrap().clone();
+            p.applied = p.applied.max(applied);
             res = self.commit(&mut w, &p);
+            if res.is_ok() {
+                *self.payload.lock().unwrap() = p;
+            }
         }
         if res.is_err() {
             // Half a batch must not ride along with the next commit; the batch is retried.
             let _ = rollback(&mut w);
         }
         res
+    }
+
+    /// A complete index out of step with the change log of its database is rebuilt: the log
+    /// was acknowledged beyond what it holds (an index directory restored from an older backup,
+    /// or a second index following the same log), or the log is behind it (the database was
+    /// restored from an older dump). `acked` = `meta.search_applied`, `last_id` = the last id
+    /// handed out. Returns whether a rebuild was scheduled.
+    pub fn rebuild_if_out_of_step(&self, acked: i64, last_id: i64) -> bool {
+        let mut p = self.payload.lock().unwrap();
+        if !p.complete || (acked <= p.applied && p.applied <= last_id) {
+            return false;
+        }
+        tracing::warn!(
+            "search index in {}: holds changes up to {}, the database's change log is at {acked} \
+             acknowledged / {last_id} issued; rebuilding",
+            self.dir.display(),
+            p.applied
+        );
+        p.complete = false;
+        p.cursor = None;
+        self.ready.store(false, Ordering::Release);
+        true
+    }
+
+    /// A fresh build reflects the database from now on: the changes acknowledged so far are in.
+    fn start_applied_at(&self, acked: i64) {
+        self.payload.lock().unwrap().applied = acked;
     }
 
     fn set_build_progress(&self, done: u64, total: u64) {
@@ -694,12 +763,16 @@ pub async fn facets(
 pub async fn build(pool: &PgPool, idx: &Arc<SearchIndex>) -> Result<u64> {
     let started = Instant::now();
     let total = load::infohash_count(pool).await?;
+    let (acked, _) = load::log_position(pool).await?;
     let mut cursor = {
         let idx = idx.clone();
         tokio::task::spawn_blocking(move || idx.begin_build())
             .await
             .map_err(join_err)??
     };
+    if cursor.is_empty() {
+        idx.start_applied_at(acked);
+    }
     let mut done = idx.num_docs();
     idx.set_build_progress(done, total);
     tracing::info!(
@@ -761,9 +834,10 @@ pub async fn apply_changes(pool: &PgPool, idx: &Arc<SearchIndex>) -> Result<usiz
         return Ok(0);
     }
     let docs = load::load_docs(pool, &infohashes).await?;
+    let applied = ids.iter().copied().max().unwrap_or(0);
     {
         let idx = idx.clone();
-        tokio::task::spawn_blocking(move || idx.replace(&infohashes, docs))
+        tokio::task::spawn_blocking(move || idx.replace(&infohashes, docs, applied))
             .await
             .map_err(join_err)??;
     }

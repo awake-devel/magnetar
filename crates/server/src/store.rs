@@ -337,8 +337,11 @@ impl PgStore {
 
     /// Index state for `/api/v1/stats`; None when no index is attached (disabled).
     pub async fn search_index_status(&self) -> Option<SearchIndexStatus> {
-        let idx = self.search_index.get()?;
-        let mut st = idx.status();
+        let idx = self.search_index.get()?.clone();
+        // `status` lists the index directory: off the runtime.
+        let mut st = tokio::task::spawn_blocking(move || idx.status())
+            .await
+            .ok()?;
         match search_index::load::backlog(&self.pool, magnetar_core::now()).await {
             Ok((pending, lag)) => {
                 st.pending = pending;

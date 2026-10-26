@@ -38,8 +38,17 @@ lowest id (D6). Fields:
 ## Lifecycle
 
 - **Open**: `serve` opens the index, or creates an empty one when the directory is missing,
-  unreadable, built from another database (the id the migration stores in
-  `settings.search.index_id`) or of another `SCHEMA_VERSION`.
+  unreadable (also a missing or damaged segment file), built from another database (the id the
+  migration stores in `settings.search.index_id`) or of another `SCHEMA_VERSION`. It also
+  rebuilds a complete index that is out of step with the change log: each commit records the
+  highest log id it covers, each acknowledgement stores the highest id in
+  `meta.search_applied`, and an index behind `search_applied` (its directory restored from an
+  older backup, or a second index following the same log) or ahead of the log's sequence (the
+  database restored from an older `pg_dump`) would otherwise miss changes for good. Only an
+  empty directory or one holding Tantivy files (`meta.json`, `.managed.json`) is ever wiped: a
+  `MAGNETAR_SEARCH_INDEX_DIR` pointing at other data makes the index fail to open (searches
+  stay on Postgres) instead of deleting it. Another process holding the directory's writer
+  lock is an error too, never a reason to wipe.
 - **Build**: in the background, walking `torrent_infohashes` in byte order, 4 queries of 2000
   infohashes in flight, documents added on blocking threads (`spawn_blocking`), never on the
   async runtime. Every 200 000 infohashes it commits with the keyset cursor in the commit

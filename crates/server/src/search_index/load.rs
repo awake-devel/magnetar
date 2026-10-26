@@ -204,14 +204,49 @@ pub async fn pending_changes(pool: &PgPool, limit: i64) -> Result<(Vec<i64>, Vec
 }
 
 /// Forget exactly the log rows that were indexed (a row committed late, with a lower id than
-/// some of these, stays and is picked up next time).
+/// some of these, stays and is picked up next time), and record the highest one in
+/// `meta.search_applied`, which `log_position` compares with the index on the next start.
 pub async fn ack_changes(pool: &PgPool, ids: &[i64]) -> Result<()> {
-    sqlx::query("DELETE FROM search_changes WHERE id = ANY($1)")
+    let Some(max) = ids.iter().copied().max() else {
+        return Ok(());
+    };
+    let mut tx = pool.begin().await.map_err(db)?;
+    let gone = sqlx::query("DELETE FROM search_changes WHERE id = ANY($1)")
         .bind(ids)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
-        .map_err(db)?;
-    Ok(())
+        .map_err(db)?
+        .rows_affected();
+    if gone < ids.len() as u64 {
+        // Only one index may follow the log: another one deletes the rows this one needs.
+        tracing::error!(
+            "search index: {} of {} change log rows were already gone; is a second `serve` \
+             with its own index using this database?",
+            ids.len() as u64 - gone,
+            ids.len()
+        );
+    }
+    sqlx::query(
+        "INSERT INTO meta (key, value) VALUES ('search_applied', $1)
+         ON CONFLICT (key) DO UPDATE SET value = greatest(meta.value, EXCLUDED.value)",
+    )
+    .bind(max)
+    .execute(&mut *tx)
+    .await
+    .map_err(db)?;
+    tx.commit().await.map_err(db)
+}
+
+/// Where the change log stands: the highest id an index acknowledged (`meta.search_applied`)
+/// and the last id handed out by its sequence (0 when none).
+pub async fn log_position(pool: &PgPool) -> Result<(i64, i64)> {
+    sqlx::query_as(
+        "SELECT coalesce((SELECT value FROM meta WHERE key = 'search_applied'), 0),
+                (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM search_changes_id_seq)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(db)
 }
 
 /// Queued changes and the age of the oldest one (seconds), for `/api/v1/stats`.
