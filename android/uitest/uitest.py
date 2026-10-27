@@ -92,6 +92,8 @@ class Node:
         x1, y1, x2, y2 = map(int, re.findall(r"\d+", e.get("bounds", "[0,0][0,0]")))
         self.center = ((x1 + x2) // 2, (y1 + y2) // 2)
         self.top = y1
+        self.left = x1
+        self.right = x2
 
 
 def dump():
@@ -104,6 +106,12 @@ def dump():
             anr = [n for n in nodes if n.id == "android:id/aerr_wait"]
             if anr:
                 tap(anr[0])
+                time.sleep(1.0)
+                continue
+            # The app's one-time notification prompt (a fresh install): answer "Don't allow".
+            deny = [n for n in nodes if n.id == "com.android.permissioncontroller:id/permission_deny_button"]
+            if deny:
+                tap(deny[0])
                 time.sleep(1.0)
                 continue
             return nodes
@@ -125,14 +133,14 @@ def wait(rid=None, text_re=None, timeout=20):
     raise AssertionError(f"timed out waiting for {rid or ''} {text_re or ''}")
 
 
-def scroll_to(rid, tries=8):
-    """Swipes up until [rid] is on screen (uiautomator lists visible nodes only)."""
+def scroll_to(rid, tries=8, up=False):
+    """Swipes until [rid] is on screen (uiautomator lists visible nodes only); [up] scrolls back."""
     for _ in range(tries):
         hits = find(dump(), rid)
         if hits:
             return hits
         # A slow swipe (no fling), then let it settle so the coordinates hold.
-        shell("input swipe 540 1700 540 900 600")
+        shell("input swipe 540 900 540 1700 600" if up else "input swipe 540 1700 540 900 600")
         time.sleep(0.8)
     raise AssertionError("not found after scrolling: " + rid)
 
@@ -147,6 +155,43 @@ def type_text(text):
 
 def back():
     shell("input keyevent 4")
+
+
+def long_press(n, ms=900):
+    shell(f"input swipe {n.center[0]} {n.center[1]} {n.center[0]} {n.center[1]} {ms}")
+
+
+def get_json(base, path):
+    return json.load(urllib.request.urlopen(base + path))
+
+
+def graph_subject():
+    """Screen position of the graph's subject node, from the debug build's MagnetarGraph log."""
+    out = shell("logcat -d -s MagnetarGraph:I", check=False)
+    m = re.findall(r"MagnetarGraph: subject (-?\d+) (-?\d+)", out)
+    return (int(m[-1][0]), int(m[-1][1])) if m else None
+
+
+def flow_graph_from_card(card_rid):
+    """Open a graph, tap its subject node on the canvas, then the node list."""
+    shell("logcat -c")
+    tap(wait(card_rid)[0])
+    wait("graph_canvas", timeout=25)
+    end = time.time() + 20
+    pos = None
+    while time.time() < end and pos is None:
+        time.sleep(0.5)
+        pos = graph_subject()
+    assert pos, "graph laid out (subject position logged)"
+    time.sleep(0.5)
+    shell(f"input tap {pos[0]} {pos[1]}")
+    wait("graph_node_card", timeout=10)
+    ok("graph: laid out, tapping the subject node opens its card")
+    tap(wait("graph_view_toggle")[0])
+    tap(wait("graph_node_0")[0])
+    wait("graph_node_card")
+    ok("graph: node list selects a node")
+    back()
 
 
 def timings():
@@ -261,12 +306,92 @@ def run_fake(port):
     ok("fake: saved search created with its filters, listed on Saved")
     tap(wait("tab_search")[0])
 
+    flow_stats(base)
+    flow_settings(base)
+
     # Notification deep link → detail.
     shell(f"am force-stop {PKG}")
     launch(deep_link="magnetar://torrent/" + fake_server.HITS[1]["infohash"])
     wait("detail_title", timeout=25)
     ok("fake: magnetar://torrent deep link opens the detail")
     srv.shutdown()
+
+
+def flow_stats(base):
+    """Stats tab on the fake server: health, cross-filter, long press to Search, activity, graphs, status."""
+    tap(wait("tab_stats")[0])
+    wait("health_card", timeout=25)
+    wait(text_re=r"^Not checked yet$")
+    wait(text_re=r"^380 \(38% of 1,000\)$")
+    ok("stats: health card with seed checks and 'not checked yet' apart")
+    tap(scroll_to("bar_language_fr")[0])
+    wait("stats_chip_language_fr")
+    time.sleep(1.0)
+    last = [b for b in get_json(base, "/_uitest/breakdowns") if "year" not in b["fields"]][-1]
+    assert last["query"]["languages"] == ["fr"], "cross-filter sent"
+    assert last["query"]["include_adult"] is False, "adult switch sent (off)"
+    wait(text_re=r"^500 torrents match$")
+    ok("stats: tap a bar cross-filters every chart")
+    long_press(scroll_to("slice_resolution_1080p")[0])
+    wait("search_box", timeout=15)
+    time.sleep(1.0)
+    q = get_json(base, "/_uitest/searches")[-1]
+    assert q["languages"] == ["fr"] and q["resolutions"] == ["1080p"], "long press searched with the filters"
+    ok("stats: long press opens Search with the value and the cross-filters")
+    tap(wait("tab_stats")[0])
+    tap(scroll_to("stats_clear", up=True)[0])
+    chart = scroll_to("activity_chart", tries=25)[0]
+    tap(chart)
+    wait("activity_value", r":")
+    tap(scroll_to("activity_dht_torrents_added")[0])
+    wait("activity_chart", timeout=15)
+    ok("stats: activity chart answers a tap, DHT series offered")
+
+    tap(wait("stats_tab_graphs")[0])
+    flow_graph_from_card("graph_card_wot")
+    wait("stats_tab_status")
+    tap(wait("stats_tab_status")[0])
+    wait("status_server")
+    wait("status_backlog")
+    wait(text_re=r"^Due now$")
+    ok("stats: status shows server, index and seed-check backlog")
+    tap(wait("stats_tab_charts")[0])
+    tap(wait("tab_search")[0])
+
+
+def flow_settings(base):
+    """Settings on the fake server: test connection, nsec cleared, threshold pushed on Save."""
+    tap(wait("tab_settings")[0])
+    tap(wait("settings_test")[0])
+    wait("settings_test_result", r"Connected", timeout=20)
+    ok("settings: test connection")
+    tap(wait("settings_root")[0])
+    type_text("nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5")
+    wait(text_re=r"private key")
+    root = wait("settings_root")[0]
+    assert "nsec" not in root.text and "vl029" not in root.text, "no part of the nsec left in the field"
+    ok("settings: an nsec typed into the root field is cleared, none of it stays")
+    tap(root)
+    type_text("npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6")
+    back()  # hide the keyboard
+    sl = scroll_to("settings_threshold")[0]
+    # A tap at 3/4 of the slider's width sets the threshold to about 75.
+    shell(f"input tap {sl.left + (sl.right - sl.left) * 3 // 4} {sl.center[1]}")
+    tap(scroll_to("settings_save")[0])
+    time.sleep(1.5)
+    puts = get_json(base, "/_uitest/trust_puts")
+    assert puts, "trust settings pushed"
+    assert puts[-1]["root"] == fake_server.ROOT_HEX, "root sent as hex"
+    assert puts[-1]["threshold"] > 50, "threshold pushed"
+    ok("settings: Save pushes root and threshold (PUT /settings/trust)")
+    tap(scroll_to("settings_adult")[0])
+    tap(wait("tab_stats")[0])
+    time.sleep(1.5)
+    assert get_json(base, "/_uitest/breakdowns")[-1]["query"]["include_adult"] is True, "switch on reaches the charts"
+    tap(wait("tab_settings")[0])
+    tap(scroll_to("settings_adult")[0])
+    ok("settings: adult switch applies at once (charts asked again with include_adult)")
+    tap(wait("tab_search")[0])
 
 
 def production_token():
@@ -318,6 +443,16 @@ def run_production(url, queries):
     ok("production: filter sheet shows live counts")
     back()
     wait("search_box")
+    # Read-only: the Stats tab (GET health/series, POST breakdown counts) and the web of trust.
+    tap(wait("tab_stats")[0])
+    wait("health_card", timeout=40)
+    wait("health_not_checked", timeout=10)
+    scroll_to("breakdown_language")
+    ok("production: stats health and breakdowns")
+    tap(wait("stats_tab_graphs")[0])
+    flow_graph_from_card("graph_card_wot")
+    tap(wait("stats_tab_charts")[0])
+    tap(wait("tab_search")[0])
     return live
 
 

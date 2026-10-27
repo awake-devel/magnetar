@@ -12,7 +12,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TOKEN = "uitest-token"
 FEATURES = ["filters", "facet_set", "media_releases", "liveness_history", "adult_filter", "origin", "dht",
-            "saved_search_poll", "browse_checked_dht"]
+            "saved_search_poll", "browse_checked_dht", "stats", "graphs"]
+ROOT_HEX = "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d"
 
 
 def hit(i, title, **kw):
@@ -40,6 +41,55 @@ class State:
     next_id = 1
     requests = []
     searches = []
+    breakdowns = []
+    trust = {"root": None, "threshold": 20}
+    trust_puts = []
+
+
+STATS_HEALTH = {
+    "torrents": 1000, "media_linked": 400, "attrs_missing": 0, "computed_at": 1_790_000_000,
+    "liveness": {"enabled": True, "torrents": 1000, "never_checked": 380, "due_now": 450, "checked_24h": 600,
+                 "checks_per_hour": 30, "alive": 350, "dead": 240, "unknown": 30, "trackers": 9,
+                 "trackers_backed_off": 1, "dht_nodes": 100, "last_batch": {"hashes": 200, "ms": 60000},
+                 "last_batch_at": 1_789_999_000},
+    "search_index": {"state": "ready", "docs": 1000, "pending": 3, "lag_secs": 2, "bytes": 1_000_000},
+    "relays": {"total": 10, "enabled": 10, "ok_24h": 7, "failing": 3, "productive": 2},
+    "crawler": {"running": False, "last_run": 1_789_999_500, "passes": 4},
+    "dht": {"mode": "polite", "running": True, "uptime_secs": 600, "virtual_nodes": 1, "external_ip": "public",
+            "queries_per_sec": 50.0, "answered_share": 0.4, "hashes_per_min": 120.0, "queue_len": 5,
+            "metadata_per_min": 3.5, "fetch_success_rate": 0.25, "stored_total": 300, "adult_total": 20,
+            "blocked_total": 2, "upnp": {"state": "off", "mappings": []}},
+}
+
+VALUES = {
+    "category": [("video", 600), ("audio", 250), ("book", 150)],
+    "language": [("fr", 400), ("en", 300), ("ja", 100)],
+    "resolution": [("1080p", 500), ("720p", 200), ("2160p", 100)],
+    "media_kind": [("movie", 300), ("series", 200)],
+    "origin": [("nostr", 700), ("dht", 300)],
+    "year": [("2024", 300), ("2023", 200), ("2020", 50)],
+}
+
+
+def breakdown(req):
+    q = req.get("query", {})
+    total = 1000 // (2 if q.get("languages") else 1)
+    out = []
+    for f in req.get("fields", []):
+        counts = [{"value": v, "count": c // (2 if q.get("languages") and f != "language" else 1)} for v, c in VALUES.get(f, [])]
+        out.append({"field": f, "total": total, "counts": counts, "other": 0, "other_values": 0, "missing": 10})
+    return {"total": total, "breakdowns": out, "computed_at": 1_790_000_000}
+
+
+def graph(kind):
+    nodes = [{"id": ROOT_HEX, "kind": "root", "label": "You", "weight": 0, "score": None, "detail": ["you (trust root)"]}]
+    edges = []
+    for i in range(1, 12):
+        nodes.append({"id": "%064x" % i, "kind": "publisher", "label": "pub%d" % i, "weight": i, "score": 5 * i,
+                      "detail": ["%d torrents" % i]})
+        if i <= 8:
+            edges.append({"source": 0, "target": i, "weight": 1, "kind": "follows"})
+    return {"kind": kind, "nodes": nodes, "edges": edges, "truncated": False, "note": None}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -76,6 +126,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/_uitest/requests":
             with State.lock:
                 return self.send(200, State.requests)
+        if path == "/_uitest/breakdowns":
+            with State.lock:
+                return self.send(200, State.breakdowns)
+        if path == "/_uitest/trust_puts":
+            with State.lock:
+                return self.send(200, State.trust_puts)
         if path == "/_uitest/searches":
             with State.lock:
                 return self.send(200, State.searches)
@@ -120,6 +176,35 @@ class Handler(BaseHTTPRequestHandler):
                                    "total": 1, "truncated": False,
                                    "groups": [{"season": None, "episode": None, "resolution": "1080p", "language": "vff",
                                                "language_label": "VFF (France)", "releases": [HITS[0]]}]})
+        if path == "/api/v1/stats/health":
+            return self.send(200, STATS_HEALTH)
+        if path == "/api/v1/stats/breakdown" and method == "POST":
+            req = self.body()
+            with State.lock:
+                State.breakdowns.append(req)
+            return self.send(200, breakdown(req))
+        if path == "/api/v1/stats/timeseries":
+            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+            params = dict(p.split("=", 1) for p in qs.split("&") if "=" in p)
+            metric = params.get("metric", "torrents_total").split(",")[0]
+            bucket = params.get("bucket", "day")
+            step = 3600 if bucket == "hour" else 86400
+            counter = metric not in ("torrents_total", "db_size")
+            pts = [{"at": 1_789_000_000 + i * step, "value": (i * 7) % 40 if counter else 500 + i * 5} for i in range(30)]
+            return self.send(200, {"since": 1_789_000_000, "until": 1_790_000_000,
+                                   "series": [{"metric": metric, "kind": "counter" if counter else "gauge",
+                                               "bucket": bucket, "points": pts}]})
+        if path.startswith("/api/v1/graphs/"):
+            return self.send(200, graph(path.split("/")[4]))
+        if path == "/api/v1/settings/trust" and method == "GET":
+            with State.lock:
+                return self.send(200, State.trust)
+        if path == "/api/v1/settings/trust" and method == "PUT":
+            t = self.body()
+            with State.lock:
+                State.trust_puts.append(t)
+                State.trust = {"root": t.get("root"), "threshold": t.get("threshold", 20)}
+                return self.send(200, State.trust)
         if path == "/api/v1/saved-searches" and method == "GET":
             with State.lock:
                 return self.send(200, State.saved)
