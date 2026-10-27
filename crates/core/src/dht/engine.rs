@@ -27,7 +27,7 @@ use super::krpc::{
 };
 use super::limiter::{Brake, Bucket, IP_BUCKETS_CAP, Pace, PerIp};
 use super::peerstore::{self, PeerStore};
-use super::pool::{Pool, PoolCounts};
+use super::pool::{Pool, PoolCounts, Tier};
 use super::routing::{K, RoutingTable, Seen};
 
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(4);
@@ -209,7 +209,16 @@ struct Counters {
     age_answered: [AtomicU64; 3],
     repeat_sent: AtomicU64,
     repeat_answered: AtomicU64,
+    /// D95: lookup queries answered, lookup seeds by tier (fresh, unknown, struck) and
+    /// candidates a walk skipped as dead.
+    lookup_answered: AtomicU64,
+    lookup_seeds: [AtomicU64; 3],
+    lookup_dead_skipped: AtomicU64,
 }
+
+/// Lookup seeds are ranked among this many closest known contacts per seed wanted (D95):
+/// 4 × 16 = 64 pool candidates, about two prefix bits further out than the 16 closest.
+pub const SEED_SPREAD: usize = 4;
 
 /// Pool nodes younger than this count as "young" in [`NodeAgeStats`].
 pub const YOUNG_NODE: Duration = Duration::from_secs(300);
@@ -293,6 +302,14 @@ pub struct EngineStats {
     /// Answer share by how long the queried node has been known (rate limiting or a pool that
     /// wears out shows as old/repeat shares falling while young ones hold).
     pub by_node_age: NodeAgeStats,
+    /// D95: lookup queries answered (of `lookup_queries`), lookup seeds by tier (answered
+    /// within 15 min / not known to be silent / silent since their last answer), and walk
+    /// candidates skipped because they never answered [`super::pool::DEAD_AFTER`] queries.
+    pub lookup_answered: u64,
+    pub lookup_seeds_fresh: u64,
+    pub lookup_seeds_unknown: u64,
+    pub lookup_seeds_struck: u64,
+    pub lookup_dead_skipped: u64,
 }
 
 /// Queries sent and answered by destination (answers = responses, not error replies).
@@ -321,6 +338,19 @@ impl EngineStats {
     pub fn queries_per_lookup(&self) -> f64 {
         ratio(self.lookup_queries, self.lookups)
     }
+
+    /// Share of `get_peers` lookup queries answered (late answers included, D95).
+    pub fn lookup_answered_share(&self) -> f64 {
+        ratio(self.lookup_answered, self.lookup_queries)
+    }
+
+    /// Share of lookup seeds that answered within the last 15 minutes (D95).
+    pub fn lookup_seeds_fresh_share(&self) -> f64 {
+        ratio(
+            self.lookup_seeds_fresh,
+            self.lookup_seeds_fresh + self.lookup_seeds_unknown + self.lookup_seeds_struck,
+        )
+    }
 }
 
 fn ratio(a: u64, b: u64) -> f64 {
@@ -335,6 +365,9 @@ pub struct PoolStats {
     pub bep51_unknown: usize,
     pub evicted: u64,
     pub dropped_silent: u64,
+    /// D95: dropped after never answering, and such addresses remembered now.
+    pub dropped_dead: u64,
+    pub dead_known: usize,
 }
 
 impl From<PoolCounts> for PoolStats {
@@ -346,6 +379,8 @@ impl From<PoolCounts> for PoolStats {
             bep51_unknown: c.bep51_unknown,
             evicted: c.evicted,
             dropped_silent: c.dropped_silent,
+            dropped_dead: c.dropped_dead,
+            dead_known: c.dead_known,
         }
     }
 }
@@ -693,6 +728,42 @@ impl Dht {
         all
     }
 
+    /// Lookup seeds (D95): the [`SEED_SPREAD`] × `k` closest contacts of the crawl pool and the
+    /// `k` closest of each routing table, ranked by [`super::lookup::rank_seeds`] (nodes that
+    /// answered recently first, then untried ones, then silent ones; dead ones never), with
+    /// their tiers. The pool's tier wins for a contact both know (it sees every query).
+    pub fn lookup_seeds(&self, target: &Id, k: usize) -> Vec<(CompactNode, Tier)> {
+        let now = Instant::now();
+        let s = self.inner.state.lock().unwrap();
+        let mut all = s.pool.closest_ranked(target, k * SEED_SPREAD, now);
+        for v in &s.nodes {
+            for (n, t) in v.routing.closest_ranked(target, k, now) {
+                all.push((n, s.pool.tier_of(&n.addr, now).unwrap_or(t)));
+            }
+        }
+        drop(s);
+        let out = super::lookup::rank_seeds(all, target, k);
+        for (_, t) in &out {
+            match t {
+                Tier::Fresh => bump(&self.inner.c.lookup_seeds[0]),
+                Tier::Unknown => bump(&self.inner.c.lookup_seeds[1]),
+                Tier::Struck => bump(&self.inner.c.lookup_seeds[2]),
+                Tier::Dead => {}
+            }
+        }
+        out
+    }
+
+    /// The pool's tier of each address (unknown to the pool → [`Tier::Unknown`]), one lock.
+    pub fn tiers_of(&self, addrs: &[SocketAddrV4]) -> Vec<Tier> {
+        let now = Instant::now();
+        let s = self.inner.state.lock().unwrap();
+        addrs
+            .iter()
+            .map(|a| s.pool.tier_of(a, now).unwrap_or(Tier::Unknown))
+            .collect()
+    }
+
     /// Halve the KRPC query rate until `until` (router health probe, D66). Extends an active
     /// brake, never shortens it.
     pub fn brake_until(&self, until: Instant) {
@@ -794,6 +865,11 @@ impl Dht {
                 repeat_sent: g(&c.repeat_sent),
                 repeat_answered: g(&c.repeat_answered),
             },
+            lookup_answered: g(&c.lookup_answered),
+            lookup_seeds_fresh: g(&c.lookup_seeds[0]),
+            lookup_seeds_unknown: g(&c.lookup_seeds[1]),
+            lookup_seeds_struck: g(&c.lookup_seeds[2]),
+            lookup_dead_skipped: g(&c.lookup_dead_skipped),
         }
     }
 
@@ -823,6 +899,19 @@ impl Dht {
 
     pub(crate) fn note_lookup_late(&self) {
         bump(&self.inner.c.lookup_late);
+    }
+
+    pub(crate) fn note_lookup_answered(&self) {
+        bump(&self.inner.c.lookup_answered);
+    }
+
+    pub(crate) fn note_dead_skipped(&self, n: u64) {
+        if n > 0 {
+            self.inner
+                .c
+                .lookup_dead_skipped
+                .fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     /// Keep only the addresses we may hand the fetcher (one lock for the whole list).
@@ -973,7 +1062,17 @@ impl Dht {
             bump(&c.repeat_sent);
         }
         let rx = guard.rx.as_mut().expect("receiver until drop");
-        match tokio::time::timeout(self.inner.cfg.query_timeout, rx).await {
+        let r = tokio::time::timeout(self.inner.cfg.query_timeout, rx).await;
+        if let Ok(Ok(_)) = &r {
+            // Any answer, error replies included, shows the node is alive (D95).
+            self.inner
+                .state
+                .lock()
+                .unwrap()
+                .pool
+                .heard(&to, Instant::now());
+        }
+        match r {
             Ok(Ok(Reply::Response(r))) => {
                 bump(&c.age_answered[age]);
                 if repeat {
@@ -988,6 +1087,7 @@ impl Dht {
                 bump(&c.timeouts);
                 let mut s = self.inner.state.lock().unwrap();
                 s.nodes[key.0].routing.failed(&to);
+                s.pool.silent(&to);
                 Err(QueryError::Timeout)
             }
         }
@@ -1012,6 +1112,18 @@ impl Dht {
     pub fn learn_nodes(&self, nodes: &[CompactNode], target: &Id) {
         let mut s = self.inner.state.lock().unwrap();
         self.learn(&mut s, nodes, target, Instant::now());
+    }
+
+    /// [`learn_nodes`](Self::learn_nodes), returning each contact's tier afterwards (D95), in
+    /// the same lock.
+    pub fn learn_ranked(&self, nodes: &[CompactNode], target: &Id) -> Vec<Tier> {
+        let now = Instant::now();
+        let mut s = self.inner.state.lock().unwrap();
+        self.learn(&mut s, nodes, target, now);
+        nodes
+            .iter()
+            .map(|n| s.pool.tier_of(&n.addr, now).unwrap_or(Tier::Unknown))
+            .collect()
     }
 
     async fn recv_loop(&self, i: usize) {

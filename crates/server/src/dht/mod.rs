@@ -289,6 +289,12 @@ pub struct PeerStats {
     /// Fetches handed a peer that announced the hash to us.
     pub announce_fetches: u64,
     pub status_write_errors: u64,
+    /// D95: share of lookup queries answered, share of seeds that answered within 15 min,
+    /// `get_peers` queries sent per torrent stored, lookup candidates skipped as dead.
+    pub lookup_answered_share: f64,
+    pub lookup_seeds_fresh_share: f64,
+    pub queries_per_stored: f64,
+    pub lookup_dead_skipped: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -416,6 +422,17 @@ fn peer_stats(p: &Pipeline, e: &EngineStats) -> PeerStats {
         announce_retriaged: get(&p.c.announce_retriaged),
         announce_fetches: get(&p.c.fetch_announce),
         status_write_errors: get(&p.c.status_errors),
+        lookup_answered_share: e.lookup_answered_share(),
+        lookup_seeds_fresh_share: e.lookup_seeds_fresh_share(),
+        queries_per_stored: {
+            let stored = p.persisted.lock().unwrap().stored;
+            if stored > 0 {
+                e.sent_get_peers as f64 / stored as f64
+            } else {
+                0.0
+            }
+        },
+        lookup_dead_skipped: e.lookup_dead_skipped,
     }
 }
 
@@ -937,7 +954,7 @@ async fn progress_loop(p: Arc<Pipeline>, dht: Dht, mut stop: watch::Receiver<boo
         let a0 = &e0.by_node_age;
         let mins = PROGRESS_EVERY.as_secs_f64() / 60.0;
         tracing::info!(
-            "DHT minute: {:.0} q/s, answered {:.3} (young {:.3}, old {:.3}, unpooled {:.3}, repeat {:.3}), collected {:.0}/min, lookups {:.0}/min at {:.0} ms and {:.1} queries, metadata {:.0}/min, fake skipped {}",
+            "DHT minute: {:.0} q/s, answered {:.3} (young {:.3}, old {:.3}, unpooled {:.3}, repeat {:.3}), collected {:.0}/min, lookups {:.0}/min at {:.0} ms and {:.1} queries (answered {:.3}, fresh seeds {:.3}), metadata {:.0}/min, fake skipped {}",
             d(e.queries_sent, e0.queries_sent) as f64 / PROGRESS_EVERY.as_secs_f64(),
             share(
                 d(e.answered, e0.answered),
@@ -968,6 +985,17 @@ async fn progress_loop(p: Arc<Pipeline>, dht: Dht, mut stop: watch::Receiver<boo
             share(
                 d(e.lookup_queries, e0.lookup_queries),
                 d(e.lookups, e0.lookups)
+            ),
+            share(
+                d(e.lookup_answered, e0.lookup_answered),
+                d(e.lookup_queries, e0.lookup_queries)
+            ),
+            share(
+                d(e.lookup_seeds_fresh, e0.lookup_seeds_fresh),
+                d(
+                    e.lookup_seeds_fresh + e.lookup_seeds_unknown + e.lookup_seeds_struck,
+                    e0.lookup_seeds_fresh + e0.lookup_seeds_unknown + e0.lookup_seeds_struck
+                )
             ),
             d(
                 f.ok + f.private + f.v2_only + f.invalid,
@@ -1232,6 +1260,9 @@ pub async fn run(
     }
     let mut rep = rep;
     rep.persist = p.persisted.lock().unwrap().clone();
+    if rep.persist.stored > 0 {
+        rep.peers.queries_per_stored = rep.engine.sent_get_peers as f64 / rep.persist.stored as f64;
+    }
     rep.persist_errors = get(&p.c.persist_errors);
     rep.marked_no_peers = get(&p.c.marked_failed);
     rep.reclassified = reclassified;

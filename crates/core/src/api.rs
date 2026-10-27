@@ -209,6 +209,17 @@ pub struct DhtStats {
     pub answered_share_old: f64,
     pub answered_share_unpooled: f64,
     pub answered_share_repeat: f64,
+    // --- D95 (serde default) ---
+    /// Over the rate window: share of `get_peers` lookup queries answered, share of lookup
+    /// seeds that had answered within 15 minutes, and `get_peers` queries sent (sampling node
+    /// and lookups) per torrent stored.
+    pub lookup_answered_share: f64,
+    pub lookup_seeds_fresh_share: f64,
+    pub queries_per_stored: f64,
+    /// Since the start: pool nodes dropped for never answering two queries, and lookup
+    /// candidates skipped for that reason.
+    pub pool_dropped_dead: u64,
+    pub lookup_dead_skipped: u64,
 }
 
 /// Router port mappings for the crawler (D57, D72).

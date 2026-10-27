@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use magnetar_core::dht::krpc::{self, Body, CompactNode, Id, Message, Response};
 use magnetar_core::dht::lookup::{Method, lookup};
-use magnetar_core::dht::{Dht, EngineConfig, Mode, collect_peers};
+use magnetar_core::dht::{Dht, EngineConfig, Mode, Tier, collect_peers};
 use tokio::net::UdpSocket;
 
 #[derive(Clone)]
@@ -23,6 +23,11 @@ struct Script {
 
 /// A node on its own loopback address that answers every query as scripted.
 async fn node(ip: Ipv4Addr, s: Script) -> SocketAddrV4 {
+    node_with(ip, s, Vec::new()).await
+}
+
+/// [`node`] that also returns `nodes` in every answer.
+async fn node_with(ip: Ipv4Addr, s: Script, nodes: Vec<CompactNode>) -> SocketAddrV4 {
     let sock = UdpSocket::bind((ip, 0)).await.unwrap();
     let addr = match sock.local_addr().unwrap() {
         SocketAddr::V4(a) => a,
@@ -44,6 +49,7 @@ async fn node(ip: Ipv4Addr, s: Script) -> SocketAddrV4 {
                 body: Body::Response(Response {
                     id: s.id,
                     values: s.values.clone(),
+                    nodes: nodes.clone(),
                     token: Some(b"tok".to_vec()),
                     ..Default::default()
                 }),
@@ -364,5 +370,159 @@ async fn the_pace_queue_does_not_fill_the_transaction_map() {
         "{:?}",
         rs.iter().find(|r| r.is_err())
     );
+    d.shutdown().await;
+}
+
+/// D95: lookups rank their seeds by responsiveness. 4 silent pool nodes nearest the target, 4
+/// answering ones (with peers) further out. The first lookup asks the silent ones first (all
+/// untried, nearest first) and strikes them; the second gets the answering ones as its first
+/// seeds and silences the struck ones a second time, which drops them as dead; the third never
+/// asks them. Every lookup still ends and finds the peers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lookups_prefer_nodes_that_answer() {
+    let t: Id = rand::random();
+    let mut silent = Vec::new();
+    for i in 0..4u8 {
+        let id = near(&t, 40 + i as usize, i);
+        let a = node(
+            Ipv4Addr::new(127, 0, 36, 10 + i),
+            Script {
+                id,
+                delay: None,
+                values: vec![],
+            },
+        )
+        .await;
+        silent.push(CompactNode { id, addr: a });
+    }
+    let mut live = Vec::new();
+    for i in 0..4u8 {
+        let id = near(&t, 20 + i as usize, 10 + i);
+        let a = node(
+            Ipv4Addr::new(127, 0, 36, 20 + i),
+            Script {
+                id,
+                delay: Some(Duration::ZERO),
+                values: vec![peer(&format!("9.9.9.{}:1", 20 + i))],
+            },
+        )
+        .await;
+        live.push(CompactNode { id, addr: a });
+    }
+    let mut c = EngineConfig::new(Mode::Polite);
+    c.bind = Ipv4Addr::new(127, 0, 36, 1);
+    c.ports = vec![0];
+    c.qps = 1000;
+    c.allow_loopback = true;
+    c.sample = false;
+    // Soft = hard timeout: a silent query is waited for and ends as a timeout (a strike).
+    c.query_timeout = Duration::from_millis(300);
+    c.lookup_timeout = Duration::from_millis(300);
+    c.per_ip_qps = 100.0;
+    let (d, _rx) = Dht::start(c).await.unwrap();
+    let far = t.map(|b| !b); // learnt "while looking for" another target: no node-farm rule
+    let all: Vec<CompactNode> = silent.iter().chain(&live).copied().collect();
+    d.learn_nodes(&all, &far);
+    let seeds = d.lookup_seeds(&t, 16);
+    assert_eq!(seeds.len(), 8);
+    assert!(seeds.iter().all(|(_, tier)| *tier == Tier::Unknown));
+    assert_eq!(seeds[0].0, silent[3], "untried: nearest first");
+
+    let mut found = 0;
+    for round in 0..3 {
+        let c = collect_peers(&d, t, None, None, Duration::from_secs(5), 0).await;
+        assert!(c.looked_up);
+        assert_eq!(c.peers.len(), 4, "round {round}: {c:?}");
+        found += c.peers.len();
+        let st = d.stats();
+        match round {
+            0 => {
+                assert_eq!(c.queries, 8);
+                assert_eq!(st.pool.dropped_dead, 0);
+                let seeds = d.lookup_seeds(&t, 16);
+                let tiers: Vec<Tier> = seeds.iter().map(|(_, t)| *t).collect();
+                assert_eq!(&tiers[..4], &[Tier::Fresh; 4], "{seeds:?}");
+                assert_eq!(&tiers[4..], &[Tier::Struck; 4]);
+                assert!(seeds[..4].iter().all(|(n, _)| live.contains(n)));
+            }
+            1 => {
+                // Struck nodes are still in the window by distance and asked after the live ones.
+                assert_eq!(c.queries, 8);
+                assert_eq!(st.pool.dropped_dead, 4);
+            }
+            _ => {
+                assert_eq!(c.queries, 4, "dead nodes are not asked");
+                assert_eq!(d.lookup_seeds(&t, 16).len(), 4);
+            }
+        }
+    }
+    assert_eq!(found, 12);
+    let st = d.stats();
+    // Lookup answers: 4 + 4 + 4 of 8 + 8 + 4 queries.
+    assert_eq!((st.lookup_queries, st.lookup_answered), (20, 12));
+    assert_eq!(st.pool.dead_known, 4);
+    d.shutdown().await;
+}
+
+/// D95: contacts that answers name but the pool dropped as dead are not walked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dead_contacts_in_answers_are_skipped() {
+    let t: Id = rand::random();
+    let dead_id = near(&t, 60, 1);
+    let dead = node(
+        Ipv4Addr::new(127, 0, 37, 10),
+        Script {
+            id: dead_id,
+            delay: None,
+            values: vec![],
+        },
+    )
+    .await;
+    let dead_node = CompactNode {
+        id: dead_id,
+        addr: dead,
+    };
+    let id = near(&t, 20, 2);
+    let a = node_with(
+        Ipv4Addr::new(127, 0, 37, 11),
+        Script {
+            id,
+            delay: Some(Duration::ZERO),
+            values: vec![peer("9.9.9.37:1")],
+        },
+        vec![dead_node],
+    )
+    .await;
+    let mut c = EngineConfig::new(Mode::Polite);
+    c.bind = Ipv4Addr::new(127, 0, 37, 1);
+    c.ports = vec![0];
+    c.qps = 1000;
+    c.allow_loopback = true;
+    c.sample = false;
+    c.query_timeout = Duration::from_millis(300);
+    c.lookup_timeout = Duration::from_millis(300);
+    c.per_ip_qps = 100.0;
+    let (d, _rx) = Dht::start(c).await.unwrap();
+    d.learn_nodes(&[dead_node], &t.map(|b| !b));
+    for _ in 0..2 {
+        let _ = d
+            .query(0, dead, magnetar_core::dht::krpc::Query::Ping)
+            .await;
+    }
+    assert_eq!(d.stats().pool.dropped_dead, 1);
+    let r = lookup(
+        &d,
+        0,
+        t,
+        Method::GetPeers,
+        vec![CompactNode { id, addr: a }],
+        vec![],
+        Duration::from_secs(5),
+        0,
+    )
+    .await;
+    assert_eq!((r.queried, r.answered, r.dead_skipped), (1, 1, 1));
+    assert_eq!(r.peers, vec![peer("9.9.9.37:1")]);
+    assert_eq!(d.stats().lookup_dead_skipped, 1);
     d.shutdown().await;
 }

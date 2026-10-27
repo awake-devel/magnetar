@@ -51,6 +51,12 @@ struct Snap {
     /// Sent / answered by node age: young, old, unpooled, repeat (D93).
     age_sent: [u64; 4],
     age_answered: [u64; 4],
+    /// D95: lookup queries answered, seeds (fresh, all), `get_peers` sent, torrents stored.
+    lookup_answered: u64,
+    seeds_fresh: u64,
+    seeds: u64,
+    get_peers: u64,
+    stored: u64,
 }
 
 struct Running {
@@ -120,6 +126,11 @@ fn snap(p: &Pipeline, dht: &Dht) -> Snap {
             e.by_node_age.unpooled_answered,
             e.by_node_age.repeat_answered,
         ],
+        lookup_answered: e.lookup_answered,
+        seeds_fresh: e.lookup_seeds_fresh,
+        seeds: e.lookup_seeds_fresh + e.lookup_seeds_unknown + e.lookup_seeds_struck,
+        get_peers: e.sent_get_peers,
+        stored: persisted.stored,
     }
 }
 
@@ -285,6 +296,16 @@ impl DhtService {
         out.answered_share_old = age(1);
         out.answered_share_unpooled = age(2);
         out.answered_share_repeat = age(3);
+        // D95.
+        out.lookup_answered_share = share(
+            d(cur.lookup_answered, old.lookup_answered),
+            d(cur.lookup_queries, old.lookup_queries),
+        );
+        out.lookup_seeds_fresh_share =
+            share(d(cur.seeds_fresh, old.seeds_fresh), d(cur.seeds, old.seeds));
+        out.queries_per_stored = share(d(cur.get_peers, old.get_peers), d(cur.stored, old.stored));
+        out.pool_dropped_dead = e.pool.dropped_dead;
+        out.lookup_dead_skipped = e.lookup_dead_skipped;
         out
     }
 

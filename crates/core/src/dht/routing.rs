@@ -196,6 +196,35 @@ impl RoutingTable {
         all.into_iter().take(k).map(|(_, n)| n).collect()
     }
 
+    /// [`RoutingTable::closest`] with a lookup tier (D95): good → fresh, a failure since the
+    /// last answer → struck, otherwise unknown.
+    pub fn closest_ranked(
+        &self,
+        target: &NodeId,
+        k: usize,
+        now: Instant,
+    ) -> Vec<(CompactNode, super::pool::Tier)> {
+        use super::pool::Tier;
+        let mut all: Vec<(NodeId, CompactNode, Tier)> = self
+            .buckets
+            .iter()
+            .flat_map(|b| b.entries.iter())
+            .filter(|e| !e.is_bad())
+            .map(|e| {
+                let t = if e.fails > 0 {
+                    Tier::Struck
+                } else if e.is_good(now) {
+                    Tier::Fresh
+                } else {
+                    Tier::Unknown
+                };
+                (distance(&e.node.id, target), e.node, t)
+            })
+            .collect();
+        all.sort_unstable_by_key(|(d, _, _)| *d);
+        all.into_iter().take(k).map(|(_, n, t)| (n, t)).collect()
+    }
+
     /// Up to `n` good contacts (for persistence between runs, BEP 5).
     pub fn good(&self, now: Instant, n: usize) -> Vec<CompactNode> {
         self.buckets

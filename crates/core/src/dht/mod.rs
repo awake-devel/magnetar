@@ -18,3 +18,4 @@ pub mod routing;
 pub use engine::{Dht, EngineConfig, EngineStats, Identity, Mode, QueryError, Sighting, Via};
 pub use krpc::{CompactNode, Id};
 pub use lookup::{Collected, collect_peers};
+pub use pool::Tier;

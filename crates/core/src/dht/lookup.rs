@@ -6,6 +6,10 @@
 //! out, or (for `get_peers`) once enough peers are known. Node-farm rules (D45): ids sharing ≥ 64
 //! bits with the target and IPs answering from ≥ 3 ports are not walked through and their
 //! `values` are ignored.
+//!
+//! Responsiveness (D95): seeds are ranked by [`rank_seeds`] (nodes that answered recently first),
+//! within the walk's window candidates are asked in [`Tier`] order (then by distance), and
+//! contacts the pool dropped as dead (never answered, silent twice) are not walked at all.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -19,6 +23,7 @@ use tokio::time::Instant;
 use super::engine::{Dht, FARM_PREFIX_BITS, QueryError};
 use super::id::{common_prefix_bits, distance};
 use super::krpc::{CompactNode, Id, Query, Response};
+use super::pool::Tier;
 
 const WIDTH: usize = 16;
 const DONE: usize = 8;
@@ -49,6 +54,7 @@ enum St {
 struct Cand {
     id: Option<Id>,
     st: St,
+    tier: Tier,
     values: Vec<SocketAddrV4>,
 }
 
@@ -62,6 +68,8 @@ pub struct LookupResult {
     pub late: u32,
     /// Closest answering nodes, nearest first.
     pub closest: Vec<CompactNode>,
+    /// Contacts not walked because the pool dropped them as dead (D95).
+    pub dead_skipped: u32,
 }
 
 /// Walk towards `target` from `seeds` (known ids) and `extra` (addresses without ids, e.g. the
@@ -132,24 +140,36 @@ pub async fn lookup_into(
     let mut cands: HashMap<SocketAddrV4, Cand> = HashMap::new();
     // Candidates per IP, kept as candidates are added (the node-farm port rule).
     let mut ports: HashMap<Ipv4Addr, usize> = HashMap::new();
+    // Dead contacts are not added (D95); returns 1 when one was skipped.
     let add = |cands: &mut HashMap<SocketAddrV4, Cand>,
                ports: &mut HashMap<Ipv4Addr, usize>,
                a: SocketAddrV4,
-               id: Option<Id>| {
+               id: Option<Id>,
+               tier: Tier|
+     -> u64 {
+        if tier == Tier::Dead {
+            return u64::from(!cands.contains_key(&a));
+        }
         if let std::collections::hash_map::Entry::Vacant(v) = cands.entry(a) {
             v.insert(Cand {
                 id,
                 st: St::New,
+                tier,
                 values: Vec::new(),
             });
             *ports.entry(*a.ip()).or_default() += 1;
         }
+        0
     };
-    for s in seeds {
-        add(&mut cands, &mut ports, s.addr, Some(s.id));
-    }
-    for a in extra {
-        add(&mut cands, &mut ports, a, None);
+    let mut dead = 0u64;
+    let first: Vec<(SocketAddrV4, Option<Id>)> = seeds
+        .iter()
+        .map(|s| (s.addr, Some(s.id)))
+        .chain(extra.iter().map(|a| (*a, None)))
+        .collect();
+    let addrs: Vec<SocketAddrV4> = first.iter().map(|(a, _)| *a).collect();
+    for ((a, id), t) in first.into_iter().zip(dht.tiers_of(&addrs)) {
+        dead += add(&mut cands, &mut ports, a, id, t);
     }
     let suspicious = |ports: &HashMap<Ipv4Addr, usize>, a: &SocketAddrV4, id: Option<Id>| {
         ports.get(a.ip()).copied().unwrap_or(0) >= FARM_PORTS
@@ -190,7 +210,11 @@ pub async fn lookup_into(
         if peers_enough || closest_done || Instant::now() >= deadline || dht.is_stopped() {
             break;
         }
-        for a in &window {
+        // Within the window, contacts likely to answer go first (D95); the window itself and
+        // the end test stay by distance.
+        let mut order = window.clone();
+        order.sort_by_key(|a| cands[a].tier); // stable: distance order within a tier
+        for a in &order {
             if waiting >= ALPHA || inflight.len() >= MAX_OUT {
                 break;
             }
@@ -265,6 +289,9 @@ pub async fn lookup_into(
         match r {
             Ok(r) => {
                 res.answered += 1;
+                if method == Method::GetPeers {
+                    dht.note_lookup_answered();
+                }
                 if was == Some(St::Slow) {
                     res.late += 1;
                     if method == Method::GetPeers {
@@ -284,12 +311,12 @@ pub async fn lookup_into(
                 if let Some(c) = cands.get_mut(&addr) {
                     c.values = std::mem::take(&mut values);
                 }
-                dht.learn_nodes(&r.nodes, &target);
-                for n in r.nodes {
+                let tiers = dht.learn_ranked(&r.nodes, &target);
+                for (n, t) in r.nodes.into_iter().zip(tiers) {
                     if cands.len() >= MAX_CANDIDATES {
                         break;
                     }
-                    add(&mut cands, &mut ports, n.addr, Some(n.id));
+                    dead += add(&mut cands, &mut ports, n.addr, Some(n.id), t);
                 }
             }
             Err(_) => {
@@ -299,6 +326,8 @@ pub async fn lookup_into(
             }
         }
     }
+    dht.note_dead_skipped(dead);
+    res.dead_skipped += dead as u32;
     let mut peers: Vec<SocketAddrV4> = Vec::new();
     let mut seen = HashSet::new();
     for (a, c) in &cands {
@@ -324,6 +353,24 @@ pub async fn lookup_into(
 }
 
 const K_RESULT: usize = 8;
+
+/// Pick `k` lookup seeds from candidates with their tiers (D95): dead ones never, one per
+/// address (its best tier), then by tier (answered recently, untried, silent since) and within
+/// a tier by distance to `target`. The candidates are the closest few dozen known contacts, so
+/// a responsive seed is at most a couple of prefix bits further out than the nearest one, and
+/// the walk regains that in its first round; an unanswered seed costs a query of the budget.
+pub fn rank_seeds(
+    mut cands: Vec<(CompactNode, Tier)>,
+    target: &Id,
+    k: usize,
+) -> Vec<(CompactNode, Tier)> {
+    cands.retain(|(_, t)| *t != Tier::Dead);
+    cands.sort_by_key(|(n, t)| (n.addr, *t));
+    cands.dedup_by_key(|(n, _)| n.addr);
+    cands.sort_by_key(|(n, t)| (*t, distance(&n.id, target), n.addr));
+    cands.truncate(k);
+    cands
+}
 
 /// Peers found for one infohash, and how.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -398,7 +445,11 @@ pub async fn collect_peers(
     }
     if out.peers.is_empty() && budget > Duration::ZERO {
         out.looked_up = true;
-        let seeds = dht.closest_known(&info_hash, WIDTH);
+        let seeds: Vec<CompactNode> = dht
+            .lookup_seeds(&info_hash, WIDTH)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
         let extra = if seeds.len() < DONE {
             dht.bootstrap_addrs().to_vec()
         } else {
@@ -463,4 +514,66 @@ pub async fn collect_peers(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cn(id: Id, i: u32) -> CompactNode {
+        CompactNode {
+            id,
+            addr: SocketAddrV4::new(Ipv4Addr::from(0x0200_0000 + i), 6881),
+        }
+    }
+
+    /// An id sharing `bits` leading bits with `t`.
+    fn near(t: &Id, bits: usize) -> Id {
+        let mut id = *t;
+        id[bits / 8] ^= 0x80 >> (bits % 8);
+        id
+    }
+
+    #[test]
+    fn seeds_rank_by_tier_then_distance() {
+        let t: Id = rand::random();
+        let cands = vec![
+            (cn(near(&t, 30), 1), Tier::Unknown),
+            (cn(near(&t, 40), 2), Tier::Struck),
+            (cn(near(&t, 50), 3), Tier::Dead),
+            (cn(near(&t, 10), 4), Tier::Fresh),
+            (cn(near(&t, 20), 5), Tier::Fresh),
+            (cn(near(&t, 25), 6), Tier::Unknown),
+        ];
+        let got: Vec<(u32, Tier)> = rank_seeds(cands.clone(), &t, 16)
+            .into_iter()
+            .map(|(n, t)| (u32::from(*n.addr.ip()) - 0x0200_0000, t))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (5, Tier::Fresh),
+                (4, Tier::Fresh),
+                (1, Tier::Unknown),
+                (6, Tier::Unknown),
+                (2, Tier::Struck),
+            ],
+            "fresh first (nearest first), dead never"
+        );
+        assert_eq!(rank_seeds(cands, &t, 2).len(), 2);
+    }
+
+    #[test]
+    fn a_contact_listed_twice_keeps_its_best_tier() {
+        let t: Id = rand::random();
+        let a = cn(near(&t, 30), 1);
+        let b = cn(near(&t, 31), 2);
+        let got = rank_seeds(
+            vec![(a, Tier::Struck), (b, Tier::Unknown), (a, Tier::Fresh)],
+            &t,
+            16,
+        );
+        assert_eq!(got, vec![(a, Tier::Fresh), (b, Tier::Unknown)]);
+        assert!(rank_seeds(Vec::new(), &t, 16).is_empty());
+    }
 }
