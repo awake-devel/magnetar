@@ -102,14 +102,14 @@ class MagnetarApi(
         return baseUrl.newBuilder().addPathSegments(rel).build()
     }
 
-    suspend fun trustSettings(): TrustSettings =
+    override suspend fun trustSettings(): TrustSettings =
         get("api/v1/settings/trust", RequestClass.DETAIL, TrustSettings.serializer())
 
     /**
      * `PUT /api/v1/settings/trust`. Sends both fields: a null [TrustSettings.root] clears the
      * root, so pass the current one when only the threshold changes.
      */
-    suspend fun putTrustSettings(settings: TrustSettings): TrustSettings = send(
+    override suspend fun putTrustSettings(settings: TrustSettings): TrustSettings = send(
         "PUT", "api/v1/settings/trust", RequestClass.DETAIL,
         encode(TrustSettings.serializer(), settings), TrustSettings.serializer(),
     )
@@ -144,6 +144,41 @@ class MagnetarApi(
         }.build()
         val text = execute(Request.Builder().url(url).get().build(), RequestClass.POLL)
         return decode(SavedSearchPoll.serializer(), text)
+    }
+
+    /** Feature `stats` (D47): seed checks, index, relays, crawler, DHT crawler. */
+    override suspend fun statsHealth(): StatsHealth =
+        get("api/v1/stats/health", RequestClass.STATS, StatsHealth.serializer())
+
+    /** Feature `stats`; 503 `search_index_unavailable` while the index builds. */
+    override suspend fun breakdown(request: BreakdownRequest): BreakdownSet = post(
+        "api/v1/stats/breakdown", RequestClass.STATS,
+        BreakdownRequest.serializer(), request.copy(top = request.top.coerceIn(1, 50)), BreakdownSet.serializer(),
+    )
+
+    /** Feature `stats`: [metrics] per `hour` or `day` (UTC buckets) since [since] (server default when null). */
+    override suspend fun timeseries(metrics: List<String>, bucket: String, since: Long?): TimeseriesSet {
+        val url = url("api/v1/stats/timeseries").newBuilder().apply {
+            addQueryParameter("metric", metrics.joinToString(","))
+            addQueryParameter("bucket", if (bucket == "hour") "hour" else "day")
+            if (since != null) addQueryParameter("since", since.toString())
+        }.build()
+        return decode(TimeseriesSet.serializer(), execute(Request.Builder().url(url).get().build(), RequestClass.STATS))
+    }
+
+    /**
+     * Feature `graphs`: `wot`, `relays`, `media/{id}`, `swarm/{infohash}`; anything else is
+     * refused before a request is made.
+     */
+    override suspend fun graph(path: String): Graph {
+        val p = when {
+            path == "wot" || path == "relays" -> path
+            path.startsWith("media/") && path.removePrefix("media/").toLongOrNull()?.let { it > 0 } == true ->
+                "media/" + path.removePrefix("media/").toLong()
+            path.startsWith("swarm/") -> "swarm/" + segment(path.removePrefix("swarm/"))
+            else -> throw ApiException.NotFound("No such graph")
+        }
+        return get("api/v1/graphs/$p", RequestClass.STATS, Graph.serializer())
     }
 
     // --- plumbing ---

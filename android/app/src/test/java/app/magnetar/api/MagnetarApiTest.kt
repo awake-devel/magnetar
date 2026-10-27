@@ -403,4 +403,64 @@ class MagnetarApiTest {
         assertNull(a.posterUrl("//evil.example/x.jpg"))
         assertNull(a.posterUrl("/api/../../x"))
     }
+
+    @Test
+    fun `stats endpoints`() = runBlocking {
+        server.enqueue(
+            json(
+                """{"torrents":958106,"liveness":{"enabled":true,"torrents":957462,"never_checked":367301,"due_now":431893,
+                "checked_24h":575104,"checks_per_hour":30000,"alive":340984,"dead":233018,"unknown":16159,"trackers":9,
+                "trackers_backed_off":1,"dht_nodes":4096,"last_batch":{"items":2000,"hashes":2000,"ms":178861,"new_field":1},
+                "last_batch_at":1793068974},"search_index":{"state":"ready","docs":958088,"pending":96,"lag_secs":1},
+                "relays":{"total":1476,"enabled":1476,"ok_24h":1019,"failing":470,"productive":88},
+                "crawler":{"running":true,"last_run":1793069082,"last_report":{"relays_tried":40,"relays_ok":40,"errors":[]},"passes":8},
+                "media_linked":413971,"attrs_missing":0,"computed_at":1793069116,
+                "dht":{"mode":"aggressive","running":true,"ports":[6891,6892],"queries_per_sec":2779.27,"blocked_total":4982,
+                "upnp":{"state":"off","mappings":[]}}}""",
+            ),
+        )
+        val h = api().statsHealth()
+        assertEquals(h.liveness?.neverChecked, 367301L)
+        assertEquals(h.liveness?.lastBatch?.ms, 178861L)
+        assertEquals(h.relays.ok24h, 1019L)
+        assertEquals(h.dht?.blockedTotal, 4982L)
+        assertEquals(h.dht?.ports, listOf(6891, 6892))
+        assertEquals(server.takeRequest().url.encodedPath, "/api/v1/stats/health")
+
+        server.enqueue(json("""{"total":5,"breakdowns":[{"field":"language","total":5,"counts":[{"value":"fr","count":3}],"other":1,"other_values":1,"missing":1}],"computed_at":1}"""))
+        val b = api().breakdown(BreakdownRequest(SearchQuery(includeAdult = false), listOf("language"), top = 500))
+        assertEquals(b.field("language")?.counts?.single()?.count, 3L)
+        val br = server.takeRequest()
+        assertEquals(br.method, "POST")
+        assertEquals(br.url.encodedPath, "/api/v1/stats/breakdown")
+        val body = br.body!!.utf8()
+        assertTrue(body.contains("\"top\":50"), body)
+        assertTrue(body.contains("\"include_adult\":false"), body)
+
+        server.enqueue(json("""{"since":1,"until":2,"series":[{"metric":"db_size","kind":"gauge","bucket":"day","points":[{"at":1,"value":11510920895}]}]}"""))
+        val t = api().timeseries(listOf("db_size", "dht_torrents_added"), "hour", since = 100)
+        assertEquals(t.series.single().points.single().value, 11510920895L)
+        val tr = server.takeRequest()
+        assertEquals(tr.url.encodedPath, "/api/v1/stats/timeseries")
+        assertEquals(tr.url.queryParameter("metric"), "db_size,dht_torrents_added")
+        assertEquals(tr.url.queryParameter("bucket"), "hour")
+        assertEquals(tr.url.queryParameter("since"), "100")
+    }
+
+    @Test
+    fun `graph paths are checked before anything is sent`() = runBlocking {
+        val ih = "ab".repeat(20)
+        server.enqueue(json("""{"kind":"swarm","nodes":[{"id":"$ih","kind":"torrent","label":"x","weight":3,"score":null,"detail":[]}],"edges":[],"truncated":false,"note":null}"""))
+        assertEquals(api().graph("swarm/${ih.uppercase()}").nodes.single().kind, "torrent")
+        assertEquals(server.takeRequest().url.encodedPath, "/api/v1/graphs/swarm/$ih")
+        server.enqueue(json("""{"kind":"media","nodes":[],"edges":[{"source":0,"target":1,"weight":1,"kind":"quality"}]}"""))
+        assertEquals(api().graph("media/42").edges.single().target, 1)
+        assertEquals(server.takeRequest().url.encodedPath, "/api/v1/graphs/media/42")
+        for (bad in listOf("../health", "media/x", "media/-1", "swarm/zz", "wot/../relays", "")) {
+            expect<ApiException.NotFound> { runBlocking { api().graph(bad) } }
+        }
+        assertEquals(server.requestCount, 2)
+        server.enqueue(json("""{"error":"not_found","message":"unknown media"}""", 404))
+        expect<ApiException.NotFound> { runBlocking { api().graph("media/7") } }
+    }
 }

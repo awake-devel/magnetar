@@ -10,7 +10,7 @@ import kotlinx.serialization.Serializable
  * (docs/APP.md §4). Lists of enum-like values (categories, media kinds) are plain strings, so a
  * value added by a newer server never fails a whole saved search.
  *
- * The stats and graph types are added by the stage that draws them.
+ * The stats and graph types are in StatsModels.kt.
  */
 
 /** `GET /health` (no auth). */

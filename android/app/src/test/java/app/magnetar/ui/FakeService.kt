@@ -1,6 +1,12 @@
 package app.magnetar.ui
 
+import app.magnetar.api.BreakdownRequest
+import app.magnetar.api.BreakdownSet
 import app.magnetar.api.FacetSet
+import app.magnetar.api.Graph
+import app.magnetar.api.StatsHealth
+import app.magnetar.api.TimeseriesSet
+import app.magnetar.api.TrustSettings
 import app.magnetar.api.FacetsRequest
 import app.magnetar.api.Health
 import app.magnetar.api.Liveness
@@ -43,12 +49,27 @@ open class FakeService : MagnetarService {
     var checks = 0
     var updates = mutableListOf<SavedSearch>()
 
+    var trust = TrustSettings(root = null, threshold = 20)
+    val trustPuts = mutableListOf<TrustSettings>()
+    var trustError: Exception? = null
+    var statsHealthAnswer: () -> StatsHealth = { StatsHealth() }
+    var breakdownAnswer: (BreakdownRequest) -> BreakdownSet = { BreakdownSet() }
+    var breakdownError: Exception? = null
+    var breakdownDelayMs = 0L
+    val breakdownRequests = mutableListOf<BreakdownRequest>()
+    var timeseriesAnswer: (List<String>, String) -> TimeseriesSet = { _, _ -> TimeseriesSet() }
+    val timeseriesCalls = mutableListOf<Pair<List<String>, String>>()
+    var graphAnswer: (String) -> Graph = { Graph() }
+    val graphCalls = mutableListOf<String>()
+
     var healthDelayMs = 0L
+    var healthError: Exception? = null
     var healthCalls = 0
 
     override suspend fun health(): Health {
         healthCalls++
         kotlinx.coroutines.delay(healthDelayMs)
+        healthError?.let { throw it }
         return Health(status = "ok", version = "test", db = true, features = features)
     }
 
@@ -101,6 +122,37 @@ open class FakeService : MagnetarService {
     }
 
     override suspend fun pollSavedSearches(since: Long?, includeAdult: Boolean) = SavedSearchPoll()
+
+    override suspend fun trustSettings(): TrustSettings {
+        trustError?.let { throw it }
+        return trust
+    }
+
+    override suspend fun putTrustSettings(settings: TrustSettings): TrustSettings {
+        trustError?.let { throw it }
+        trustPuts += settings
+        trust = settings
+        return settings
+    }
+
+    override suspend fun statsHealth() = statsHealthAnswer()
+
+    override suspend fun breakdown(request: BreakdownRequest): BreakdownSet {
+        breakdownRequests += request
+        kotlinx.coroutines.delay(breakdownDelayMs)
+        breakdownError?.let { throw it }
+        return breakdownAnswer(request)
+    }
+
+    override suspend fun timeseries(metrics: List<String>, bucket: String, since: Long?): TimeseriesSet {
+        timeseriesCalls += metrics to bucket
+        return timeseriesAnswer(metrics, bucket)
+    }
+
+    override suspend fun graph(path: String): Graph {
+        graphCalls += path
+        return graphAnswer(path)
+    }
 
     companion object {
         fun hit(title: String, ih: String = "%040x".format(title.hashCode().toLong() and 0xffffffffL)) =

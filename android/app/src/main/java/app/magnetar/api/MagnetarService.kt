@@ -18,4 +18,12 @@ interface MagnetarService {
     suspend fun updateSavedSearch(search: SavedSearch): SavedSearch
     suspend fun deleteSavedSearch(id: Long)
     suspend fun pollSavedSearches(since: Long?, includeAdult: Boolean): SavedSearchPoll
+    suspend fun trustSettings(): TrustSettings
+    suspend fun putTrustSettings(settings: TrustSettings): TrustSettings
+    suspend fun statsHealth(): StatsHealth
+    suspend fun breakdown(request: BreakdownRequest): BreakdownSet
+    suspend fun timeseries(metrics: List<String>, bucket: String, since: Long? = null): TimeseriesSet
+
+    /** [path]: `wot`, `relays`, `media/{id}` or `swarm/{infohash}`. */
+    suspend fun graph(path: String): Graph
 }
