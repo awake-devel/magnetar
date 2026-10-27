@@ -215,6 +215,21 @@ class SearchViewModelTest {
     }
 
     @Test
+    fun `an invalid server URL asks for Settings instead of saying unreachable`() = runTest {
+        val fake = FakeService()
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        val settings = MutableStateFlow(AppSettings(serverUrl = "not a url", apiToken = "t"))
+        val r = app.magnetar.data.Repository(
+            settings, { s -> app.magnetar.api.MagnetarApi.create(s.serverUrl, s.apiToken) }, null, backgroundScope,
+            StandardTestDispatcher(testScheduler),
+        )
+        val vm = SearchViewModel(r, clock = { currentTime })
+        advanceUntilIdle()
+        assertTrue(vm.state.value.notConfigured)
+        assertTrue(fake.searches.isEmpty())
+    }
+
+    @Test
     fun `the open sheet asks for live counts of its draft, debounced`() = runTest {
         val fake = FakeService()
         fake.facetAnswer = { FacetSet(total = 3, facets = listOf(FacetCounts("resolution", 3, listOf(FacetCount("1080p", 3))))) }

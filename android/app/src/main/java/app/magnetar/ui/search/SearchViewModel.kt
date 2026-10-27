@@ -215,8 +215,10 @@ class SearchViewModel(
             onTiming("${clock() - r.askedAtMs} cached len=${r.text.trim().length}")
         }
         try {
+            // An invalid server URL is NotConfigured, not "unreachable".
+            val service = repo.service()
             if (health == null) throw ApiException.Network(java.io.IOException("health unreachable"))
-            val page = repo.service().search(query(r, features))
+            val page = service.search(query(r, features))
             val hits = visible(page.hits, r, features)
             _state.update {
                 // Same first hit as the preview: keep the scroll position.
