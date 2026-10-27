@@ -33,6 +33,9 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import app.magnetar.MagnetarApp
 import app.magnetar.api.Features
+import app.magnetar.api.MagnetarApi
+import app.magnetar.ui.graph.GraphScreen
+import app.magnetar.ui.graph.GraphViewModel
 import app.magnetar.ui.common.AppIcons
 import app.magnetar.ui.detail.DetailScreen
 import app.magnetar.ui.detail.DetailViewModel
@@ -41,7 +44,9 @@ import app.magnetar.ui.saved.SavedViewModel
 import app.magnetar.ui.search.SearchScreen
 import app.magnetar.ui.search.SearchViewModel
 import app.magnetar.ui.settings.SettingsScreen
+import app.magnetar.ui.settings.SettingsViewModel
 import app.magnetar.ui.stats.StatsScreen
+import app.magnetar.ui.stats.StatsViewModel
 import app.magnetar.ui.title.TitleScreen
 import app.magnetar.ui.title.TitleViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -57,8 +62,12 @@ enum class Tab(val route: String, val label: String, val icon: () -> ImageVector
 object Routes {
     const val TORRENT = "torrent/{infohash}"
     const val TITLE = "title/{mediaId}"
+    const val GRAPH = "graph?path={path}"
     fun torrent(infohash: String) = "torrent/$infohash"
     fun title(mediaId: Long) = "title/$mediaId"
+
+    /** [path]: `wot`, `relays`, `media/{id}`, `swarm/{infohash}` (an argument, so the slash is kept). */
+    fun graph(path: String) = "graph?path=" + android.net.Uri.encode(path)
 }
 
 @OptIn(ExperimentalComposeUiApi::class)
@@ -74,6 +83,9 @@ fun AppShell(app: MagnetarApp, openTorrent: MutableStateFlow<String?>) {
     // The title page needs `media_releases` (D44): an older server would answer 404.
     val toTitle: (Long) -> Unit = { id -> nav.navigate(Routes.title(id)) }
     val openTitle = toTitle.takeIf { health?.has(Features.MEDIA_RELEASES) == true }
+    // The graphs need `graphs` (D47).
+    val toGraph: (String) -> Unit = { path -> nav.navigate(Routes.graph(path)) }
+    val openGraph = toGraph.takeIf { health?.has(Features.GRAPHS) == true }
 
     // Activity-scoped: the search, its filters and its scroll survive tab switches, and the
     // title page reads the active filters from it.
@@ -127,8 +139,45 @@ fun AppShell(app: MagnetarApp, openTorrent: MutableStateFlow<String?>) {
                     notificationsOn = settings.notifySavedSearches,
                 )
             }
-            composable(Tab.STATS.route) { StatsScreen() }
-            composable(Tab.SETTINGS.route) { SettingsScreen(app) }
+            composable(Tab.STATS.route) {
+                val vm: StatsViewModel = viewModel(factory = viewModelFactory { initializer { StatsViewModel(repo) } })
+                StatsScreen(
+                    vm = vm,
+                    onSearch = { nav.switchTab(Tab.SEARCH.route) },
+                    onOpenGraph = toGraph,
+                    onOpenSettings = { nav.switchTab(Tab.SETTINGS.route) },
+                )
+            }
+            composable(Tab.SETTINGS.route) {
+                val vm: SettingsViewModel = viewModel(
+                    factory = viewModelFactory {
+                        initializer {
+                            SettingsViewModel(
+                                repo = repo,
+                                update = app.settingsStore::update,
+                                serviceFor = { s -> MagnetarApi.create(s.serverUrl, s.apiToken, app.http) },
+                            )
+                        }
+                    },
+                )
+                SettingsScreen(vm = vm, settings = settings, health = health)
+            }
+            composable(
+                Routes.GRAPH,
+                arguments = listOf(navArgument("path") { type = NavType.StringType; defaultValue = "wot" }),
+            ) { entry ->
+                val path = entry.arguments?.getString("path").orEmpty()
+                val vm: GraphViewModel = viewModel(
+                    viewModelStoreOwner = entry,
+                    factory = viewModelFactory { initializer { GraphViewModel(repo, path) } },
+                )
+                GraphScreen(
+                    vm = vm,
+                    onBack = { nav.popBackStack() },
+                    onOpenTorrent = { nav.navigate(Routes.torrent(it)) },
+                    onOpenMedia = toTitle,
+                )
+            }
             composable(Routes.TORRENT, arguments = listOf(navArgument("infohash") { type = NavType.StringType })) { entry ->
                 val infohash = entry.arguments?.getString("infohash").orEmpty()
                 val vm: DetailViewModel = viewModel(
@@ -140,6 +189,7 @@ fun AppShell(app: MagnetarApp, openTorrent: MutableStateFlow<String?>) {
                     threshold = settings.trustThreshold,
                     onBack = { nav.popBackStack() },
                     onOpenMedia = openTitle,
+                    onOpenGraph = openGraph,
                 )
             }
             composable(Routes.TITLE, arguments = listOf(navArgument("mediaId") { type = NavType.LongType })) { entry ->
@@ -153,6 +203,7 @@ fun AppShell(app: MagnetarApp, openTorrent: MutableStateFlow<String?>) {
                     threshold = settings.trustThreshold,
                     onBack = { nav.popBackStack() },
                     onOpenTorrent = { nav.navigate(Routes.torrent(it)) },
+                    onOpenGraph = openGraph,
                 )
             }
         }

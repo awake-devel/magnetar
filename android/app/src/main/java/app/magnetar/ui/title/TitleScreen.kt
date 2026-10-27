@@ -37,6 +37,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.magnetar.api.MediaInfo
 import app.magnetar.api.ReleaseGroup
+import app.magnetar.ui.common.AppIcons
 import app.magnetar.ui.common.Banner
 import app.magnetar.ui.common.CenteredMessage
 import app.magnetar.ui.common.Poster
@@ -64,7 +65,13 @@ fun groupHeading(g: ReleaseGroup): String = listOf(
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-fun TitleScreen(vm: TitleViewModel, threshold: Int, onBack: () -> Unit, onOpenTorrent: (String) -> Unit) {
+fun TitleScreen(
+    vm: TitleViewModel,
+    threshold: Int,
+    onBack: () -> Unit,
+    onOpenTorrent: (String) -> Unit,
+    onOpenGraph: ((String) -> Unit)? = null,
+) {
     val state by vm.state.collectAsStateWithLifecycle()
     val r = state.releases
     val media = r?.media
@@ -73,6 +80,13 @@ fun TitleScreen(vm: TitleViewModel, threshold: Int, onBack: () -> Unit, onOpenTo
             TopAppBar(
                 title = { Text(media?.title ?: "Releases", maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
+                actions = {
+                    onOpenGraph?.let { open ->
+                        IconButton(onClick = { open("media/${vm.mediaId}") }, modifier = Modifier.testTag("title_graph")) {
+                            Icon(AppIcons.Graph, "Releases graph")
+                        }
+                    }
+                },
             )
         },
     ) { padding ->

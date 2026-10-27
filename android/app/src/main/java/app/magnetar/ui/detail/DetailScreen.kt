@@ -86,7 +86,13 @@ private const val MAX_FILE_ROWS = 300
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DetailScreen(vm: DetailViewModel, threshold: Int, onBack: () -> Unit, onOpenMedia: ((Long) -> Unit)?) {
+fun DetailScreen(
+    vm: DetailViewModel,
+    threshold: Int,
+    onBack: () -> Unit,
+    onOpenMedia: ((Long) -> Unit)?,
+    onOpenGraph: ((String) -> Unit)? = null,
+) {
     val state by vm.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val snackbar = remember { SnackbarHostState() }
@@ -147,6 +153,7 @@ fun DetailScreen(vm: DetailViewModel, threshold: Int, onBack: () -> Unit, onOpen
                         onOpen = ::openMagnet,
                         onCheck = vm::checkNow,
                         onOpenMedia = onOpenMedia,
+                        onOpenGraph = onOpenGraph,
                     )
                 }
             }
@@ -165,6 +172,7 @@ private fun DetailBody(
     onOpen: () -> Unit,
     onCheck: () -> Unit,
     onOpenMedia: ((Long) -> Unit)?,
+    onOpenGraph: ((String) -> Unit)?,
 ) {
     val s = detail.summary
     val tree = remember(detail.files) { buildFileTree(detail.files) }
@@ -218,7 +226,9 @@ private fun DetailBody(
 
         detail.media?.let { m -> item { MediaCard(m, onOpenMedia) } }
 
-        item { SwarmCard(detail.liveness, s.bestPeers, checking, history, onCheck) }
+        item {
+            SwarmCard(detail.liveness, s.bestPeers, checking, history, onCheck, onGraph = onOpenGraph?.let { open -> { open("swarm/${s.infohash}") } })
+        }
 
         // DHT-only: no publisher, so no trust score; the card says why it is listed (D74).
         detail.dht?.let { d -> item { DhtCard(d, s.title) } }
@@ -381,7 +391,14 @@ private fun TrustCard(trust: TrustScore, threshold: Int, open: Boolean, onToggle
 
 /** Swarm: the latest check, *Check now*, and the seeder history (D45). */
 @Composable
-private fun SwarmCard(l: Liveness?, bestPeers: Int?, checking: Boolean, history: LivenessHistory?, onCheck: () -> Unit) {
+private fun SwarmCard(
+    l: Liveness?,
+    bestPeers: Int?,
+    checking: Boolean,
+    history: LivenessHistory?,
+    onCheck: () -> Unit,
+    onGraph: (() -> Unit)?,
+) {
     Card(Modifier.fillMaxWidth().padding(top = 12.dp).testTag("swarm_card")) {
         Column(Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -414,6 +431,13 @@ private fun SwarmCard(l: Liveness?, bestPeers: Int?, checking: Boolean, history:
             history?.let { h ->
                 Text("Seeders, last ${h.keepDays.takeIf { it > 0 } ?: 90} days", style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(top = 8.dp))
                 SeederHistoryChart(h.points)
+            }
+            onGraph?.let {
+                TextButton(onClick = it, modifier = Modifier.testTag("swarm_graph")) {
+                    Icon(AppIcons.Graph, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("Swarm graph")
+                }
             }
         }
     }
