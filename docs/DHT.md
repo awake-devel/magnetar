@@ -1,4 +1,4 @@
-# DHT crawler (ARCHITECTURE.md D49–D75)
+# DHT crawler (ARCHITECTURE.md D49–D76)
 
 Design document for the native Mainline DHT crawler. Status: **stages 1 (discovery), 2
 (metadata fetch) and 3 (classification and safety) built**: KRPC node, BEP 42 ids, routing,
@@ -440,7 +440,10 @@ Both modes honour every rule of §3.4 (interval, per-IP rate, honest ids, no fak
 
 - Incoming `announce_peer` (valid token): the announcer is a peer that **has** the torrent →
   infohash enters triage with the peer `(source IP, implied_port ? source port : port)` attached,
-  top priority. We also store it in the peer store (BEP 5: "the queried node should store the IP
+  top priority. The announcer's own `get_peers` usually came first, so the seen filter already
+  knows the hash: an announce with a peer bypasses it (§18, D76) and moves the queued hash to
+  the announce lane with that peer, hands the peer to a collection in flight, or goes to
+  Postgres triage again (which retries a `failed` row whose last attempt is > 10 min old). We also store it in the peer store (BEP 5: "the queried node should store the IP
   address … under the infohash"), 45 min TTL, 100 k entries, and serve it back honestly.
 - Incoming `get_peers`: the infohash enters triage (priority 1, no peer). We answer with our
   closest `nodes` and a token, and `values` only from the peer store.
@@ -473,8 +476,10 @@ samples / announces / get_peers ──► seen filter (2 × Bloom) ──► bat
   retry loop).
 - **Consumers**: peer collection (64 workers aggressive, 8 polite,
   `MAGNETAR_DHT_PEER_LOOKUPS`): announcer, else `get_peers` to the sampling node, else an
-  iterative lookup (≤ 10 s, stops at 12 peers). No peer at all → `failed` / `no_peers` with the
-  backoff below. Hashes with peers go through a bounded channel (capacity = fetch workers, so
+  iterative lookup (≤ 10 s, stops at 12 peers, `MAGNETAR_DHT_PEERS_PER_HASH`; a node silent for
+  1.5 s no longer holds up the walk, §18). No peer at all → `failed` / `no_peers` with the
+  backoff below, written by a status writer in batches (≤ 500 rows or 1 s, one statement), so a
+  collector never waits on the database (§18). Hashes with peers go through a bounded channel (capacity = fetch workers, so
   collection blocks while every fetcher is busy) to `MAGNETAR_DHT_FETCH_CONCURRENCY` fetch
   workers (stage 2); results are written by one persister in batches (§2.4, §14). A fetch cut
   short by a stop keeps its lease and comes back through the retry loop.
@@ -768,6 +773,8 @@ others are still planned (their stage in brackets).
 | `MAGNETAR_DHT_POOL` | `1000000` / `200000` | crawl pool size (nodes) |
 | `MAGNETAR_DHT_PEER_LOOKUPS` | `64` / `8` | peer collections (sampling node, then lookup) at once (D62) |
 | `MAGNETAR_DHT_FETCH_CONCURRENCY` | `128` / `16` | metadata fetches in flight |
+| `MAGNETAR_DHT_LOOKUP_TIMEOUT_MS` | `1500` | soft per-query timeout of lookups (100–4000, §18, D76) |
+| `MAGNETAR_DHT_PEERS_PER_HASH` | `12` | peers tried per hash by the fetcher, and where a lookup stops (1–64, §18) |
 | `MAGNETAR_DHT_METADATA_MAX` | `16777216` | bytes, per info dict |
 | `MAGNETAR_DHT_TCP_RATE` | `150` | new TCP connection attempts/s, all fetches (D66) |
 | `MAGNETAR_DHT_TCP_MAX` | `350` | TCP connections open at once (D66) |
@@ -829,6 +836,10 @@ when that is off. `--dry-run`: no database at all (dedupe in memory). `serve` st
   (aggressive), samples/h, new unique hashes/h, queue length by priority, fetches in flight,
   fetch ok/fail per hour by error code, hit rate, stored total, blocked total, adult share,
   `v2_only`/`private` counts, UPnP state (mapped ports, lease expiry, last error).
+- D76 adds (serde default, older servers leave them 0): `collected`, `from_source`, `looked_up`,
+  `announce_fetches`, `announce_upgraded`, `incoming_*` per query type, `fake_peers_skipped` /
+  `_banned` / `_tracked`, `lookup_mean_ms`, `queries_per_lookup`, `lookup_slow_share`, and the
+  answer share by node age `answered_share_young` / `_old` / `_unpooled` / `_repeat` (§18).
 - `stats_series` metrics: `dht_torrents_added`, `dht_hashes_seen`, `dht_fetch_ok`,
   `dht_fetch_fail`, `dht_blocked`; breakdown field `origin`.
 - Targets on the laptop (to be measured in stage 8): ≤ 25 % of one core, ≤ 400 MB RSS for the
@@ -1334,3 +1345,117 @@ with mapped ports, the app on a phone, the Docker image running the crawler (onl
 the Nostr ingest `blocked` rejection over HTTP (covered by the Postgres tests only: building a
 live blocked event would mean looking at the list), and a latency baseline on this copy before
 any DHT row (the index was built during the crawl; §16 measured 16.3 ms p95 before).
+
+## 18. Throughput work on a public line (D76, 2026-10-27)
+
+Starting point (production, direct fiber line, public IP, `QPS 3000`, `PEER_LOOKUPS 2048`,
+`FETCH_CONCURRENCY 2048`, `TCP_RATE 1000`, `TCP_MAX 4000`): ~2 700 metadata/min, KRPC at its
+cap, answered share falling 51 % → 43 % in 10 min, ~1 core. A packet-level study
+(`~/.cache/peer-reuse-research/REPORT.md`) found lookups running their whole 10 s budget, answers
+p50 100 ms / p99 559 ms / 0.25 % after 1 s, a ~1.2 s single-row `mark_failed` in the collector,
+announces lost after the announcer's own `get_peers`, and "accept-all" fake peers.
+
+### 18.1 What changed
+
+- **Lookup soft timeout and branch widening** (`MAGNETAR_DHT_LOOKUP_TIMEOUT_MS`, default 1500,
+  `core::dht::lookup`): a lookup waits for at most 4 queries; one unanswered 1.5 s after it was
+  **sent** turns *slow*: its slot goes to the next candidate and it no longer holds up the end of
+  the walk (it is left out of the closest-8 test), but its answer is still used until the 4 s
+  hard timeout (libtorrent's short timeout). A lookup has at most 8 queries out, slow ones
+  included. The `get_peers` to the sampling node uses the same timeout: past it the lookup
+  starts, and a late answer with peers still wins (the walk is dropped). Sampling, pings and
+  bucket refreshes keep the 4 s timeout.
+  *First build mistake, found live*: the soft timer started when a query joined the global pace
+  queue, and the transaction was registered before the pace wait. With 1024 lookups the pace
+  queue alone is seconds long, so nearly every query went "slow" before it left, lookups queued
+  ever more, and the pending map (cap QPS × 4 s × 2) refused 350 k queries as `busy`
+  (445 metadata/min instead of ~1 100). Now the timer runs from the send, and a transaction
+  exists only once its datagram is on the wire (`Dht::query_then`); tests
+  `the_soft_timeout_starts_at_the_send`, `the_pace_queue_does_not_fill_the_transaction_map`.
+- **Early stop counts usable peers only** (bug): "enough peers" counted every `values` entry,
+  also those of node-farm answers (ignored in the result) and non-global addresses (dropped
+  before the fetcher), so one such answer could end a walk with nothing usable.
+- **Status writes out of the collectors**: `no_peers` failures go to a writer task (≤ 500 rows
+  or 1 s, one `UPDATE … FROM unnest(…)`); a hash listed `n` times ends as after `n` single
+  writes (test `batched_failures_match_single_writes`). The old build at 1024 collectors
+  exhausted the Postgres pool with single-row updates: 415 "pool timed out" warnings in 10 min,
+  and triage batches failed with it.
+- **Triage off the receive loop** (bug): the loop awaited each Postgres triage statement
+  (mean 126 ms, up to 28 s measured), and meanwhile the engine's 10 000-sighting channel
+  overflowed: 14 896 (old build) to 152 876 sightings dropped per 10 min, never even recorded.
+  Batches now go to a triage task; when it is 16 batches behind, the current batch keeps
+  growing (up to 100 000 sightings, then new ones are dropped and counted as
+  `triage_dropped`), so the loop never waits on Postgres.
+- **Announces after the seen filter** (bug, 0 rows `via = announce` in production): an announce
+  with a peer for an already-seen hash moves the queued hash to the announce lane with that
+  peer, hands the peer to a collection in flight (it goes first in the fetch), or goes to
+  Postgres triage again (where the existing 10-min retry of a `failed` row now actually
+  applies; before, the seen filter hid every announce from it for 6–12 h). A sighting of higher
+  priority also moves a queued hash up (`FetchQueue::push`). `dht_seen.via` is set to announce.
+- **Fake-peer reputation** in `core::metainfo` (no middleware, no database, no address ranges): a
+  peer (`ip:port`) that accepts our BitTorrent handshake **for the hash** and then never sends
+  its BEP 10 extended handshake gets a strike (two when its peer id starts with `-XT` or
+  `cf-aa84-`, which only doubles a strike the behaviour earned); 3 strikes → skipped for 1 h;
+  strikes are forgotten 1 h after the last one, verified metadata clears them; LRU of 50 000
+  entries. Skipped peers do not use up the per-hash cap; a hash whose only peers are skipped
+  fails as `fake_peers`.
+- **Peers per hash** configurable (`MAGNETAR_DHT_PEERS_PER_HASH`, default 12, 1–64): the fetcher's
+  cap and where a lookup stops.
+- **Stats** (`DhtStats`, serde default, §10): `collected`, `from_source`, `looked_up`,
+  `announce_fetches`, `announce_upgraded`, incoming queries per type, `fake_peers_skipped` /
+  `_banned` / `_tracked`, `lookup_mean_ms`, `queries_per_lookup`, `lookup_slow_share` (over the
+  rate window), and **answer share by node age**: queries to pool nodes < 5 min old, older ones,
+  nodes not in the pool, and pool nodes asked again after answering a sample (`repeat`). The
+  `dht` command's report has the same plus triage timings, and logs one line a minute with
+  these rates.
+
+### 18.2 Measured (laptop on the same fiber line, production crawler running alongside)
+
+Release builds, `magnetar-server dht --mode aggressive --seconds 600`, fresh scratch database
+each (bootstrap from the routers), UDP 17891–17894 (before) / 18891–18894 (after),
+`QPS 1000`, `PEER_LOOKUPS 1024`, `FETCH_CONCURRENCY 2048`, `TCP_RATE 1000`, `TCP_MAX 4000`,
+`PROBE off`, no UPnP. Runs are sequential, so DHT conditions differ between them by a few
+percent.
+
+| run | metadata/min | fetch success | collected/min | q/s sent | answered | queries/lookup | lookup mean | TCP attempts/success | open TCP mean / max | CPU (of a core) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| old build (`ab51607`) | 1170 | 29.8 % | 6540 | 844 | 56.8 % | n/a | n/a | 16.8 | 702 / 1157 | 0.30 |
+| first D76 build (timer before the pace wait) | 446 | 25.5 % | 5149 | 377 | 67.6 % | 25.8 | 5.9 s | 18.2 | 286 / 690 | 0.15 |
+| timer fixed, triage still inline | 1025 | 29.9 % | 5679 | 803 | 56.8 % | 16.8 | 7.8 s | 17.2 | 621 / 1119 | 0.21 |
+| D76 (triage in its own task), 12 peers/hash | 1031 | 29.8 % | 5561 | 794 | 58.8 % | 16.9 | 8.0 s | 17.4 | 594 / 1218 | 0.33 |
+| D76 (triage in its own task), lookup timeout 4000 (no widening) | 1177 | 30.1 % | 6128 | 859 | 57.2 % | 15.2 | 7.9 s | 16.9 | 635 / 1154 | 0.28 |
+| D76 (triage in its own task), 256 lookups | 568 | 30.4 % | 2492 | 979 | 46.7 % | 32.1 | 6.2 s | 18.4 | 344 / 472 | 0.20 |
+| D76 (triage in its own task), 24 peers/hash | 1153 | 34.8 % | 5399 | 806 | 54.7 % | 17.5 | 8.2 s | 18.2 | 694 / 1307 | 0.23 |
+| D76 (triage in its own task), 48 peers/hash | 1131 | 34.7 % | 5340 | 789 | 58.2 % | 17.9 | 8.5 s | 21.7 | 848 / 1525 | 0.21 |
+
+The last change (the triage hand-off that never waits, below) came after these runs and was not
+measured live; in the D76 runs triage took up to 5.3 s, 15.6 s and 27.9 s (busy disk shared with
+the production database), and in the 4000 ms run 152 876 sightings were still dropped while the
+loop waited for its 16-batch slack.
+
+Old build: `marked_no_peers` 25 506, 415 pool-timeout warnings, 14 896 sightings dropped,
+484 316 lookup queries refused by our own per-IP limit (1 q/s, D54) against 506 623 sent.
+
+**Reading it.** At this setting the soft timeout does not raise throughput: the same build with
+the timeout at 4000 ms (no widening) did as well or better (1 177 vs 1 031 metadata/min, 15.2 vs
+16.9 queries per lookup, same ~8 s lookups). Lookups are bounded by the KRPC budget, not by
+silent nodes. Only ~15 % of lookup queries go slow once the timer runs
+from the send; the mean lookup stays ~8 s because each query first waits in the global pace
+queue (1024 lookups × 4 queries at ~800 q/s ≈ 5 s per round), and sent queries per collected
+hash stay ~8 (before 7.7). Fewer lookups (256) reach the KRPC cap (980 q/s) but collect less
+(2 450/min, 32 queries per lookup, sampling starved, 5 283 hashes left queued): the per-IP limit
+refuses fewer of their queries, so each walk sends more. What did help: **24 peers per hash**
+(success 29.8 % → 34.8 %); 48 gives nothing more (34.7 %, 1 131/min) for more TCP (21.7 attempts per success, up to 1 525 connections open). The fixes for the pool exhaustion and the dropped sightings
+remove losses that grow with load (production runs at 3× this rate).
+
+**Answer share by node age** (the 51 % → 43 % question): in every run the overall share falls
+over 10 min (e.g. 0.73 → 0.48), while pool nodes asked again after answering a sample keep
+answering **94–97 %** throughout, and nodes in the pool for more than 5 min 0.64–0.84. The fall
+comes from **young pool nodes** (0.73 → 0.35): contacts learned from answers, most of which never
+answer. So it is not the same nodes rate-limiting us; it is the pool filling with dead contacts
+and lookups seeding from them. Not changed here (candidates: prefer nodes that answered when
+seeding lookups, or only pool nodes that answered once).
+
+**Not verified**: the effect at production settings (QPS 3000, 2048 lookups) and over hours;
+whether the fake-peer skips reach the ~10 % of accepted handshakes the study saw (skips in
+10 min: 223, 381, 74, 305, 300 attempts in the five final runs, against ~180 k TCP attempts; 334–475 peers reached 3 strikes per run).
