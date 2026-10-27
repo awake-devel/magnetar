@@ -1487,4 +1487,92 @@ the defaults became `MAGNETAR_DHT_LOOKUP_TIMEOUT_MS=4000` and `MAGNETAR_DHT_PEER
 The same old build stored ~2 700/min the night before: the DHT varies a lot by hour, so only
 compare runs made close together.
 
-__SECTION19__
+## 19. Lookup seeds from nodes that answer (D95, 2026-10-27)
+
+§18.2 found that the falling answer share is pool dilution: young pool nodes, learnt from
+answers, mostly never answer (0.73 → 0.35 in 10 min), while nodes asked again after answering
+keep answering 94–97 %. Lookups are bounded by the KRPC budget, so every query to a silent node
+costs throughput. This section tracks responsiveness in memory and uses it when choosing whom a
+lookup asks.
+
+### 19.1 What changed (`core::dht::{pool, lookup, engine}`)
+
+- **Per-node responsiveness in the pool**: every query of ours to a pool node (lookup, sample,
+  ping, refresh) updates `heard` (last answer, error replies included) and `silent`
+  (unanswered queries in a row, reset by an answer). Two fields per entry, no new structure.
+  A query the walk drops while it waits counts as a silence once it waited the lookup timeout.
+  Without that, a walk that ended on its soft timer (equal to the hard one by default) won the
+  race against the hard timeout, and the silence was lost (seen as a flaky test).
+- **Tiers** (`pool::Tier`): *fresh* = answered within 15 min and not silent since; *unknown* =
+  never asked, or answered long ago; *struck* = silent at least once since its last answer;
+  *dead* = never answered and silent `DEAD_AFTER` = 2 times. A dead node is dropped from the
+  pool and its address goes into a FIFO set (pool cap / 4, 1 024–262 144 addresses, ~2–6 MB
+  at most), so answers naming it again do not re-add it, and walks do not add it as a
+  candidate. An answer from a remembered address removes it from the set. A node that ever
+  answered is never dead, only struck (the sampler's own 3-silences rule still applies to it).
+- **Seeds** (`Dht::lookup_seeds`, `lookup::rank_seeds`): the 64 closest pool contacts plus the
+  16 closest of each routing table. Dead ones are left out. Contacts our per-IP limit (D54)
+  would refuse right now (`PerIp::available`, no state change) go last, struck ones before
+  those, and otherwise distance decides. The best 16 are taken.
+- **Inside the walk**: the window (16 closest) and the end test (8 closest answered) stay by
+  distance. Among the window's untried candidates, rate-limited and struck ones are asked after
+  the others. Dead contacts named in answers are skipped (`lookup_dead_skipped`).
+- **Stats**: `EngineStats` gains `lookup_answered`, seeds by tier, `lookup_dead_skipped`, and
+  pool `dropped_dead` / `dead_known`. `DhtStats` (serde default) gains
+  `lookup_answered_share`, `lookup_seeds_fresh_share` and `queries_per_stored` (`get_peers`
+  sent per torrent stored) over the rate window, plus `pool_dropped_dead` and
+  `lookup_dead_skipped`. The `dht` report has the same in `peers`, and the minute log line shows
+  the lookup answer share and the fresh-seed share.
+
+**Rejected after measuring: "fresh first."** The first build ordered seeds and the walk's
+queries by tier (fresh, unknown, struck). Live, against `main` in the same hour on the ONT, it
+stored **903 and 944 metadata/min against 1 196–1 355** (−21 to −28 %) even though the answer
+share rose to 0.78–0.81 and held through the run. Walks went to nodes that answer but sit
+further from the hash: peers were found for 58–64 % of hashes (main 62–63 %, V1 69–70 %).
+Without the per-IP key it was worse still: on the Neufbox, every seed was fresh, the concurrent
+lookups asked the same few nodes, and our own 1 q/s limit refused 3.2 queries per query sent
+(main 0.76). So only negative evidence (struck, dead, rate-limited now) moves a contact back.
+
+### 19.2 Measured (laptop on the ONT, production crawler running alongside)
+
+Release `dht --mode aggressive --seconds 600`, a fresh scratch database each on `magnetar-pg`,
+UDP 17891–17894 (`main` at `3bdde50`) / 18891–18894 (branch), `QPS 1000`, `PEER_LOOKUPS 1024`,
+`FETCH_CONCURRENCY 2048`, `TCP_RATE 1000`, `TCP_MAX 4000`, `PROBE off`, no UPnP. Runs are
+interleaved, 10:03–11:18 local, all after the laptop moved to the ONT and the production
+crawler restarted at QPS 3000 / 2048 lookups (≈ 09:58). A `main` run spanning that moment was
+discarded. *tier-first* = first build (§19.1, rejected), *V1* = as committed. CPU = share of one
+core. Answer share "first → last" is per minute. "young" is pool nodes < 5 min old over the run
+(last minute in brackets). Refused = queries our per-IP limit refused per query sent.
+
+| run (start) | build | metadata/min | fetch success | answered (first → last) | young (last min) | old | unpooled | repeat | found peers | queries/lookup | lookup mean | lookup answered | get_peers/stored | refused/sent | q/s | CPU |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 10:03 | tier-first | 903 | 29.8 % | 0.81 (0.81 → 0.83) | 0.77 (0.70) | 0.91 | 0.82 | 0.96 | 57.7 % | 12.2 | 9.3 s | 0.57 | 51.1 | 0.21 | 770 | 0.37 |
+| 10:14 | main | 1 196 | 30.9 % | 0.58 (0.71 → 0.52) | 0.55 (0.41) | 0.70 | 0.78 | 0.95 | 62.8 % | 15.8 | 8.2 s | – | 41.8 | 0.85 | 838 | 0.36 |
+| 10:25 | tier-first | 944 | 30.2 % | 0.78 (0.81 → 0.78) | 0.74 (0.65) | 0.91 | 0.80 | 0.97 | 63.5 % | 13.2 | 9.1 s | 0.57 | 51.1 | 0.20 | 804 | 0.33 |
+| 10:36 | main | 1 355 | 35.0 % | 0.58 (0.74 → 0.49) | 0.55 (0.36) | 0.69 | 0.78 | 0.95 | 63.0 % | 16.2 | 8.0 s | – | 37.8 | 0.87 | 856 | 0.37 |
+| 10:47 | V1 | 1 234 | 31.7 % | 0.63 (0.77 → 0.59) | 0.59 (0.49) | 0.77 | 0.77 | 0.95 | 69.8 % | 11.5 | 9.0 s | 0.47 | 39.3 | 0.20 | 818 | 0.37 |
+| 10:58 | main | 1 291 | 32.9 % | 0.60 (0.73 → 0.53) | 0.57 (0.42) | 0.73 | 0.79 | 0.96 | 62.2 % | 15.8 | 8.1 s | – | 38.9 | 0.90 | 841 | 0.29 |
+| 11:08 | V1 | 1 255 | 31.9 % | 0.64 (0.75 → 0.56) | 0.61 (0.45) | 0.77 | 0.77 | 0.95 | 68.8 % | 11.4 | 9.0 s | 0.46 | 38.5 | 0.22 | 805 | 0.30 |
+
+V1 dropped 16.5–16.7 k pool nodes as dead per run (of ~750 k) and skipped 4.3–10.6 k dead
+candidates in walks. RSS peak 342–382 MB in every run. Three earlier runs on the Neufbox
+(09:32–09:41, QPS 300) were all stopped by the router latency guard within 37 s–5 min and are
+not compared.
+
+**Reading it.** V1 does **not** raise throughput at this setting: 1 234 and 1 255 metadata/min
+against 1 196, 1 355 and 1 291 for `main` in the same 75 minutes (−3 % on the means, inside
+`main`'s spread). What it changes is how lookups spend their queries: 28 % fewer queries per
+lookup (11.4 vs 15.8–16.2), peers found for 69–70 % of looked-up hashes instead of 62–63 %
+(7.8–7.9 peers vs 7.2–7.3), a quarter of the per-IP refusals, and 10–20 % fewer timeouts. The
+same number of `get_peers` per stored torrent (38.5–39.3 vs 37.8–41.8). But lookups last longer
+(9.0 s vs 8.0–8.2 s). In `main`, a refused query fails instantly and drops out of the window,
+so walks end sooner on whatever is left. At 1 024 concurrent lookups, collected hashes per
+minute is about concurrency ÷ lookup time, so V1 collects ~9 % fewer hashes and gains that back
+in hit rate. The answer share still falls during a run (0.75–0.77 → 0.56–0.59, against
+0.71–0.74 → 0.49–0.53), because dead nodes are only known after two silences. Young pool nodes
+end at 0.45–0.49 instead of 0.36–0.42.
+
+**Not verified**: production settings (QPS 3000, 2048 lookups) and runs longer than 10 min
+(the dead set fills over hours); whether more concurrent lookups turn V1's cheaper lookups into
+throughput (the next thing to try: `PEER_LOOKUPS` above 1024 at the same QPS, KRPC was at
+~80 % of its cap in every run); the Neufbox profile (no complete run there today).

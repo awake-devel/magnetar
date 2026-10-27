@@ -7,9 +7,11 @@
 //! bits with the target and IPs answering from ≥ 3 ports are not walked through and their
 //! `values` are ignored.
 //!
-//! Responsiveness (D95): seeds are ranked by [`rank_seeds`] (nodes that answered recently first),
-//! within the walk's window candidates are asked in [`Tier`] order (then by distance), and
-//! contacts the pool dropped as dead (never answered, silent twice) are not walked at all.
+//! Responsiveness (D95), negative evidence only: seeds are picked by [`rank_seeds`], and within
+//! the walk's window candidates silent since their last answer or rate-limited right now are
+//! asked after the others (distance order otherwise); contacts the pool dropped as dead (never
+//! answered, silent twice) are not walked at all. Asking nodes that answered recently *first*
+//! was measured and lost a fifth of the output (§19).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -210,18 +212,18 @@ pub async fn lookup_into(
         if peers_enough || closest_done || Instant::now() >= deadline || dht.is_stopped() {
             break;
         }
-        // Within the window, contacts we may query now and likely to answer go first (D95);
-        // the window itself and the end test stay by distance.
+        // Within the window, contacts rate-limited right now or silent since their last answer
+        // go last (D95); otherwise, and for the window and the end test, distance decides.
         let fresh: Vec<SocketAddrV4> = window
             .iter()
             .filter(|a| cands[*a].st == St::New)
             .copied()
             .collect();
         let limited = dht.limited(&fresh);
-        let mut order: Vec<(bool, Tier, SocketAddrV4)> = fresh
+        let mut order: Vec<(bool, bool, SocketAddrV4)> = fresh
             .iter()
             .zip(limited)
-            .map(|(a, l)| (l, cands[a].tier, *a))
+            .map(|(a, l)| (l, cands[a].tier == Tier::Struck, *a))
             .collect();
         order.sort_by_key(|(l, t, _)| (*l, *t)); // stable: distance order within
         let order: Vec<SocketAddrV4> = order.into_iter().map(|(_, _, a)| a).collect();
@@ -374,19 +376,27 @@ pub struct SeedCand {
     pub limited: bool,
 }
 
-/// Pick `k` lookup seeds (D95): dead ones never, one per address (its best tier), then
-/// contacts we may query right now before rate-limited ones, then by tier (answered recently,
-/// untried, silent since), and within that by distance to `target`. The candidates are the
-/// closest few dozen known contacts, so a responsive seed is at most a couple of prefix bits
-/// further out than the nearest one, and the walk regains that in its first round; an
-/// unanswered seed costs a query of the budget. The per-IP key matters: ranking by tier alone
-/// sent the concurrent lookups to the same few responsive nodes, and the 1 q/s per-IP limit
-/// refused 3× more queries than were sent (first live run, §19).
+/// Pick `k` lookup seeds (D95): dead ones never, one per address (its best tier), contacts we
+/// may query right now before rate-limited ones, then contacts not silent since their last
+/// answer (fresh or untried alike) before struck ones, and otherwise by distance to `target`.
+///
+/// Only negative evidence moves a contact back (§19): with fresh contacts first, walks went to
+/// nodes that answer but sit further from the hash, found peers less often, and stored 21–25 %
+/// less than `main` in the same hour; ranking without the per-IP key sent the concurrent
+/// lookups to the same few responsive nodes, and the 1 q/s per-IP limit refused 3.2 queries
+/// per query sent.
 pub fn rank_seeds(mut cands: Vec<SeedCand>, target: &Id, k: usize) -> Vec<SeedCand> {
     cands.retain(|c| c.tier != Tier::Dead);
     cands.sort_by_key(|c| (c.node.addr, c.tier));
     cands.dedup_by_key(|c| c.node.addr);
-    cands.sort_by_key(|c| (c.limited, c.tier, distance(&c.node.id, target), c.node.addr));
+    cands.sort_by_key(|c| {
+        (
+            c.limited,
+            c.tier == Tier::Struck,
+            distance(&c.node.id, target),
+            c.node.addr,
+        )
+    });
     cands.truncate(k);
     cands
 }
@@ -562,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn seeds_rank_by_tier_then_distance() {
+    fn seeds_rank_struck_and_limited_last() {
         let t: Id = rand::random();
         let cands = vec![
             sc(cn(near(&t, 30), 1), Tier::Unknown, false),
@@ -580,14 +590,14 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                (5, Tier::Fresh),
-                (4, Tier::Fresh),
                 (1, Tier::Unknown),
                 (6, Tier::Unknown),
+                (5, Tier::Fresh),
+                (4, Tier::Fresh),
                 (2, Tier::Struck),
                 (7, Tier::Fresh),
             ],
-            "queryable first, then fresh (nearest first), dead never"
+            "by distance (fresh and untried alike), then struck, then rate-limited; dead never"
         );
         assert_eq!(rank_seeds(cands, &t, 2).len(), 2);
     }
@@ -606,9 +616,10 @@ mod tests {
             &t,
             16,
         );
+        // b is nearer; a kept its best tier (fresh, not struck).
         assert_eq!(
             got,
-            vec![sc(a, Tier::Fresh, false), sc(b, Tier::Unknown, false)]
+            vec![sc(b, Tier::Unknown, false), sc(a, Tier::Fresh, false)]
         );
         assert!(rank_seeds(Vec::new(), &t, 16).is_empty());
     }

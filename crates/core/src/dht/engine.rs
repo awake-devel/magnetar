@@ -742,9 +742,9 @@ impl Dht {
     }
 
     /// Lookup seeds (D95): the [`SEED_SPREAD`] × `k` closest contacts of the crawl pool and the
-    /// `k` closest of each routing table, ranked by [`super::lookup::rank_seeds`] (nodes that
-    /// answered recently first, then untried ones, then silent ones; dead ones never), with
-    /// their tiers. The pool's tier wins for a contact both know (it sees every query).
+    /// `k` closest of each routing table, ranked by [`super::lookup::rank_seeds`] (by distance,
+    /// contacts silent since their last answer and rate-limited ones after the rest, dead ones
+    /// never), with their tiers. The pool's tier wins for a contact both know (it sees every query).
     pub fn lookup_seeds(&self, target: &Id, k: usize) -> Vec<super::lookup::SeedCand> {
         use super::lookup::SeedCand;
         let now = Instant::now();

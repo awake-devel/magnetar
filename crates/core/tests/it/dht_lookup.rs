@@ -373,13 +373,13 @@ async fn the_pace_queue_does_not_fill_the_transaction_map() {
     d.shutdown().await;
 }
 
-/// D95: lookups rank their seeds by responsiveness. 4 silent pool nodes nearest the target, 4
-/// answering ones (with peers) further out. The first lookup asks the silent ones first (all
-/// untried, nearest first) and strikes them; the second gets the answering ones as its first
-/// seeds and silences the struck ones a second time, which drops them as dead; the third never
-/// asks them. Every lookup still ends and finds the peers.
+/// D95: silent contacts go after the others, then are dropped. 4 silent pool nodes nearest the
+/// target, 4 answering ones (with peers) further out. The first lookup asks the silent ones
+/// first (all untried, nearest first) and strikes them; the second gets the answering ones as
+/// its first seeds and silences the struck ones a second time, which drops them as dead; the
+/// third never asks them. Every lookup still ends and finds the peers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn lookups_prefer_nodes_that_answer() {
+async fn silent_nodes_go_last_then_are_dropped() {
     let t: Id = rand::random();
     let mut silent = Vec::new();
     for i in 0..4u8 {
