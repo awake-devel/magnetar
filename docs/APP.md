@@ -366,7 +366,9 @@ bundled `fake_server.py`; `--production URL` adds read-only flows and the timing
   trackers backing off, last batch), relays and crawler, DHT crawler.
 
 Health, breakdowns and graphs are cached (D83) and shown at once with "cached · N ago", kept
-offline. A server without `stats` gets a one-line "older than the app" instead of the charts.
+offline; the features of the last `/health` answer are cached too, so a server that is down when
+the tab opens still gets the cached charts and graphs (D92). A server without `stats` gets a
+one-line "older than the app" instead of the charts.
 
 **Settings** (`ui/settings`), D91: Server (URL, token, *Test connection*), Trust (root key, *Get
 my key from Amber*, threshold, *Save*), Content (*Show adult content*), Notifications

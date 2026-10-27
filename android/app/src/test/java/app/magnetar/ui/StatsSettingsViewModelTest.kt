@@ -166,6 +166,25 @@ class StatsSettingsViewModelTest {
     }
 
     @Test
+    fun `server down at open still shows the cached breakdowns and graphs`() = runTest {
+        main()
+        val fake = statsFake()
+        val r = repo(fake)
+        StatsViewModel(r)
+        advanceUntilIdle()
+        // Server unreachable from the start (no /health): the cache key must not change.
+        fake.healthError = ApiException.Network(IOException("down"))
+        fake.breakdownError = ApiException.Network(IOException("down"))
+        val vm = StatsViewModel(r)
+        advanceUntilIdle()
+        val s = vm.state.value
+        assertNull(s.health)
+        assertEquals(s.breakdowns?.total, 100)
+        assertNotNull(s.breakdowns?.field("origin"))
+        assertTrue(s.hasStats && s.hasGraphs)
+    }
+
+    @Test
     fun `no server, no requests`() = runTest {
         main()
         val fake = statsFake()

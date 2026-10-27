@@ -270,6 +270,9 @@ mode, no router port opened, 10 minutes, 2026-10-26)
   the app adds no detection of its own.
 - No new library: the charts are drawn by the app (D89); Vico was checked (3.3.1, Apache-2.0)
   and not needed. Stats answers are cached like search pages and shown offline with their age.
+- Review fixes (D92): with the server down from the start, the Stats tab now shows the cached
+  charts and the Graphs tab (the features of the last answer are kept), instead of "Server
+  unreachable" with nothing cached.
 
 ## Older servers and offline mode
 

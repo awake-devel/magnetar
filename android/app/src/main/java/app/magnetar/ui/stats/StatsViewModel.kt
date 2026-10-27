@@ -53,8 +53,13 @@ data class StatsUiState(
     val series: Timeseries? = null,
     val seriesLoading: Boolean = false,
     val seriesError: String? = null,
+    /**
+     * Features of the last `/health` answer from this server (cached), used while it is
+     * unreachable: the cached charts are keyed by the request, which depends on the features.
+     */
+    val knownFeatures: List<String>? = null,
 ) {
-    private val features: Set<String> get() = health?.features?.toSet().orEmpty()
+    val features: Set<String> get() = (health?.features ?: knownFeatures).orEmpty().toSet()
     val hasStats: Boolean get() = Features.STATS in features
     val hasGraphs: Boolean get() = Features.GRAPHS in features
     val hasDht: Boolean get() = Features.DHT in features || stats?.dht != null
@@ -98,7 +103,15 @@ class StatsViewModel(
         }
         viewModelScope.launch {
             val h = repo.refreshHealth(force = true)
-            _state.update { it.copy(health = h, healthChecked = true, healthError = if (h == null) "Server unreachable" else null) }
+            val known = if (h != null) {
+                repo.writeCache(CACHE_FEATURES, "", Health.serializer(), h)
+                h.features
+            } else {
+                repo.readCache(CACHE_FEATURES, "", Health.serializer())?.value?.features
+            }
+            _state.update {
+                it.copy(health = h, knownFeatures = known, healthChecked = true, healthError = if (h == null) "Server unreachable" else null)
+            }
             if (h?.has(Features.STATS) == true || h == null) {
                 breakdownRequests.value++
                 seriesRequests.value++
@@ -108,7 +121,7 @@ class StatsViewModel(
     }
 
     private fun query(filters: SearchFilters): SearchQuery {
-        val features = _state.value.health?.features?.toSet().orEmpty()
+        val features = _state.value.features
         return buildQuery(
             text = "",
             filters = filters.supportedBy(features),
@@ -122,7 +135,7 @@ class StatsViewModel(
 
     private suspend fun loadBreakdowns() {
         val s = _state.value
-        val features = s.health?.features?.toSet().orEmpty()
+        val features = s.features
         val q = query(s.filters)
         val main = BreakdownRequest(q, breakdownFields(features), top = 10)
         val years = BreakdownRequest(q, listOf("year"), top = 50)
@@ -170,6 +183,7 @@ class StatsViewModel(
                     // A cached answer stays offline; another error clears it (it would mislead).
                     breakdowns = if (e.isOffline) it.breakdowns else null,
                     years = if (e.isOffline) it.years else null,
+                    breakdownCachedAtMs = if (e.isOffline) it.breakdownCachedAtMs else null,
                 )
             }
         }
@@ -262,5 +276,6 @@ class StatsViewModel(
     companion object {
         const val CACHE_BREAKDOWN = "stats/breakdown"
         const val CACHE_HEALTH = "stats/health"
+        const val CACHE_FEATURES = "stats/features"
     }
 }
