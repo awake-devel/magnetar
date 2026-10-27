@@ -245,18 +245,44 @@ mode, no router port opened, 10 minutes, 2026-10-26)
   first search; *All releases* is only offered by servers that have title pages; old saved
   searches without a name are not uploaded twice when the move is retried.
 
+### App rebuild, stage 4: stats, graphs and settings (D89–D91, docs/APP.md §13)
+
+- **Stats → Charts**: a health card (seed checks as seeded / dead / no answer, with *not
+  checked yet* on its own line; index, relays, linked titles, last crawl, and the DHT
+  crawler's discovery, queue, metadata, stored and blocked counts), breakdown donuts and bars
+  (category, languages, resolution, movie/series/anime, release source, codec, HDR, audio,
+  genre, publisher categories, Nostr / DHT) and a year histogram. Tap a value to filter every
+  other chart by it; long-press to open Search with it and the active filters. Activity over
+  days or hours, DHT series included; pinch to zoom, drag sideways, tap for a value.
+- **Stats → Graphs**: web of trust and relays; the releases graph of a title (title page,
+  top bar) and the swarm graph of a torrent (detail, swarm card). The graph is fitted to the
+  screen and keeps detached groups and lone nodes next to the main cluster (D90); pinch,
+  drag, double-tap to fit, tap a node for its card, or switch to the node *List*.
+- **Stats → Status**: server version and the features it lacks, search index, seed-check
+  backlog (due now, time to clear it, checks per hour, last batch), relays, DHT crawler.
+- **Settings**: server URL with the plain-HTTP warning, API token (Show/Hide), *Test
+  connection* (before saving); trust root with *Get my key from Amber*, an nsec is refused and
+  cleared at once even when typed one character at a time; trust threshold, sent to the server
+  on *Save* (`PUT /api/v1/settings/trust`, only when it differs; an empty field never wipes the
+  server's root unless you emptied it); *Show adult content* and *Saved-search alerts*
+  switches (apply at once); notification permission; TMDB / IMDb attribution; versions.
+- Adult content: unchanged, hidden by default; the switch is sent with every chart request;
+  the app adds no detection of its own.
+- No new library: the charts are drawn by the app (D89); Vico was checked (3.3.1, Apache-2.0)
+  and not needed. Stats answers are cached like search pages and shown offline with their age.
+
 ## Older servers and offline mode
 
 - The app asks `GET /health` for `features` and hides what the server lacks: an older server
   still works, without filters, title pages, history, Stats or graphs.
-- Offline (phone cache only) the app still filters by the parsed attributes it can compute
-  locally (language, resolution, source, codecs…), not by genre, kind or rating; the Stats tab
-  shows counts of the phone's own cache without cross-filtering.
+- Offline the rebuilt app (D79) shows the last cached answers (search pages, details, title
+  pages, Stats) with their age; it has no local index, so nothing new can be searched or
+  counted offline.
 - An older app talking to the new server keeps working: all new fields have defaults. It gets
   adult content hidden (the new default) and has no switch to show it.
 - The new app talking to an older server drops adult results itself (that server ignores the
   setting). It hides the Source chips and DHT charts when the server does not list `origin` /
-  `dht`; offline, the phone's cache holds Nostr torrents only, so DHT results need the server.
+  `dht`.
 
 ## Upgrade notes
 

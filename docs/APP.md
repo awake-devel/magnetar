@@ -42,8 +42,9 @@ Not in the app, by decision (D79):
   to ≤ ~600 px high) and kept in a 16 MB memory LRU. Coil 3.6.3 was planned (D80) but pulls
   `accompanist-drawablepainter`, a JetBrains Compose foundation build and OkHttp 4 for ~60
   lines of work.
-- **Charts: Vico** (kept from D47) for the time series; breakdown bars/donuts and the graphs
-  are drawn with Compose `Canvas` (as before: own force layout, no graph library).
+- **Charts: Compose `Canvas`, no chart library (D89).** The activity series, the breakdown
+  bars/donuts, the year histogram and the graphs are all drawn with `Canvas` (own force layout,
+  no graph library). Vico 3.3.1 (Apache-2.0) was checked but not re-added (§13).
 - **Background: WorkManager** for the hourly saved-search poll (§8). No foreground service.
 - **Settings: `SharedPreferences`** file `settings` (the old app's file, §7), wrapped by
   `settings.SettingsStore` exposing a `StateFlow<AppSettings>`. No DataStore: it would need a
@@ -58,7 +59,7 @@ Not in the app, by decision (D79):
 | `org.jetbrains.kotlin.plugin.serialization` (Gradle plugin) | 2.4.21 (= the Kotlin / compose plugin version) | Apache-2.0 | compiler plugin |
 | `org.jetbrains.kotlinx:kotlinx-coroutines-android` | 1.11.0 | Apache-2.0 | coroutines (kept) |
 | ~~`io.coil-kt.coil3:coil-compose` + `coil-network-okhttp`~~ | 3.6.3 | Apache-2.0 | **not added** (D85): posters use OkHttp's cache + `BitmapFactory` |
-| `com.patrykandpatrick.vico:compose-m3` | 3.3.1 | Apache-2.0 | time-series charts (kept, D47) — re-added in the Stats stage |
+| ~~`com.patrykandpatrick.vico:compose-m3`~~ | 3.3.1 (POM: Apache-2.0; deps `vico:compose` 3.3.1, `material3` 1.9.0, Kotlin stdlib 2.4.10) | Apache-2.0 | **not added** (D89): the series are drawn with Compose `Canvas` |
 | AndroidX: compose BOM 2026.09.00, material3, material-icons-core, core-ktx 1.19.1, activity-compose 1.13.0, lifecycle-*-compose 2.11.0, navigation-compose 2.10.2, work-runtime-ktx 2.12.0 | (kept) | Apache-2.0 | UI, navigation, background work |
 | test: `org.testng:testng` | 7.12.0 | Apache-2.0 (deps: jcommander 1.83 Apache-2.0, slf4j-api 2.0.16 MIT, webjars jquery 3.7.1 MIT; guice is optional, not pulled) | unit test runner, `useTestNG()` |
 | test: `com.squareup.okhttp3:mockwebserver3` | 5.5.1 | Apache-2.0 | API client tests |
@@ -284,12 +285,9 @@ Settings warning for `http://` to a host that is neither loopback nor Tailscale 
 3. **Done (D85–D87)**: search, filter sheet, detail, title page, cache, and (brought forward
    from stage 4) saved searches, the poll worker and notifications, import of the old saved
    searches. Emulator UI test (§12).
-4. (merged into stage 3)
-5. Stats and graphs.
-6. Settings screen (test connection, Amber, threshold push, adult switch, attribution; the old
-   `ui/settings/TmdbAttribution.kt` and the http warning of `SettingsViewModel.kt` are in git
-   history before this stage, `res/drawable/tmdb_logo.xml` is kept).
-7. Polish, emulator UI tests, release build.
+4. **Done (D89–D91)**: Stats (charts, graphs, status) and the Settings screen (§13). The
+   old stages 5 (stats and graphs) and 6 (settings) were merged into it.
+5. Polish, more emulator UI tests, release build (R8 keep rules).
 
 ## 12. Search side as built (stage 3, D85–D87)
 
@@ -336,3 +334,49 @@ poll worker and the legacy import are as §7 and §8 describe.
 `uiautomator dump` + `input` (Compose test tags are resource ids via `testTagsAsResourceId`,
 also set inside the sheet, dialog and menu windows). Writes and deterministic checks go to the
 bundled `fake_server.py`; `--production URL` adds read-only flows and the timing measurement.
+
+## 13. Stats, graphs and settings as built (stage 4, D89–D91)
+
+**Stats** (`ui/stats`): three tabs in the screen.
+
+- *Charts*: the health card (`GET /stats/health`): seed checks as one status bar of the torrents
+  checked at least once (seeded / dead / no answer, each with its number and share) and,
+  **separately**, "Not checked yet: N (x % of all)", since never checked is not a result; then
+  index state, relays answering, linked titles, names to parse, last crawl, and the DHT
+  crawler's lines (mode, nodes, uptime, discovery rate, queue, metadata rate and success,
+  stored with the adult share, blocked as a count only, queries, router ports, address class).
+  Then the breakdowns (`POST /stats/breakdown`, top 10; years in a second request, top 50):
+  donuts for category, resolution, movie/series/anime, Nostr/DHT; bars for the rest; a year
+  histogram. **Tap** a bar, slice or year: it becomes a cross-filter (chips at the top; every
+  other chart is counted again with it, its own chart is not). **Long press**: Search with that
+  value plus the active cross-filters (a publisher category becomes the search text); *Search
+  these* runs the chips. Requests are one flow with `collectLatest`, so a newer tap cancels the
+  counts in flight. The adult switch goes into every breakdown body. Activity: one metric at a
+  time (`GET /stats/timeseries`), days or hours, the DHT metrics (`dht_torrents_added`,
+  `dht_hashes_seen`, `dht_fetch_ok`, `dht_fetch_fail`, `dht_blocked` as a count) when the server
+  runs the crawler.
+- *Graphs*: web of trust and relays cards; the title-releases graph opens from the title page's
+  top bar and the swarm graph from the detail's swarm card (both need `graphs`). Graph screen
+  (`ui/graph`): force layout off the main thread (D90), fitted to the view, pinch / drag / double
+  tap to fit, tap a node for its card (*Open torrent*, *Open title*, *Copy npub*, *Copy URL*),
+  *List* for the nodes as rows.
+- *Status*: server (state, version, features it lacks), search index (state, searchable torrents,
+  changes queued and their age, last update, size), seed checks (status bar, due now with the
+  time to clear it at the last hour's pace, never checked, checked in 24 h, checks per hour,
+  trackers backing off, last batch), relays and crawler, DHT crawler.
+
+Health, breakdowns and graphs are cached (D83) and shown at once with "cached · N ago", kept
+offline. A server without `stats` gets a one-line "older than the app" instead of the charts.
+
+**Settings** (`ui/settings`), D91: Server (URL, token, *Test connection*), Trust (root key, *Get
+my key from Amber*, threshold, *Save*), Content (*Show adult content*), Notifications
+(*Saved-search alerts*, permission state, *Allow*), About (versions, TMDB / IMDb attribution).
+Text fields are saved with *Save*; the switches apply at once.
+
+**Emulator UI test** (`android/uitest`): stage 4 adds, on the fake server, the health card and
+"not checked yet", tap = cross-filter (request body checked), long press = Search with the value
+and the cross-filters, the activity chart, the web-of-trust graph (tap on the laid-out subject
+node, then the node list), the Status tab, Settings *Test connection*, an nsec typed into the
+root field (nothing of it stays), *Save* sending `PUT /settings/trust` with the hex root and the
+threshold, and the adult switch reaching the charts. With `--production`: the health card,
+the breakdowns and the web-of-trust graph, read-only (the Settings flow is never run there).
