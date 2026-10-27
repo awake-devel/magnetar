@@ -95,6 +95,9 @@ pub struct FetchConfig {
     pub fake_strikes: u8,
     pub fake_ban: Duration,
     pub fake_cap: usize,
+    /// Keep the verified raw bytes in [`Fetched::raw`] (crawl workers upload them for the
+    /// server to verify again, D97). Off on the server: the bytes are dropped after parsing.
+    pub keep_raw: bool,
 }
 
 impl Default for FetchConfig {
@@ -118,6 +121,7 @@ impl Default for FetchConfig {
             fake_strikes: 3,
             fake_ban: Duration::from_secs(3600),
             fake_cap: 50_000,
+            keep_raw: false,
         }
     }
 }
@@ -160,6 +164,11 @@ impl PeerError {
             PeerError::HashMismatch => "hash_mismatch",
         }
     }
+
+    /// The error a [`code`](Self::code) names (worker reports, D97).
+    pub fn from_code(code: &str) -> Option<Self> {
+        PEER_ERRORS.into_iter().find(|e| e.code() == code)
+    }
 }
 
 impl From<std::io::Error> for PeerError {
@@ -194,6 +203,8 @@ pub struct Fetched {
     pub metadata_size: usize,
     /// Peers connected to for this hash (successful one included).
     pub peers_tried: usize,
+    /// The verified bytes, only with [`FetchConfig::keep_raw`].
+    pub raw: Option<Vec<u8>>,
 }
 
 /// Final result for a hash with verified bytes.
@@ -517,6 +528,81 @@ fn identify(
     (id, parsed)
 }
 
+/// The [`Outcome`] of verified bytes (`raw_len` of them; `raw` kept only when asked).
+fn outcome_of(
+    sighted: [u8; 20],
+    raw_len: usize,
+    raw: Option<Vec<u8>>,
+    id: Identity,
+    parsed: Result<InfoSummary, InfoError>,
+    tried: usize,
+) -> Outcome {
+    let info = match (id, parsed) {
+        (Identity::V2Only, _) => return Outcome::V2Only,
+        (_, Err(e)) => return Outcome::Invalid(e),
+        (_, Ok(s)) => s,
+    };
+    if info.private {
+        return Outcome::Private;
+    }
+    let (v1, v2) = match id {
+        Identity::V1 { v2 } => (sighted, v2),
+        Identity::Hybrid { v1, v2 } => (v1, Some(v2)),
+        Identity::V2Only => return Outcome::V2Only,
+    };
+    Outcome::Ok(Box::new(Fetched {
+        sighted,
+        v1,
+        v2,
+        info,
+        metadata_size: raw_len,
+        peers_tried: tried,
+        raw,
+    }))
+}
+
+/// Why bytes handed to [`outcome_from_raw`] are not an info dict of the hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawError {
+    /// Longer than the `metadata_max` given (nothing was hashed).
+    TooLarge,
+    /// Neither the SHA-1 nor the truncated SHA-256 of the bytes is the hash.
+    Mismatch,
+}
+
+/// Verify bytes that did not come from our own fetcher (a crawl worker's upload, D97) exactly
+/// as a fetched dict is: size bound, hash of the raw bytes, value count before any decode
+/// (`too_complex` above [`max_values`]), parse, identity. Synchronous and CPU-bound (run it off
+/// the async threads); its memory is bounded like a fetcher decode: about 3 × the size plus
+/// 64 B per value, at most `metadata_max / 8` values.
+pub fn outcome_from_raw(
+    sighted: [u8; 20],
+    raw: &[u8],
+    metadata_max: usize,
+) -> Result<Outcome, RawError> {
+    if raw.len() > metadata_max {
+        return Err(RawError::TooLarge);
+    }
+    let m = match_hash(&sighted, raw).ok_or(RawError::Mismatch)?;
+    let limit = max_values(metadata_max);
+    if bencode::count_values(raw, limit) > limit {
+        let id = match m {
+            Match::Sha1 => Identity::V1 { v2: None },
+            Match::TruncatedSha256 { v1, v2 } => Identity::Hybrid { v1, v2 },
+        };
+        return Ok(outcome_of(
+            sighted,
+            raw.len(),
+            None,
+            id,
+            Err(InfoError::TooComplex),
+            0,
+        ));
+    }
+    let (id, parsed) = identify(m, raw, parse_info(raw));
+    Ok(outcome_of(sighted, raw.len(), None, id, parsed, 0))
+}
+
 impl Fetcher {
     pub fn new(mut cfg: FetchConfig) -> Self {
         // A single fetch must always fit the in-flight budget.
@@ -703,40 +789,22 @@ impl Fetcher {
     fn outcome(
         &self,
         sighted: [u8; 20],
-        raw_len: usize,
+        raw: Vec<u8>,
         id: Identity,
         parsed: Result<InfoSummary, InfoError>,
         tried: usize,
     ) -> Outcome {
-        let info = match (id, parsed) {
-            (Identity::V2Only, _) => return Outcome::V2Only,
-            (_, Err(e)) => return Outcome::Invalid(e),
-            (_, Ok(s)) => s,
-        };
-        if info.private {
-            return Outcome::Private;
-        }
-        let (v1, v2) = match id {
-            Identity::V1 { v2 } => (sighted, v2),
-            Identity::Hybrid { v1, v2 } => (v1, Some(v2)),
-            Identity::V2Only => return Outcome::V2Only,
-        };
-        Outcome::Ok(Box::new(Fetched {
-            sighted,
-            v1,
-            v2,
-            info,
-            metadata_size: raw_len,
-            peers_tried: tried,
-        }))
+        let len = raw.len();
+        let raw = self.inner.cfg.keep_raw.then_some(raw);
+        outcome_of(sighted, len, raw, id, parsed, tried)
     }
 
-    /// One peer session. Returns the raw size, identity and parse result of verified bytes.
+    /// One peer session. Returns the raw bytes, identity and parse result of verified bytes.
     async fn peer(
         &self,
         info_hash: [u8; 20],
         addr: SocketAddrV4,
-    ) -> Result<(usize, Identity, Result<InfoSummary, InfoError>), PeerError> {
+    ) -> Result<(Vec<u8>, Identity, Result<InfoSummary, InfoError>), PeerError> {
         if !self.inner.filter.allows(&addr) {
             return Err(PeerError::Filtered);
         }
@@ -801,7 +869,7 @@ impl Fetcher {
         connected: Instant,
         accepted: &mut Option<[u8; 20]>,
         ext_seen: &mut bool,
-    ) -> Result<(usize, Identity, Result<InfoSummary, InfoError>), PeerError> {
+    ) -> Result<(Vec<u8>, Identity, Result<InfoSummary, InfoError>), PeerError> {
         let cfg = &self.inner.cfg;
         let c = &self.inner.c;
         let (rd, mut wr) = stream.into_split();
@@ -940,7 +1008,7 @@ impl Fetcher {
                 Match::Sha1 => Identity::V1 { v2: None },
                 Match::TruncatedSha256 { v1, v2 } => Identity::Hybrid { v1, v2 },
             };
-            return Ok((size, id, Err(InfoError::TooComplex)));
+            return Ok((raw, id, Err(InfoError::TooComplex)));
         }
         let cost_units = decode_cost(size, values)
             .div_ceil(UNIT)
@@ -951,13 +1019,14 @@ impl Fetcher {
             .acquire_many(u32::try_from(cost_units).unwrap_or(u32::MAX))
             .await
             .map_err(|_| PeerError::Closed)?;
-        let (id, parsed) = tokio::task::spawn_blocking(move || {
+        let (raw, id, parsed) = tokio::task::spawn_blocking(move || {
             let parsed = parse_info(&raw);
-            identify(m, &raw, parsed)
+            let (id, parsed) = identify(m, &raw, parsed);
+            (raw, id, parsed)
         })
         .await
         .map_err(|_| PeerError::Closed)?;
-        Ok((size, id, parsed))
+        Ok((raw, id, parsed))
     }
 }
 
@@ -1042,6 +1111,51 @@ mod tests {
         let t2: [u8; 32] = sha2::Sha256::digest(v2).into();
         let (id, _) = verify_and_parse(&t2[..20].try_into().unwrap(), v2).unwrap();
         assert_eq!(id, Identity::V2Only);
+    }
+
+    /// D97: what a worker uploads is verified exactly like a fetched dict.
+    #[test]
+    fn raw_uploads_are_verified_like_fetches() {
+        let v1_raw = b"d6:lengthi5e4:name1:a12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaae";
+        let h1 = sha1_smol::Sha1::from(&v1_raw[..]).digest().bytes();
+        match outcome_from_raw(h1, v1_raw, 1 << 20).unwrap() {
+            Outcome::Ok(f) => {
+                assert_eq!(
+                    (f.v1, f.info.name.as_str(), f.metadata_size),
+                    (h1, "a", v1_raw.len())
+                );
+                assert!(f.raw.is_none());
+            }
+            o => panic!("{o:?}"),
+        }
+        assert_eq!(
+            outcome_from_raw([0; 20], v1_raw, 1 << 20).unwrap_err(),
+            RawError::Mismatch
+        );
+        assert_eq!(
+            outcome_from_raw(h1, v1_raw, 10).unwrap_err(),
+            RawError::TooLarge
+        );
+        let private = b"d6:lengthi5e4:name1:a12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaa7:privatei1ee";
+        let hp = sha1_smol::Sha1::from(&private[..]).digest().bytes();
+        assert!(matches!(
+            outcome_from_raw(hp, private, 1 << 20),
+            Ok(Outcome::Private)
+        ));
+        let junk = b"i5e";
+        let hj = sha1_smol::Sha1::from(&junk[..]).digest().bytes();
+        assert!(matches!(
+            outcome_from_raw(hj, junk, 1 << 20),
+            Ok(Outcome::Invalid(_))
+        ));
+        for e in PEER_ERRORS {
+            assert_eq!(PeerError::from_code(e.code()), Some(e));
+        }
+        assert_eq!(
+            InfoError::from_code("too_complex"),
+            Some(InfoError::TooComplex)
+        );
+        assert_eq!(InfoError::from_code("x"), None);
     }
 
     #[test]

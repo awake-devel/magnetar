@@ -88,8 +88,17 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
         .clone()
         .filter(|t| !t.trim().is_empty())
         .context("MAGNETAR_API_TOKEN is required for serve")?;
+    // Worker tokens are checked before anything starts (a bad list stops the server, D96).
+    let fleet = Arc::new(crate::fleet::Fleet::from_config(&cfg)?);
     let store = open_store(&cfg).await?;
     daemons::apply_env(&store, &cfg).await?;
+    if fleet.enabled() {
+        tracing::info!(
+            "crawl workers: {} token(s) configured, seed-check leases of {} s",
+            fleet.config().tokens.len(),
+            fleet.config().lease_secs
+        );
+    }
 
     let downloader = if cfg.downloads {
         match Downloader::new(cfg.download_dir(), cfg.state_dir().join("downloads")).await {
@@ -124,6 +133,7 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
         .with_shutdown(stop_rx.clone())
         .with_downloader(downloader.clone())
         .with_tmdb(tmdb.clone())
+        .with_fleet(fleet)
         .with_liveness(Arc::new(LivenessService::new(liveness::liveness_config(
             &cfg,
         ))))

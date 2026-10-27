@@ -50,6 +50,9 @@ pub mod features {
     pub const SAVED_SEARCH_POLL: &str = "saved_search_poll";
     /// The empty query hides DHT-only torrents no seed check found peers for (D76).
     pub const BROWSE_CHECKED_DHT: &str = "browse_checked_dht";
+    /// Crawl workers can connect (`MAGNETAR_WORKER_TOKENS` set; D96) and `StatsResponse.workers`
+    /// lists them. Not in `ALL` (it depends on the configuration).
+    pub const WORKERS: &str = "workers";
     pub const ALL: &[&str] = &[
         FILTERS,
         FACET_SET,
@@ -120,6 +123,73 @@ pub struct StatsResponse {
     /// The DHT crawler (D58); None when it is off or the server is older.
     #[serde(default)]
     pub dht: Option<DhtStats>,
+    /// Crawl workers (D96–D100, docs/WORKERS.md): one entry per configured worker token,
+    /// empty when the server has none (or is older).
+    #[serde(default)]
+    pub workers: Vec<WorkerStats>,
+}
+
+/// One crawl worker as the server sees it (D99). Rates are over the last ~10 minutes and are
+/// counted by the server from what it accepted; `dht`, memory and uptime are what the
+/// worker's last heartbeat said.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WorkerStats {
+    /// The name its token was configured with (`MAGNETAR_WORKER_TOKENS`).
+    pub name: String,
+    /// Heard from in the last 2 minutes.
+    pub connected: bool,
+    pub version: Option<String>,
+    pub arch: Option<String>,
+    /// Unix times of its first and last request since the server started.
+    pub first_seen: Option<i64>,
+    pub last_seen: Option<i64>,
+    pub uptime_secs: Option<u64>,
+    /// Seed-check leases it holds now (unexpired).
+    pub leases_held: u64,
+    pub liveness_results_total: u64,
+    pub liveness_results_per_min: f64,
+    /// Infohashes it asked about (triage) and was told to fetch.
+    pub triaged_total: u64,
+    pub queued_total: u64,
+    /// Info dicts it uploaded that the server verified, and how many of those became new rows.
+    pub metadata_total: u64,
+    pub metadata_per_min: f64,
+    pub stored_total: u64,
+    /// Torrents its own blocklist stopped (reported by hash only).
+    pub blocked_total: u64,
+    /// Uploads the server refused (hash mismatch, too large, malformed).
+    pub rejected_total: u64,
+    pub rss_mb: Option<f64>,
+    pub mem_available_mb: Option<f64>,
+    /// Slowed down for memory or connection-tracking pressure.
+    pub pressure: bool,
+    pub dht: Option<WorkerDhtState>,
+}
+
+/// A worker's DHT crawler, from its heartbeat (D99).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WorkerDhtState {
+    pub mode: String,
+    pub nodes: u32,
+    pub ports: Vec<u16>,
+    /// KRPC queries per second and answered share over the last minute.
+    pub qps: f64,
+    pub answered_share: f64,
+    /// Rate brake on (answered share or router health probe).
+    pub brake_active: bool,
+    /// Times the router health probe braked since the worker started.
+    pub health_brakes: u64,
+    pub sampling_paused: bool,
+    pub routing_nodes: u64,
+    pub pool: u64,
+    pub queue: u64,
+    pub unique_per_min: f64,
+    pub metadata_per_min: f64,
+    /// Results waiting for upload.
+    pub upload_backlog: u64,
+    pub external_ip_known: bool,
 }
 
 /// The DHT crawler on the server (D58, docs/DHT.md §10). Rates are over the last ~10 minutes

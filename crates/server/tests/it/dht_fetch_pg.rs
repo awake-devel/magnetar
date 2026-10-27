@@ -43,7 +43,7 @@ impl Screen for MarkerScreen {
     }
 }
 
-fn dict(mut e: Vec<(&str, Value)>) -> Value {
+pub(crate) fn dict(mut e: Vec<(&str, Value)>) -> Value {
     e.sort_by(|a, b| a.0.cmp(b.0));
     Value::Dict(
         e.into_iter()
@@ -52,13 +52,13 @@ fn dict(mut e: Vec<(&str, Value)>) -> Value {
     )
 }
 
-fn b(s: &str) -> Value {
+pub(crate) fn b(s: &str) -> Value {
     Value::Bytes(s.as_bytes().to_vec())
 }
 
 /// A v1 info dict: `name` with a video file and a padding file (padding is not displayed but
 /// is screened).
-fn info(name: &str, pad_name: &str) -> Vec<u8> {
+pub(crate) fn info(name: &str, pad_name: &str) -> Vec<u8> {
     bencode::encode(&dict(vec![
         (
             "files",
@@ -80,7 +80,7 @@ fn info(name: &str, pad_name: &str) -> Vec<u8> {
     ]))
 }
 
-fn sha1(raw: &[u8]) -> [u8; 20] {
+pub(crate) fn sha1(raw: &[u8]) -> [u8; 20] {
     sha1_smol::Sha1::from(raw).digest().bytes()
 }
 
@@ -92,6 +92,7 @@ fn fetched(raw: &[u8], sighted: [u8; 20], v2: Option<[u8; 32]>) -> Outcome {
         info: parse_info(raw).unwrap(),
         metadata_size: raw.len(),
         peers_tried: 1,
+        raw: None,
     }))
 }
 
@@ -441,7 +442,7 @@ async fn final_statuses_and_backoff() {
 // Whole pipeline: fake DHT → peer collection → BEP 9 fetch from a fake seeder → Postgres.
 
 /// A seeder on `ip` that serves every dict in `dicts` (by infohash) over BEP 9.
-async fn seeder(ip: Ipv4Addr, dicts: HashMap<[u8; 20], Vec<u8>>) -> u16 {
+pub(crate) async fn seeder(ip: Ipv4Addr, dicts: HashMap<[u8; 20], Vec<u8>>) -> u16 {
     let l = TcpListener::bind((ip, 0)).await.unwrap();
     let port = l.local_addr().unwrap().port();
     let dicts = Arc::new(dicts);
@@ -490,7 +491,7 @@ async fn seed_one(mut s: TcpStream, dicts: Arc<HashMap<[u8; 20], Vec<u8>>>) -> O
     }
 }
 
-fn fake_cfg(ip: Ipv4Addr, bootstrap: Vec<SocketAddrV4>) -> EngineConfig {
+pub(crate) fn fake_cfg(ip: Ipv4Addr, bootstrap: Vec<SocketAddrV4>) -> EngineConfig {
     let mut c = EngineConfig::new(Mode::Aggressive);
     c.bind = ip;
     c.ports = vec![0];
@@ -508,7 +509,7 @@ fn fake_cfg(ip: Ipv4Addr, bootstrap: Vec<SocketAddrV4>) -> EngineConfig {
     c
 }
 
-async fn announce(from: &Dht, to: SocketAddrV4, hash: [u8; 20], port: u16) {
+pub(crate) async fn announce(from: &Dht, to: SocketAddrV4, hash: [u8; 20], port: u16) {
     // The fake network answers well within the query timeout, but the shared test process
     // (D78) can be busy: a lost query is retried.
     let mut r = None;

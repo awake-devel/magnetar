@@ -72,6 +72,21 @@ impl InfoError {
             InfoError::TooComplex => "too_complex",
         }
     }
+
+    /// The error a [`code`](Self::code) names (worker reports, D97).
+    pub fn from_code(code: &str) -> Option<Self> {
+        [
+            InfoError::Decode,
+            InfoError::DuplicateKeys,
+            InfoError::UnknownVersion,
+            InfoError::NoName,
+            InfoError::BadFiles,
+            InfoError::Empty,
+            InfoError::TooComplex,
+        ]
+        .into_iter()
+        .find(|e| e.code() == code)
+    }
 }
 
 /// Lossy UTF-8 without NUL (Postgres `text` and `jsonb` cannot hold U+0000).

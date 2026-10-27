@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use clap::Parser;
 use magnetar_server::config::{Cli, Command, DhtMode};
-use magnetar_server::{attrs, daemons, dht, enrich, enrich_anime, liveness, selftest, server};
+use magnetar_server::{
+    attrs, daemons, dht, enrich, enrich_anime, liveness, selftest, server, worker,
+};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -84,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
+        Command::Worker { seconds } => worker::run_from_config(&cli.config, seconds).await,
         Command::Selftest => selftest::run(&cli.config).await,
         Command::Enrich { reimport, rematch } => {
             let store = server::open_store(&cli.config).await?;

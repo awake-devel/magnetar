@@ -2562,6 +2562,7 @@ dependencies = [
  "async-trait",
  "axum",
  "clap",
+ "data-encoding",
  "flate2",
  "futures",
  "hex",

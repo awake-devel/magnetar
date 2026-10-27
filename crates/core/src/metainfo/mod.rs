@@ -10,6 +10,6 @@ pub mod wire;
 
 pub use fetch::{
     FetchConfig, FetchFailure, FetchStats, Fetched, Fetcher, Identity, Outcome, PeerError,
-    verify_and_parse,
+    RawError, outcome_from_raw, verify_and_parse,
 };
 pub use info::{InfoError, InfoFile, InfoSummary, parse_info};

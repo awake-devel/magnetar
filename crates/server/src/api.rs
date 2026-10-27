@@ -58,6 +58,8 @@ pub struct AppState {
     pub stats: Arc<StatsService>,
     /// The DHT crawler's live state (D58); None when `MAGNETAR_DHT` is off.
     pub dht: Option<Arc<DhtService>>,
+    /// Crawl workers (D96): tokens, limits, per-worker counters. No tokens = disabled.
+    pub fleet: Arc<crate::fleet::Fleet>,
 }
 
 impl AppState {
@@ -74,7 +76,13 @@ impl AppState {
             tmdb: None,
             stats: Arc::default(),
             dht: None,
+            fleet: Arc::default(),
         }
+    }
+
+    pub fn with_fleet(mut self, f: Arc<crate::fleet::Fleet>) -> Self {
+        self.fleet = f;
+        self
     }
 
     pub fn with_dht(mut self, d: Option<Arc<DhtService>>) -> Self {
@@ -171,7 +179,7 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn bearer(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
     let v = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = v.split_once(' ')?;
     scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
@@ -255,12 +263,21 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/downloads/{id}/{action}", post(download_action))
         .route("/relay", get(crate::relay::ws_handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth));
+    // Worker endpoints (D96): their own token check and a larger body limit (info dicts).
+    let workers = crate::fleet::routes()
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::fleet::worker_auth,
+        ))
+        .layer(DefaultBodyLimit::max(crate::fleet::BODY_LIMIT))
+        .layer(RequestBodyLimitLayer::new(crate::fleet::BODY_LIMIT));
     Router::new()
         .route("/health", get(health))
         .merge(protected)
-        .fallback(|| async { ApiError::not_found("no such route") })
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(RequestBodyLimitLayer::new(BODY_LIMIT))
+        .merge(workers)
+        .fallback(|| async { ApiError::not_found("no such route") })
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             REQUEST_TIMEOUT,
@@ -281,6 +298,11 @@ async fn health(State(st): State<AppState>) -> Json<Health> {
                 st.dht
                     .is_some()
                     .then_some(magnetar_core::api::features::DHT),
+            )
+            .chain(
+                st.fleet
+                    .enabled()
+                    .then_some(magnetar_core::api::features::WORKERS),
             )
             .map(str::to_string)
             .collect(),
@@ -707,12 +729,14 @@ async fn stats(State(st): State<AppState>) -> ApiResult<Json<StatsResponse>> {
         Some(d) => Some(d.stats(st.store.pool()).await),
         None => None,
     };
+    let workers = st.fleet.stats(st.store.pool(), magnetar_core::now()).await;
     Ok(Json(StatsResponse {
         store,
         crawler,
         search_index,
         liveness,
         dht,
+        workers,
     }))
 }
 

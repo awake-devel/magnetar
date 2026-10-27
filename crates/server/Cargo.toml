@@ -33,6 +33,7 @@ thiserror.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 hex.workspace = true
+data-encoding.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 nostr.workspace = true

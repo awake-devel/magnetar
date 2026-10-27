@@ -259,6 +259,7 @@ async fn server() -> api_support::FakeHttp {
                     hashes_per_min: 2.5,
                     ..Default::default()
                 }),
+                workers: Vec::new(),
             }),
             ("GET", "/api/v1/relays") => j(&vec![relay_info()]),
             ("PUT", "/api/v1/relays") => {
