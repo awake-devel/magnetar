@@ -11,7 +11,7 @@ Stats has three sections (docs/APP.md §13 for the rebuilt app):
 
 | Section | What it shows |
 |---|---|
-| Charts | health card; breakdowns of audio languages, resolutions, categories, sources, video codecs, HDR, audio formats, genres, movies/series/anime, publisher categories, years; activity over time |
+| Charts | where discoveries come from (DHT routes, relay sources, machines) with a **Crawl map** button (docs/CRAWLMAP.md); health card; breakdowns of audio languages, resolutions, categories, sources, video codecs, HDR, audio formats, genres, movies/series/anime, publisher categories, years; activity over time |
 | Graphs | web of trust, relays and publishers (a title's releases open from its title page, a torrent's swarm from its detail page) |
 | Status | server (version, missing features), search index, seed-check backlog, relays and crawler, DHT crawler (the phone keeps no torrent cache any more) |
 
@@ -110,6 +110,14 @@ rows a day, kept 800 days; `torrents_published` holds days). On the first start 
 migration, `torrents_added` is backfilled once from `events.received_at` of each infohash's
 first event (`meta.stats_since` / `stats_backfilled`); `relays_discovered`, `crawl_events`,
 `liveness_checks` and `db_size` start empty (no history to rebuild them from).
+
+Per DHT route (D102): `dht_seen_sample`, `dht_seen_get_peers`, `dht_seen_announce` (new
+`dht_seen` rows) and `dht_stored_sample`, `dht_stored_get_peers`, `dht_stored_announce` (new
+`dht_torrents` rows), counters from statement triggers, from migration `20261103000000` on.
+
+### `GET /api/v1/stats/sources`, `GET /api/v1/stats/map`
+
+Where discoveries come from and the crawl map by country / network: docs/CRAWLMAP.md.
 
 ### `GET /api/v1/stats/health`
 

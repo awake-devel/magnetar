@@ -149,6 +149,13 @@ tracking above 90 % (the Pi's table holds 7680 entries) halves the rates until i
 80 %. On top of that the router **health probe** of D66 (`MAGNETAR_DHT_PROBE`) brakes as on the
 server. Measured RSS: §6.
 
+### Crawl map (D105)
+
+With `MAGNETAR_GEOIP` on, each triage item also carries `cc` / `asn` of the node that told the
+worker about the hash, and the request carries `geo_nodes` (node counts by code) and
+`as_names`. These are optional fields: the worker API version stays **1**; an older server
+ignores them, an older worker's hashes are not located. No address leaves the worker.
+
 ### Stats
 
 `GET /api/v1/stats` (API token) → `workers: [WorkerStats]`, one per configured token:
@@ -203,6 +210,7 @@ them. Workers reach the server the way the phone does (Tailscale serve, reverse 
 | `MAGNETAR_DHT_UPNP` | **off** for workers | `true` maps the UDP ports on the router (it is somebody else's router: ask first) |
 | `MAGNETAR_LIVENESS_TRACKER_RPS`, `_TRACKER_CONCURRENCY`, `_DHT`, `_DHT_CONCURRENCY` | as the server | the worker's seed checker |
 | `MAGNETAR_BLOCKLIST_FILE` | unset | extra blocklist terms, as on the server (the server screens again anyway) |
+| `MAGNETAR_GEOIP` | `on` | crawl map (docs/CRAWLMAP.md, D105): resolve DHT nodes to country / AS number here (database downloaded into `<state dir>/geoip`, ~18 MB in memory; `country` ~8 MB; `off` = items carry no codes). Only codes are sent, never an address |
 
 `DATABASE_URL` and `MAGNETAR_API_TOKEN` are not used. `magnetar-server worker --seconds N`
 runs for N seconds; either way it prints a JSON report (seed checks, DHT counters, what the
@@ -243,7 +251,11 @@ MAGNETAR_WORKER_MIN_FREE_MB=250
 MAGNETAR_WORKER_UPLOAD_BUFFER_MB=8
 MAGNETAR_WORKER_LIVENESS_BATCH=300
 MAGNETAR_LIVENESS_DHT_CONCURRENCY=16
+MAGNETAR_GEOIP=country
 ```
+
+`MAGNETAR_GEOIP=country` keeps the crawl map's database at ~8 MB on the Pi (no networks from
+it); `off` saves that too. Not measured on the Pi.
 
 Optional on the Pi (root): `sysctl net.netfilter.nf_conntrack_max=32768` removes the
 conntrack limit (the governor then rarely brakes).
