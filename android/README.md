@@ -1,31 +1,24 @@
 # Magnetar for Android
 
-Kotlin + Jetpack Compose (Material 3) app over the Rust `magnetar-ffi` library (uniffi,
-package `app.magnetar.ffi`). No Google Play Services, no Firebase, no analytics.
+Kotlin + Jetpack Compose (Material 3) client of a Magnetar server's REST API: search, saved
+searches with notifications, Stats and Settings. No Rust inside, no downloads (magnets go to
+your torrent app), no phone crawler. No Google Play Services, no Firebase, no analytics.
+Design, screen → endpoint table and stages: **docs/APP.md** (ARCHITECTURE.md D79–D84).
 
 ## Build
 
 ```sh
-scripts/build-android.sh                  # .so + bindings + debug and release APKs
-SKIP_NATIVE=1 scripts/build-android.sh    # Kotlin/resources only, reuse the native outputs
-GRADLE_TASKS=testDebugUnitTest SKIP_NATIVE=1 scripts/build-android.sh
+scripts/build-android.sh                                     # unit tests + debug and release APKs
+GRADLE_TASKS="assembleDebug testDebugUnitTest" scripts/build-android.sh
+cd android && ./gradlew testDebugUnitTest                    # JVM unit tests only (TestNG)
 ```
 
-The script:
+Plain Gradle: the script creates `android/keystore/` on first run (see below) and runs
+`./gradlew`. Needs the JDK and the Android SDK only (no Rust, cargo-ndk or NDK since D79).
 
-1. builds `libmagnetar_ffi.so` for `arm64-v8a` and `x86_64` with cargo-ndk (`-P 26`) into
-   `app/src/main/jniLibs/`;
-2. builds the host debug library and generates the Kotlin bindings into
-   `app/src/main/java/app/magnetar/ffi/` (from the unstripped host build, since stripping removes the
-   uniffi metadata);
-3. creates `android/keystore/` on first run and runs `./gradlew assembleDebug assembleRelease`.
-
-`jniLibs/` and `app/magnetar/ffi/` are gitignored; the script regenerates them, so run it after any
-change to `crates/ffi/src/lib.rs`.
-
-Toolchain (ARCHITECTURE.md §8.1b): JDK 27, Gradle wrapper 9.8.2, AGP 9.4.1 with built-in Kotlin,
-compose compiler plugin 2.4.21, compileSdk 37, targetSdk 36, minSdk 26. Rust comes from rustup
-(`~/.cargo/bin`), not Arch's `/usr/bin/cargo`, which has no Android std.
+Toolchain (ARCHITECTURE.md §8.1): JDK 27, Gradle wrapper 9.8.2, AGP 9.4.1 with built-in Kotlin,
+compose and serialization compiler plugins 2.4.21, compileSdk 37, targetSdk 36, minSdk 26.
+`versionName` is `[workspace.package] version` from the root `Cargo.toml`.
 
 If Gradle fails with `Erreur d'entrée/sortie` / `IOException: Input/output error`, check
 `journalctl -k | grep -i csum`. This laptop's btrfs has logged checksum failures on freshly written
@@ -37,33 +30,34 @@ Gradle cache files. Point `GRADLE_USER_HOME` at a fresh directory and delete the
 `android/keystore/keystore.properties`. Both are generated on first build and gitignored.
 This key is for side-loading only, not a Play upload key. **Back the directory up.** An APK
 signed with a different key cannot update an installed copy; you would have to uninstall first,
-which deletes the app's cache and settings. If `keystore.properties` is missing, release builds
-fall back to the debug key. Release builds are not minified (`isMinifyEnabled = false`), because
-JNA has not been tested with R8.
+which deletes the app's settings. If `keystore.properties` is missing, release builds fall back
+to the debug key (and `scripts/build-android.sh` generates a new key: run it only in the checkout
+that holds the real one). Release builds are not minified yet (docs/APP.md §10).
+
+The rebuilt app keeps the package name `app.magnetar` and the key, so it installs over the old
+app; the server URL, token, trust root, threshold and switches carry over (docs/APP.md §7).
 
 ## Server URL, cleartext and Tailscale
 
-There is no default server: an empty URL means offline only (local crawl and search). The
-server runs elsewhere (docs/DEPLOY.md), typically behind `tailscale serve`, so the usual URL
-is `https://<host>.<tailnet>.ts.net`.
+There is no default server: the app asks for one. The server runs elsewhere (docs/DEPLOY.md),
+typically behind `tailscale serve`, so the usual URL is `https://<host>.<tailnet>.ts.net`.
 
 `res/xml/network_security_config.xml` permits cleartext, because the host is only known at
-runtime and a network security config can only name hosts at build time. All server traffic
-goes through the Rust client on native sockets anyway, which that file does not govern.
-Instead, Settings shows a warning when an `http://` URL points at a host where the traffic
-would be readable: anything but loopback and Tailscale (`100.64.0.0/10`,
-`fd7a:115c:a1e0::/48`, `*.ts.net`). See ARCHITECTURE.md D39.
+runtime and a network security config can only name hosts at build time. Settings warns when
+an `http://` URL points at a host where the traffic would be readable: anything but loopback
+and Tailscale (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`, `*.ts.net`). See ARCHITECTURE.md D39.
+(The warning returns with the Settings stage; the skeleton has no URL field yet.)
 
 ## App structure
 
 | Piece | Where |
 |---|---|
-| `MagnetarApp` | the single `Magnetar` instance, opened lazily off the main thread at `getDatabasePath("magnetar.db")`; settings flow |
-| Settings | `SharedPreferences` → `FfiConfig` (`Settings.kt`); downloads in `getExternalFilesDir(DOWNLOADS)/magnetar`, librqbit state in `filesDir/rqbit` |
-| Screens | `ui/` (Search, Detail, Media, Saved, Downloads, Stats with its Status section, Graph, Settings) with one ViewModel each; charts in `ui/charts/` (Vico for time series, Canvas for the rest), force layout in `ui/graph/` (D47) |
-| `CrawlSyncWorker` | hourly unique periodic work (unmetered + charging + battery not low): crawl 120 s → sync → cleanup → poll saved searches → notifications. "Crawl now" / "Sync now" enqueue a one-time run that only needs a network connection |
-| `DownloadService` | `dataSync` foreground service, started only from a user tap; progress notification; `onTimeout` (Android 15+ 6 h cap) pauses every download and stops |
-| Links | the app handles `magnet:` links (opens the detail page for that infohash) and `magnetar://torrent/<infohash>` (used by notifications) |
+| `MagnetarApp` | settings store (migration runs first), shared `OkHttpClient`, the `MagnetarApi` for the current server; removes the old app's background work |
+| `api/` | `MagnetarApi` (one suspend function per endpoint, bearer token only to the server's origin, call timeout per request class, cancellable), `Models.kt` (kotlinx.serialization mirrors of the server types), `ApiException` |
+| `settings/` | `AppSettings`, `SettingsStore` (SharedPreferences `settings`, the old app's keys, version 1) |
+| `ui/` | `AppShell` (bottom bar: Search, Saved, Stats, Settings), `theme/` (Material You + the D47 chart colours), one package per screen |
+| `Notifications` | channel `saved_searches` (the old id) |
+| Links | `magnetar://torrent/<infohash>` (used by notifications) |
 
-ffi errors (`FfiException`, Rust panics as `InternalException`, a missing native library) become
-snackbars or inline messages (`Errors.kt`). Unit tests (JVM, no device): `./gradlew testDebugUnitTest`.
+Unit tests (JVM, no device): `./gradlew testDebugUnitTest` — `MagnetarApiTest` (MockWebServer)
+and `SettingsStoreTest` (migration from the old app's preferences).

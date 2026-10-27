@@ -170,6 +170,35 @@ mode, no router port opened, 10 minutes, 2026-10-26)
   the end), and editing only a test file costs 8 s more.
 - Upgrade: no migration and no index rebuild (the browse rule reads existing index fields).
 
+### App rebuild, stage 2: app design and skeleton (D79–D84, docs/APP.md)
+
+- **The Android app is being rebuilt as a plain client of your server**: Kotlin and Jetpack
+  Compose only, no Rust library inside any more. It keeps search (instant results, filters
+  with live counts, sort, detail, title page), saved searches with hourly notifications
+  through the server, the Stats tab with its charts and four graphs, and Settings. The design,
+  every screen's API calls, the cache, timeouts, theming and accessibility are in docs/APP.md.
+- **Gone from the app**: downloads (on the phone and the server-download screen; *Open magnet*
+  and *Copy magnet* hand the torrent to your torrent app), the phone crawler and the offline
+  search database. A small cache of recent pages stays for instant display and offline
+  viewing (search stage).
+- **Your settings carry over**: same package name and signing key, so the new build installs
+  over the old one. The server URL, token, trust root, trust threshold and the adult switch are
+  read from the old app's settings; the old "background sync" switch becomes the saved-search
+  notification switch. The old background crawl job and the "Downloads" notification channel
+  are removed; the "Saved search alerts" channel keeps its id, so its sound settings stay. Old
+  saved searches (kept only on the phone before) are moved to the server in the saved-search
+  stage.
+- Adult content stays hidden by default with a Settings switch to show it; the app adds no
+  adult detection of its own (no stricter rules).
+- This stage is the skeleton only: bottom bar (Search, Saved, Stats, Settings), theme (unchanged
+  dark theme and chart colours), the API client and the settings store. The tabs are
+  placeholders; Settings shows the migrated server and has *Test connection*.
+- **Build**: plain Gradle (`scripts/build-android.sh` no longer needs Rust, cargo-ndk or the
+  NDK, and runs the unit tests). `crates/ffi` and `crates/uniffi-bindgen` are deleted from the
+  workspace. New libraries, versions and licences checked on Maven Central: OkHttp 5.5.1,
+  kotlinx.serialization 1.12.0 (Apache-2.0); unit tests run on TestNG 7.12.0 (Apache-2.0)
+  instead of JUnit 4 (EPL-1.0, not on the allowed licence list).
+
 ## Older servers and offline mode
 
 - The app asks `GET /health` for `features` and hides what the server lacks: an older server

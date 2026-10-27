@@ -2,21 +2,12 @@
 
 ## Laptop toolchain (verified in docs/research/android.md §0 and rust-crates.md §0)
 
-- **PATH gotcha:** Arch's `/usr/bin/cargo` and `rustc` come first in PATH and have **no
-  Android std**, which fails with `E0463 can't find crate for core`. Every Android build needs:
-  ```sh
-  export PATH=$HOME/.cargo/bin:$HOME/.local/bin:$PATH
-  export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/29.0.14206865
-  ```
-  The scripts set both.
-- rustup stable with the targets `aarch64-linux-android` and `x86_64-linux-android`. The
-  workspace MSRV is 1.94 (sqlx 0.9).
-- `cargo-ndk` 4.x (here 4.1.2 in `~/.local/bin`) and NDK r29. NDK r29 produces the 16 KB
-  aligned LOAD segments that Android 15+ requires.
-- JDK 17 or newer (system JDK 27 works with Gradle 9.8.2), AGP 9.4.1, compileSdk 37. Kotlin
-  bindings are generated from the unstripped host build.
-- No OpenSSL and no aws-lc in our code: TLS is rustls with ring and webpki-roots. librqbit
-  pulls `aws-lc-rs` for downloads, and that still cross-compiles with cargo-ndk.
+- rustup stable (or Arch's cargo) for the server; the workspace MSRV is 1.94 (sqlx 0.9).
+- The Android app is plain Kotlin since D79 (docs/APP.md): JDK 17 or newer (system JDK 27 works
+  with Gradle 9.8.2), AGP 9.4.1, the Android SDK with compileSdk 37. No Rust Android targets,
+  cargo-ndk or NDK any more.
+- No OpenSSL and no aws-lc in our code: TLS is rustls with ring and webpki-roots (librqbit
+  pulls `aws-lc-rs` for the server's downloads).
 - If a Gradle build dies with `Erreur d'entrée/sortie` / EIO, check
   `journalctl -k | grep -i csum`. This laptop has logged btrfs checksum errors in `~/.gradle`.
   Use a separate `GRADLE_USER_HOME` to route around it, and look at the hardware.
@@ -26,7 +17,7 @@
 | Script | What |
 |---|---|
 | `scripts/build-linux.sh <x86_64\|aarch64>` | static server binary `dist/magnetar-server-<arch>-linux` for that architecture, on a matching host (docs/LINUX.md). CI's release workflow calls it |
-| `scripts/build-android.sh` | `.so` (cargo-ndk `-P 26`) + Kotlin bindings + APK (android/README.md) |
+| `scripts/build-android.sh` | Gradle: unit tests + debug and release APKs (android/README.md) |
 | `scripts/test.sh [--ignored] [--no-android]` | the "done" gate (see README) |
 | `scripts/release.sh [--version V] [--suffix S] [--prerelease] [--notes FILE] [--no-apk] [--build\|--publish]` | finishes a release CI started: dry run by default; `--build` builds the APK into `dist/`; `--publish` uploads it and publishes |
 | `docker build .` / `docker compose up -d --build` | the server image from source (docs/DOCKER.md) |

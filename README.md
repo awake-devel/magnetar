@@ -28,27 +28,29 @@ It runs in two places, and both of them crawl:
        v                                              v
 +--------------------------------+      +------------------------------------+
 | magnetar-server (Docker/Linux) |      | Android app (Kotlin + Compose)     |
-|  crawler loop (every 15 min)   |      |  WorkManager: crawl -> sync ->     |
-|  liveness: UDP/HTTP scrape,    |      |    cleanup -> saved-search poll    |
-|    DHT BEP 33 fallback         |      |  magnetar-ffi (Rust, uniffi):      |
-|  trust: depth-2 web of trust   |      |    SQLite + FTS5 cache, crawler,   |
-|  saved searches -> ntfy        |      |    API client, librqbit downloads  |
+|  crawler loop (every 15 min)   |      |  search, filters, detail, titles,  |
+|  liveness: UDP/HTTP scrape,    |      |  saved searches (hourly poll),     |
+|    DHT BEP 33 fallback         |      |  Stats + graphs, Settings          |
+|  trust: depth-2 web of trust   |      |  OkHttp + kotlinx.serialization;   |
+|  saved searches -> ntfy        |      |  no Rust, no downloads (D79)       |
 |  librqbit downloads            |      +-----------------+------------------+
-|  axum API 127.0.0.1:8787       |<-- HTTPS + Bearer token + search / detail /
-|  /relay WS (NIP-01 + NIP-77)   |<-- negentropy sync up --+ downloads / settings
-+---------------+----------------+   (Tailscale serve or a reverse proxy;
-               | TCP or unix socket          batch POST fallback for sync)
+|  axum API 127.0.0.1:8787       |<-- HTTPS + Bearer token: REST API only ---+
+|  /relay WS (NIP-01 + NIP-77)   |   (Tailscale serve or a reverse proxy)
++---------------+----------------+
+               | TCP or unix socket
                v
      Postgres 18 (tsvector + pg_trgm)
 ```
 
-The crates are `crates/core` (shared logic, no database driver), `crates/server`
-(Postgres, the API, the relay endpoint and the daemons), `crates/ffi` (SQLite store and
-uniffi API for Android) and `android/` (the app, package `app.magnetar`).
+The crates are `crates/core` (shared logic, no database driver) and `crates/server`
+(Postgres, the API, the relay endpoint and the daemons); `android/` is the app (package
+`app.magnetar`), a Kotlin client of the server's REST API since the rebuild (docs/APP.md,
+D79; the Rust `crates/ffi` library it used before is deleted).
 
 ## Features
 
-Status for v0.1.0 (first pre-release). "Tested" means automated tests plus an end-to-end run
+Status for v0.1.0 (first pre-release). The app rows describe the v0.1.0 app; the rebuilt app
+(docs/APP.md) drops the phone cache, phone crawler and downloads. "Tested" means automated tests plus an end-to-end run
 of the app on an Android 17 (API 37) x86_64 emulator against a live server crawling real relays.
 
 | Feature | Where | Status |
@@ -144,16 +146,12 @@ docker build -t magnetar .                 # the server image, for this machine'
 scripts/build-linux.sh x86_64              # dist/magnetar-server-x86_64-linux (static); aarch64 on an arm64 host
 cargo build --release -p magnetar-server   # plain native build
 
-# Android: Arch's /usr/bin/cargo has no Android std; the rustup toolchain must come first:
-export PATH=$HOME/.cargo/bin:$HOME/.local/bin:$PATH
-export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/29.0.14206865
-scripts/build-android.sh                   # .so via cargo-ndk + Kotlin bindings + APK
+scripts/build-android.sh                   # Android: unit tests + debug and release APKs (Gradle)
 ```
 
-The Android build needs the rustup stable toolchain with the `aarch64-linux-android` and
-`x86_64-linux-android` targets, `cargo-ndk` 4.x, NDK r29, JDK 17+ (27 works with Gradle
-9.8.2), and the Android SDK with compileSdk 37. Do not install aws-lc or OpenSSL: TLS is
-rustls with ring and webpki-roots. More in [docs/SETUP.md](docs/SETUP.md).
+The Android build needs JDK 17+ (27 works with Gradle 9.8.2) and the Android SDK with
+compileSdk 37; no Rust (D79). Do not install aws-lc or OpenSSL for the server: TLS is rustls
+with ring and webpki-roots. More in [docs/SETUP.md](docs/SETUP.md).
 
 Releases: pushing a tag `vX.Y.Z` makes CI build the image (both architectures) and the Linux
 binaries and attach them to a draft release. `scripts/release.sh` then builds and signs the

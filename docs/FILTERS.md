@@ -15,8 +15,8 @@ series grouped by season/episode, quality and language.
 | Backfill, `magnetar-server attrs` | `crates/server/src/attrs.rs` |
 | Index facets/filters | `crates/server/src/search_index/{schema,collect}.rs` (`SCHEMA_VERSION` 2) |
 | SQL fallback filters | `crates/server/src/search.rs` (`push_attr_filters`) |
-| Phone cache | SQLite V4 `torrent_attrs`, `crates/ffi/src/store.rs` (`push_attr_filters`, `backfill_attrs`) |
-| App | `ui/search/FilterSheet.kt`, `ui/media/MediaScreen.kt` |
+| Phone cache | none since the app rebuild (D79); the old SQLite V4 `torrent_attrs` lived in the deleted `crates/ffi` |
+| App | filter sheet and title page of the rebuilt app (docs/APP.md, search stage) |
 
 ## Parsing
 
@@ -186,8 +186,9 @@ back to the local cache's grouping for the title page.
 
 A query that needs `filters` (any release/media filter or rating sort, e.g. from a saved search
 made against a newer server) is never sent to a server whose `/health` does not list it: that
-server would ignore the filters and answer unfiltered results. The ffi asks `/health` once per
-configuration and searches the local cache instead; saved-search notifications do the same.
+server would ignore the filters and answer unfiltered results. The rebuilt app (D79,
+docs/APP.md §4) hides those filters for such a server and says so for a saved search that uses
+them (until then the old ffi searched the local cache instead).
 
 ## Performance (2026-10-26, this laptop: 12 threads, NVMe, Postgres 18 in docker)
 
