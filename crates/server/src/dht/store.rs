@@ -139,23 +139,67 @@ pub async fn mark_failed(
     error: &str,
     now: i64,
 ) -> sqlx::Result<()> {
-    sqlx::query(
+    mark_failed_batch(pool, &[(*info_hash, error.to_string(), now)]).await?;
+    Ok(())
+}
+
+/// [`mark_failed`] for many hashes in one statement (D93: the collectors hand their outcomes to
+/// a writer task instead of waiting ~1 s each on a single-row UPDATE). A hash listed `n` times
+/// ends exactly as after `n` single calls in order: `attempts + n`, the backoff of that attempt
+/// counted from its last time, its last error. Returns the rows updated.
+pub async fn mark_failed_batch(
+    pool: &PgPool,
+    items: &[([u8; 20], String, i64)],
+) -> sqlx::Result<u64> {
+    if items.is_empty() {
+        return Ok(0);
+    }
+    let mut by: std::collections::BTreeMap<[u8; 20], (i32, &str, i64)> = Default::default();
+    for (h, err, at) in items {
+        let e = by.entry(*h).or_insert((0, err, *at));
+        e.0 += 1;
+        e.1 = err;
+        e.2 = *at;
+    }
+    let hashes: Vec<Vec<u8>> = by.keys().map(|h| h.to_vec()).collect();
+    let errs: Vec<&str> = by.values().map(|v| v.1).collect();
+    let ats: Vec<i64> = by.values().map(|v| v.2).collect();
+    let ns: Vec<i32> = by.values().map(|v| v.0).collect();
+    let r = sqlx::query(
         r#"
-        UPDATE dht_seen SET status = 2, attempts = attempts + 1, last_error = left($2, 32),
-            next_attempt_at = CASE attempts + 1 WHEN 1 THEN $3 + $4 WHEN 2 THEN $3 + $5
-                                                WHEN 3 THEN $3 + $6 ELSE NULL END
-        WHERE infohash = $1
+        UPDATE dht_seen s SET status = 2, attempts = s.attempts + u.n,
+            last_error = left(u.err, 32),
+            next_attempt_at = CASE s.attempts + u.n WHEN 1 THEN u.at + $5 WHEN 2 THEN u.at + $6
+                                                    WHEN 3 THEN u.at + $7 ELSE NULL END
+        FROM unnest($1::bytea[], $2::text[], $3::int8[], $4::int4[]) AS u(h, err, at, n)
+        WHERE s.infohash = u.h
         "#,
     )
-    .bind(info_hash.as_slice())
-    .bind(error)
-    .bind(now)
+    .bind(&hashes)
+    .bind(&errs)
+    .bind(&ats)
+    .bind(&ns)
     .bind(BACKOFF_SECS[0])
     .bind(BACKOFF_SECS[1])
     .bind(BACKOFF_SECS[2])
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(r.rows_affected())
+}
+
+/// Hashes an announce reached after the seen filter (D93): their `dht_seen` row says so, so a
+/// retry comes back as an announce (whatever the row's status: the fetch may already have
+/// finished when this is written).
+pub async fn set_via_announce(pool: &PgPool, hashes: &[[u8; 20]]) -> sqlx::Result<u64> {
+    if hashes.is_empty() {
+        return Ok(0);
+    }
+    let v: Vec<Vec<u8>> = hashes.iter().map(|h| h.to_vec()).collect();
+    let r = sqlx::query("UPDATE dht_seen SET via = 1 WHERE infohash = ANY($1) AND via <> 1")
+        .bind(&v)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
 }
 
 pub fn via_from_code(code: i16) -> Via {

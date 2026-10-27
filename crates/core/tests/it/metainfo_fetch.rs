@@ -32,6 +32,9 @@ enum Behave {
     NoUtMetadata,
     /// Accepts the connection, then says nothing.
     Silent,
+    /// Answers the handshake for any hash with this peer id, then never sends the BEP 10
+    /// extended handshake (the "accept-all" fake peers seen live, D93).
+    Echo([u8; 20]),
     /// Sends a 4 GiB length prefix on a non-extended message.
     HugeOther,
     /// Sends a 1 MiB `extended` message.
@@ -108,7 +111,11 @@ async fn serve(mut s: TcpStream, raw: Vec<u8>, hash: [u8; 20], behave: Behave) {
         tokio::time::sleep(Duration::from_secs(60)).await;
         return;
     }
-    let mut ours = wire::handshake(&hash, &[0x42; 20]);
+    let pid = match &behave {
+        Behave::Echo(id) => *id,
+        _ => [0x42; 20],
+    };
+    let mut ours = wire::handshake(&hash, &pid);
     if matches!(behave, Behave::NoExtBit) {
         ours[25] = 0;
     }
@@ -116,6 +123,10 @@ async fn serve(mut s: TcpStream, raw: Vec<u8>, hash: [u8; 20], behave: Behave) {
         ours[28] ^= 1;
     }
     if s.write_all(&ours).await.is_err() {
+        return;
+    }
+    if matches!(behave, Behave::Echo(_)) {
+        tokio::time::sleep(Duration::from_secs(60)).await;
         return;
     }
     // Noise before the extended handshake: a bitfield, as real clients send.
@@ -596,4 +607,65 @@ async fn value_bombs_are_refused_before_decoding() {
         fetcher().fetch(h, &[p]).await.unwrap(),
         Outcome::Ok(_)
     ));
+}
+
+/// D93: a peer that takes the handshake for the hash and never sends its extended handshake
+/// earns a strike per fetch; after 3 it is skipped (for an hour), a known echo peer id counts
+/// double, a peer that serves metadata is never struck, and the skipped peer does not use up
+/// the per-hash cap.
+#[tokio::test]
+async fn fake_peers_are_struck_then_skipped() {
+    let raw = info_v1("Rep", 1000, false);
+    let h = sha1(&raw);
+    let f = Fetcher::new(FetchConfig {
+        allow_loopback: true,
+        connect_timeout: Duration::from_secs(1),
+        handshake_timeout: Duration::from_millis(300),
+        peer_timeout: Duration::from_secs(2),
+        connects_per_sec: 1000,
+        max_peers: 1,
+        ..FetchConfig::default()
+    });
+    let fake = peer(raw.clone(), h, Behave::Echo([0x41; 20])).await;
+    for _ in 0..3 {
+        let e = f.fetch(h, &[fake]).await.unwrap_err();
+        assert_eq!((e.error, e.peers_tried), (PeerError::Timeout, 1));
+    }
+    let st = f.stats();
+    assert_eq!(
+        (st.fake_strikes, st.fake_banned, st.fake_tracked),
+        (3, 1, 1)
+    );
+    // Skipped now: no connection, and with max_peers = 1 the good peer behind it is still
+    // tried (the skipped one does not count against the cap).
+    let good = peer(raw.clone(), h, Behave::Good).await;
+    let t0 = Instant::now();
+    assert!(matches!(
+        f.fetch(h, &[fake, good]).await,
+        Ok(Outcome::Ok(_))
+    ));
+    assert!(
+        t0.elapsed() < Duration::from_millis(300),
+        "fake not waited for"
+    );
+    let e = f.fetch(h, &[fake]).await.unwrap_err();
+    assert_eq!((e.peers_tried, e.skipped, e.code()), (0, 1, "fake_peers"));
+    assert_eq!(f.stats().fake_skipped, 2);
+    // The good peer earned nothing; an echo peer id counts double: skipped after 2.
+    for _ in 0..3 {
+        assert!(f.fetch(h, &[good]).await.is_ok());
+    }
+    let mut xt = [0x30; 20];
+    xt[..8].copy_from_slice(b"-XT0100-");
+    let echo = peer(raw.clone(), h, Behave::Echo(xt)).await;
+    for _ in 0..2 {
+        assert_eq!(f.fetch(h, &[echo]).await.unwrap_err().peers_tried, 1);
+    }
+    assert_eq!(f.fetch(h, &[echo]).await.unwrap_err().skipped, 1);
+    // Refusing the handshake (wrong hash) is not the fake behaviour: never struck.
+    let wrong = peer(raw.clone(), h, Behave::WrongHash).await;
+    for _ in 0..4 {
+        assert_eq!(f.fetch(h, &[wrong]).await.unwrap_err().peers_tried, 1);
+    }
+    assert_eq!(f.stats().fake_banned, 2);
 }

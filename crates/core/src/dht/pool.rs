@@ -46,6 +46,8 @@ pub struct PoolEntry {
     pub failures: u8,
     pub last_answer: Option<Instant>,
     pub in_flight: bool,
+    /// When the node entered the pool (answer share by node age, D93).
+    pub added: Instant,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +181,7 @@ impl Pool {
             failures: 0,
             last_answer: None,
             in_flight: false,
+            added: now,
         });
         self.index.insert(node.addr, i);
         self.by_prefix[prefix16(&node.id)].push(node.addr);

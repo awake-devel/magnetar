@@ -461,6 +461,8 @@ async fn crawler_maps_its_ports_and_reports_live_stats() {
         pool_cap: 10_000,
         fetch_known: false,
         peer_lookups: 4,
+        lookup_timeout: Duration::from_millis(1500),
+        peers_per_hash: 12,
         dry_run: false,
         bloom_bits: 1 << 20,
         queue_cap: 1000,

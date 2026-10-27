@@ -380,6 +380,7 @@ async fn final_statuses_and_backoff() {
         error,
         oversize,
         peers_tried: 2,
+        skipped: 0,
     };
     let items = vec![
         FetchResult {
@@ -583,6 +584,8 @@ async fn pipeline_fetches_and_stores_from_a_fake_seeder() {
         pool_cap: 10_000,
         fetch_known: false,
         peer_lookups: 8,
+        lookup_timeout: Duration::from_millis(1500),
+        peers_per_hash: 12,
         dry_run: false,
         bloom_bits: 1 << 20,
         queue_cap: 1000,
@@ -757,6 +760,8 @@ async fn pipeline_blocklist_run(cap: Capture) {
         pool_cap: 10_000,
         fetch_known: false,
         peer_lookups: 8,
+        lookup_timeout: Duration::from_millis(1500),
+        peers_per_hash: 12,
         dry_run: false,
         bloom_bits: 1 << 20,
         queue_cap: 1000,

@@ -72,7 +72,7 @@ must be updated together to get all of it, but each side keeps working with an o
 - Settings: "Get my key from Amber" fills the trust root from a NIP-55 signer (only the
   public key is asked for). A private key (`nsec1…`) pasted into the field is cleared at once.
 
-### Torrents found on the BitTorrent DHT (docs/DHT.md, ARCHITECTURE.md D49–D75)
+### Torrents found on the BitTorrent DHT (docs/DHT.md, ARCHITECTURE.md D49–D75, D93)
 
 The server can now find torrents by itself on the BitTorrent DHT, the network every
 BitTorrent client uses to find peers, instead of only receiving them from Nostr publishers.
@@ -129,6 +129,23 @@ mode, no router port opened, 10 minutes, 2026-10-26)
 - The crawler's own load is small (2–3 % of a core, ~100 MB in the crawl-only runs); during
   this run the whole server, including the one-off index rebuild below and seed checks, used
   37 % of a core and at most 850 MB of memory.
+
+**Faster and leaner on a public line (D93, docs/DHT.md §18)**
+
+- Fixes that stop losing work under load: the crawler no longer waits on the database for every
+  hash it gives up on (at 1024 parallel lookups the old one ran out of database connections and
+  dropped whole batches), and new hashes are no longer thrown away while the database is busy
+  (15–150 thousand per 10 minutes in our runs). Peers that announce a torrent to the crawler are
+  now used even when that torrent was already seen a moment earlier (before, they were dropped,
+  and no torrent was ever fetched from its announcer).
+- Peers that pretend to have every torrent are skipped for an hour after three tries.
+- New settings: `MAGNETAR_DHT_PEERS_PER_HASH` (default 12; 24 gave about 12 % more torrents a
+  minute in our runs, 48 no more than 24) and `MAGNETAR_DHT_LOOKUP_TIMEOUT_MS` (default 1500;
+  in our runs at 1 000 queries/s it made no difference, 4000 restores the old behaviour).
+- Stats show more of the crawler: lookups (time, queries), where peers came from, incoming
+  queries by type, skipped fake peers, and the answer share by how long a node has been
+  known. That last one shows why the answer share falls during a run: nodes we ask again keep
+  answering (94–97 %), newly learned ones mostly do not.
 
 **Upgrade**
 

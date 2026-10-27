@@ -103,7 +103,7 @@ The Postgres credentials and volumes are described in docs/DOCKER.md.
 
 ### DHT crawler (stages 1–4: discovery, metadata fetch, classification and blocklist, search and ops)
 
-Designed in docs/DHT.md (ARCHITECTURE.md D49–D75). Stage 1 implements discovery: BEP 51
+Designed in docs/DHT.md (ARCHITECTURE.md D49–D75, D93). Stage 1 implements discovery: BEP 51
 sampling, passive capture, triage into `dht_seen` and peer collection; stage 2 downloads and
 verifies each torrent's metadata from its peers (BEP 9, TCP); stage 3 classifies it (category,
 adult tag) and passes every name through the hard illegal-content blocklist before anything
@@ -121,7 +121,9 @@ crawler shows up in `/api/v1/stats`, `/api/v1/stats/health` and `/health` (featu
 | `MAGNETAR_DHT_QPS` | `200` / `50` | outbound DHT queries per second, all kinds (router benchmark: 300 safe, 400 breaks the neufbox) |
 | `MAGNETAR_DHT_POOL` | `1000000` / `200000` | nodes kept for sampling (1000–20000000) |
 | `MAGNETAR_DHT_FETCH_KNOWN` | `false` | also queue infohashes already known from Nostr |
-| `MAGNETAR_DHT_PEER_LOOKUPS` | `64` / `8` | peer collections running at once (1–512) |
+| `MAGNETAR_DHT_PEER_LOOKUPS` | `64` / `8` | peer collections running at once (1–8192; each is a light task, the KRPC rate is the real limit) |
+| `MAGNETAR_DHT_LOOKUP_TIMEOUT_MS` | `1500` | soft per-query timeout of peer lookups, ms (100–4000; D93). A node silent this long no longer holds up the lookup: the next node is asked, and its answer is still used if it comes within the 4 s hard timeout. Also applies to the `get_peers` sent to the node that sampled a hash. 4000 = no widening (the old behaviour) |
+| `MAGNETAR_DHT_PEERS_PER_HASH` | `12` | peers the metadata fetcher tries per infohash (1–64), 4 at once; a lookup stops once it knows this many (D93) |
 | `MAGNETAR_DHT_FETCH_CONCURRENCY` | `128` / `16` | metadata fetches in flight (1–2048); each opens ≤ 4 TCP connections at once, within the two limits below |
 | `MAGNETAR_DHT_TCP_RATE` | `150` | new TCP connection attempts per second, all fetches (1–2000). Each attempt is a NAT entry on the router: on the user's SFR neufbox 200/s was safe and 400/s cut the line (docs/research/router-bench.md) |
 | `MAGNETAR_DHT_TCP_MAX` | `350` | TCP connections open at once (1–10000); the same router held ~440 |
