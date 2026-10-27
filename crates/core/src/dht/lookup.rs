@@ -210,10 +210,21 @@ pub async fn lookup_into(
         if peers_enough || closest_done || Instant::now() >= deadline || dht.is_stopped() {
             break;
         }
-        // Within the window, contacts likely to answer go first (D95); the window itself and
-        // the end test stay by distance.
-        let mut order = window.clone();
-        order.sort_by_key(|a| cands[a].tier); // stable: distance order within a tier
+        // Within the window, contacts we may query now and likely to answer go first (D95);
+        // the window itself and the end test stay by distance.
+        let fresh: Vec<SocketAddrV4> = window
+            .iter()
+            .filter(|a| cands[*a].st == St::New)
+            .copied()
+            .collect();
+        let limited = dht.limited(&fresh);
+        let mut order: Vec<(bool, Tier, SocketAddrV4)> = fresh
+            .iter()
+            .zip(limited)
+            .map(|(a, l)| (l, cands[a].tier, *a))
+            .collect();
+        order.sort_by_key(|(l, t, _)| (*l, *t)); // stable: distance order within
+        let order: Vec<SocketAddrV4> = order.into_iter().map(|(_, _, a)| a).collect();
         for a in &order {
             if waiting >= ALPHA || inflight.len() >= MAX_OUT {
                 break;
@@ -354,20 +365,28 @@ pub async fn lookup_into(
 
 const K_RESULT: usize = 8;
 
-/// Pick `k` lookup seeds from candidates with their tiers (D95): dead ones never, one per
-/// address (its best tier), then by tier (answered recently, untried, silent since) and within
-/// a tier by distance to `target`. The candidates are the closest few dozen known contacts, so
-/// a responsive seed is at most a couple of prefix bits further out than the nearest one, and
-/// the walk regains that in its first round; an unanswered seed costs a query of the budget.
-pub fn rank_seeds(
-    mut cands: Vec<(CompactNode, Tier)>,
-    target: &Id,
-    k: usize,
-) -> Vec<(CompactNode, Tier)> {
-    cands.retain(|(_, t)| *t != Tier::Dead);
-    cands.sort_by_key(|(n, t)| (n.addr, *t));
-    cands.dedup_by_key(|(n, _)| n.addr);
-    cands.sort_by_key(|(n, t)| (*t, distance(&n.id, target), n.addr));
+/// A lookup seed candidate (D95).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeedCand {
+    pub node: CompactNode,
+    pub tier: Tier,
+    /// Our per-IP limit (D54) has no token for its IP right now: a query would be refused.
+    pub limited: bool,
+}
+
+/// Pick `k` lookup seeds (D95): dead ones never, one per address (its best tier), then
+/// contacts we may query right now before rate-limited ones, then by tier (answered recently,
+/// untried, silent since), and within that by distance to `target`. The candidates are the
+/// closest few dozen known contacts, so a responsive seed is at most a couple of prefix bits
+/// further out than the nearest one, and the walk regains that in its first round; an
+/// unanswered seed costs a query of the budget. The per-IP key matters: ranking by tier alone
+/// sent the concurrent lookups to the same few responsive nodes, and the 1 q/s per-IP limit
+/// refused 3× more queries than were sent (first live run, §19).
+pub fn rank_seeds(mut cands: Vec<SeedCand>, target: &Id, k: usize) -> Vec<SeedCand> {
+    cands.retain(|c| c.tier != Tier::Dead);
+    cands.sort_by_key(|c| (c.node.addr, c.tier));
+    cands.dedup_by_key(|c| c.node.addr);
+    cands.sort_by_key(|c| (c.limited, c.tier, distance(&c.node.id, target), c.node.addr));
     cands.truncate(k);
     cands
 }
@@ -448,7 +467,7 @@ pub async fn collect_peers(
         let seeds: Vec<CompactNode> = dht
             .lookup_seeds(&info_hash, WIDTH)
             .into_iter()
-            .map(|(n, _)| n)
+            .map(|c| c.node)
             .collect();
         let extra = if seeds.len() < DONE {
             dht.bootstrap_addrs().to_vec()
@@ -527,6 +546,14 @@ mod tests {
         }
     }
 
+    fn sc(node: CompactNode, tier: Tier, limited: bool) -> SeedCand {
+        SeedCand {
+            node,
+            tier,
+            limited,
+        }
+    }
+
     /// An id sharing `bits` leading bits with `t`.
     fn near(t: &Id, bits: usize) -> Id {
         let mut id = *t;
@@ -538,16 +565,17 @@ mod tests {
     fn seeds_rank_by_tier_then_distance() {
         let t: Id = rand::random();
         let cands = vec![
-            (cn(near(&t, 30), 1), Tier::Unknown),
-            (cn(near(&t, 40), 2), Tier::Struck),
-            (cn(near(&t, 50), 3), Tier::Dead),
-            (cn(near(&t, 10), 4), Tier::Fresh),
-            (cn(near(&t, 20), 5), Tier::Fresh),
-            (cn(near(&t, 25), 6), Tier::Unknown),
+            sc(cn(near(&t, 30), 1), Tier::Unknown, false),
+            sc(cn(near(&t, 40), 2), Tier::Struck, false),
+            sc(cn(near(&t, 50), 3), Tier::Dead, false),
+            sc(cn(near(&t, 10), 4), Tier::Fresh, false),
+            sc(cn(near(&t, 20), 5), Tier::Fresh, false),
+            sc(cn(near(&t, 25), 6), Tier::Unknown, false),
+            sc(cn(near(&t, 60), 7), Tier::Fresh, true),
         ];
         let got: Vec<(u32, Tier)> = rank_seeds(cands.clone(), &t, 16)
             .into_iter()
-            .map(|(n, t)| (u32::from(*n.addr.ip()) - 0x0200_0000, t))
+            .map(|c| (u32::from(*c.node.addr.ip()) - 0x0200_0000, c.tier))
             .collect();
         assert_eq!(
             got,
@@ -557,8 +585,9 @@ mod tests {
                 (1, Tier::Unknown),
                 (6, Tier::Unknown),
                 (2, Tier::Struck),
+                (7, Tier::Fresh),
             ],
-            "fresh first (nearest first), dead never"
+            "queryable first, then fresh (nearest first), dead never"
         );
         assert_eq!(rank_seeds(cands, &t, 2).len(), 2);
     }
@@ -569,11 +598,18 @@ mod tests {
         let a = cn(near(&t, 30), 1);
         let b = cn(near(&t, 31), 2);
         let got = rank_seeds(
-            vec![(a, Tier::Struck), (b, Tier::Unknown), (a, Tier::Fresh)],
+            vec![
+                sc(a, Tier::Struck, false),
+                sc(b, Tier::Unknown, false),
+                sc(a, Tier::Fresh, false),
+            ],
             &t,
             16,
         );
-        assert_eq!(got, vec![(a, Tier::Fresh), (b, Tier::Unknown)]);
+        assert_eq!(
+            got,
+            vec![sc(a, Tier::Fresh, false), sc(b, Tier::Unknown, false)]
+        );
         assert!(rank_seeds(Vec::new(), &t, 16).is_empty());
     }
 }

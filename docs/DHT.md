@@ -1,4 +1,4 @@
-# DHT crawler (ARCHITECTURE.md D49–D75, D93)
+# DHT crawler (ARCHITECTURE.md D49–D75, D93, D95)
 
 Design document for the native Mainline DHT crawler. Status: **stages 1 (discovery), 2
 (metadata fetch) and 3 (classification and safety) built**: KRPC node, BEP 42 ids, routing,
@@ -435,6 +435,8 @@ Both modes honour every rule of §3.4 (interval, per-IP rate, honest ids, no fak
   are scanned first). Seeding from the routing tables alone (~100 contacts, nearly all far from
   a random infohash) sent every concurrent lookup to the same few nodes and into the per-IP
   limit.
+  Since D95 (§19) the seeds are ranked by responsiveness among the 64 closest pool contacts,
+  and pool nodes that never answered two queries are dropped and skipped.
 
 ### 3.6 Passive capture (aggressive only)
 
@@ -844,6 +846,9 @@ when that is off. `--dry-run`: no database at all (dedupe in memory). `serve` st
   `announce_fetches`, `announce_upgraded`, `incoming_*` per query type, `fake_peers_skipped` /
   `_banned` / `_tracked`, `lookup_mean_ms`, `queries_per_lookup`, `lookup_slow_share`, and the
   answer share by node age `answered_share_young` / `_old` / `_unpooled` / `_repeat` (§18).
+- D95 adds (serde default): `lookup_answered_share`, `lookup_seeds_fresh_share`,
+  `queries_per_stored` (rate window), `pool_dropped_dead`, `lookup_dead_skipped` (since the
+  start) (§19).
 - `stats_series` metrics: `dht_torrents_added`, `dht_hashes_seen`, `dht_fetch_ok`,
   `dht_fetch_fail`, `dht_blocked`; breakdown field `origin`.
 - Targets on the laptop (to be measured in stage 8): ≤ 25 % of one core, ≤ 400 MB RSS for the
@@ -1481,3 +1486,5 @@ At this load the 1.5 s timeout loses a fifth to a half of the output, and 24 pee
 the defaults became `MAGNETAR_DHT_LOOKUP_TIMEOUT_MS=4000` and `MAGNETAR_DHT_PEERS_PER_HASH=24`.
 The same old build stored ~2 700/min the night before: the DHT varies a lot by hour, so only
 compare runs made close together.
+
+__SECTION19__

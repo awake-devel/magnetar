@@ -425,8 +425,8 @@ async fn lookups_prefer_nodes_that_answer() {
     d.learn_nodes(&all, &far);
     let seeds = d.lookup_seeds(&t, 16);
     assert_eq!(seeds.len(), 8);
-    assert!(seeds.iter().all(|(_, tier)| *tier == Tier::Unknown));
-    assert_eq!(seeds[0].0, silent[3], "untried: nearest first");
+    assert!(seeds.iter().all(|c| c.tier == Tier::Unknown && !c.limited));
+    assert_eq!(seeds[0].node, silent[3], "untried: nearest first");
 
     let mut found = 0;
     for round in 0..3 {
@@ -440,10 +440,10 @@ async fn lookups_prefer_nodes_that_answer() {
                 assert_eq!(c.queries, 8);
                 assert_eq!(st.pool.dropped_dead, 0);
                 let seeds = d.lookup_seeds(&t, 16);
-                let tiers: Vec<Tier> = seeds.iter().map(|(_, t)| *t).collect();
+                let tiers: Vec<Tier> = seeds.iter().map(|c| c.tier).collect();
                 assert_eq!(&tiers[..4], &[Tier::Fresh; 4], "{seeds:?}");
                 assert_eq!(&tiers[4..], &[Tier::Struck; 4]);
-                assert!(seeds[..4].iter().all(|(n, _)| live.contains(n)));
+                assert!(seeds[..4].iter().all(|c| live.contains(&c.node)));
             }
             1 => {
                 // Struck nodes are still in the window by distance and asked after the live ones.
@@ -524,5 +524,58 @@ async fn dead_contacts_in_answers_are_skipped() {
     assert_eq!((r.queried, r.answered, r.dead_skipped), (1, 1, 1));
     assert_eq!(r.peers, vec![peer("9.9.9.37:1")]);
     assert_eq!(d.stats().lookup_dead_skipped, 1);
+    d.shutdown().await;
+}
+
+/// D95: a seed our per-IP limit would refuse right now goes after those we may query, whatever
+/// its tier (ranking by tier alone sent concurrent lookups to the same responsive nodes, and the
+/// limit refused most of those queries in the first live run).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rate_limited_seeds_go_last() {
+    let t: Id = rand::random();
+    let mut nodes = Vec::new();
+    for i in 0..2u8 {
+        let id = near(&t, 30 + i as usize, i);
+        let a = node(
+            Ipv4Addr::new(127, 0, 38, 10 + i),
+            Script {
+                id,
+                delay: Some(Duration::ZERO),
+                values: vec![],
+            },
+        )
+        .await;
+        nodes.push(CompactNode { id, addr: a });
+    }
+    let mut c = EngineConfig::new(Mode::Polite);
+    c.bind = Ipv4Addr::new(127, 0, 38, 1);
+    c.ports = vec![0];
+    c.qps = 1000;
+    c.allow_loopback = true;
+    c.sample = false;
+    c.query_timeout = Duration::from_millis(300);
+    c.per_ip_qps = 0.01; // burst 2, then nothing for minutes
+    let (d, _rx) = Dht::start(c).await.unwrap();
+    d.learn_nodes(&nodes, &t.map(|b| !b));
+    let ping = magnetar_core::dht::krpc::Query::Ping;
+    // nodes[1] (nearer) answers twice and uses up its tokens; nodes[0] answers once.
+    for _ in 0..2 {
+        d.query(0, nodes[1].addr, ping.clone()).await.unwrap();
+    }
+    d.query(0, nodes[0].addr, ping.clone()).await.unwrap();
+    let seeds = d.lookup_seeds(&t, 16);
+    let got: Vec<(CompactNode, Tier, bool)> =
+        seeds.iter().map(|c| (c.node, c.tier, c.limited)).collect();
+    assert_eq!(
+        got,
+        vec![
+            (nodes[0], Tier::Fresh, false),
+            (nodes[1], Tier::Fresh, true)
+        ]
+    );
+    assert_eq!(
+        d.limited(&[nodes[0].addr, nodes[1].addr]),
+        vec![false, true]
+    );
     d.shutdown().await;
 }

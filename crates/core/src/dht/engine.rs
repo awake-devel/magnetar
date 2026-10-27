@@ -519,10 +519,17 @@ type PendingKey = (usize, [u8; 2], SocketAddrV4);
 
 /// Owns a query's receiver; on drop removes the transaction unless it already belongs to a newer
 /// query with the same key (its sender is then still open).
+///
+/// A query dropped while it waits for its answer (a lookup that ended) counts as a silence
+/// for the pool (D95) once it waited the lookup timeout: with the lookup timeout equal to the
+/// hard one (the default), a walk often ends on the soft timer just before the hard one fires,
+/// and those silences would otherwise never be recorded.
 struct PendingGuard<'a> {
     dht: &'a Dht,
     key: PendingKey,
     rx: Option<oneshot::Receiver<Reply>>,
+    /// Set once the datagram is sent, cleared when an answer or the hard timeout is handled.
+    waiting_since: Option<Instant>,
 }
 
 impl Drop for PendingGuard<'_> {
@@ -531,6 +538,12 @@ impl Drop for PendingGuard<'_> {
         let mut s = self.dht.inner.state.lock().unwrap();
         if s.pending.get(&self.key).is_some_and(|tx| tx.is_closed()) {
             s.pending.remove(&self.key);
+        }
+        if self
+            .waiting_since
+            .is_some_and(|t| t.elapsed() >= self.dht.lookup_timeout())
+        {
+            s.pool.silent(&self.key.2);
         }
     }
 }
@@ -732,19 +745,36 @@ impl Dht {
     /// `k` closest of each routing table, ranked by [`super::lookup::rank_seeds`] (nodes that
     /// answered recently first, then untried ones, then silent ones; dead ones never), with
     /// their tiers. The pool's tier wins for a contact both know (it sees every query).
-    pub fn lookup_seeds(&self, target: &Id, k: usize) -> Vec<(CompactNode, Tier)> {
+    pub fn lookup_seeds(&self, target: &Id, k: usize) -> Vec<super::lookup::SeedCand> {
+        use super::lookup::SeedCand;
         let now = Instant::now();
         let s = self.inner.state.lock().unwrap();
-        let mut all = s.pool.closest_ranked(target, k * SEED_SPREAD, now);
+        let mut all: Vec<SeedCand> = s
+            .pool
+            .closest_ranked(target, k * SEED_SPREAD, now)
+            .into_iter()
+            .map(|(node, tier)| SeedCand {
+                node,
+                tier,
+                limited: false,
+            })
+            .collect();
         for v in &s.nodes {
-            for (n, t) in v.routing.closest_ranked(target, k, now) {
-                all.push((n, s.pool.tier_of(&n.addr, now).unwrap_or(t)));
+            for (node, t) in v.routing.closest_ranked(target, k, now) {
+                all.push(SeedCand {
+                    node,
+                    tier: s.pool.tier_of(&node.addr, now).unwrap_or(t),
+                    limited: false,
+                });
             }
+        }
+        for c in &mut all {
+            c.limited = !s.per_ip.available(c.node.addr.ip(), now);
         }
         drop(s);
         let out = super::lookup::rank_seeds(all, target, k);
-        for (_, t) in &out {
-            match t {
+        for c in &out {
+            match c.tier {
                 Tier::Fresh => bump(&self.inner.c.lookup_seeds[0]),
                 Tier::Unknown => bump(&self.inner.c.lookup_seeds[1]),
                 Tier::Struck => bump(&self.inner.c.lookup_seeds[2]),
@@ -752,6 +782,16 @@ impl Dht {
             }
         }
         out
+    }
+
+    /// Whether our per-IP limit would refuse a query to each address right now (D95).
+    pub fn limited(&self, addrs: &[SocketAddrV4]) -> Vec<bool> {
+        let now = Instant::now();
+        let s = self.inner.state.lock().unwrap();
+        addrs
+            .iter()
+            .map(|a| !s.per_ip.available(a.ip(), now))
+            .collect()
     }
 
     /// The pool's tier of each address (unknown to the pool → [`Tier::Unknown`]), one lock.
@@ -1044,6 +1084,7 @@ impl Dht {
             dht: self,
             key,
             rx: Some(rx),
+            waiting_since: None,
         };
         if self.inner.sockets[key.0]
             .send_to(&wire, SocketAddr::V4(to))
@@ -1052,6 +1093,7 @@ impl Dht {
         {
             return Err(QueryError::Io);
         }
+        guard.waiting_since = Some(Instant::now());
         on_sent();
         bump(&c.sent[kind.min(4)]);
         c.udp_bytes_out
@@ -1063,6 +1105,7 @@ impl Dht {
         }
         let rx = guard.rx.as_mut().expect("receiver until drop");
         let r = tokio::time::timeout(self.inner.cfg.query_timeout, rx).await;
+        guard.waiting_since = None;
         if let Ok(Ok(_)) = &r {
             // Any answer, error replies included, shows the node is alive (D95).
             self.inner

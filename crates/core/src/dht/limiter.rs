@@ -46,6 +46,14 @@ impl PerIp {
         self.buckets.is_empty()
     }
 
+    /// Whether [`try_take`](Self::try_take) would succeed for `ip` now (nothing changes; a full
+    /// map is not considered).
+    pub fn available(&self, ip: &Ipv4Addr, now: Instant) -> bool {
+        self.buckets.get(ip).is_none_or(|(tokens, at)| {
+            tokens + now.saturating_duration_since(*at).as_secs_f64() * self.rate >= 1.0
+        })
+    }
+
     /// Take one token for `ip` if available.
     pub fn try_take(&mut self, ip: Ipv4Addr, now: Instant) -> bool {
         if !self.buckets.contains_key(&ip) && self.buckets.len() >= self.cap {
@@ -224,9 +232,12 @@ mod tests {
         let mut l = PerIp::new(1.0, 2.0, 4);
         let ip = Ipv4Addr::new(1, 2, 3, 4);
         let t = Instant::now();
+        assert!(l.available(&ip, t));
         assert!(l.try_take(ip, t));
         assert!(l.try_take(ip, t));
+        assert!(!l.available(&ip, t));
         assert!(!l.try_take(ip, t));
+        assert!(l.available(&ip, t + Duration::from_millis(1000)));
         assert!(!l.try_take(ip, t + Duration::from_millis(900)));
         assert!(l.try_take(ip, t + Duration::from_millis(1000)));
         assert!(l.try_take(Ipv4Addr::new(1, 2, 3, 5), t));
