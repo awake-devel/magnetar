@@ -19,6 +19,7 @@ name = "magnetar-server"
 path = "src/main.rs"
 
 [dependencies]
+libc = "0.2"
 magnetar-core = { workspace = true, features = ["downloads", "enrich", "dht-crawl"] }
 sqlx.workspace = true
 axum.workspace = true

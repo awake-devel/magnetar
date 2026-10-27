@@ -16,6 +16,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
     // Two rustls providers are linked (ring + librqbit's aws-lc): pin ring process-wide (D28).
     magnetar_core::http::install_crypto_provider();
+    raise_open_files_limit();
 
     let cli = Cli::parse();
     // D53: the hard blocklist is loaded before any command; a list that does not load stops
@@ -108,3 +109,41 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 }
+
+/// The DHT crawler keeps thousands of TCP connections open (`MAGNETAR_DHT_TCP_MAX`), but most
+/// systems start a process with a soft limit of 1024 open files (Docker included). Raise the soft
+/// limit to the hard one, as far as 1 Mi; a failure only logs, the server still runs.
+#[cfg(unix)]
+fn raise_open_files_limit() {
+    const WANT: libc::rlim_t = 1 << 20;
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit only read or write the struct passed by pointer.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        tracing::warn!(
+            "open files limit: getrlimit failed: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    let target = lim.rlim_max.min(WANT);
+    if lim.rlim_cur >= target {
+        return;
+    }
+    let old = lim.rlim_cur;
+    lim.rlim_cur = target;
+    // SAFETY: as above.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } != 0 {
+        tracing::warn!(
+            "open files limit: setrlimit failed: {}",
+            std::io::Error::last_os_error()
+        );
+    } else {
+        tracing::info!("open files limit raised from {old} to {target}");
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_open_files_limit() {}

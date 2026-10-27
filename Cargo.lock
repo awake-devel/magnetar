@@ -2567,6 +2567,7 @@ dependencies = [
  "hex",
  "httpdate",
  "igd-next",
+ "libc",
  "magnetar-core",
  "nostr",
  "nostr-memory",
