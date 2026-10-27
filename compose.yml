@@ -71,6 +71,9 @@ services:
       MAGNETAR_LIVENESS_TRACKER_CONCURRENCY:
       MAGNETAR_LIVENESS_DHT:
       MAGNETAR_LIVENESS_DHT_CONCURRENCY:
+      # Crawl workers on other machines (docs/WORKERS.md): name:token,... ; unset = no workers.
+      MAGNETAR_WORKER_TOKENS:
+      MAGNETAR_WORKER_LEASE_SECS:
       # DHT crawler (docs/DHT.md, off by default). Its UDP ports are published only by the
       # overlay docker/compose.dht.yml, which also turns it on.
       MAGNETAR_DHT:
