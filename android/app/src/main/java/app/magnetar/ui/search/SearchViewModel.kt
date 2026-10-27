@@ -94,7 +94,7 @@ private data class SearchRequest(
 class SearchViewModel(
     private val repo: Repository,
     private val clock: () -> Long = System::currentTimeMillis,
-    /** Time from the user's action to results on screen: "<ms> live|cached". */
+    /** Time from the user's action to results on screen: "<ms> live|cached len=<text length>" (never the text). */
     private val onTiming: (String) -> Unit = {},
 ) : ViewModel() {
     private val _state = MutableStateFlow(SearchUiState())
@@ -212,7 +212,7 @@ class SearchViewModel(
                     endReached = true, generation = it.generation + 1,
                 )
             }
-            onTiming("${clock() - r.askedAtMs} cached")
+            onTiming("${clock() - r.askedAtMs} cached len=${r.text.trim().length}")
         }
         try {
             if (health == null) throw ApiException.Network(java.io.IOException("health unreachable"))
@@ -229,7 +229,7 @@ class SearchViewModel(
                 )
             }
             shownSeq = r.seq
-            onTiming("${clock() - r.askedAtMs} live")
+            onTiming("${clock() - r.askedAtMs} live len=${r.text.trim().length}")
             repo.writeCache(CACHE_SEARCH, key, SearchPage.serializer(), page)
         } catch (e: CancellationException) {
             throw e

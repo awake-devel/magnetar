@@ -34,6 +34,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.unit.dp
 import app.magnetar.api.FacetCounts
 import app.magnetar.api.FacetSet
@@ -50,7 +51,7 @@ private fun chipText(label: String, count: Long?) = label + (count?.let { " (${f
  * chips that stay where they first appeared (a value that would give nothing stays in place,
  * disabled), and Back / swipe-down apply like the Show button.
  */
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class, androidx.compose.ui.ExperimentalComposeUiApi::class)
 @Composable
 fun FilterSheet(
     initial: SearchFilters,
@@ -108,7 +109,7 @@ fun FilterSheet(
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
         modifier = Modifier.testTag("filter_sheet"),
     ) {
-        Column(Modifier.padding(horizontal = 16.dp).verticalScroll(rememberScrollState())) {
+        Column(Modifier.semantics { testTagsAsResourceId = true }.padding(horizontal = 16.dp).verticalScroll(rememberScrollState())) {
             Title("Categories")
             val categoryCounts: FacetCounts? = facets?.field("category")
             ChipRow(

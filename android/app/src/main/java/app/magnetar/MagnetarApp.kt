@@ -9,6 +9,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.work.WorkManager
 import app.magnetar.api.ApiException
 import app.magnetar.api.Http
+import app.magnetar.api.TimingListener
 import app.magnetar.api.MagnetarApi
 import app.magnetar.api.awaitBytes
 import app.magnetar.cache.PageCache
@@ -34,7 +35,11 @@ class MagnetarApp : Application() {
     val settingsStore: SettingsStore by lazy { SettingsStore(this) }
 
     /** One connection pool and dispatcher for the whole app (docs/APP.md §4). */
-    val http: OkHttpClient by lazy { Http.baseClient() }
+    val http: OkHttpClient by lazy {
+        Http.baseClient().let {
+            if (BuildConfig.DEBUG) it.newBuilder().eventListenerFactory { TimingListener() }.build() else it
+        }
+    }
 
     /** Lives as long as the process: settings watchers, the poll scheduling. */
     val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)

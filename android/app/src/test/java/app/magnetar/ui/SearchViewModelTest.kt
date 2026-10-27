@@ -172,7 +172,7 @@ class SearchViewModelTest {
         advanceUntilIdle()
         assertEquals(second.state.value.hits.single().title, "live")
         assertNull(second.state.value.cachedAtMs)
-        assertTrue(timings.any { it.endsWith("cached") } && timings.any { it.endsWith("live") }, timings.toString())
+        assertTrue(timings.any { it.contains("cached len=4") } && timings.any { it.contains("live len=4") }, timings.toString())
     }
 
     @Test

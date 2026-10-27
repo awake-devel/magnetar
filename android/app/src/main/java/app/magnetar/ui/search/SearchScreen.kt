@@ -50,6 +50,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -227,6 +229,7 @@ val SORT_LABELS = mapOf(
     Sort.RATING to "Rating",
 )
 
+@OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
 @Composable
 private fun SortMenu(
     expanded: Boolean,
@@ -244,7 +247,7 @@ private fun SortMenu(
                 text = { Text(SORT_LABELS.getValue(s)) },
                 leadingIcon = { RadioButton(selected = s == sort, onClick = null) },
                 onClick = { onSort(s) },
-                modifier = Modifier.testTag("sort_${s.name.lowercase()}"),
+                modifier = Modifier.semantics { testTagsAsResourceId = true }.testTag("sort_${s.name.lowercase()}"),
             )
         }
         HorizontalDivider()

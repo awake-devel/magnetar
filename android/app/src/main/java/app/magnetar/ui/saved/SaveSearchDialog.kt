@@ -18,8 +18,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTagsAsResourceId
 
 /** "Save search": the current text, filters and sort, stored on the server (D77). */
+@OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
 @Composable
 fun SaveSearchDialog(
     initialName: String,
@@ -33,7 +36,7 @@ fun SaveSearchDialog(
         onDismissRequest = onDismiss,
         title = { Text("Save search") },
         text = {
-            Column {
+            Column(Modifier.semantics { testTagsAsResourceId = true }) {
                 OutlinedTextField(
                     value = name,
                     onValueChange = { name = it.take(200) },
@@ -60,8 +63,9 @@ fun SaveSearchDialog(
         confirmButton = {
             TextButton(
                 onClick = { onSave(name.trim(), notify) },
+                // The confirm button is outside the text slot: tag it in its own semantics.
                 enabled = name.isNotBlank(),
-                modifier = Modifier.testTag("save_confirm"),
+                modifier = Modifier.semantics { testTagsAsResourceId = true }.testTag("save_confirm"),
             ) { Text("Save") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
