@@ -48,6 +48,7 @@ anitomy-ng.workspace = true
 ruzstd.workspace = true
 tantivy.workspace = true
 igd-next = { workspace = true, optional = true }
+maxminddb.workspace = true
 
 [dev-dependencies]
 tokio-tungstenite.workspace = true

@@ -375,3 +375,31 @@ pub(super) async fn sampler(
         }
     }
 }
+
+impl DhtService {
+    /// The server's line in `/api/v1/stats/sources.machines` (D102): counters of the running
+    /// crawler since it started. None while it is not running.
+    pub fn machine(&self, now: i64) -> Option<magnetar_core::api::MachineSources> {
+        let i = self.inner.lock().unwrap();
+        let r = i.running.as_ref()?;
+        let c = &r.p.c;
+        let f = r.p.fetcher.stats();
+        let route = |k: usize| get(&c.by_route[k]);
+        Some(magnetar_core::api::MachineSources {
+            name: "server".into(),
+            kind: "server".into(),
+            connected: true,
+            since: Some(now - r.started.elapsed().as_secs() as i64),
+            dht_triaged: get(&c.unique),
+            dht_queued: get(&c.queued),
+            dht_metadata: f.ok + f.private + f.v2_only + f.invalid,
+            dht_stored: r.p.persisted.lock().unwrap().stored,
+            dht_triaged_by_route: magnetar_core::api::RouteTriple {
+                sample: route(0),
+                get_peers: route(1),
+                announce: route(2),
+            },
+            ..Default::default()
+        })
+    }
+}

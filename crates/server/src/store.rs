@@ -1294,6 +1294,16 @@ impl Store for PgStore {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    async fn record_relay_torrents(&self, url: &str, torrents: u64) -> Result<()> {
+        sqlx::query("UPDATE relays SET torrents_found = torrents_found + $2 WHERE url = $1")
+            .bind(url)
+            .bind(to_i64(torrents))
+            .execute(&self.pool)
+            .await
+            .map_err(db)?;
+        Ok(())
+    }
+
     async fn record_relay_result(
         &self,
         url: &str,

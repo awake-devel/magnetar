@@ -9,6 +9,8 @@ use tokio::sync::watch;
 
 use crate::api::{self, AppState};
 use crate::config::Config;
+use crate::crawlmap::{self, CrawlMap};
+use crate::geo::GeoMode;
 use crate::liveness::{self, LivenessService};
 use crate::search_index::{self, SearchIndex};
 use crate::store::PgStore;
@@ -129,7 +131,12 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
     };
 
     let (stop_tx, stop_rx) = watch::channel(false);
+    // Crawl map (D101–D105): counters by country / network; the database loads in the
+    // background (download on first start), the map says "missing" meanwhile.
+    let geo_cfg = cfg.geo_config(cfg.state_dir().join("geoip"));
+    let crawlmap = Arc::new(CrawlMap::new(geo_cfg.mode, crawlmap::NODE_BITS_SERVER));
     let state = AppState::new(store.clone(), &token)
+        .with_crawlmap(crawlmap.clone())
         .with_shutdown(stop_rx.clone())
         .with_downloader(downloader.clone())
         .with_tmdb(tmdb.clone())
@@ -185,6 +192,25 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
             store.pool().clone(),
             cfg.clone(),
             svc.clone(),
+            (geo_cfg.mode != GeoMode::Off).then(|| crawlmap.clone()),
+            stop_rx.clone(),
+        )));
+    }
+    daemons.push(tokio::spawn(crawlmap::refresh_loop(
+        crawlmap.clone(),
+        geo_cfg.clone(),
+        stop_rx.clone(),
+    )));
+    {
+        let (dht, liveness, fleet) = (
+            state.dht.clone(),
+            state.liveness.clone(),
+            state.fleet.clone(),
+        );
+        daemons.push(tokio::spawn(crawlmap::server_loop(
+            crawlmap.clone(),
+            store.pool().clone(),
+            move || api::crawl_machines(dht.as_deref(), &liveness, &fleet, magnetar_core::now()),
             stop_rx.clone(),
         )));
     }

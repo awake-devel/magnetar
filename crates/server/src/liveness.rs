@@ -70,6 +70,8 @@ pub struct LivenessService {
     boosts: Mutex<HashMap<String, i16>>,
     last: Mutex<Option<(i64, BatchReport)>>,
     stats: tokio::sync::Mutex<Option<(Instant, LivenessStats)>>,
+    /// Infohashes the server's own batches checked since the start (D102).
+    checked: std::sync::atomic::AtomicU64,
 }
 
 impl Default for LivenessService {
@@ -85,7 +87,13 @@ impl LivenessService {
             boosts: Mutex::default(),
             last: Mutex::default(),
             stats: tokio::sync::Mutex::default(),
+            checked: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Seed checks written by the server's own batches since the start.
+    pub fn checked_total(&self) -> u64 {
+        self.checked.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn config(&self) -> &LivenessConfig {
@@ -160,6 +168,8 @@ impl LivenessService {
         let (results, report) = self.scraper.check(&items, now).await;
         // Scheduled from the batch's start, like the results' `checked_at`.
         write_results(pool, &rows, &results, now, Expiry::Scheduled).await?;
+        self.checked
+            .fetch_add(rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
         crate::stats::bump(pool, crate::stats::LIVENESS_CHECKS, rows.len() as i64).await;
         tracing::info!(
             checked = report.hashes,

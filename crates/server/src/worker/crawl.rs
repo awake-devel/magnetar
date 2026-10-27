@@ -253,6 +253,9 @@ async fn triage_loop(
             s = rx.recv() => match s {
                 Some(s) => {
                     add(&p.c.sightings, 1);
+                    if let Some(g) = &p.opts.geo {
+                        g.dht_node(s.from, magnetar_core::now());
+                    }
                     if batch.len() >= TRIAGE_BACKLOG_MAX {
                         add(&p.c.triage_dropped, 1);
                     } else if seen.check_and_insert(&s.info_hash, Instant::now()) {
@@ -289,14 +292,31 @@ async fn triage_task(
     mut stop: watch::Receiver<bool>,
 ) {
     while let Some(batch) = rx.recv().await {
+        // D105: codes of the telling nodes (never their addresses), node counts, AS names.
+        let (geo, (geo_nodes, as_names)) = match &p.opts.geo {
+            Some(g) => (
+                g.dht_hashes(batch.iter().map(|s| s.from), false),
+                g.take_upload(),
+            ),
+            None => (Vec::new(), (Vec::new(), Vec::new())),
+        };
         let req = TriageRequest {
             items: batch
                 .iter()
-                .map(|s| TriageItem {
-                    h: hex::encode(s.info_hash),
-                    via: via_text(s.via).into(),
+                .enumerate()
+                .map(|(i, s)| {
+                    let code = geo.get(i).copied().flatten();
+                    TriageItem {
+                        h: hex::encode(s.info_hash),
+                        via: via_text(s.via).into(),
+                        // "" = resolved, not in the database (counted as unknown).
+                        cc: code.map(|c| c.cc_text()),
+                        asn: code.and_then(|c| c.asn()),
+                    }
                 })
                 .collect(),
+            geo_nodes,
+            as_names,
         };
         add(&p.c.triaged, batch.len() as u64);
         let r = with_retry(3, &mut stop, || {

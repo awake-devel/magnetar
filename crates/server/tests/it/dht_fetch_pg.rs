@@ -598,6 +598,7 @@ async fn pipeline_fetches_and_stores_from_a_fake_seeder() {
         screen: Some(Arc::new(MarkerScreen)),
         upnp: None,
         service: None,
+        geo: None,
     };
     let (_tx, stop) = tokio::sync::watch::channel(false);
     let rep = dht::run(
@@ -774,6 +775,7 @@ async fn pipeline_blocklist_run(cap: Capture) {
         screen: Some(Arc::new(BlocklistScreen(Arc::new(list)))),
         upnp: None,
         service: None,
+        geo: None,
     };
     let crawler_ip = Ipv4Addr::new(127, 0, 21, 1);
     let (_tx, stop) = tokio::sync::watch::channel(false);

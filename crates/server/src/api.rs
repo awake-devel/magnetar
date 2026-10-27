@@ -60,6 +60,8 @@ pub struct AppState {
     pub dht: Option<Arc<DhtService>>,
     /// Crawl workers (D96): tokens, limits, per-worker counters. No tokens = disabled.
     pub fleet: Arc<crate::fleet::Fleet>,
+    /// Crawl map counters and geo database (D101–D105).
+    pub crawlmap: Arc<crate::crawlmap::CrawlMap>,
 }
 
 impl AppState {
@@ -77,7 +79,13 @@ impl AppState {
             stats: Arc::default(),
             dht: None,
             fleet: Arc::default(),
+            crawlmap: Arc::default(),
         }
+    }
+
+    pub fn with_crawlmap(mut self, c: Arc<crate::crawlmap::CrawlMap>) -> Self {
+        self.crawlmap = c;
+        self
     }
 
     pub fn with_fleet(mut self, f: Arc<crate::fleet::Fleet>) -> Self {
@@ -236,6 +244,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/stats/timeseries", get(timeseries))
         .route("/api/v1/stats/health", get(stats_health))
+        .route("/api/v1/stats/sources", get(stats_sources))
+        .route("/api/v1/stats/map", get(stats_map))
         .route("/api/v1/graphs/wot", get(graph_wot))
         .route("/api/v1/graphs/relays", get(graph_relays))
         .route("/api/v1/graphs/media/{id}", get(graph_media))
@@ -822,6 +832,78 @@ async fn stats_health(State(st): State<AppState>) -> ApiResult<Json<StatsHealth>
         h.dht = Some(d.stats(st.store.pool()).await);
     }
     Ok(Json(h))
+}
+
+/// The server itself, then each crawl worker (D102). Live counters since the start.
+pub fn crawl_machines(
+    dht: Option<&DhtService>,
+    liveness: &LivenessService,
+    fleet: &crate::fleet::Fleet,
+    now: i64,
+) -> Vec<MachineSources> {
+    let mut server = dht.and_then(|d| d.machine(now)).unwrap_or(MachineSources {
+        name: "server".into(),
+        kind: "server".into(),
+        ..Default::default()
+    });
+    server.seed_checks = liveness.checked_total();
+    let mut out = vec![server];
+    out.extend(fleet.machines(now));
+    out
+}
+
+fn store_error(e: sqlx::Error) -> ApiError {
+    ApiError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "store",
+        crate::dht::persist::error_class(&e),
+    )
+}
+
+/// `GET /api/v1/stats/sources` (D102).
+async fn stats_sources(State(st): State<AppState>) -> ApiResult<Json<CrawlSources>> {
+    let now = magnetar_core::now();
+    let machines = crawl_machines(st.dht.as_deref(), &st.liveness, &st.fleet, now);
+    let s = st
+        .crawlmap
+        .sources(st.store.pool(), machines, now)
+        .await
+        .map_err(store_error)?;
+    Ok(Json(s))
+}
+
+/// `GET /api/v1/stats/map?layer=dht|nostr&window=day|all` (D103).
+async fn stats_map(
+    State(st): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> ApiResult<Json<magnetar_core::api::CrawlMap>> {
+    let mut layer = crate::crawlmap::Layer::Dht;
+    let mut day = true;
+    for (k, v) in url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes()) {
+        match (k.as_ref(), v.as_ref()) {
+            ("layer", "dht") => layer = crate::crawlmap::Layer::Dht,
+            ("layer", "nostr") => layer = crate::crawlmap::Layer::Nostr,
+            ("window", "day") => day = true,
+            ("window", "all") => day = false,
+            ("layer", v) => {
+                return Err(ApiError::bad_request(format!(
+                    "bad layer {v:?} (dht, nostr)"
+                )));
+            }
+            ("window", v) => {
+                return Err(ApiError::bad_request(format!(
+                    "bad window {v:?} (day, all)"
+                )));
+            }
+            _ => {}
+        }
+    }
+    let m = st
+        .crawlmap
+        .map(st.store.pool(), layer, day, magnetar_core::now())
+        .await
+        .map_err(store_error)?;
+    Ok(Json(m))
 }
 
 /// A graph through the shared cache; None (unknown media/infohash) answers 404.

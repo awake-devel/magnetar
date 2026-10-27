@@ -45,6 +45,8 @@ httpdate = "=1.0.3"
 anitomy-ng = { version = "=1.0.10", default-features = false }
 ruzstd = "=0.9.0"
 tantivy = { version = "=0.27.0", default-features = false, features = ["mmap", "lz4-compression"] }
+# MMDB reader for the crawl map's DB-IP Lite databases (D104; ISC, oschwald/maxminddb-rust).
+maxminddb = { version = "=0.32.0", default-features = false }
 # UPnP IGD client for the DHT crawler's port mappings (D57, D72; MIT).
 igd-next = { version = "=0.18.0", default-features = false, features = ["aio_tokio"] }
 

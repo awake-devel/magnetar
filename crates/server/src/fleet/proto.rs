@@ -125,12 +125,42 @@ pub struct TriageItem {
     pub h: String,
     /// `sample`, `announce` or `get_peers`.
     pub via: String,
+    /// Country (ISO alpha-2) and AS number of the node that told the worker about the hash,
+    /// resolved on the worker (D105); `""` = resolved but unknown. Never an address. Absent:
+    /// no geo database there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asn: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct TriageRequest {
     pub items: Vec<TriageItem>,
+    /// DHT nodes the worker heard from (once per node and UTC day) since its last request, by
+    /// country and network (D105). Aggregates only.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub geo_nodes: Vec<GeoTally>,
+    /// AS organisation names the worker has not sent yet (public registry data).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub as_names: Vec<AsName>,
+}
+
+/// A count by country / network (no address).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct GeoTally {
+    pub cc: Option<String>,
+    pub asn: Option<u32>,
+    pub n: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AsName {
+    pub asn: u32,
+    pub org: String,
 }
 
 /// The hashes this worker should fetch now: new to the whole fleet, or due again. Each is

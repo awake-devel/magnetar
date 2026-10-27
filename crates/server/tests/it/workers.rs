@@ -315,6 +315,7 @@ fn opts(
         },
         upload_buffer: 4 << 20,
         heartbeat_every: Duration::from_secs(1),
+        geo: None,
     }
 }
 
@@ -439,7 +440,9 @@ async fn triage_one(c: &Client, h: [u8; 20]) {
                 items: vec![TriageItem {
                     h: hex::encode(h),
                     via: "sample".into(),
+                    ..Default::default()
                 }],
+                ..Default::default()
             },
         )
         .await
@@ -489,7 +492,9 @@ async fn uploads_are_verified_classified_and_screened_by_the_server() {
                 items: vec![TriageItem {
                     h: hex::encode(h),
                     via: "announce".into(),
+                    ..Default::default()
                 }],
+                ..Default::default()
             },
         )
         .await
@@ -710,6 +715,7 @@ fn worker_dht(ports: Vec<u16>) -> DhtOptions {
         screen: screen::global_screen(),
         upnp: None,
         service: None,
+        geo: None,
     }
 }
 

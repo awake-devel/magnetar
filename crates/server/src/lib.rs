@@ -3,6 +3,7 @@
 pub mod api;
 pub mod attrs;
 pub mod config;
+pub mod crawlmap;
 pub mod daemons;
 pub mod dht;
 pub mod discovery;
@@ -10,6 +11,7 @@ pub mod enrich;
 pub mod enrich_anime;
 pub mod filter;
 pub mod fleet;
+pub mod geo;
 pub mod graphs;
 pub mod liveness;
 pub mod media_lock;

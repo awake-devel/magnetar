@@ -92,6 +92,10 @@ services:
       MAGNETAR_DHT_UPNP_GATEWAY:
       MAGNETAR_DHT_UPNP_LOCAL_IP:
       MAGNETAR_BLOCKLIST_FILE:
+      # Crawl map (docs/CRAWLMAP.md): DB-IP Lite databases downloaded into state/geoip.
+      MAGNETAR_GEOIP:
+      MAGNETAR_GEOIP_DIR:
+      MAGNETAR_GEOIP_DOWNLOAD:
       RUST_LOG: ${RUST_LOG:-info}
     # Image default is 10001:10001. Set to your own uid:gid when MAGNETAR_DATA is a host folder.
     user: ${MAGNETAR_UID:-10001}:${MAGNETAR_GID:-10001}

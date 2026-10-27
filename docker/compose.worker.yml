@@ -39,6 +39,8 @@ services:
       MAGNETAR_DHT_PROBE: ${MAGNETAR_DHT_PROBE:-1.1.1.1:443,9.9.9.9:443}
       MAGNETAR_DHT_UPNP: ${MAGNETAR_DHT_UPNP:-false}
       MAGNETAR_LIVENESS_DHT_CONCURRENCY: ${MAGNETAR_LIVENESS_DHT_CONCURRENCY:-32}
+      # Crawl map (docs/CRAWLMAP.md): on | country | off; databases in the worker state dir.
+      MAGNETAR_GEOIP: ${MAGNETAR_GEOIP:-on}
       RUST_LOG: ${RUST_LOG:-info}
     # Only when Docker's DNS cannot resolve a Tailscale (MagicDNS) name: set both variables
     # (the server's name and its `tailscale ip -4`). The default entry is inert.

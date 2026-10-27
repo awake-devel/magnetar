@@ -92,6 +92,8 @@ pub struct DhtOptions {
     pub upnp: Option<upnp::UpnpConfig>,
     /// Live state for the API (`serve`); None for the bounded `dht` command.
     pub service: Option<Arc<status::DhtService>>,
+    /// Crawl map counters (D101): None = no counting by country / network.
+    pub geo: Option<Arc<crate::crawlmap::CrawlMap>>,
 }
 
 impl DhtOptions {
@@ -154,6 +156,7 @@ impl DhtOptions {
                 )
             }),
             service: None,
+            geo: None,
         })
     }
 }
@@ -213,6 +216,8 @@ struct Counters {
     triage_dropped: AtomicU64,
     triage_ms: AtomicU64,
     triage_max_ms: AtomicU64,
+    /// Unique sightings per route: sample, get_peers, announce (D102).
+    by_route: [AtomicU64; 3],
 }
 
 fn add(a: &AtomicU64, n: u64) {
@@ -500,7 +505,13 @@ async fn flush(p: &Pipeline, batch: &mut Vec<Sighting>, status: &mpsc::Sender<St
     let queued: HashSet<[u8; 20]> = match &p.pool {
         Some(pool) if !p.opts.dry_run => {
             let b: Vec<([u8; 20], Via)> = items.iter().map(|s| (s.info_hash, s.via)).collect();
-            match store::triage(pool, &b, magnetar_core::now(), p.opts.fetch_known).await {
+            // D101: the telling node → country / network, counted and kept as codes only.
+            let geo = match &p.opts.geo {
+                Some(g) => g.dht_hashes(items.iter().map(|s| s.from), true),
+                None => Vec::new(),
+            };
+            match store::triage_geo(pool, &b, &geo, magnetar_core::now(), p.opts.fetch_known).await
+            {
                 Ok(o) => {
                     add(&p.c.blocked, o.blocked as u64);
                     add(&p.c.known, o.known as u64);
@@ -606,10 +617,14 @@ async fn triage_loop(
             s = rx.recv() => match s {
                 Some(s) => {
                     add(&p.c.sightings, 1);
+                    if let Some(g) = &p.opts.geo {
+                        g.dht_node(s.from, magnetar_core::now());
+                    }
                     if batch.len() >= TRIAGE_BACKLOG_MAX {
                         add(&p.c.triage_dropped, 1);
                     } else if seen.check_and_insert(&s.info_hash, Instant::now()) {
                         add(&p.c.unique, 1);
+                        add(&p.c.by_route[crate::fleet::ingest::route_index(s.via)], 1);
                         if batch.is_empty() {
                             flush_at = Instant::now() + BATCH_WAIT;
                         }
@@ -791,6 +806,9 @@ async fn persist_flush(p: &Pipeline, pool: &PgPool, batch: &mut Vec<FetchResult>
     .await
     {
         Ok(o) => {
+            if let Some(g) = &p.opts.geo {
+                g.add_stored(&o.stored_geo);
+            }
             let mut t = p.persisted.lock().unwrap();
             t.stored += o.stored;
             t.not_new += o.not_new;
@@ -1293,12 +1311,14 @@ pub async fn dht_loop(
     pool: PgPool,
     cfg: Arc<Config>,
     svc: Arc<status::DhtService>,
+    geo: Option<Arc<crate::crawlmap::CrawlMap>>,
     mut stop: watch::Receiver<bool>,
 ) {
     let Some(mut opts) = DhtOptions::from_config(&cfg, cfg.dht) else {
         return;
     };
     opts.service = Some(svc.clone());
+    opts.geo = geo;
     let mut failures = 0u32;
     loop {
         let started = Instant::now();
@@ -1339,6 +1359,7 @@ mod tests {
             via: Via::Sample,
             source: None,
             peer: None,
+            from: None,
         };
         let (tx, mut rx) = mpsc::channel(1);
         let mut batch = vec![s(1)];

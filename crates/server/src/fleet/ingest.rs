@@ -17,8 +17,19 @@ use sqlx::PgPool;
 use super::proto::*;
 use super::{ApiResult, MAX_RESULTS, MAX_TRIAGE, WorkerName, json};
 use crate::api::{ApiError, AppState};
+use crate::crawlmap::{Layer, Metric};
 use crate::dht::persist::{self, FetchResult};
 use crate::dht::store;
+use crate::geo::{GeoCode, GeoMode};
+
+/// Index of a route in `RouteTriple` order: sample, get_peers, announce.
+pub fn route_index(v: Via) -> usize {
+    match v {
+        Via::Sample => 0,
+        Via::GetPeers => 1,
+        Via::Announce => 2,
+    }
+}
 
 pub fn via_of(s: &str) -> Via {
     match s {
@@ -41,24 +52,46 @@ pub async fn triage(
             format!("at most {MAX_TRIAGE} hashes per triage"),
         ));
     }
-    let batch: Vec<([u8; 20], Via)> = r
-        .items
-        .iter()
-        .filter_map(|i| Some((parse_hash(&i.h)?, via_of(&i.via))))
-        .collect();
+    let mut batch: Vec<([u8; 20], Via)> = Vec::with_capacity(r.items.len());
+    let mut geo: Vec<Option<GeoCode>> = Vec::with_capacity(r.items.len());
+    let counting = st.crawlmap.mode() != GeoMode::Off;
+    let mut by_route = [0u64; 3];
+    for i in &r.items {
+        let Some(h) = parse_hash(&i.h) else { continue };
+        let via = via_of(&i.via);
+        by_route[route_index(via)] += 1;
+        batch.push((h, via));
+        // D105: the worker resolved the node to codes; counted as `hashes` here.
+        let code = (counting && (i.cc.is_some() || i.asn.is_some()))
+            .then(|| GeoCode::from_parts(i.cc.as_deref(), i.asn));
+        if let Some(c) = code {
+            st.crawlmap.add(Layer::Dht, Metric::Hashes, c, 1);
+        }
+        geo.push(code);
+    }
+    st.crawlmap.add_upload(&r.geo_nodes, &r.as_names);
     let now = magnetar_core::now();
-    let o = store::triage(st.store.pool(), &batch, now, st.fleet.config().fetch_known)
-        .await
-        .map_err(|e| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "store",
-                persist::error_class(&e),
-            )
-        })?;
+    let o = store::triage_geo(
+        st.store.pool(),
+        &batch,
+        &geo,
+        now,
+        st.fleet.config().fetch_known,
+    )
+    .await
+    .map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "store",
+            persist::error_class(&e),
+        )
+    })?;
     st.fleet.with(&name, |e| {
         e.triaged += batch.len() as u64;
         e.queued += o.queued.len() as u64;
+        for (t, n) in e.triaged_by_route.iter_mut().zip(by_route) {
+            *t += n;
+        }
     });
     Ok(Json(TriageResponse {
         fetch: o.queued.iter().map(hex::encode).collect(),
@@ -173,6 +206,7 @@ pub async fn dht_results(
     }
     let pool = st.store.pool();
     let fleet = st.fleet.clone();
+    let crawlmap = st.crawlmap.clone();
     let cfg = fleet.config();
     let now = magnetar_core::now();
     let mut ack = DhtAck::default();
@@ -309,6 +343,7 @@ pub async fn dht_results(
         let o = persist::persist_batch(pool, chunk, fleet.screen.as_deref(), cfg.fetch_known, now)
             .await
             .map_err(store_err)?;
+        crawlmap.add_stored(&o.stored_geo);
         stored += o.stored;
         ack.stored += o.stored as u32;
         ack.not_new += o.not_new as u32;

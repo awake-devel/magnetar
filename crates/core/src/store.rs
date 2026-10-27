@@ -57,6 +57,11 @@ pub trait Store: Send + Sync {
         found: u64,
         now: i64,
     ) -> Result<()>;
+    /// New torrent events (kind 2003) a relay delivered in a pass, on top of
+    /// `record_relay_result`'s `found` (D102). Default: not recorded.
+    async fn record_relay_torrents(&self, _url: &str, _torrents: u64) -> Result<()> {
+        Ok(())
+    }
     async fn set_relay_enabled(&self, url: &str, enabled: bool) -> Result<()>;
     async fn set_relay_supports_neg(&self, url: &str, supports: bool) -> Result<()>;
     async fn get_cursor(&self, relay: &str, kind: u16) -> Result<Option<Cursor>>;
