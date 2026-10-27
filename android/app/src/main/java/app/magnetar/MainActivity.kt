@@ -11,7 +11,9 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
+import androidx.compose.runtime.CompositionLocalProvider
 import app.magnetar.ui.AppShell
+import app.magnetar.ui.common.LocalPosterLoader
 import app.magnetar.ui.theme.MagnetarTheme
 import kotlinx.coroutines.flow.MutableStateFlow
 
@@ -29,7 +31,9 @@ class MainActivity : ComponentActivity() {
         val app = application as MagnetarApp
         setContent {
             MagnetarTheme {
-                AppShell(app = app, openTorrent = openTorrent)
+                CompositionLocalProvider(LocalPosterLoader provides app::loadPoster) {
+                    AppShell(app = app, openTorrent = openTorrent)
+                }
             }
         }
         askNotificationsOnce()

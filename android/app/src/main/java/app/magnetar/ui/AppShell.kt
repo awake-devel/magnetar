@@ -14,8 +14,15 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTagsAsResourceId
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavHostController
 import androidx.navigation.NavType
@@ -26,11 +33,16 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import app.magnetar.MagnetarApp
 import app.magnetar.ui.common.AppIcons
-import app.magnetar.ui.common.PlaceholderScreen
+import app.magnetar.ui.detail.DetailScreen
+import app.magnetar.ui.detail.DetailViewModel
 import app.magnetar.ui.saved.SavedScreen
+import app.magnetar.ui.saved.SavedViewModel
 import app.magnetar.ui.search.SearchScreen
+import app.magnetar.ui.search.SearchViewModel
 import app.magnetar.ui.settings.SettingsScreen
 import app.magnetar.ui.stats.StatsScreen
+import app.magnetar.ui.title.TitleScreen
+import app.magnetar.ui.title.TitleViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 
 /** The four tabs of the bottom bar (docs/APP.md §1). */
@@ -43,15 +55,26 @@ enum class Tab(val route: String, val label: String, val icon: () -> ImageVector
 
 object Routes {
     const val TORRENT = "torrent/{infohash}"
+    const val TITLE = "title/{mediaId}"
     fun torrent(infohash: String) = "torrent/$infohash"
+    fun title(mediaId: Long) = "title/$mediaId"
 }
 
+@OptIn(ExperimentalComposeUiApi::class)
 @Composable
 fun AppShell(app: MagnetarApp, openTorrent: MutableStateFlow<String?>) {
     val nav = rememberNavController()
     val backStack by nav.currentBackStackEntryAsState()
     val route = backStack?.destination?.route
     val pending by openTorrent.collectAsState()
+    val settings by app.settingsStore.settings.collectAsState()
+    val repo = app.repository
+
+    // Activity-scoped: the search, its filters and its scroll survive tab switches, and the
+    // title page reads the active filters from it.
+    val searchVm: SearchViewModel = viewModel(
+        factory = viewModelFactory { initializer { SearchViewModel(repo, onTiming = app::logTiming) } },
+    )
 
     LaunchedEffect(pending) {
         pending?.let {
@@ -61,6 +84,8 @@ fun AppShell(app: MagnetarApp, openTorrent: MutableStateFlow<String?>) {
     }
 
     Scaffold(
+        // Compose test tags become resource ids for the emulator UI test (android/uitest).
+        modifier = Modifier.semantics { testTagsAsResourceId = true },
         bottomBar = {
             if (Tab.entries.any { it.route == route }) {
                 NavigationBar {
@@ -71,6 +96,7 @@ fun AppShell(app: MagnetarApp, openTorrent: MutableStateFlow<String?>) {
                             // The label names the item for TalkBack.
                             icon = { Icon(tab.icon(), contentDescription = null) },
                             label = { Text(tab.label) },
+                            modifier = Modifier.testTag("tab_${tab.route}"),
                         )
                     }
                 }
@@ -78,18 +104,50 @@ fun AppShell(app: MagnetarApp, openTorrent: MutableStateFlow<String?>) {
         },
     ) { padding ->
         NavHost(nav, startDestination = Tab.SEARCH.route, modifier = Modifier.padding(padding)) {
-            composable(Tab.SEARCH.route) { SearchScreen() }
-            composable(Tab.SAVED.route) { SavedScreen() }
+            composable(Tab.SEARCH.route) {
+                SearchScreen(
+                    vm = searchVm,
+                    threshold = settings.trustThreshold,
+                    onOpen = { nav.navigate(Routes.torrent(it)) },
+                    onOpenMedia = { nav.navigate(Routes.title(it)) },
+                    onOpenSettings = { nav.switchTab(Tab.SETTINGS.route) },
+                )
+            }
+            composable(Tab.SAVED.route) {
+                val vm: SavedViewModel = viewModel(factory = viewModelFactory { initializer { SavedViewModel(repo) } })
+                SavedScreen(
+                    vm = vm,
+                    onRun = { nav.switchTab(Tab.SEARCH.route) },
+                    onOpenSettings = { nav.switchTab(Tab.SETTINGS.route) },
+                    notificationsOn = settings.notifySavedSearches,
+                )
+            }
             composable(Tab.STATS.route) { StatsScreen() }
             composable(Tab.SETTINGS.route) { SettingsScreen(app) }
-            composable(
-                Routes.TORRENT,
-                arguments = listOf(navArgument("infohash") { type = NavType.StringType }),
-            ) { entry ->
-                PlaceholderScreen(
-                    title = "Torrent",
-                    text = "Detail of ${entry.arguments?.getString("infohash").orEmpty()} " +
-                        "comes with the search stage.",
+            composable(Routes.TORRENT, arguments = listOf(navArgument("infohash") { type = NavType.StringType })) { entry ->
+                val infohash = entry.arguments?.getString("infohash").orEmpty()
+                val vm: DetailViewModel = viewModel(
+                    viewModelStoreOwner = entry,
+                    factory = viewModelFactory { initializer { DetailViewModel(repo, infohash) } },
+                )
+                DetailScreen(
+                    vm = vm,
+                    threshold = settings.trustThreshold,
+                    onBack = { nav.popBackStack() },
+                    onOpenMedia = { nav.navigate(Routes.title(it)) },
+                )
+            }
+            composable(Routes.TITLE, arguments = listOf(navArgument("mediaId") { type = NavType.LongType })) { entry ->
+                val mediaId = entry.arguments?.getLong("mediaId") ?: 0L
+                val vm: TitleViewModel = viewModel(
+                    viewModelStoreOwner = entry,
+                    factory = viewModelFactory { initializer { TitleViewModel(repo, mediaId, searchVm.state.value.filters) } },
+                )
+                TitleScreen(
+                    vm = vm,
+                    threshold = settings.trustThreshold,
+                    onBack = { nav.popBackStack() },
+                    onOpenTorrent = { nav.navigate(Routes.torrent(it)) },
                 )
             }
         }
