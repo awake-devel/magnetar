@@ -7,7 +7,7 @@
 //! bits with the target and IPs answering from ≥ 3 ports are not walked through and their
 //! `values` are ignored.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 
@@ -23,6 +23,9 @@ use super::krpc::{CompactNode, Id, Query, Response};
 const WIDTH: usize = 16;
 const DONE: usize = 8;
 const ALPHA: usize = 4;
+/// Queries a lookup has out at once, slow ones included (D76): widening never piles more than
+/// this onto the global pace queue.
+const MAX_OUT: usize = 2 * ALPHA;
 const MAX_CANDIDATES: usize = 512;
 const FARM_PORTS: usize = 3;
 
@@ -36,6 +39,9 @@ pub enum Method {
 enum St {
     New,
     InFlight,
+    /// No answer within the lookup timeout: no longer waited for (its slot goes to the next
+    /// candidate, and it does not hold up the end of the walk), but a late answer is taken.
+    Slow,
     Answered,
     Failed,
 }
@@ -51,6 +57,9 @@ pub struct LookupResult {
     pub peers: Vec<SocketAddrV4>,
     pub queried: u32,
     pub answered: u32,
+    /// Queries that went slow, and slow ones that still answered.
+    pub slow: u32,
+    pub late: u32,
     /// Closest answering nodes, nearest first.
     pub closest: Vec<CompactNode>,
 }
@@ -68,50 +77,111 @@ pub async fn lookup(
     budget: Duration,
     want_peers: usize,
 ) -> LookupResult {
-    let deadline = Instant::now() + budget;
+    let mut res = LookupResult::default();
+    lookup_into(
+        dht, node, target, method, seeds, extra, budget, want_peers, &mut res,
+    )
+    .await;
+    res
+}
+
+/// Records a `get_peers` lookup's wall time when it ends, also when it is dropped mid-walk.
+struct Meter<'a> {
+    dht: &'a Dht,
+    started: Instant,
+    on: bool,
+}
+
+impl Drop for Meter<'_> {
+    fn drop(&mut self) {
+        if self.on {
+            self.dht.note_lookup(self.started.elapsed());
+        }
+    }
+}
+
+/// [`lookup`] writing into `res` as it goes, so a caller that drops the walk early (the
+/// sampling node answered after all) still has its counts.
+///
+/// Branch widening (D76, like libtorrent's short timeout): at most [`ALPHA`] queries are
+/// *waited for* at once. A query unanswered after `Dht::lookup_timeout` (1.5 s by default) turns
+/// slow: it frees its slot, so the next candidate is asked, and the walk no longer waits for it
+/// to finish; its answer is still used if it comes before the hard query timeout (4 s). Answers
+/// arrive within 1 s 99.75 % of the time, so a silent node (35–52 % of them) used to hold a
+/// slot for 4 s and most walks ran their whole 10 s budget.
+#[allow(clippy::too_many_arguments)]
+pub async fn lookup_into(
+    dht: &Dht,
+    node: usize,
+    target: Id,
+    method: Method,
+    seeds: Vec<CompactNode>,
+    extra: Vec<SocketAddrV4>,
+    budget: Duration,
+    want_peers: usize,
+    res: &mut LookupResult,
+) -> usize {
+    let started = Instant::now();
+    let _meter = Meter {
+        dht,
+        started,
+        on: method == Method::GetPeers,
+    };
+    let deadline = started + budget;
+    let soft = dht.lookup_timeout();
     let mut cands: HashMap<SocketAddrV4, Cand> = HashMap::new();
-    for s in seeds {
-        cands.insert(
-            s.addr,
-            Cand {
-                id: Some(s.id),
+    // Candidates per IP, kept as candidates are added (the node-farm port rule).
+    let mut ports: HashMap<Ipv4Addr, usize> = HashMap::new();
+    let add = |cands: &mut HashMap<SocketAddrV4, Cand>,
+               ports: &mut HashMap<Ipv4Addr, usize>,
+               a: SocketAddrV4,
+               id: Option<Id>| {
+        if let std::collections::hash_map::Entry::Vacant(v) = cands.entry(a) {
+            v.insert(Cand {
+                id,
                 st: St::New,
                 values: Vec::new(),
-            },
-        );
+            });
+            *ports.entry(*a.ip()).or_default() += 1;
+        }
+    };
+    for s in seeds {
+        add(&mut cands, &mut ports, s.addr, Some(s.id));
     }
     for a in extra {
-        cands.entry(a).or_insert(Cand {
-            id: None,
-            st: St::New,
-            values: Vec::new(),
-        });
+        add(&mut cands, &mut ports, a, None);
     }
-    let mut res = LookupResult::default();
-    let mut inflight = FuturesUnordered::new();
-    let ports_of = |cands: &HashMap<SocketAddrV4, Cand>| {
-        let mut m: HashMap<Ipv4Addr, usize> = HashMap::new();
-        for a in cands.keys() {
-            *m.entry(*a.ip()).or_default() += 1;
-        }
-        m
-    };
     let suspicious = |ports: &HashMap<Ipv4Addr, usize>, a: &SocketAddrV4, id: Option<Id>| {
         ports.get(a.ip()).copied().unwrap_or(0) >= FARM_PORTS
             || id.is_some_and(|id| common_prefix_bits(&id, &target) >= FARM_PREFIX_BITS)
     };
+    let mut inflight = FuturesUnordered::new();
+    // Sends report here: the soft timeout runs from the datagram leaving, not from the query
+    // joining the global pace queue (with many lookups that queue alone can take seconds).
+    let (sent_tx, mut sent_rx) = tokio::sync::mpsc::unbounded_channel::<SocketAddrV4>();
+    // Queries waited for (in flight and not slow), and when each turns slow (send order, so
+    // the front is always the next one due).
+    let mut waiting = 0usize;
+    let mut due: VecDeque<(Instant, SocketAddrV4)> = VecDeque::new();
+    // Usable peers so far (non-farm answerers, addresses we may connect to).
+    let mut good: HashSet<SocketAddrV4> = HashSet::new();
     loop {
         let window: Vec<SocketAddrV4> = {
-            let ports = ports_of(&cands);
             let mut live: Vec<([u8; 20], SocketAddrV4)> = cands
                 .iter()
-                .filter(|(a, c)| c.st != St::Failed && !suspicious(&ports, a, c.id))
+                .filter(|(a, c)| {
+                    !matches!(c.st, St::Failed | St::Slow) && !suspicious(&ports, a, c.id)
+                })
                 .map(|(a, c)| (c.id.map_or([0xff; 20], |id| distance(&id, &target)), *a))
                 .collect();
+            if live.len() > WIDTH {
+                live.select_nth_unstable(WIDTH);
+                live.truncate(WIDTH);
+            }
             live.sort_unstable();
-            live.into_iter().take(WIDTH).map(|(_, a)| a).collect()
+            live.into_iter().map(|(_, a)| a).collect()
         };
-        let peers_enough = want_peers > 0 && distinct_peers(&cands) >= want_peers;
+        let peers_enough = want_peers > 0 && good.len() >= want_peers;
         let closest_done = !window.is_empty()
             && window
                 .iter()
@@ -121,7 +191,7 @@ pub async fn lookup(
             break;
         }
         for a in &window {
-            if inflight.len() >= ALPHA {
+            if waiting >= ALPHA || inflight.len() >= MAX_OUT {
                 break;
             }
             let c = cands.get_mut(a).expect("window from cands");
@@ -129,38 +199,97 @@ pub async fn lookup(
                 continue;
             }
             c.st = St::InFlight;
+            waiting += 1;
             res.queried += 1;
+            if method == Method::GetPeers {
+                dht.note_lookup_query();
+            }
             let q = match method {
                 Method::FindNode => Query::FindNode { target },
                 Method::GetPeers => Query::GetPeers { info_hash: target },
             };
             let a = *a;
-            inflight.push(async move { (a, dht.query(node, a, q).await) });
+            let tx = sent_tx.clone();
+            inflight.push(async move {
+                let r = dht
+                    .query_then(node, a, q, move || {
+                        let _ = tx.send(a);
+                    })
+                    .await;
+                (a, r)
+            });
         }
         if inflight.is_empty() {
             break;
         }
-        let next = tokio::time::timeout_at(deadline, inflight.next()).await;
-        let Ok(Some((addr, r))) = next else { break };
+        while due
+            .front()
+            .is_some_and(|(_, a)| cands.get(a).is_none_or(|c| c.st != St::InFlight))
+        {
+            due.pop_front();
+        }
+        let wake = due.front().map_or(deadline, |(t, _)| (*t).min(deadline));
+        let next = tokio::select! {
+            Some(a) = sent_rx.recv() => {
+                due.push_back((Instant::now() + soft, a));
+                continue;
+            }
+            n = inflight.next() => n,
+            _ = tokio::time::sleep_until(wake) => {
+                let now = Instant::now();
+                while let Some(&(t, a)) = due.front() {
+                    if t > now {
+                        break;
+                    }
+                    due.pop_front();
+                    if let Some(c) = cands.get_mut(&a)
+                        && c.st == St::InFlight
+                    {
+                        c.st = St::Slow;
+                        waiting -= 1;
+                        res.slow += 1;
+                        if method == Method::GetPeers {
+                            dht.note_lookup_slow();
+                        }
+                    }
+                }
+                continue;
+            }
+        };
+        let Some((addr, r)) = next else { break };
         let r: Result<Response, QueryError> = r;
+        let was = cands.get(&addr).map(|c| c.st);
+        if was == Some(St::InFlight) {
+            waiting -= 1;
+        }
         match r {
             Ok(r) => {
                 res.answered += 1;
+                if was == Some(St::Slow) {
+                    res.late += 1;
+                    if method == Method::GetPeers {
+                        dht.note_lookup_late();
+                    }
+                }
+                let mut values = r.values;
                 if let Some(c) = cands.get_mut(&addr) {
                     c.st = St::Answered;
                     c.id = Some(r.id);
-                    c.values = r.values;
+                }
+                if !values.is_empty() && !suspicious(&ports, &addr, Some(r.id)) {
+                    let mut usable = values.clone();
+                    dht.retain_allowed(&mut usable);
+                    good.extend(usable);
+                }
+                if let Some(c) = cands.get_mut(&addr) {
+                    c.values = std::mem::take(&mut values);
                 }
                 dht.learn_nodes(&r.nodes, &target);
                 for n in r.nodes {
                     if cands.len() >= MAX_CANDIDATES {
                         break;
                     }
-                    cands.entry(n.addr).or_insert(Cand {
-                        id: Some(n.id),
-                        st: St::New,
-                        values: Vec::new(),
-                    });
+                    add(&mut cands, &mut ports, n.addr, Some(n.id));
                 }
             }
             Err(_) => {
@@ -172,7 +301,6 @@ pub async fn lookup(
     }
     let mut peers: Vec<SocketAddrV4> = Vec::new();
     let mut seen = HashSet::new();
-    let ports = ports_of(&cands);
     for (a, c) in &cands {
         if suspicious(&ports, a, c.id) {
             continue;
@@ -192,15 +320,10 @@ pub async fn lookup(
     answered.truncate(K_RESULT);
     res.closest = answered;
     res.peers = peers;
-    res
+    res.peers.len()
 }
 
 const K_RESULT: usize = 8;
-
-fn distinct_peers(cands: &HashMap<SocketAddrV4, Cand>) -> usize {
-    let set: HashSet<&SocketAddrV4> = cands.values().flat_map(|c| c.values.iter()).collect();
-    set.len()
-}
 
 /// Peers found for one infohash, and how.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -217,6 +340,9 @@ pub struct Collected {
 /// sampled the hash (it stores peers for exactly that hash), then an iterative lookup bounded by
 /// `budget` when that gave nothing. Peers on non-global addresses are dropped (the fetcher must
 /// never be pointed at the LAN or loopback, docs/DHT.md §3.8).
+///
+/// The sampling node gets the lookup timeout too (D76): when it has not answered by then the
+/// lookup starts, and a late answer with peers still wins (the lookup is dropped then).
 pub async fn collect_peers(
     dht: &Dht,
     info_hash: Id,
@@ -238,14 +364,36 @@ pub async fn collect_peers(
         return out;
     }
     let node = dht.next_node();
+    let mut pending = None;
     if let Some(src) = source {
         out.queries += 1;
-        if let Ok(r) = dht.query(node, src, Query::GetPeers { info_hash }).await {
-            for p in r.values {
-                push(&mut out, p);
+        let (sent_tx, sent_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut q = Box::pin(
+            dht.query_then(node, src, Query::GetPeers { info_hash }, move || {
+                let _ = sent_tx.send(());
+            }),
+        );
+        // The lookup timeout runs from the send (after the global pace wait).
+        let soft = dht.lookup_timeout();
+        let first = tokio::select! {
+            r = &mut q => Ok(r),
+            _ = async {
+                match sent_rx.await {
+                    Ok(()) => tokio::time::sleep(soft).await,
+                    Err(_) => std::future::pending().await, // not sent: q ends at once
+                }
+            } => Err(()),
+        };
+        match first {
+            Ok(Ok(r)) => {
+                for p in r.values {
+                    push(&mut out, p);
+                }
+                out.from_source = !out.peers.is_empty();
+                dht.learn_nodes(&r.nodes, &info_hash);
             }
-            out.from_source = !out.peers.is_empty();
-            dht.learn_nodes(&r.nodes, &info_hash);
+            Ok(Err(_)) => {}
+            Err(_) => pending = Some(q),
         }
     }
     if out.peers.is_empty() && budget > Duration::ZERO {
@@ -256,20 +404,62 @@ pub async fn collect_peers(
         } else {
             Vec::new()
         };
-        let r = lookup(
-            dht,
-            node,
-            info_hash,
-            Method::GetPeers,
-            seeds,
-            extra,
-            budget,
-            want,
-        )
-        .await;
-        out.queries += r.queried;
-        for p in r.peers {
-            push(&mut out, p);
+        let mut lr = LookupResult::default();
+        let mut late: Option<Response> = None;
+        {
+            let walk = lookup_into(
+                dht,
+                node,
+                info_hash,
+                Method::GetPeers,
+                seeds,
+                extra,
+                budget,
+                want,
+                &mut lr,
+            );
+            tokio::pin!(walk);
+            let mut walked = false;
+            loop {
+                tokio::select! {
+                    r = async { pending.as_mut().expect("guarded").await }, if pending.is_some() => {
+                        pending = None;
+                        if let Ok(r) = r {
+                            dht.learn_nodes(&r.nodes, &info_hash);
+                            let mut v = r.values.clone();
+                            dht.retain_allowed(&mut v);
+                            if !v.is_empty() {
+                                late = Some(r);
+                                break; // the walk is dropped: the sampling node had peers
+                            }
+                        }
+                        if walked {
+                            break;
+                        }
+                    }
+                    found = &mut walk, if !walked => {
+                        walked = true;
+                        // A walk that found nothing still waits for the sampling node.
+                        if found > 0 || pending.is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        out.queries += lr.queried;
+        match late {
+            Some(r) => {
+                for p in r.values {
+                    push(&mut out, p);
+                }
+                out.from_source = !out.peers.is_empty();
+            }
+            None => {
+                for p in std::mem::take(&mut lr.peers) {
+                    push(&mut out, p);
+                }
+            }
         }
     }
     out

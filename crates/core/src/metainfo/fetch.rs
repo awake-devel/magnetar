@@ -17,6 +17,7 @@
 //! Peers are untrusted: every length is checked, unknown messages are skipped within a byte
 //! budget, and nothing here logs a name or path (docs/DHT.md §7.1).
 
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddrV4;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -89,6 +90,11 @@ pub struct FetchConfig {
     pub client: String,
     /// Test seam: lets 127.0.0.0/8 peers through. Never set from configuration.
     pub allow_loopback: bool,
+    /// Fake-peer reputation (D76): strikes before a peer is skipped, for how long, and how many
+    /// peers are remembered (LRU).
+    pub fake_strikes: u8,
+    pub fake_ban: Duration,
+    pub fake_cap: usize,
 }
 
 impl Default for FetchConfig {
@@ -109,6 +115,9 @@ impl Default for FetchConfig {
             decode_parallel: 4,
             client: format!("Magnetar {}", env!("CARGO_PKG_VERSION")),
             allow_loopback: false,
+            fake_strikes: 3,
+            fake_ban: Duration::from_secs(3600),
+            fake_cap: 50_000,
         }
     }
 }
@@ -219,11 +228,15 @@ pub struct FetchFailure {
     /// Every peer that sent a usable extended handshake claimed more than `metadata_max`.
     pub oversize: bool,
     pub peers_tried: usize,
+    /// Peers not tried because the reputation cache skips them (fake peers, D76).
+    pub skipped: usize,
 }
 
 impl FetchFailure {
     pub fn code(&self) -> &'static str {
-        if self.peers_tried == 0 {
+        if self.peers_tried == 0 && self.skipped > 0 {
+            "fake_peers"
+        } else if self.peers_tried == 0 {
             "no_peers"
         } else {
             self.error.code()
@@ -249,6 +262,9 @@ struct Counters {
     tcp_bytes_out: AtomicU64,
     metadata_bytes: AtomicU64,
     ok_ms_total: AtomicU64,
+    fake_strikes: AtomicU64,
+    fake_banned: AtomicU64,
+    fake_skipped: AtomicU64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -272,6 +288,13 @@ pub struct FetchStats {
     pub metadata_bytes: u64,
     /// Mean wall time of a successful hash, ms.
     pub ok_mean_ms: f64,
+    /// Fake-peer reputation (D76): strikes given (a peer took our handshake for the hash, then
+    /// never sent its extended handshake), peers that reached the limit and were skipped for
+    /// an hour, peer attempts skipped for that, peers remembered now.
+    pub fake_strikes: u64,
+    pub fake_banned: u64,
+    pub fake_skipped: u64,
+    pub fake_tracked: usize,
 }
 
 const PEER_ERRORS: [PeerError; 13] = [
@@ -312,7 +335,125 @@ struct Inner {
     conns: Semaphore,
     /// While in the future, connection attempts are paced at half the rate (D66).
     braked_until: Mutex<Option<Instant>>,
+    reputation: Mutex<Reputation>,
     c: Counters,
+}
+
+/// Peer ids of clients seen answering the BitTorrent handshake for **any** hash and then never
+/// sending the BEP 10 handshake (docs research 2026-10-26: ~10 % of accepted handshakes). A
+/// match only doubles a strike that the behaviour earned anyway; it is never a rule by itself.
+const ECHO_PREFIXES: [&[u8]; 2] = [b"-XT", b"cf-aa84-"];
+
+fn echo_prefix(peer_id: &[u8; 20]) -> bool {
+    ECHO_PREFIXES.iter().any(|p| peer_id.starts_with(p))
+}
+
+struct RepEntry {
+    strikes: u8,
+    banned_until: Option<Instant>,
+    last: Instant,
+    stamp: u64,
+}
+
+/// Bounded fake-peer memory (D76): `ip:port` → strikes. A peer that accepts our handshake for
+/// a hash and never sends its extended handshake gets a strike (two when its peer id has an
+/// [`ECHO_PREFIXES`] prefix); at `limit` strikes it is skipped for `ban`. Strikes without a ban
+/// are forgotten `ban` after the last one, verified metadata from the peer clears them, and
+/// the least recently struck entry goes when `cap` is reached. Memory only: no database, no
+/// address ranges.
+pub(crate) struct Reputation {
+    map: HashMap<SocketAddrV4, RepEntry>,
+    /// Touch order with lazy stamps (stale pairs are skipped).
+    order: VecDeque<(SocketAddrV4, u64)>,
+    next: u64,
+    cap: usize,
+    limit: u8,
+    ban: Duration,
+}
+
+impl Reputation {
+    pub(crate) fn new(cap: usize, limit: u8, ban: Duration) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            next: 0,
+            cap: cap.max(1),
+            limit: limit.max(1),
+            ban,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether `a` is skipped now (an expired entry is dropped on the way).
+    pub(crate) fn skipped(&mut self, a: &SocketAddrV4, now: Instant) -> bool {
+        let Some(e) = self.map.get(a) else {
+            return false;
+        };
+        match e.banned_until {
+            Some(u) if now < u => true,
+            Some(_) => {
+                self.map.remove(a);
+                false
+            }
+            None => {
+                if now.saturating_duration_since(e.last) >= self.ban {
+                    self.map.remove(a);
+                }
+                false
+            }
+        }
+    }
+
+    /// Add `n` strikes; true when this makes the peer skipped.
+    pub(crate) fn strike(&mut self, a: SocketAddrV4, n: u8, now: Instant) -> bool {
+        if !self.map.contains_key(&a) && self.map.len() >= self.cap {
+            self.evict();
+        }
+        self.next += 1;
+        let stamp = self.next;
+        let e = self.map.entry(a).or_insert(RepEntry {
+            strikes: 0,
+            banned_until: None,
+            last: now,
+            stamp,
+        });
+        if e.banned_until.is_some_and(|u| now >= u)
+            || (e.banned_until.is_none() && now.saturating_duration_since(e.last) >= self.ban)
+        {
+            e.strikes = 0;
+            e.banned_until = None;
+        }
+        e.strikes = e.strikes.saturating_add(n);
+        e.last = now;
+        e.stamp = stamp;
+        self.order.push_back((a, stamp));
+        let banned = e.banned_until.is_none() && e.strikes >= self.limit;
+        if banned {
+            e.banned_until = Some(now + self.ban);
+        }
+        if self.order.len() > 4 * self.cap + 1024 {
+            let map = &self.map;
+            self.order
+                .retain(|(a, st)| map.get(a).is_some_and(|e| e.stamp == *st));
+        }
+        banned
+    }
+
+    pub(crate) fn clear(&mut self, a: &SocketAddrV4) {
+        self.map.remove(a);
+    }
+
+    fn evict(&mut self) {
+        while let Some((a, st)) = self.order.pop_front() {
+            if self.map.get(&a).is_some_and(|e| e.stamp == st) {
+                self.map.remove(&a);
+                return;
+            }
+        }
+    }
 }
 
 /// Shared by every fetch of a crawler: holds the global bounds.
@@ -398,6 +539,11 @@ impl Fetcher {
                 connects: Mutex::new(Pace::new(cfg.connects_per_sec.max(1), now)),
                 conns: Semaphore::new(cfg.max_connections.clamp(1, Semaphore::MAX_PERMITS)),
                 braked_until: Mutex::new(None),
+                reputation: Mutex::new(Reputation::new(
+                    cfg.fake_cap,
+                    cfg.fake_strikes,
+                    cfg.fake_ban,
+                )),
                 c: Counters::default(),
                 cfg,
             }),
@@ -445,6 +591,10 @@ impl Fetcher {
             } else {
                 0.0
             },
+            fake_strikes: g(&c.fake_strikes),
+            fake_banned: g(&c.fake_banned),
+            fake_skipped: g(&c.fake_skipped),
+            fake_tracked: self.inner.reputation.lock().unwrap().len(),
         }
     }
 
@@ -466,6 +616,7 @@ impl Fetcher {
             error: PeerError::Timeout,
             oversize: false,
             peers_tried: peers.len().min(self.inner.cfg.max_peers),
+            skipped: 0,
         }));
         let c = &self.inner.c;
         match &r {
@@ -492,7 +643,24 @@ impl Fetcher {
         peers: &[SocketAddrV4],
     ) -> Result<Outcome, FetchFailure> {
         let cfg = &self.inner.cfg;
-        let mut todo = peers.iter().copied().take(cfg.max_peers);
+        // Peers the reputation cache skips do not use up the per-hash cap.
+        let mut skipped = 0usize;
+        let list: Vec<SocketAddrV4> = {
+            let now = Instant::now();
+            let mut rep = self.inner.reputation.lock().unwrap();
+            peers
+                .iter()
+                .copied()
+                .filter(|p| {
+                    let s = rep.skipped(p, now);
+                    skipped += usize::from(s);
+                    !s
+                })
+                .take(cfg.max_peers)
+                .collect()
+        };
+        add(&self.inner.c.fake_skipped, skipped as u64);
+        let mut todo = list.into_iter();
         let mut running = FuturesUnordered::new();
         let mut tried = 0usize;
         let mut furthest: Option<PeerError> = None;
@@ -528,6 +696,7 @@ impl Fetcher {
             error: furthest.unwrap_or(PeerError::Filtered),
             oversize: sized > 0 && oversized == sized,
             peers_tried: tried,
+            skipped,
         })
     }
 
@@ -596,9 +765,33 @@ impl Fetcher {
         add(&self.inner.c.connected, 1);
         let _ = stream.set_nodelay(true);
         let connected = Instant::now();
-        tokio::time::timeout(cfg.peer_timeout, self.session(stream, info_hash, connected))
-            .await
-            .map_err(|_| PeerError::Timeout)?
+        let mut hs: Option<[u8; 20]> = None;
+        let mut ext = false;
+        let r = tokio::time::timeout(
+            cfg.peer_timeout,
+            self.session(stream, info_hash, connected, &mut hs, &mut ext),
+        )
+        .await
+        .unwrap_or(Err(PeerError::Timeout));
+        match (&r, hs) {
+            (Ok(_), _) => self.inner.reputation.lock().unwrap().clear(&addr),
+            // Took the handshake for this hash, never sent the extended one: a strike.
+            (Err(_), Some(id)) if !ext => {
+                let n = if echo_prefix(&id) { 2 } else { 1 };
+                add(&self.inner.c.fake_strikes, 1);
+                let banned = self
+                    .inner
+                    .reputation
+                    .lock()
+                    .unwrap()
+                    .strike(addr, n, Instant::now());
+                if banned {
+                    add(&self.inner.c.fake_banned, 1);
+                }
+            }
+            _ => {}
+        }
+        r
     }
 
     async fn session(
@@ -606,6 +799,8 @@ impl Fetcher {
         stream: TcpStream,
         info_hash: [u8; 20],
         connected: Instant,
+        accepted: &mut Option<[u8; 20]>,
+        ext_seen: &mut bool,
     ) -> Result<(usize, Identity, Result<InfoSummary, InfoError>), PeerError> {
         let cfg = &self.inner.cfg;
         let c = &self.inner.c;
@@ -621,10 +816,11 @@ impl Fetcher {
             let mut b = [0u8; wire::HANDSHAKE_LEN];
             rd.read_exact(&mut b).await?;
             add(&c.tcp_bytes_in, b.len() as u64);
-            wire::parse_handshake(&b, &info_hash).map_err(|e| match e {
+            let theirs = wire::parse_handshake(&b, &info_hash).map_err(|e| match e {
                 WireError::NoExtensions => PeerError::NoExtensions,
                 _ => PeerError::Handshake,
             })?;
+            *accepted = Some(theirs.peer_id);
             // BEP 10: the extended handshake goes to peers that set the extension bit, so ours
             // is sent only once theirs is known to have it.
             let ours = wire::our_extended_handshake(&cfg.client);
@@ -633,6 +829,7 @@ impl Fetcher {
             loop {
                 if let Msg::Extended(p) = read_msg(&mut rd, &mut discard, &c.tcp_bytes_in).await? {
                     if p.first() == Some(&wire::EXT_HANDSHAKE) {
+                        *ext_seen = true;
                         return wire::parse_ext_handshake(&p[1..]).map_err(|_| PeerError::Protocol);
                     }
                     charge(&mut discard, p.len())?;
@@ -880,6 +1077,41 @@ mod tests {
     }
 
     #[test]
+    fn reputation_strikes_bans_expires_and_is_bounded() {
+        let a: SocketAddrV4 = "8.8.8.8:6881".parse().unwrap();
+        let b: SocketAddrV4 = "8.8.4.4:6881".parse().unwrap();
+        let hour = Duration::from_secs(3600);
+        let t = Instant::now();
+        let mut r = Reputation::new(3, 3, hour);
+        assert!(!r.strike(a, 1, t));
+        assert!(!r.strike(a, 1, t));
+        assert!(!r.skipped(&a, t));
+        assert!(r.strike(a, 1, t), "third strike");
+        assert!(r.skipped(&a, t + hour - Duration::from_secs(1)));
+        assert!(!r.skipped(&a, t + hour), "ban over");
+        assert_eq!(r.len(), 0);
+        // An echo prefix counts double, never alone: two failures, not one.
+        assert!(!r.strike(b, 2, t));
+        assert!(r.strike(b, 2, t));
+        // Strikes without a ban are forgotten an hour after the last one.
+        let c: SocketAddrV4 = "1.1.1.1:1".parse().unwrap();
+        r.strike(c, 2, t);
+        assert!(!r.strike(c, 1, t + hour), "old strikes reset");
+        // Success clears.
+        r.clear(&c);
+        assert!(!r.skipped(&c, t));
+        // Bounded: the least recently struck entry goes.
+        let mut r = Reputation::new(2, 3, hour);
+        for i in 0..10u16 {
+            r.strike(SocketAddrV4::new([9, 9, 9, 9].into(), i + 1), 1, t);
+        }
+        assert_eq!(r.len(), 2);
+        assert!(echo_prefix(b"-XT0100-abcdefghijkl"));
+        assert!(echo_prefix(b"cf-aa84-abcdefghijkl"));
+        assert!(!echo_prefix(b"-qB4650-abcdefghijkl"));
+    }
+
+    #[test]
     fn peer_id_shape() {
         let id = new_peer_id();
         assert_eq!(&id[..8], b"-MG0300-");
@@ -887,12 +1119,15 @@ mod tests {
 
     #[test]
     fn failure_codes() {
-        let f = FetchFailure {
+        let mut f = FetchFailure {
             error: PeerError::Connect,
             oversize: false,
             peers_tried: 0,
+            skipped: 0,
         };
         assert_eq!(f.code(), "no_peers");
+        f.skipped = 2;
+        assert_eq!(f.code(), "fake_peers");
         assert!(PeerError::HashMismatch > PeerError::Connect);
     }
 }

@@ -31,6 +31,10 @@ use super::pool::{Pool, PoolCounts};
 use super::routing::{K, RoutingTable, Seen};
 
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(4);
+/// Lookup queries count as slow after this (D76): the lookup stops waiting for them and asks the
+/// next candidate, but still takes a late answer until [`QUERY_TIMEOUT`]. Measured on a public
+/// line: answers p50 100 ms, p99 559 ms, 0.25 % after 1 s.
+pub const LOOKUP_TIMEOUT: Duration = Duration::from_millis(1500);
 /// `v` = "MG" (unregistered in BEP 20, checked 2026-10-26) + 2 version bytes.
 pub const VERSION: [u8; 4] = [b'M', b'G', 0, 2];
 /// Ids sharing this many leading bits with a target were made for it (D45's node-farm rule).
@@ -69,6 +73,8 @@ pub struct EngineConfig {
     /// Test seam: lets 127.0.0.0/8 through the address filter. Never set from configuration.
     pub allow_loopback: bool,
     pub query_timeout: Duration,
+    /// Soft per-query timeout of iterative lookups (≤ `query_timeout`, D76).
+    pub lookup_timeout: Duration,
     pub sighting_capacity: usize,
     /// Run the BEP 51 sampler (tests may drive queries by hand).
     pub sample: bool,
@@ -97,6 +103,7 @@ impl EngineConfig {
             identity: None,
             allow_loopback: false,
             query_timeout: QUERY_TIMEOUT,
+            lookup_timeout: LOOKUP_TIMEOUT,
             sighting_capacity: 10_000,
             sample: true,
             per_ip_qps: 1.0,
@@ -189,7 +196,26 @@ struct Counters {
     ip_changes: AtomicU64,
     udp_bytes_in: AtomicU64,
     udp_bytes_out: AtomicU64,
+    /// `get_peers` lookups (D76): count, wall time, queries sent, queries that went slow and
+    /// slow queries answered late.
+    lookups: AtomicU64,
+    lookup_ms: AtomicU64,
+    lookup_queries: AtomicU64,
+    lookup_slow: AtomicU64,
+    lookup_late: AtomicU64,
+    /// Queries sent / answered by destination: not in the pool, in the pool < 5 min, older
+    /// (index [`AGE_UNPOOLED`] …); and to pool nodes that answered a sample before.
+    age_sent: [AtomicU64; 3],
+    age_answered: [AtomicU64; 3],
+    repeat_sent: AtomicU64,
+    repeat_answered: AtomicU64,
 }
+
+/// Pool nodes younger than this count as "young" in [`NodeAgeStats`].
+pub const YOUNG_NODE: Duration = Duration::from_secs(300);
+const AGE_UNPOOLED: usize = 0;
+const AGE_YOUNG: usize = 1;
+const AGE_OLD: usize = 2;
 
 fn bump(a: &AtomicU64) {
     a.fetch_add(1, Ordering::Relaxed);
@@ -256,6 +282,49 @@ pub struct EngineStats {
     /// included).
     pub udp_bytes_in: u64,
     pub udp_bytes_out: u64,
+    /// Iterative `get_peers` lookups finished (or cut short), their total wall time in ms, the
+    /// queries they sent, how many of those went slow (no answer within the lookup timeout)
+    /// and how many slow ones still answered (D76).
+    pub lookups: u64,
+    pub lookup_ms_total: u64,
+    pub lookup_queries: u64,
+    pub lookup_slow: u64,
+    pub lookup_late: u64,
+    /// Answer share by how long the queried node has been known (rate limiting or a pool that
+    /// wears out shows as old/repeat shares falling while young ones hold).
+    pub by_node_age: NodeAgeStats,
+}
+
+/// Queries sent and answered by destination (answers = responses, not error replies).
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct NodeAgeStats {
+    /// Not in the crawl pool (bootstrap routers, nodes only seen in lookups).
+    pub unpooled_sent: u64,
+    pub unpooled_answered: u64,
+    /// In the pool for less than [`YOUNG_NODE`].
+    pub young_sent: u64,
+    pub young_answered: u64,
+    pub old_sent: u64,
+    pub old_answered: u64,
+    /// Pool nodes that answered a `sample_infohashes` before (the same nodes, asked again).
+    pub repeat_sent: u64,
+    pub repeat_answered: u64,
+}
+
+impl EngineStats {
+    /// Mean wall time of a `get_peers` lookup, ms.
+    pub fn lookup_mean_ms(&self) -> f64 {
+        ratio(self.lookup_ms_total, self.lookups)
+    }
+
+    /// Queries sent per `get_peers` lookup.
+    pub fn queries_per_lookup(&self) -> f64 {
+        ratio(self.lookup_queries, self.lookups)
+    }
+}
+
+fn ratio(a: u64, b: u64) -> f64 {
+    if b > 0 { a as f64 / b as f64 } else { 0.0 }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -710,7 +779,59 @@ impl Dht {
             peer_store_peers: s.peers.peers(),
             udp_bytes_in: g(&c.udp_bytes_in),
             udp_bytes_out: g(&c.udp_bytes_out),
+            lookups: g(&c.lookups),
+            lookup_ms_total: g(&c.lookup_ms),
+            lookup_queries: g(&c.lookup_queries),
+            lookup_slow: g(&c.lookup_slow),
+            lookup_late: g(&c.lookup_late),
+            by_node_age: NodeAgeStats {
+                unpooled_sent: g(&c.age_sent[AGE_UNPOOLED]),
+                unpooled_answered: g(&c.age_answered[AGE_UNPOOLED]),
+                young_sent: g(&c.age_sent[AGE_YOUNG]),
+                young_answered: g(&c.age_answered[AGE_YOUNG]),
+                old_sent: g(&c.age_sent[AGE_OLD]),
+                old_answered: g(&c.age_answered[AGE_OLD]),
+                repeat_sent: g(&c.repeat_sent),
+                repeat_answered: g(&c.repeat_answered),
+            },
         }
+    }
+
+    /// Soft per-query timeout of lookups (clamped to the hard query timeout).
+    pub fn lookup_timeout(&self) -> Duration {
+        let c = &self.inner.cfg;
+        c.lookup_timeout
+            .clamp(Duration::from_millis(1), c.query_timeout)
+    }
+
+    /// Lookup accounting (D76), see [`EngineStats::lookups`].
+    pub(crate) fn note_lookup(&self, elapsed: Duration) {
+        bump(&self.inner.c.lookups);
+        self.inner
+            .c
+            .lookup_ms
+            .fetch_add(elapsed.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_lookup_query(&self) {
+        bump(&self.inner.c.lookup_queries);
+    }
+
+    pub(crate) fn note_lookup_slow(&self) {
+        bump(&self.inner.c.lookup_slow);
+    }
+
+    pub(crate) fn note_lookup_late(&self) {
+        bump(&self.inner.c.lookup_late);
+    }
+
+    /// Keep only the addresses we may hand the fetcher (one lock for the whole list).
+    pub fn retain_allowed(&self, v: &mut Vec<SocketAddrV4>) {
+        let s = self.inner.state.lock().unwrap();
+        v.retain(|a| {
+            s.filter.allows(a)
+                && !(a.ip().is_loopback() && self.inner.local_ports.contains(&a.port()))
+        });
     }
 
     fn sight(&self, s: Sighting) {
@@ -727,7 +848,19 @@ impl Dht {
         to: SocketAddrV4,
         q: Query,
     ) -> Result<Response, QueryError> {
-        self.query_inner(node, to, q, true).await
+        self.query_inner(node, to, q, true, || {}).await
+    }
+
+    /// [`query`](Self::query), calling `on_sent` once the datagram is on the wire (after the
+    /// pace wait): lookups start their soft timeout there (D76).
+    pub async fn query_then(
+        &self,
+        node: usize,
+        to: SocketAddrV4,
+        q: Query,
+        on_sent: impl FnOnce(),
+    ) -> Result<Response, QueryError> {
+        self.query_inner(node, to, q, true, on_sent).await
     }
 
     async fn query_inner(
@@ -736,13 +869,14 @@ impl Dht {
         to: SocketAddrV4,
         q: Query,
         pace: bool,
+        on_sent: impl FnOnce(),
     ) -> Result<Response, QueryError> {
         let c = &self.inner.c;
         if self.is_stopped() {
             return Err(QueryError::Stopped);
         }
         let kind = query_kind(&q);
-        let (key, rx, at, wire) = {
+        let (node, at, age, repeat) = {
             let mut s = self.inner.state.lock().unwrap();
             let node = node % s.nodes.len();
             let now = Instant::now();
@@ -760,12 +894,41 @@ impl Dht {
                 bump(&c.busy);
                 return Err(QueryError::Busy);
             }
+            let (age, repeat) = match s.pool.get(&to) {
+                None => (AGE_UNPOOLED, false),
+                Some(e) => (
+                    if now.saturating_duration_since(e.added) < YOUNG_NODE {
+                        AGE_YOUNG
+                    } else {
+                        AGE_OLD
+                    },
+                    e.last_answer.is_some(),
+                ),
+            };
             let braked = s.brake.active(now);
             let at = if pace {
                 s.pace.reserve(now, braked)
             } else {
                 now
             };
+            (node, at, age, repeat)
+        };
+        // Wait for the pace slot *before* the transaction exists (D76): the pending map then
+        // holds only queries on the wire (≤ QPS × timeout), not the pace queue as well (which,
+        // with many lookups, filled the cap and turned queries into `Busy`).
+        if at > Instant::now() {
+            let mut stop = self.inner.stop.clone();
+            tokio::select! {
+                _ = tokio::time::sleep_until(at) => {}
+                _ = stop.wait_for(|s| *s) => return Err(QueryError::Stopped),
+            }
+        }
+        let (key, rx, wire) = {
+            let mut s = self.inner.state.lock().unwrap();
+            if s.pending.len() >= s.pending_cap {
+                bump(&c.busy);
+                return Err(QueryError::Busy);
+            }
             let mut tid: [u8; 2] = rand::random();
             while s.pending.contains_key(&(node, tid, to)) {
                 tid = rand::random();
@@ -783,7 +946,7 @@ impl Dht {
                 ip: None,
                 version: Some(VERSION.to_vec()),
             });
-            ((node, tid, to), rx, at, wire)
+            ((node, tid, to), rx, wire)
         };
         // Removes the transaction however this future ends, cancellation included (a lookup
         // that stops early drops its in-flight queries; without this they leaked until the
@@ -793,13 +956,6 @@ impl Dht {
             key,
             rx: Some(rx),
         };
-        if at > Instant::now() {
-            let mut stop = self.inner.stop.clone();
-            tokio::select! {
-                _ = tokio::time::sleep_until(at) => {}
-                _ = stop.wait_for(|s| *s) => return Err(QueryError::Stopped),
-            }
-        }
         if self.inner.sockets[key.0]
             .send_to(&wire, SocketAddr::V4(to))
             .await
@@ -807,13 +963,24 @@ impl Dht {
         {
             return Err(QueryError::Io);
         }
+        on_sent();
         bump(&c.sent[kind.min(4)]);
         c.udp_bytes_out
             .fetch_add(wire.len() as u64, Ordering::Relaxed);
         self.inner.state.lock().unwrap().brake.sent();
+        bump(&c.age_sent[age]);
+        if repeat {
+            bump(&c.repeat_sent);
+        }
         let rx = guard.rx.as_mut().expect("receiver until drop");
         match tokio::time::timeout(self.inner.cfg.query_timeout, rx).await {
-            Ok(Ok(Reply::Response(r))) => Ok(r),
+            Ok(Ok(Reply::Response(r))) => {
+                bump(&c.age_answered[age]);
+                if repeat {
+                    bump(&c.repeat_answered);
+                }
+                Ok(r)
+            }
             Ok(Ok(Reply::Error(code))) => Err(QueryError::Remote(code)),
             Ok(Err(_)) => Err(QueryError::Stopped),
             Err(_) => {
@@ -1143,7 +1310,7 @@ impl Dht {
                 inflight.spawn(async move {
                     let target: Id = rand::random();
                     if let Ok(r) = d
-                        .query_inner(node, addr, Query::FindNode { target }, false)
+                        .query_inner(node, addr, Query::FindNode { target }, false, || {})
                         .await
                     {
                         d.learn_nodes(&r.nodes, &target);
@@ -1163,7 +1330,7 @@ impl Dht {
     async fn sample_one(&self, node: usize, addr: SocketAddrV4) {
         let target: Id = rand::random();
         let r = self
-            .query_inner(node, addr, Query::SampleInfohashes { target }, false)
+            .query_inner(node, addr, Query::SampleInfohashes { target }, false, || {})
             .await;
         let now = Instant::now();
         let mut found = Vec::new();

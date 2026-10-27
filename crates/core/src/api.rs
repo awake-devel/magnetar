@@ -166,6 +166,41 @@ pub struct DhtStats {
     pub seen_failed: u64,
     pub upnp: Option<UpnpStatus>,
     pub last_error: Option<String>,
+    // --- D76 (all serde default: older servers leave them 0) ---
+    /// Since the start: hashes given to peer collection, how many got peers from the node
+    /// that sampled them, how many needed an iterative lookup, and fetches handed a peer that
+    /// announced the hash to us.
+    pub collected: u64,
+    pub from_source: u64,
+    pub looked_up: u64,
+    pub announce_fetches: u64,
+    /// Announces that reached a hash already seen (seen filter) and upgraded it to the
+    /// announce lane, or gave their peer to a collection in flight.
+    pub announce_upgraded: u64,
+    /// Incoming queries since the start, per type.
+    pub incoming_ping: u64,
+    pub incoming_find_node: u64,
+    pub incoming_get_peers: u64,
+    pub incoming_announce_peer: u64,
+    pub incoming_sample_infohashes: u64,
+    pub incoming_unknown: u64,
+    /// Peer attempts skipped by the fake-peer reputation since the start, and peers skipped
+    /// right now or carrying strikes.
+    pub fake_peers_skipped: u64,
+    pub fake_peers_banned: u64,
+    pub fake_peers_tracked: u64,
+    /// `get_peers` lookups over the rate window: mean wall time and queries per lookup, and
+    /// the share of their queries that went slow (no answer within the lookup timeout).
+    pub lookup_mean_ms: f64,
+    pub queries_per_lookup: f64,
+    pub lookup_slow_share: f64,
+    /// Answer share over the rate window by how long the queried node has been in the crawl
+    /// pool (< 5 min, older, not in it) and for pool nodes asked again after answering a
+    /// sample: old/repeat falling while young holds points at nodes rate-limiting us.
+    pub answered_share_young: f64,
+    pub answered_share_old: f64,
+    pub answered_share_unpooled: f64,
+    pub answered_share_repeat: f64,
 }
 
 /// Router port mappings for the crawler (D57, D72).
