@@ -93,8 +93,9 @@ class SettingsViewModel(
             try {
                 val t = serviceFor(s).trustSettings()
                 _state.update { st ->
-                    val fill = st.form.rootKey.isBlank() && !rootEdited && t.root != null
-                    val root = if (fill && t.root != null) Nip19.npub(t.root) else st.form.rootKey
+                    val serverRoot = t.root?.takeIf { st.form.rootKey.isBlank() && !rootEdited }
+                    val fill = serverRoot != null
+                    val root = serverRoot?.let(Nip19::npub) ?: st.form.rootKey
                     st.copy(
                         serverTrust = t,
                         serverTrustError = null,
@@ -114,15 +115,66 @@ class SettingsViewModel(
 
     fun setToken(v: String) = _state.update { it.copy(form = it.form.copy(apiToken = v), token = checkToken(v), testResult = null) }
 
-    /** A pasted nsec never stays in the field, not even unsaved. */
+    /**
+     * After an nsec was detected and cleared, the rest of it may still arrive: typed by hand,
+     * or from a keyboard that sends a paste as keystrokes, one character (or a few) at a time.
+     * While [dropping], values made only of bech32 data characters (at most 58, an nsec's data
+     * part) are dropped too. Nothing is held back or put together again; typing goes on as
+     * usual with the first character that cannot be part of the key (`1`, `b`, `i`, `o`, a
+     * capital, a space…). The start of an npub ("n", "np", "npu") stays visible, so a public
+     * key can be typed right after. [dropped] keeps the last few dropped characters, to see
+     * `nsec1` typed again.
+     */
+    private var dropping = false
+    private var dropped = ""
+
+    /** A pasted (or typed) nsec never stays in the field, not even unsaved. */
     fun setRootKey(v: String) {
         rootEdited = true
         if (isPrivateKey(v)) {
-            _state.update { it.copy(form = it.form.copy(rootKey = ""), root = Check(error = PRIVATE_KEY_ERROR)) }
+            dropKey()
             return
+        }
+        if (dropping) {
+            val l = v.lowercase()
+            when {
+                // The keyboard echoes the cleared field back as an empty value: keep the warning.
+                v.isEmpty() -> {
+                    keepCleared()
+                    return
+                }
+                // The start of a public key typed by hand is shown as typed.
+                "npub1".startsWith(l) || "nprofile1".startsWith(l) -> {
+                    _state.update { it.copy(form = it.form.copy(rootKey = v), root = Check()) }
+                    return
+                }
+                // `nsec` typed again (its letters were dropped as data): a new private key.
+                (dropped + l).let { it.contains("nsec1") || it.contains("ncryptsec1") } -> {
+                    dropKey()
+                    return
+                }
+                v.length <= NSEC_DATA_LEN && v.all { it in BECH32_CHARS } -> {
+                    dropped = (dropped + v).takeLast(10)
+                    keepCleared()
+                    return
+                }
+                else -> {
+                    dropping = false
+                    dropped = ""
+                }
+            }
         }
         _state.update { it.copy(form = it.form.copy(rootKey = v), root = checkRootKey(v)) }
     }
+
+    private fun dropKey() {
+        dropping = true
+        dropped = ""
+        keepCleared()
+    }
+
+    private fun keepCleared() =
+        _state.update { it.copy(form = it.form.copy(rootKey = ""), root = Check(error = PRIVATE_KEY_ERROR)) }
 
     /** The answer of a NIP-55 signer (`get_public_key`): hex or npub, shown as npub. */
     fun onSignerKey(key: String?) {
@@ -214,6 +266,11 @@ class SettingsViewModel(
             _state.update { it.copy(serverTrustError = e.userMessage()) }
             false
         }
+    }
+
+    private companion object {
+        const val BECH32_CHARS = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+        const val NSEC_DATA_LEN = 58
     }
 
     /** Checks the URL and token in the form (saved or not): `/health`, then an authenticated read. */

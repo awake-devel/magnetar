@@ -232,6 +232,33 @@ class StatsSettingsViewModelTest {
         assertEquals(vm.state.value.root.error, PRIVATE_KEY_ERROR)
         assertTrue(vm.saveNow())
         assertEquals(store.flow.value.rootNpub, "")
+        // Typed one key at a time: the rest of the key never piles up in the field.
+        val nsec = "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5"
+        var field = ""
+        for (ch in nsec) {
+            vm.setRootKey(field + ch)
+            field = vm.state.value.form.rootKey
+            // The keyboard echoes the cleared field (seen on the emulator).
+            if (field.isEmpty()) vm.setRootKey("")
+        }
+        assertEquals(field, "")
+        assertEquals(vm.state.value.root.error, PRIVATE_KEY_ERROR)
+        // A real public key afterwards is taken as usual, pasted or typed.
+        vm.setRootKey(npub)
+        assertEquals(vm.state.value.form.rootKey, npub)
+        assertNull(vm.state.value.root.error)
+        vm.setRootKey(nsec)
+        field = ""
+        for (ch in npub) {
+            vm.setRootKey(field + ch)
+            field = vm.state.value.form.rootKey
+        }
+        assertEquals(field, npub)
+        // Pasted, then typed again by hand: nothing of either stays.
+        vm.setRootKey(nsec)
+        for (ch in nsec) vm.setRootKey(vm.state.value.form.rootKey + ch)
+        assertEquals(vm.state.value.form.rootKey, "")
+        assertEquals(vm.state.value.root.error, PRIVATE_KEY_ERROR)
     }
 
     @Test

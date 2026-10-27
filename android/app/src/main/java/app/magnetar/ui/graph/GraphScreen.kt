@@ -1,5 +1,15 @@
 package app.magnetar.ui.graph
 
+import android.util.Log
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.text.font.FontWeight
+import app.magnetar.BuildConfig
+import app.magnetar.ui.common.formatCompact
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -118,6 +128,8 @@ fun GraphScreen(
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
+    // The node list: the same nodes as text rows, for TalkBack and for a quick scan.
+    var asList by rememberSaveable { mutableStateOf(false) }
     val colors = chartColors()
     val context = LocalContext.current
     Scaffold(
@@ -127,7 +139,12 @@ fun GraphScreen(
                 navigationIcon = {
                     IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
                 },
-                actions = { IconButton(onClick = vm::refresh, modifier = Modifier.testTag("graph_refresh")) { Icon(Icons.Filled.Refresh, "Reload") } },
+                actions = {
+                    TextButton(onClick = { asList = !asList }, modifier = Modifier.testTag("graph_view_toggle")) {
+                        Text(if (asList) "Graph" else "List")
+                    }
+                    IconButton(onClick = vm::refresh, modifier = Modifier.testTag("graph_refresh")) { Icon(Icons.Filled.Refresh, "Reload") }
+                },
             )
         },
         snackbarHost = { SnackbarHost(snackbar) },
@@ -146,15 +163,19 @@ fun GraphScreen(
                     g.note?.let { Banner(it) }
                     if (g.truncated) Banner("Only the ${g.nodes.size} most important nodes are shown.")
                     Legend(g, colors)
-                    Box(Modifier.weight(1f).fillMaxWidth().testTag("graph_canvas")) {
-                        GraphCanvas(g, state, colors, onSelect = vm::select)
-                        if (!state.settled) {
-                            Text(
-                                "Laying out…",
-                                Modifier.align(Alignment.TopEnd).padding(8.dp),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = colors.inkMuted,
-                            )
+                    if (asList) {
+                        NodeList(g, state.selected, colors, Modifier.weight(1f), onSelect = vm::select)
+                    } else {
+                        Box(Modifier.weight(1f).fillMaxWidth().testTag("graph_canvas")) {
+                            GraphCanvas(g, state, colors, onSelect = vm::select)
+                            if (!state.settled) {
+                                Text(
+                                    "Laying out…",
+                                    Modifier.align(Alignment.TopEnd).padding(8.dp),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = colors.inkMuted,
+                                )
+                            }
                         }
                     }
                     state.selected?.let { i ->
@@ -172,6 +193,44 @@ fun GraphScreen(
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+/** Every node as a row, heaviest first: label, kind, weight, trust score; tap selects it. */
+@Composable
+private fun NodeList(g: Graph, selected: Int?, colors: ChartColors, modifier: Modifier, onSelect: (Int?) -> Unit) {
+    val order = remember(g) { g.nodes.indices.sortedWith(compareBy({ it != 0 }, { -g.nodes[it].weight })) }
+    LazyColumn(modifier.fillMaxWidth().testTag("graph_list")) {
+        items(order, key = { it }) { i ->
+            val n = g.nodes[i]
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable { onSelect(i) }
+                    .heightIn(min = 48.dp)
+                    .padding(horizontal = 16.dp, vertical = 6.dp)
+                    .testTag("graph_node_$i"),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(Modifier.size(10.dp).background(colors.kindColor(n.kind), CircleShape))
+                Spacer(Modifier.width(8.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        n.label.ifBlank { n.id },
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = if (i == selected) FontWeight.Bold else null,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        listOfNotNull(KIND_LABEL[n.kind] ?: n.kind, n.score?.let { "trust $it" }).joinToString(" · "),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = colors.inkMuted,
+                    )
+                }
+                Text(formatCompact(n.weight), style = MaterialTheme.typography.labelMedium)
             }
         }
     }
@@ -231,6 +290,12 @@ private fun GraphCanvas(g: Graph, state: GraphUiState, colors: ChartColors, onSe
     val labels = remember(g) { HashMap<Int, TextLayoutResult>() }
     val labelStyle = TextStyle(color = colors.ink, fontSize = 11.sp)
 
+    var origin by remember { mutableStateOf(Offset.Zero) }
+    LaunchedEffect(state.settled, scale, ox, oy, origin) {
+        if (BuildConfig.DEBUG && state.settled && n > 0) {
+            Log.i("MagnetarGraph", "subject ${(origin.x + x[0] * scale + ox).toInt()} ${(origin.y + y[0] * scale + oy).toInt()}")
+        }
+    }
     LaunchedEffect(x, size, userMoved) {
         if (userMoved || n == 0 || size == IntSize.Zero) return@LaunchedEffect
         // Fit the whole layout to the view (labels and the largest radius stay inside).
@@ -244,6 +309,7 @@ private fun GraphCanvas(g: Graph, state: GraphUiState, colors: ChartColors, onSe
         Modifier
             .fillMaxSize()
             .onSizeChanged { size = it }
+            .onGloballyPositioned { origin = it.positionInRoot() }
             .semantics {
                 contentDescription = "${g.nodes.size} nodes, ${g.edges.size} links. Tap a node for details, double-tap to fit."
             }

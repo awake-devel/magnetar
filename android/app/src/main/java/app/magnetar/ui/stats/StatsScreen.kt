@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -107,11 +108,21 @@ private fun Charts(state: StatsUiState, colors: ChartColors, vm: StatsViewModel,
             item { Banner("This server is older than the app and has no charts (it lacks the stats feature).") }
             return@LazyColumn
         }
-        if (state.loadingBreakdowns) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
-        state.breakdownError?.let { e ->
-            item { Banner((if (set != null) "Offline: " else "") + e + (state.breakdownCachedAtMs?.let { " · " + cachedAgo(it) } ?: ""), error = true) }
-        } ?: state.breakdownCachedAtMs?.let { item { Banner(cachedAgo(it)) } }
-        state.stats?.let { h -> item(key = "health") { HealthCard(h, colors) } }
+        // One first item for everything that appears late (progress, banners, health): items
+        // inserted above the first visible one would be scrolled out of view (keyed list). It is
+        // never empty (a zero-height first item does not anchor the scroll position).
+        item(key = "top") {
+            Column(Modifier.fillMaxWidth().heightIn(min = 1.dp)) {
+                if (state.loadingBreakdowns) LinearProgressIndicator(Modifier.fillMaxWidth())
+                val error = state.breakdownError
+                if (error != null) {
+                    Banner((if (set != null) "Offline: " else "") + error + (state.breakdownCachedAtMs?.let { " · " + cachedAgo(it) } ?: ""), error = true)
+                } else {
+                    state.breakdownCachedAtMs?.let { Banner(cachedAgo(it)) }
+                }
+                state.stats?.let { h -> HealthCard(h, colors) }
+            }
+        }
         item(key = "filters") { FilterRow(state, vm, onSearch) }
         if (set != null) {
             item(key = "total") {
