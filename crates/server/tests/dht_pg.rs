@@ -244,6 +244,77 @@ async fn failures_back_off_and_announces_retry() {
     assert_eq!(seen_row(pool, &h).await.unwrap().0, 0);
 }
 
+/// D76: the batched write (one statement, the collectors no longer wait on it) ends every row
+/// exactly as the single-row calls did, a hash listed twice included.
+#[tokio::test]
+async fn batched_failures_match_single_writes() {
+    let Some(db) = test_db().await else { return };
+    let pool = db.store.pool();
+    let hs: Vec<[u8; 20]> = (1..=4u8).map(|i| [i; 20]).collect();
+    let b = [9u8; 20];
+    let mut all = hs.clone();
+    all.push(b);
+    let input: Vec<([u8; 20], Via)> = all.iter().map(|h| (*h, Via::Sample)).collect();
+    dstore::triage(pool, &input, NOW, false).await.unwrap();
+    // Reference: single writes, hash i failed i times.
+    for (i, h) in hs.iter().enumerate() {
+        for k in 0..=i {
+            dstore::mark_failed(pool, h, "no_peers", NOW + k as i64)
+                .await
+                .unwrap();
+        }
+    }
+    let want: Vec<_> = futures::future::join_all(hs.iter().map(|h| seen_row(pool, h))).await;
+    // Same history through the batch, on a fresh copy of each row.
+    sqlx::query(
+        "UPDATE dht_seen SET status = 0, attempts = 0, last_error = NULL, next_attempt_at = $1",
+    )
+    .bind(NOW + 3600)
+    .execute(pool)
+    .await
+    .unwrap();
+    let mut batch = Vec::new();
+    for (i, h) in hs.iter().enumerate() {
+        for k in 0..=i {
+            batch.push((*h, "no_peers".to_string(), NOW + k as i64));
+        }
+    }
+    batch.push(([0xEE; 20], "no_peers".into(), NOW)); // no row: ignored
+    let n = dstore::mark_failed_batch(pool, &batch).await.unwrap();
+    assert_eq!(n, 4);
+    let got: Vec<_> = futures::future::join_all(hs.iter().map(|h| seen_row(pool, h))).await;
+    assert_eq!(got, want);
+    assert_eq!(
+        got.iter()
+            .map(|r| r.as_ref().unwrap().4.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("no_peers"); 4]
+    );
+    let nexts: Vec<Option<i64>> = got.iter().map(|r| r.as_ref().unwrap().3).collect();
+    assert_eq!(
+        nexts,
+        vec![
+            Some(NOW + 3600),
+            Some(NOW + 1 + 6 * 3600),
+            Some(NOW + 2 + 24 * 3600),
+            None
+        ]
+    );
+    // The untouched row is still queued; the via upgrade records the announce on any row.
+    assert_eq!(seen_row(pool, &b).await.unwrap().0, 0);
+    assert_eq!(
+        dstore::set_via_announce(pool, &[b, hs[0]]).await.unwrap(),
+        2
+    );
+    assert_eq!(
+        dstore::set_via_announce(pool, &[b]).await.unwrap(),
+        0,
+        "already"
+    );
+    assert_eq!(seen_row(pool, &b).await.unwrap().1, 1);
+    assert_eq!(seen_row(pool, &hs[0]).await.unwrap().1, 1);
+}
+
 #[tokio::test]
 async fn retry_loop_takes_due_rows_and_settles_known_and_blocked() {
     let Some(db) = test_db().await else { return };
@@ -381,6 +452,8 @@ fn opts(ports: usize) -> DhtOptions {
         pool_cap: 10_000,
         fetch_known: false,
         peer_lookups: 8,
+        lookup_timeout: Duration::from_millis(1500),
+        peers_per_hash: 12,
         dry_run: false,
         bloom_bits: 1 << 20,
         queue_cap: 1000,
@@ -565,4 +638,121 @@ async fn dry_run_touches_no_database() {
     for (d, _) in net {
         d.shutdown().await;
     }
+}
+
+/// D76 bug: a client sends get_peers, then announce_peer for the same hash (what every client
+/// does). The get_peers sighting passed the seen filter first, so the announce, the only one
+/// carrying a live peer, was dropped there: 0 rows `via = announce` in production. Now the
+/// queued hash moves to the announce lane with that peer (or the peer joins its collection),
+/// and the fetch is handed the announcer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn announce_after_get_peers_keeps_its_peer() {
+    let Some(db) = test_db().await else { return };
+    let pool = db.store.pool().clone();
+    let crawler_ip = Ipv4Addr::new(127, 0, 9, 1);
+    // Nothing else on the network: only the announces can give peers.
+    let mut o = opts(1);
+    o.peer_lookups = 1;
+    o.fetch_concurrency = 1;
+    let (_tx, stop) = tokio::sync::watch::channel(false);
+    // A fixed port for the crawler, so the client can reach it.
+    let port = {
+        let s = std::net::UdpSocket::bind((crawler_ip, 0)).unwrap();
+        s.local_addr().unwrap().port()
+    };
+    o.ports = vec![port];
+    let run = tokio::spawn(dht::run(
+        Some(pool.clone()),
+        o,
+        stop,
+        Some(Duration::from_secs(8)),
+        move |c: &mut EngineConfig| {
+            c.bind = crawler_ip;
+            c.bootstrap = vec![SocketAddrV4::new(Ipv4Addr::new(127, 0, 9, 99), 9)];
+            c.allow_loopback = true;
+            c.query_timeout = Duration::from_secs(3);
+            c.lookup_timeout = Duration::from_millis(100);
+            c.per_ip_qps = 100.0;
+            c.response_per_ip = 1000.0;
+            c.response_rate = 10_000.0;
+            c.vote_responders = 3;
+            c.vote_prefixes = 1;
+        },
+    ));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (client, _crx) = Dht::start(fake_cfg(Ipv4Addr::new(127, 0, 9, 2), vec![]))
+        .await
+        .unwrap();
+    let to = SocketAddrV4::new(crawler_ip, port);
+    let hashes: Vec<[u8; 20]> = (0..6).map(|_| rand::random()).collect();
+    let get_peers = |h: [u8; 20]| {
+        let client = client.clone();
+        async move {
+            client
+                .query(0, to, Query::GetPeers { info_hash: h })
+                .await
+                .expect("get_peers")
+                .token
+                .expect("token")
+        }
+    };
+    let announce_with = |h: [u8; 20], token: Vec<u8>| {
+        let client = client.clone();
+        async move {
+            client
+                .query(
+                    0,
+                    to,
+                    Query::AnnouncePeer {
+                        info_hash: h,
+                        port: 7777,
+                        implied_port: false,
+                        token,
+                    },
+                )
+                .await
+                .expect("announce");
+        }
+    };
+    // Three get_peers first: after the triage batch (1 s) the first is being collected (its
+    // lookup waits 3 s on a silent router), the other two wait in the lowest lane...
+    let mut tokens = Vec::new();
+    for h in &hashes[..3] {
+        tokens.push(get_peers(*h).await);
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // ...when their announces arrive (one joins the collection, two move up a lane).
+    for (h, t) in hashes[..3].iter().zip(tokens) {
+        announce_with(*h, t).await;
+    }
+    // Three more back to back: both sightings land in the same triage batch.
+    for h in &hashes[3..] {
+        let t = get_peers(*h).await;
+        announce_with(*h, t).await;
+    }
+    let rep = run.await.unwrap().unwrap();
+    eprintln!("{}", serde_json::to_string_pretty(&rep.peers).unwrap());
+    let p = &rep.peers;
+    assert_eq!(
+        (
+            p.announce_attached,
+            p.announce_upgraded,
+            p.announce_retriaged
+        ),
+        (1, 2, 3),
+        "{p:?}"
+    );
+    assert_eq!(
+        p.announce_fetches, 6,
+        "every hash fetched from its announcer: {p:?}"
+    );
+    assert_eq!(rep.fetch.hashes, 6, "{:?}", rep.fetch);
+    // Fetches fail (nothing listens on 7777): the rows record their announce origin.
+    let vias: Vec<i16> = sqlx::query_scalar("SELECT via FROM dht_seen")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(vias.len(), 6);
+    assert!(vias.iter().all(|v| *v == 1), "{vias:?}");
+    client.shutdown().await;
 }

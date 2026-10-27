@@ -236,6 +236,13 @@ pub struct Config {
     /// (default 64 aggressive, 8 polite).
     #[arg(long, env = "MAGNETAR_DHT_PEER_LOOKUPS", value_parser = clap::value_parser!(u32).range(1..=8192))]
     pub dht_peer_lookups: Option<u32>,
+    /// Soft per-query timeout of peer lookups, ms (D76): a query unanswered by then no longer
+    /// holds up the lookup (the next node is asked), a late answer is still used until 4 s.
+    #[arg(long, env = "MAGNETAR_DHT_LOOKUP_TIMEOUT_MS", default_value_t = 1500, value_parser = clap::value_parser!(u32).range(100..=4000))]
+    pub dht_lookup_timeout_ms: u32,
+    /// Peers tried per infohash by the metadata fetcher; a lookup stops once it knows this many.
+    #[arg(long, env = "MAGNETAR_DHT_PEERS_PER_HASH", default_value_t = 12, value_parser = clap::value_parser!(u32).range(1..=64))]
+    pub dht_peers_per_hash: u32,
     /// BEP 9 metadata fetches in flight (default 128 aggressive, 16 polite).
     #[arg(long, env = "MAGNETAR_DHT_FETCH_CONCURRENCY", value_parser = clap::value_parser!(u32).range(1..=2048))]
     pub dht_fetch_concurrency: Option<u32>,

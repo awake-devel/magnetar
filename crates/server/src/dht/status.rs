@@ -44,6 +44,13 @@ struct Snap {
     incoming: u64,
     queries: u64,
     answered: u64,
+    lookups: u64,
+    lookup_ms: u64,
+    lookup_queries: u64,
+    lookup_slow: u64,
+    /// Sent / answered by node age: young, old, unpooled, repeat (D76).
+    age_sent: [u64; 4],
+    age_answered: [u64; 4],
 }
 
 struct Running {
@@ -97,7 +104,27 @@ fn snap(p: &Pipeline, dht: &Dht) -> Snap {
             + e.incoming_unknown,
         queries: e.queries_sent,
         answered: e.answered,
+        lookups: e.lookups,
+        lookup_ms: e.lookup_ms_total,
+        lookup_queries: e.lookup_queries,
+        lookup_slow: e.lookup_slow,
+        age_sent: [
+            e.by_node_age.young_sent,
+            e.by_node_age.old_sent,
+            e.by_node_age.unpooled_sent,
+            e.by_node_age.repeat_sent,
+        ],
+        age_answered: [
+            e.by_node_age.young_answered,
+            e.by_node_age.old_answered,
+            e.by_node_age.unpooled_answered,
+            e.by_node_age.repeat_answered,
+        ],
     }
+}
+
+fn share(a: u64, b: u64) -> f64 {
+    if b > 0 { a as f64 / b as f64 } else { 0.0 }
 }
 
 impl std::fmt::Debug for DhtService {
@@ -224,6 +251,40 @@ impl DhtService {
         out.fetch_failed = f.failed + f.oversize;
         out.stored = persisted.stored;
         out.blocked = persisted.blocked;
+        // D76.
+        let c = &r.p.c;
+        out.collected = get(&c.collected);
+        out.from_source = get(&c.from_source);
+        out.looked_up = get(&c.looked_up);
+        out.announce_fetches = get(&c.fetch_announce);
+        out.announce_upgraded = get(&c.announce_upgraded) + get(&c.announce_attached);
+        out.incoming_ping = e.incoming_ping;
+        out.incoming_find_node = e.incoming_find_node;
+        out.incoming_get_peers = e.incoming_get_peers;
+        out.incoming_announce_peer = e.incoming_announce_peer;
+        out.incoming_sample_infohashes = e.incoming_sample_infohashes;
+        out.incoming_unknown = e.incoming_unknown;
+        out.fake_peers_skipped = f.fake_skipped;
+        out.fake_peers_banned = f.fake_banned;
+        out.fake_peers_tracked = f.fake_tracked as u64;
+        let d = |a: u64, b: u64| a.saturating_sub(b);
+        let lookups = d(cur.lookups, old.lookups);
+        out.lookup_mean_ms = share(d(cur.lookup_ms, old.lookup_ms), lookups);
+        out.queries_per_lookup = share(d(cur.lookup_queries, old.lookup_queries), lookups);
+        out.lookup_slow_share = share(
+            d(cur.lookup_slow, old.lookup_slow),
+            d(cur.lookup_queries, old.lookup_queries),
+        );
+        let age = |i: usize| {
+            share(
+                d(cur.age_answered[i], old.age_answered[i]),
+                d(cur.age_sent[i], old.age_sent[i]),
+            )
+        };
+        out.answered_share_young = age(0);
+        out.answered_share_old = age(1);
+        out.answered_share_unpooled = age(2);
+        out.answered_share_repeat = age(3);
         out
     }
 

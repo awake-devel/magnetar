@@ -46,8 +46,14 @@ const RETRY_EVERY: Duration = Duration::from_secs(60);
 const PERSIST_EVERY: Duration = Duration::from_secs(600);
 /// Budget of one iterative peer lookup (docs/DHT.md §4 step 1).
 const LOOKUP_BUDGET: Duration = Duration::from_secs(10);
-/// Stop a lookup once this many peers are known: the metadata stage tries ≤ 12 per hash (D56).
-const WANT_PEERS: usize = 12;
+/// Default peers tried per hash by the fetcher, and where a lookup stops (D56, D76).
+pub const PEERS_PER_HASH: usize = 12;
+/// Status writes from the collectors (D76): flushed every 500 rows or 1 s; the channel lets a
+/// collector run this far ahead of a slow database before it waits.
+const STATUS_BATCH_MAX: usize = 500;
+const STATUS_BATCH_WAIT: Duration = Duration::from_secs(1);
+const STATUS_CHANNEL: usize = 65_536;
+const PROGRESS_EVERY: Duration = Duration::from_secs(60);
 /// Backpressure (D62): sampling pauses while this many hashes wait for peer collection and
 /// resumes below half of it, so discovery does not outrun consumption.
 const QUEUE_HIGH: usize = 10_000;
@@ -74,6 +80,10 @@ pub struct DhtOptions {
     pub pool_cap: usize,
     pub fetch_known: bool,
     pub peer_lookups: usize,
+    /// Soft per-query timeout of lookups (`MAGNETAR_DHT_LOOKUP_TIMEOUT_MS`, D76).
+    pub lookup_timeout: Duration,
+    /// Peers tried per hash, and where a lookup stops (`MAGNETAR_DHT_PEERS_PER_HASH`).
+    pub peers_per_hash: usize,
     /// No database: dedupe in memory only, nothing read or written.
     pub dry_run: bool,
     pub bloom_bits: u64,
@@ -120,6 +130,8 @@ impl DhtOptions {
                 .dht_peer_lookups
                 .map(|n| n as usize)
                 .unwrap_or(if aggressive { 64 } else { 8 }),
+            lookup_timeout: Duration::from_millis(u64::from(cfg.dht_lookup_timeout_ms)),
+            peers_per_hash: cfg.dht_peers_per_hash as usize,
             dry_run: false,
             bloom_bits: seen::DEFAULT_BITS,
             queue_cap: queue::DEFAULT_CAP,
@@ -190,6 +202,17 @@ struct Counters {
     marked_failed: AtomicU64,
     paused_ms: AtomicU64,
     persist_errors: AtomicU64,
+    /// D76: seen announces that moved a queued hash to the announce lane, gave their peer to a
+    /// running collection, or went to Postgres triage again; fetches given an announcer.
+    announce_upgraded: AtomicU64,
+    announce_attached: AtomicU64,
+    announce_retriaged: AtomicU64,
+    fetch_announce: AtomicU64,
+    status_errors: AtomicU64,
+    triage_flushes: AtomicU64,
+    triage_dropped: AtomicU64,
+    triage_ms: AtomicU64,
+    triage_max_ms: AtomicU64,
 }
 
 fn add(a: &AtomicU64, n: u64) {
@@ -198,6 +221,15 @@ fn add(a: &AtomicU64, n: u64) {
 
 fn get(a: &AtomicU64) -> u64 {
     a.load(Ordering::Relaxed)
+}
+
+/// A per-hash status write handed to the writer task (D76).
+#[derive(Clone, Debug)]
+pub enum StatusOp {
+    /// `store::mark_failed` (`error` code, unix time).
+    Failed([u8; 20], &'static str, i64),
+    /// `store::set_via_announce`.
+    ViaAnnounce([u8; 20]),
 }
 
 /// A hash with its peers, ready for the metadata fetcher.
@@ -242,6 +274,21 @@ pub struct PeerStats {
     pub from_sampling_node: u64,
     pub iterative_lookups: u64,
     pub queries_per_hash: f64,
+    /// D76: `get_peers` lookups (the engine's count, walks dropped early included), their mean
+    /// wall time, queries per lookup, share of their queries that went slow, slow ones that
+    /// answered late.
+    pub lookups: u64,
+    pub lookup_mean_ms: f64,
+    pub queries_per_lookup: f64,
+    pub lookup_slow_share: f64,
+    pub lookup_late: u64,
+    /// Seen announces: upgraded a queued hash, joined a running collection, re-triaged.
+    pub announce_upgraded: u64,
+    pub announce_attached: u64,
+    pub announce_retriaged: u64,
+    /// Fetches handed a peer that announced the hash to us.
+    pub announce_fetches: u64,
+    pub status_write_errors: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -274,6 +321,12 @@ pub struct Report {
     pub retried: u64,
     pub marked_no_peers: u64,
     pub triage_errors: u64,
+    /// Postgres triage statements, their mean and longest time (D76).
+    pub triage_flushes: u64,
+    pub triage_mean_ms: f64,
+    pub triage_max_ms: u64,
+    /// Sightings dropped because the triage backlog was full.
+    pub triage_dropped: u64,
     pub queue_len: usize,
     pub queue_lanes: [usize; 3],
     pub queue_overflow: u64,
@@ -317,7 +370,7 @@ fn proc_cpu_seconds() -> Option<f64> {
     Some((ut + st) / 100.0)
 }
 
-fn peer_stats(p: &Pipeline) -> PeerStats {
+fn peer_stats(p: &Pipeline, e: &EngineStats) -> PeerStats {
     let mut v = p.peer_counts.lock().unwrap().clone();
     v.sort_unstable();
     let n = get(&p.c.collected);
@@ -349,6 +402,20 @@ fn peer_stats(p: &Pipeline) -> PeerStats {
         } else {
             0.0
         },
+        lookups: e.lookups,
+        lookup_mean_ms: e.lookup_mean_ms(),
+        queries_per_lookup: e.queries_per_lookup(),
+        lookup_slow_share: if e.lookup_queries > 0 {
+            e.lookup_slow as f64 / e.lookup_queries as f64
+        } else {
+            0.0
+        },
+        lookup_late: e.lookup_late,
+        announce_upgraded: get(&p.c.announce_upgraded),
+        announce_attached: get(&p.c.announce_attached),
+        announce_retriaged: get(&p.c.announce_retriaged),
+        announce_fetches: get(&p.c.fetch_announce),
+        status_write_errors: get(&p.c.status_errors),
     }
 }
 
@@ -386,11 +453,19 @@ fn report(p: &Pipeline, dht: &Dht, started: Instant) -> Report {
         retried: get(&p.c.retried),
         marked_no_peers: get(&p.c.marked_failed),
         triage_errors: get(&p.c.triage_errors),
+        triage_flushes: get(&p.c.triage_flushes),
+        triage_mean_ms: if get(&p.c.triage_flushes) > 0 {
+            get(&p.c.triage_ms) as f64 / get(&p.c.triage_flushes) as f64
+        } else {
+            0.0
+        },
+        triage_max_ms: get(&p.c.triage_max_ms),
+        triage_dropped: get(&p.c.triage_dropped),
         queue_len: q.len(),
         queue_lanes: q.lane_lens(),
         queue_overflow: q.overflow,
         sampling_paused_secs: get(&p.c.paused_ms) as f64 / 1000.0,
-        peers: peer_stats(p),
+        peers: peer_stats(p, &engine),
         metadata_per_min: verified as f64 / mins,
         fetch_success_rate: if finished > 0 {
             verified as f64 / finished as f64
@@ -416,7 +491,7 @@ fn report(p: &Pipeline, dht: &Dht, started: Instant) -> Report {
     }
 }
 
-async fn flush(p: &Pipeline, batch: &mut Vec<Sighting>) {
+async fn flush(p: &Pipeline, batch: &mut Vec<Sighting>, status: &mpsc::Sender<StatusOp>) {
     if batch.is_empty() {
         return;
     }
@@ -458,13 +533,69 @@ async fn flush(p: &Pipeline, batch: &mut Vec<Sighting>) {
                 retry: false,
                 queued_at: now,
             });
+        } else if let (Via::Announce, Some(peer), false) =
+            (s.via, s.peer, queued.contains(&s.info_hash))
+        {
+            // Its get_peers sighting may have been in the previous batch (triaged just before
+            // this one): that queued the hash, so the announce joins it now.
+            let a = p
+                .queue
+                .lock()
+                .unwrap()
+                .attach_announce(s.info_hash, peer, now);
+            if a != queue::Attach::No {
+                add(&p.c.announce_upgraded, 1);
+                if p.pool.is_some() {
+                    let _ = status.send(StatusOp::ViaAnnounce(s.info_hash)).await;
+                }
+            }
         }
+    }
+}
+
+/// Sightings kept while the triage task is behind (one batch then grows past `BATCH_MAX`).
+const TRIAGE_BACKLOG_MAX: usize = 100_000;
+
+/// Hand a batch to the triage writer without waiting (D76). The loop used to await each
+/// Postgres triage statement (up to 28 s measured on a busy disk) while the engine's
+/// 10 000-sighting channel overflowed (15 k–153 k sightings lost per 10 min). When the writer
+/// is 16 batches behind, the batch stays here and keeps growing; past
+/// [`TRIAGE_BACKLOG_MAX`] new sightings are dropped and counted.
+/// Returns false when the batch stayed here.
+fn hand(batches: &mpsc::Sender<Vec<Sighting>>, batch: &mut Vec<Sighting>) -> bool {
+    if batch.is_empty() {
+        return true;
+    }
+    match batches.try_send(std::mem::take(batch)) {
+        Err(mpsc::error::TrySendError::Full(b)) => {
+            *batch = b;
+            false
+        }
+        _ => true,
+    }
+}
+
+/// Runs the Postgres triage of each batch, one at a time, until the loop is gone.
+async fn triage_writer(
+    p: Arc<Pipeline>,
+    mut rx: mpsc::Receiver<Vec<Sighting>>,
+    status: mpsc::Sender<StatusOp>,
+) {
+    while let Some(mut b) = rx.recv().await {
+        let t = Instant::now();
+        flush(&p, &mut b, &status).await;
+        let ms = t.elapsed().as_millis() as u64;
+        add(&p.c.triage_flushes, 1);
+        add(&p.c.triage_ms, ms);
+        p.c.triage_max_ms.fetch_max(ms, Ordering::Relaxed);
     }
 }
 
 async fn triage_loop(
     p: Arc<Pipeline>,
     mut rx: mpsc::Receiver<Sighting>,
+    status: mpsc::Sender<StatusOp>,
+    batches: mpsc::Sender<Vec<Sighting>>,
     mut stop: watch::Receiver<bool>,
 ) {
     let mut seen = SeenFilter::new(p.opts.bloom_bits, seen::DEFAULT_K, seen::ROTATE_EVERY);
@@ -475,14 +606,43 @@ async fn triage_loop(
             s = rx.recv() => match s {
                 Some(s) => {
                     add(&p.c.sightings, 1);
-                    if seen.check_and_insert(&s.info_hash, Instant::now()) {
+                    if batch.len() >= TRIAGE_BACKLOG_MAX {
+                        add(&p.c.triage_dropped, 1);
+                    } else if seen.check_and_insert(&s.info_hash, Instant::now()) {
                         add(&p.c.unique, 1);
                         if batch.is_empty() {
                             flush_at = Instant::now() + BATCH_WAIT;
                         }
                         batch.push(s);
                         if batch.len() >= BATCH_MAX {
-                            flush(&p, &mut batch).await;
+                            let _ = hand(&batches, &mut batch);
+                        }
+                    } else if let (Via::Announce, Some(peer)) = (s.via, s.peer) {
+                        // D76: an announce carries a live peer; the seen filter must not drop
+                        // it (the announcer's own get_peers usually came first).
+                        let a = p.queue.lock().unwrap().attach_announce(s.info_hash, peer, Instant::now());
+                        match a {
+                            queue::Attach::Queued | queue::Attach::Collecting => {
+                                add(if a == queue::Attach::Queued {
+                                    &p.c.announce_upgraded
+                                } else {
+                                    &p.c.announce_attached
+                                }, 1);
+                                if p.pool.is_some() {
+                                    let _ = status.send(StatusOp::ViaAnnounce(s.info_hash)).await;
+                                }
+                            }
+                            queue::Attach::No => {
+                                // Postgres decides: a failed row > 10 min old is retried.
+                                add(&p.c.announce_retriaged, 1);
+                                if batch.is_empty() {
+                                    flush_at = Instant::now() + BATCH_WAIT;
+                                }
+                                batch.push(s);
+                                if batch.len() >= BATCH_MAX {
+                                    let _ = hand(&batches, &mut batch);
+                                }
+                            }
                         }
                     } else {
                         add(&p.c.bloom_skipped, 1);
@@ -490,22 +650,30 @@ async fn triage_loop(
                 }
                 None => break,
             },
-            _ = tokio::time::sleep_until(flush_at), if !batch.is_empty() => flush(&p, &mut batch).await,
+            _ = tokio::time::sleep_until(flush_at), if !batch.is_empty() => {
+                if !hand(&batches, &mut batch) {
+                    flush_at = Instant::now() + Duration::from_millis(100);
+                }
+            }
             _ = stop_requested(&mut stop) => break,
         }
     }
     // Hashes of a partial batch still reach dht_seen, so the next run does not lose them.
-    flush(&p, &mut batch).await;
+    if !batch.is_empty() {
+        let _ = batches.send(batch).await;
+    }
 }
 
 async fn collector(
     p: Arc<Pipeline>,
     dht: Dht,
     jobs: mpsc::Sender<FetchJob>,
+    status: mpsc::Sender<StatusOp>,
     mut stop: watch::Receiver<bool>,
 ) {
+    let want = p.opts.peers_per_hash.max(1);
     loop {
-        let item = p.queue.lock().unwrap().pop();
+        let item = p.queue.lock().unwrap().pop_for_collection();
         let Some(item) = item else {
             tokio::select! {
                 _ = p.notify.notified() => {}
@@ -515,20 +683,30 @@ async fn collector(
             continue;
         };
         let c = tokio::select! {
-            c = collect_peers(&dht, item.info_hash, item.peer, item.source, LOOKUP_BUDGET, WANT_PEERS) => c,
+            c = collect_peers(&dht, item.info_hash, item.peer, item.source, LOOKUP_BUDGET, want) => c,
             _ = stop_requested(&mut stop) => return,
         };
+        let mut c = c;
+        let mut via = item.via;
+        // A peer that announced the hash while we collected goes first (D76).
+        if let Some(peer) = p.queue.lock().unwrap().collected(&item.info_hash)
+            && dht.allows(&peer)
+        {
+            c.peers.retain(|x| *x != peer);
+            c.peers.insert(0, peer);
+            via = Via::Announce;
+        }
         add(&p.c.collected, 1);
         add(&p.c.peers_total, c.peers.len() as u64);
         add(&p.c.lookup_queries, u64::from(c.queries));
         if !c.peers.is_empty() {
             add(&p.c.with_peers, 1);
-        } else if let Some(pool) = &p.pool {
-            // No swarm found: back off (1 h, 6 h, 24 h, then never) instead of holding the lease.
-            match store::mark_failed(pool, &item.info_hash, "no_peers", magnetar_core::now()).await
-            {
-                Ok(()) => add(&p.c.marked_failed, 1),
-                Err(e) => tracing::warn!("DHT: marking a fetch failed: {e}"),
+        } else if p.pool.is_some() {
+            // No swarm found: back off (1 h, 6 h, 24 h, then never) instead of holding the
+            // lease. Written by the status writer in batches: the collector does not wait.
+            let op = StatusOp::Failed(item.info_hash, "no_peers", magnetar_core::now());
+            if status.send(op).await.is_err() {
+                return;
             }
         }
         if item.peer.is_some() {
@@ -549,9 +727,12 @@ async fn collector(
         if c.peers.is_empty() {
             continue;
         }
+        if via == Via::Announce {
+            add(&p.c.fetch_announce, 1);
+        }
         let job = FetchJob {
             info_hash: item.info_hash,
-            via: item.via,
+            via,
             peers: c.peers,
         };
         // Blocks while every fetcher is busy: collection never runs far ahead of fetching.
@@ -676,6 +857,129 @@ async fn persist_loop(p: Arc<Pipeline>, mut rx: mpsc::Receiver<FetchResult>) {
     }
 }
 
+async fn status_flush(p: &Pipeline, pool: &PgPool, batch: &mut Vec<StatusOp>) {
+    if batch.is_empty() {
+        return;
+    }
+    let mut failed = Vec::new();
+    let mut via = Vec::new();
+    for op in batch.drain(..) {
+        match op {
+            StatusOp::Failed(h, e, at) => failed.push((h, e.to_string(), at)),
+            StatusOp::ViaAnnounce(h) => via.push(h),
+        }
+    }
+    // A row keeps its lease when a write fails: the retry loop brings it back (as before).
+    match store::mark_failed_batch(pool, &failed).await {
+        Ok(_) => add(&p.c.marked_failed, failed.len() as u64),
+        Err(e) => {
+            if get(&p.c.status_errors).is_multiple_of(100) {
+                tracing::warn!("DHT: marking fetches failed: {}", persist::error_class(&e));
+            }
+            add(&p.c.status_errors, 1);
+        }
+    }
+    if let Err(e) = store::set_via_announce(pool, &via).await {
+        if get(&p.c.status_errors).is_multiple_of(100) {
+            tracing::warn!("DHT: recording announces: {}", persist::error_class(&e));
+        }
+        add(&p.c.status_errors, 1);
+    }
+}
+
+/// Writes the collectors' per-hash outcomes in batches (≤ 500 or 1 s, D76). Runs until every
+/// sender is gone, so outcomes from before a stop are still written.
+async fn status_writer(p: Arc<Pipeline>, mut rx: mpsc::Receiver<StatusOp>) {
+    let mut batch = Vec::new();
+    let mut flush_at = Instant::now() + STATUS_BATCH_WAIT;
+    loop {
+        tokio::select! {
+            r = rx.recv() => match r {
+                Some(op) => {
+                    let Some(pool) = &p.pool else { continue };
+                    if batch.is_empty() {
+                        flush_at = Instant::now() + STATUS_BATCH_WAIT;
+                    }
+                    batch.push(op);
+                    if batch.len() >= STATUS_BATCH_MAX {
+                        status_flush(&p, pool, &mut batch).await;
+                    }
+                }
+                None => break,
+            },
+            _ = tokio::time::sleep_until(flush_at), if !batch.is_empty() => {
+                if let Some(pool) = &p.pool {
+                    status_flush(&p, pool, &mut batch).await;
+                }
+            }
+        }
+    }
+    if let Some(pool) = &p.pool {
+        status_flush(&p, pool, &mut batch).await;
+    }
+}
+
+/// One log line a minute for the bounded `dht` command: rates over that minute (counts only).
+async fn progress_loop(p: Arc<Pipeline>, dht: Dht, mut stop: watch::Receiver<bool>) {
+    let mut last = (dht.stats(), p.fetcher.stats(), get(&p.c.collected));
+    let share = |a: u64, b: u64| if b > 0 { a as f64 / b as f64 } else { 0.0 };
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(PROGRESS_EVERY) => {}
+            _ = stop_requested(&mut stop) => return,
+        }
+        let e = dht.stats();
+        let f = p.fetcher.stats();
+        let col = get(&p.c.collected);
+        let (e0, f0, c0) = &last;
+        let d = |a: u64, b: u64| a.saturating_sub(b);
+        let a = &e.by_node_age;
+        let a0 = &e0.by_node_age;
+        let mins = PROGRESS_EVERY.as_secs_f64() / 60.0;
+        tracing::info!(
+            "DHT minute: {:.0} q/s, answered {:.3} (young {:.3}, old {:.3}, unpooled {:.3}, repeat {:.3}), collected {:.0}/min, lookups {:.0}/min at {:.0} ms and {:.1} queries, metadata {:.0}/min, fake skipped {}",
+            d(e.queries_sent, e0.queries_sent) as f64 / PROGRESS_EVERY.as_secs_f64(),
+            share(
+                d(e.answered, e0.answered),
+                d(e.queries_sent, e0.queries_sent)
+            ),
+            share(
+                d(a.young_answered, a0.young_answered),
+                d(a.young_sent, a0.young_sent)
+            ),
+            share(
+                d(a.old_answered, a0.old_answered),
+                d(a.old_sent, a0.old_sent)
+            ),
+            share(
+                d(a.unpooled_answered, a0.unpooled_answered),
+                d(a.unpooled_sent, a0.unpooled_sent)
+            ),
+            share(
+                d(a.repeat_answered, a0.repeat_answered),
+                d(a.repeat_sent, a0.repeat_sent)
+            ),
+            d(col, *c0) as f64 / mins,
+            d(e.lookups, e0.lookups) as f64 / mins,
+            share(
+                d(e.lookup_ms_total, e0.lookup_ms_total),
+                d(e.lookups, e0.lookups)
+            ),
+            share(
+                d(e.lookup_queries, e0.lookup_queries),
+                d(e.lookups, e0.lookups)
+            ),
+            d(
+                f.ok + f.private + f.v2_only + f.invalid,
+                f0.ok + f0.private + f0.v2_only + f0.invalid
+            ) as f64
+                / mins,
+            d(f.fake_skipped, f0.fake_skipped),
+        );
+        last = (e, f, col);
+    }
+}
+
 /// Pause sampling above the high-water mark, resume below half of it (hysteresis).
 async fn backpressure(p: Arc<Pipeline>, dht: Dht, mut stop: watch::Receiver<bool>) {
     let high = (p.opts.queue_cap / 2).clamp(1, QUEUE_HIGH);
@@ -769,6 +1073,7 @@ pub async fn run(
     cfg.ports = opts.ports.clone();
     cfg.qps = opts.qps;
     cfg.pool_cap = opts.pool_cap;
+    cfg.lookup_timeout = opts.lookup_timeout;
     if let Some(pool) = &db {
         cfg.known_nodes = store::load_nodes(pool).await?;
         cfg.identity = store::load_identity(pool, &opts.ports).await?;
@@ -809,6 +1114,7 @@ pub async fn run(
         max_connections: opts.tcp_max,
         // The engine's loopback seam (fake networks in tests) opens the fetcher's too.
         allow_loopback: cfg.allow_loopback,
+        max_peers: opts.peers_per_hash.max(1),
         ..FetchConfig::default()
     });
     let p = Arc::new(Pipeline {
@@ -824,7 +1130,17 @@ pub async fn run(
     });
     let (int_tx, int_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
-    tasks.spawn(triage_loop(p.clone(), rx, int_rx.clone()));
+    let (status_tx, status_rx) = mpsc::channel::<StatusOp>(STATUS_CHANNEL);
+    let status_task = tokio::spawn(status_writer(p.clone(), status_rx));
+    let (batch_tx, batch_rx) = mpsc::channel::<Vec<Sighting>>(16);
+    let triage_task = tokio::spawn(triage_writer(p.clone(), batch_rx, status_tx.clone()));
+    tasks.spawn(triage_loop(
+        p.clone(),
+        rx,
+        status_tx.clone(),
+        batch_tx,
+        int_rx.clone(),
+    ));
     let workers = p.opts.fetch_concurrency.max(1);
     let (jobs_tx, jobs_rx) = mpsc::channel::<FetchJob>(workers);
     let jobs_rx = Arc::new(tokio::sync::Mutex::new(jobs_rx));
@@ -844,10 +1160,15 @@ pub async fn run(
             p.clone(),
             dht.clone(),
             jobs_tx.clone(),
+            status_tx.clone(),
             int_rx.clone(),
         ));
     }
     drop(jobs_tx);
+    drop(status_tx);
+    if p.opts.service.is_none() {
+        tasks.spawn(progress_loop(p.clone(), dht.clone(), int_rx.clone()));
+    }
     tasks.spawn(health::health_loop(
         p.opts.probe.clone(),
         dht.clone(),
@@ -899,6 +1220,9 @@ pub async fn run(
     while tasks.join_next().await.is_some() {}
     // Every result sender is gone now: the persister writes what is left and ends.
     let _ = tokio::time::timeout(Duration::from_secs(3), persister).await;
+    // The last partial triage batch still reaches dht_seen (the next run does not lose it).
+    let _ = tokio::time::timeout(Duration::from_secs(3), triage_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), status_task).await;
     if let Some(m) = mapper {
         // ≤ 2 s per mapping removal; the stop already reached it.
         let _ = tokio::time::timeout(Duration::from_secs(3), m).await;
@@ -909,6 +1233,7 @@ pub async fn run(
     let mut rep = rep;
     rep.persist = p.persisted.lock().unwrap().clone();
     rep.persist_errors = get(&p.c.persist_errors);
+    rep.marked_no_peers = get(&p.c.marked_failed);
     rep.reclassified = reclassified;
     if let Some(pool) = &db {
         persist(pool, &dht, &p.opts.ports).await;
@@ -1001,8 +1326,33 @@ pub async fn dht_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{next_share, restart_delay};
+    use super::{Sighting, Via, hand, next_share, restart_delay};
     use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    /// D76: the triage loop never waits for Postgres; a batch the busy writer cannot take yet
+    /// stays (and grows) instead of blocking the loop.
+    #[test]
+    fn hand_off_never_blocks() {
+        let s = |b: u8| Sighting {
+            info_hash: [b; 20],
+            via: Via::Sample,
+            source: None,
+            peer: None,
+        };
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut batch = vec![s(1)];
+        assert!(hand(&tx, &mut batch));
+        assert!(batch.is_empty());
+        batch.push(s(2));
+        assert!(!hand(&tx, &mut batch), "writer behind");
+        batch.push(s(3));
+        assert_eq!(batch.len(), 2, "kept, growing");
+        assert_eq!(rx.try_recv().unwrap().len(), 1);
+        assert!(hand(&tx, &mut batch));
+        assert_eq!(rx.try_recv().unwrap().len(), 2);
+        assert!(hand(&tx, &mut Vec::new()), "nothing to hand");
+    }
 
     #[test]
     fn restart_backs_off_to_a_cap() {
