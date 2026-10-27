@@ -10,8 +10,7 @@ import kotlinx.serialization.Serializable
  * (docs/APP.md §4). Lists of enum-like values (categories, media kinds) are plain strings, so a
  * value added by a newer server never fails a whole saved search.
  *
- * This stage covers what the shell, Settings and Saved need; the detail, facet, stats and graph
- * types are added by the stages that draw them.
+ * The stats and graph types are added by the stage that draws them.
  */
 
 /** `GET /health` (no auth). */
@@ -227,4 +226,193 @@ data class SavedSearchHits(
 data class TrustSettings(
     val root: String? = null,
     val threshold: Int = 20,
+)
+
+/** `POST /api/v1/facets` body (D44): counts of several facets over one search. */
+@Serializable
+data class FacetsRequest(
+    val query: SearchQuery = SearchQuery(),
+    /** Facet names: `category`, `language`, `resolution`, `origin`, … (docs/FILTERS.md). */
+    val fields: List<String> = emptyList(),
+    /** Values per facet (server default 20, at most 200). */
+    val size: Int = 30,
+)
+
+@Serializable
+data class FacetCount(val value: String = "", val count: Long = 0)
+
+@Serializable
+data class FacetCounts(
+    val field: String = "",
+    /** Results this facet's counts are taken over (every filter but its own). */
+    val total: Long = 0,
+    /** Most frequent first. */
+    val counts: List<FacetCount> = emptyList(),
+)
+
+/** Disjunctive counts: each facet applies every filter of the query except its own. */
+@Serializable
+data class FacetSet(
+    /** Results of the query with every filter. */
+    val total: Long = 0,
+    val facets: List<FacetCounts> = emptyList(),
+) {
+    fun field(name: String): FacetCounts? = facets.firstOrNull { it.field == name }
+}
+
+@Serializable
+data class TorrentFile(val path: String = "", val size: Long? = null)
+
+@Serializable
+data class Comment(
+    @SerialName("event_id") val eventId: String = "",
+    val pubkey: String = "",
+    @SerialName("created_at") val createdAt: Long = 0,
+    val kind: Int = 0,
+    val content: String = "",
+)
+
+@Serializable
+data class EventRef(
+    @SerialName("event_id") val eventId: String = "",
+    val pubkey: String = "",
+    val npub: String = "",
+    @SerialName("created_at") val createdAt: Long = 0,
+    val title: String = "",
+    val trust: Int = 0,
+)
+
+/** A seed check's answer (D17/D45); `source` is `udp`, `http`, `dht`, `dht_values` or `none`. */
+@Serializable
+data class Liveness(
+    val infohash: String = "",
+    val seeders: Int? = null,
+    val leechers: Int? = null,
+    val completed: Int? = null,
+    @SerialName("dht_peers_est") val dhtPeersEst: Int? = null,
+    val source: String = "none",
+    @SerialName("trackers_ok") val trackersOk: Int = 0,
+    @SerialName("trackers_failed") val trackersFailed: Int = 0,
+    @SerialName("checked_at") val checkedAt: Long = 0,
+    @SerialName("expires_at") val expiresAt: Long = 0,
+) {
+    /** max(seeders, DHT estimate), null when neither answered. */
+    val bestPeers: Int?
+        get() = if (seeders == null && dhtPeersEst == null) null else maxOf(seeders ?: 0, dhtPeersEst ?: 0)
+}
+
+@Serializable
+data class TrustFactor(
+    val code: String = "",
+    val delta: Int = 0,
+    val detail: String = "",
+    val evidence: List<String> = emptyList(),
+)
+
+@Serializable
+data class TrustScore(
+    val pubkey: String = "",
+    val score: Int = 0,
+    val factors: List<TrustFactor> = emptyList(),
+    val root: String? = null,
+    @SerialName("computed_at") val computedAt: Long = 0,
+)
+
+/** What the server's DHT crawler verified (D51). */
+@Serializable
+data class DhtInfo(
+    @SerialName("first_seen") val firstSeen: Long = 0,
+    @SerialName("fetched_at") val fetchedAt: Long = 0,
+    val title: String = "",
+    @SerialName("file_count") val fileCount: Int = 0,
+    @SerialName("total_size") val totalSize: Long = 0,
+    /** Classifier category (D69); a plain string so a newer value never fails the page. */
+    val category: String? = null,
+    @SerialName("peers_seen") val peersSeen: Int = 0,
+    @SerialName("discovered_via") val discoveredVia: String = "",
+    @SerialName("infohash_v2") val infohashV2: String? = null,
+)
+
+/** The identified film/series/anime of a torrent or title page (D40, D42). */
+@Serializable
+data class MediaInfo(
+    @SerialName("media_id") val mediaId: Long = 0,
+    val kind: MediaKind = MediaKind.MOVIE,
+    val title: String = "",
+    @SerialName("original_title") val originalTitle: String? = null,
+    val year: Int? = null,
+    @SerialName("end_year") val endYear: Int? = null,
+    val genres: List<String> = emptyList(),
+    val rating: Float? = null,
+    val votes: Long? = null,
+    @SerialName("runtime_min") val runtimeMin: Int? = null,
+    val season: Int? = null,
+    val episode: Int? = null,
+    val imdb: String? = null,
+    val overview: String? = null,
+    /** Server-relative poster URL (`/api/v1/media/{id}/poster`); null = none. */
+    val poster: String? = null,
+    @SerialName("episode_title") val episodeTitle: String? = null,
+) {
+    val imdbUrl: String? get() = imdb?.takeIf { IMDB_ID.matches(it) }?.let { "https://www.imdb.com/title/$it/" }
+
+    private companion object {
+        val IMDB_ID = Regex("^tt[0-9]{5,10}$")
+    }
+}
+
+/** `GET /api/v1/torrents/{infohash}`. */
+@Serializable
+data class TorrentDetail(
+    val summary: TorrentSummary = TorrentSummary(),
+    val description: String = "",
+    val files: List<TorrentFile> = emptyList(),
+    val trackers: List<String> = emptyList(),
+    val hashtags: List<String> = emptyList(),
+    @SerialName("category_path") val categoryPath: List<String> = emptyList(),
+    /** Pairs `[kind, id]` (`imdb`, `tmdb`, …). */
+    @SerialName("external_ids") val externalIds: List<List<String>> = emptyList(),
+    val magnet: String = "",
+    val liveness: Liveness? = null,
+    val trust: TrustScore = TrustScore(),
+    val events: List<EventRef> = emptyList(),
+    val comments: List<Comment> = emptyList(),
+    val media: MediaInfo? = null,
+    val dht: DhtInfo? = null,
+)
+
+@Serializable
+data class LivenessPoint(
+    val at: Long = 0,
+    val seeders: Int? = null,
+    val leechers: Int? = null,
+    @SerialName("peers_est") val peersEst: Int? = null,
+)
+
+/** `GET /api/v1/torrents/{infohash}/liveness-history` (D45): oldest first, a step line. */
+@Serializable
+data class LivenessHistory(
+    val infohash: String = "",
+    val points: List<LivenessPoint> = emptyList(),
+    @SerialName("keep_days") val keepDays: Int = 0,
+)
+
+/** One group of the title page: season/episode (series), resolution, language. */
+@Serializable
+data class ReleaseGroup(
+    val season: Int? = null,
+    val episode: Int? = null,
+    val resolution: String? = null,
+    val language: String = "",
+    @SerialName("language_label") val languageLabel: String = "",
+    val releases: List<TorrentSummary> = emptyList(),
+)
+
+/** `POST /api/v1/media/{id}/releases` (D44). */
+@Serializable
+data class MediaReleases(
+    val media: MediaInfo? = null,
+    val total: Long = 0,
+    val truncated: Boolean = false,
+    val groups: List<ReleaseGroup> = emptyList(),
 )

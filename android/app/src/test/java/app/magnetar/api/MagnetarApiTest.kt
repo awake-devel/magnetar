@@ -317,4 +317,90 @@ class MagnetarApiTest {
         assertTrue(body.contains("\"root\":\"npub1abc\""), body)
         assertTrue(body.contains("\"threshold\":30"), body)
     }
+
+    private val ih = "0123456789abcdef0123456789abcdef01234567"
+
+    @Test
+    fun `facets post the query, the fields and the size`() = runBlocking {
+        server.enqueue(json("""{"total":901,"facets":[{"field":"origin","total":901,"counts":[{"value":"nostr","count":586},{"value":"dht","count":315}]}]}"""))
+        val set = api().facets(FacetsRequest(SearchQuery(text = "dune"), listOf("category", "origin"), 40))
+        assertEquals(set.total, 901)
+        assertEquals(set.field("origin")!!.counts.map { it.value }, listOf("nostr", "dht"))
+        val req = server.takeRequest()
+        assertEquals(req.url.encodedPath, "/api/v1/facets")
+        val body = req.body!!.utf8()
+        assertTrue(body.contains("\"fields\":[\"category\",\"origin\"]"), body)
+        assertTrue(body.contains("\"size\":40"), body)
+        assertTrue(body.contains("\"include_adult\":false"), body)
+    }
+
+    @Test
+    fun `detail decodes the server's tuples and unknown fields`() = runBlocking {
+        server.enqueue(
+            json(
+                """{"summary":{"infohash":"$ih","title":"Dune","category":"video","origin":"both","best_peers":12,"future":1},
+                "description":"","files":[{"path":"a/b.mkv","size":5},{"path":"c","size":null}],"trackers":[],"hashtags":[],
+                "category_path":["Movies"],"external_ids":[["imdb","tt1160419"]],"magnet":"magnet:?xt=urn:btih:$ih",
+                "liveness":{"infohash":"$ih","seeders":3,"leechers":1,"completed":null,"dht_peers_est":9,"source":"dht_values",
+                "trackers_ok":1,"trackers_failed":0,"checked_at":5,"expires_at":9},
+                "trust":{"pubkey":"","score":40,"factors":[{"code":"FOLLOWED","delta":40,"detail":"d","evidence":[]}],"root":null,"computed_at":1,"graph_version":3},
+                "events":[],"comments":[],
+                "media":{"media_id":7,"kind":"movie","title":"Dune","year":2021,"genres":["Science Fiction"],"rating":8.0,
+                "tmdb":["movie",438631],"imdb":"tt1160419","method":"itag","confidence":0.9,"poster":"/api/v1/media/7/poster"},
+                "dht":{"first_seen":1,"fetched_at":2,"title":"Dune","file_count":2,"total_size":5,"category":"video","peers_seen":4,
+                "discovered_via":"sample","infohash_v2":null}}""",
+            ),
+        )
+        val d = api().detail(ih.uppercase())
+        assertEquals(server.takeRequest().url.encodedPath, "/api/v1/torrents/$ih")
+        assertEquals(d.summary.origin, Origin.BOTH)
+        assertEquals(d.summary.shownSeeders, 12)
+        assertEquals(d.externalIds, listOf(listOf("imdb", "tt1160419")))
+        assertEquals(d.liveness!!.bestPeers, 9)
+        assertEquals(d.media!!.imdbUrl, "https://www.imdb.com/title/tt1160419/")
+        assertEquals(d.files[1].size, null)
+        assertEquals(d.dht!!.discoveredVia, "sample")
+        assertEquals(d.trust.factors.single().code, "FOLLOWED")
+    }
+
+    @Test
+    fun `a malformed infohash is refused before anything is sent`() = runBlocking {
+        expect<ApiException.NotFound> { runBlocking { api().detail("../settings/trust") } }
+        expect<ApiException.NotFound> { runBlocking { api().checkLiveness("abc") } }
+        assertEquals(server.requestCount, 0)
+    }
+
+    @Test
+    fun `check now, seed history and title page`() = runBlocking {
+        server.enqueue(json("""{"infohash":"$ih","seeders":null,"leechers":null,"dht_peers_est":4,"source":"dht","trackers_ok":0,"trackers_failed":2,"checked_at":1,"expires_at":2}"""))
+        assertEquals(api().checkLiveness(ih).bestPeers, 4)
+        val check = server.takeRequest()
+        assertEquals(check.method, "POST")
+        assertEquals(check.url.encodedPath, "/api/v1/torrents/$ih/liveness")
+
+        server.enqueue(json("""{"infohash":"$ih","points":[{"at":1,"seeders":2,"leechers":0,"peers_est":null}],"keep_days":90}"""))
+        assertEquals(api().livenessHistory(ih, 365).points.single().seeders, 2)
+        val hist = server.takeRequest()
+        assertEquals(hist.url.encodedPath, "/api/v1/torrents/$ih/liveness-history")
+        assertEquals(hist.url.queryParameter("days"), "90")
+
+        server.enqueue(json("""{"media":{"media_id":7,"kind":"series","title":"S","method":"x","confidence":1},"total":1,"truncated":false,
+            "groups":[{"season":1,"episode":null,"resolution":"1080p","language":"vostfr","language_label":"VOSTFR","releases":[{"infohash":"$ih","title":"S01"}]}]}"""))
+        val r = api().mediaReleases(7, SearchQuery(minTrust = 0))
+        assertEquals(r.groups.single().languageLabel, "VOSTFR")
+        val rel = server.takeRequest()
+        assertEquals(rel.method, "POST")
+        assertEquals(rel.url.encodedPath, "/api/v1/media/7/releases")
+        assertTrue(rel.body!!.utf8().contains("\"min_trust\":0"))
+    }
+
+    @Test
+    fun `poster urls stay on the configured server`() {
+        val a = api(prefix = "/magnetar")
+        assertEquals(a.posterUrl("/api/v1/media/7/poster")!!.encodedPath, "/magnetar/api/v1/media/7/poster")
+        assertEquals(a.posterUrl("/api/v1/media/7/poster")!!.host, server.hostName)
+        assertNull(a.posterUrl("https://evil.example/x.jpg"))
+        assertNull(a.posterUrl("//evil.example/x.jpg"))
+        assertNull(a.posterUrl("/api/../../x"))
+    }
 }

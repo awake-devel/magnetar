@@ -87,3 +87,26 @@ suspend fun Call.awaitText(): HttpResult = suspendCancellableCoroutine { cont ->
         }
     })
 }
+
+/**
+ * Like [awaitText] for binary bodies: the bytes of a 2xx (a 304 revalidated by OkHttp's cache
+ * arrives as the cached 200), null for any other status.
+ */
+suspend fun Call.awaitBytes(): ByteArray? = suspendCancellableCoroutine { cont ->
+    cont.invokeOnCancellation { cancel() }
+    enqueue(object : Callback {
+        override fun onResponse(call: Call, response: Response) {
+            val result = try {
+                response.use { if (it.isSuccessful) it.body.bytes() else null }
+            } catch (e: IOException) {
+                onFailure(call, e)
+                return
+            }
+            cont.resume(result) { _, _, _ -> }
+        }
+
+        override fun onFailure(call: Call, e: IOException) {
+            if (!cont.isCancelled) cont.resumeWithException(e)
+        }
+    })
+}

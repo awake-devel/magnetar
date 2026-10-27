@@ -30,7 +30,7 @@ class MagnetarApi(
     base: OkHttpClient = Http.baseClient(),
     /** Call timeout per request class; tests shorten it. */
     callTimeoutMs: (RequestClass) -> Long = RequestClass::callTimeoutMs,
-) {
+) : MagnetarService {
     /** Use this client for anything else that talks to the server (posters via Coil). */
     val httpClient: OkHttpClient = base.newBuilder()
         .addInterceptor(AuthInterceptor(baseUrl, token.trim()))
@@ -50,7 +50,7 @@ class MagnetarApi(
     }
 
     /** `GET /health` (no auth needed): version and features. */
-    suspend fun health(): Health = get("health", RequestClass.DETAIL, Health.serializer())
+    override suspend fun health(): Health = get("health", RequestClass.DETAIL, Health.serializer())
 
     /**
      * Settings → "Test connection": the server answers, and the token is accepted (an
@@ -62,8 +62,45 @@ class MagnetarApi(
         return health
     }
 
-    suspend fun search(query: SearchQuery): SearchPage =
+    override suspend fun search(query: SearchQuery): SearchPage =
         post("api/v1/search", RequestClass.SEARCH, SearchQuery.serializer(), query, SearchPage.serializer())
+
+    /** Disjunctive counts for the filter sheet (feature `facet_set`); 503 while the index builds. */
+    override suspend fun facets(request: FacetsRequest): FacetSet =
+        post("api/v1/facets", RequestClass.SEARCH, FacetsRequest.serializer(), request, FacetSet.serializer())
+
+    override suspend fun detail(infohash: String): TorrentDetail =
+        get("api/v1/torrents/${segment(infohash)}", RequestClass.DETAIL, TorrentDetail.serializer())
+
+    /** "Check now": the server asks the trackers and the DHT (up to 45 s). */
+    override suspend fun checkLiveness(infohash: String): Liveness = send(
+        "POST", "api/v1/torrents/${segment(infohash)}/liveness", RequestClass.CHECK,
+        ByteArray(0).toRequestBody(null), Liveness.serializer(),
+    )
+
+    /** Feature `liveness_history`; at most 90 days. */
+    override suspend fun livenessHistory(infohash: String, days: Int): LivenessHistory {
+        val url = url("api/v1/torrents/${segment(infohash)}/liveness-history").newBuilder()
+            .addQueryParameter("days", days.coerceIn(1, 90).toString()).build()
+        return decode(LivenessHistory.serializer(), execute(Request.Builder().url(url).get().build(), RequestClass.DETAIL))
+    }
+
+    /** Feature `media_releases`: the title page, [query]'s filters applied. */
+    override suspend fun mediaReleases(mediaId: Long, query: SearchQuery): MediaReleases = post(
+        "api/v1/media/$mediaId/releases", RequestClass.SEARCH,
+        SearchQuery.serializer(), query, MediaReleases.serializer(),
+    )
+
+    /**
+     * Absolute URL of a server-relative poster path (`MediaInfo.poster`), on the configured
+     * server only (so the bearer header goes nowhere else); null for anything else.
+     */
+    fun posterUrl(path: String): HttpUrl? {
+        if (!path.startsWith("/") || path.startsWith("//")) return null
+        val rel = path.substringBefore('?').substringBefore('#').trimStart('/')
+        if (rel.split('/').any { it == ".." || it == "." }) return null
+        return baseUrl.newBuilder().addPathSegments(rel).build()
+    }
 
     suspend fun trustSettings(): TrustSettings =
         get("api/v1/settings/trust", RequestClass.DETAIL, TrustSettings.serializer())
@@ -77,22 +114,22 @@ class MagnetarApi(
         encode(TrustSettings.serializer(), settings), TrustSettings.serializer(),
     )
 
-    suspend fun savedSearches(): List<SavedSearch> =
+    override suspend fun savedSearches(): List<SavedSearch> =
         get("api/v1/saved-searches", RequestClass.DETAIL, ListSerializer(SavedSearch.serializer()))
 
     /** Creates (id 0) a saved search; returns it with its server id. */
-    suspend fun createSavedSearch(search: SavedSearch): SavedSearch = post(
+    override suspend fun createSavedSearch(search: SavedSearch): SavedSearch = post(
         "api/v1/saved-searches", RequestClass.DETAIL,
         SavedSearch.serializer(), search.copy(id = 0), SavedSearch.serializer(),
     )
 
     /** Needs `saved_search_poll`; keeps the server notifier's watermarks unless the query changes. */
-    suspend fun updateSavedSearch(search: SavedSearch): SavedSearch = send(
+    override suspend fun updateSavedSearch(search: SavedSearch): SavedSearch = send(
         "PUT", "api/v1/saved-searches/${search.id}", RequestClass.DETAIL,
         encode(SavedSearch.serializer(), search), SavedSearch.serializer(),
     )
 
-    suspend fun deleteSavedSearch(id: Long) {
+    override suspend fun deleteSavedSearch(id: Long) {
         execute(request("api/v1/saved-searches/$id").delete().build(), RequestClass.DETAIL)
     }
 
@@ -100,7 +137,7 @@ class MagnetarApi(
      * `GET /api/v1/saved-searches/poll` (D77): new hits since [since] (null = first poll: no
      * hits, the server clock as watermark). [includeAdult] = the Settings switch.
      */
-    suspend fun pollSavedSearches(since: Long?, includeAdult: Boolean): SavedSearchPoll {
+    override suspend fun pollSavedSearches(since: Long?, includeAdult: Boolean): SavedSearchPoll {
         val url = url("api/v1/saved-searches/poll").newBuilder().apply {
             if (since != null) addQueryParameter("since", since.toString())
             if (includeAdult) addQueryParameter("adult", "1")
@@ -110,6 +147,13 @@ class MagnetarApi(
     }
 
     // --- plumbing ---
+
+    /** An infohash as a path segment: 40 hex digits (a deep link's value is checked again here). */
+    private fun segment(infohash: String): String {
+        val h = infohash.trim().lowercase()
+        if (!INFOHASH.matches(h)) throw ApiException.NotFound("Not a torrent infohash")
+        return h
+    }
 
     internal fun url(path: String): HttpUrl = baseUrl.newBuilder().addPathSegments(path).build()
 
@@ -167,6 +211,7 @@ class MagnetarApi(
             encodeDefaults = true
         }
         private val JSON_MEDIA = "application/json".toMediaType()
+        private val INFOHASH = Regex("^[0-9a-f]{40}$")
 
         /**
          * The client for the server in Settings, or [ApiException.NotConfigured] when [serverUrl]
