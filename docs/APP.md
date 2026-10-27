@@ -287,7 +287,8 @@ Settings warning for `http://` to a host that is neither loopback nor Tailscale 
    searches. Emulator UI test (§12).
 4. **Done (D89–D91)**: Stats (charts, graphs, status) and the Settings screen (§13). The
    old stages 5 (stats and graphs) and 6 (settings) were merged into it.
-5. Polish, more emulator UI tests, release build (R8 keep rules).
+5. Final integration check done (D94, §14). Not done: R8 minification (keep rules for
+   kotlinx.serialization unchecked), so release builds stay unminified.
 
 ## 12. Search side as built (stage 3, D85–D87)
 
@@ -382,3 +383,25 @@ node, then the node list), the Status tab, Settings *Test connection*, an nsec t
 root field (nothing of it stays), *Save* sending `PUT /settings/trust` with the hex root and the
 threshold, and the adult switch reaching the charts. With `--production`: the health card,
 the breakdowns and the web-of-trust graph, read-only (the Settings flow is never run there).
+
+## 14. Final notes (integration check, D94)
+
+- **Upgrade path proven on the emulator**: `dist/magnetar-v0.2.0.apk` installed, server URL,
+  API token and trust root typed into its Settings, then `adb install -r` of the new release
+  APK (same certificate, SHA-256 checked with `apksigner`; same `app.magnetar`, versionCode
+  200): all three were in the new Settings screen and *Test connection* accepted the token; the
+  first search answered with no setup. The trust threshold and the adult switch were left at
+  their defaults in that run (the migration of both is covered by the unit tests in `SettingsStoreTest`).
+- **Signing**: the build reads `android/keystore/` relative to the Gradle root. A worktree has
+  no keystore (gitignored), and `scripts/build-android.sh` would then **generate a new key**,
+  giving an APK that cannot update the installed app. Build release APKs from the main checkout,
+  or point `android/keystore` at the main checkout's directory for the build only (what D94 did,
+  link removed afterwards); never copy the key.
+- **Sizes**: release APK 10.2 MB, debug 14.6 MB (old release 61.4 MB with the Rust library).
+- **UI test**: `android/uitest/uitest.py` needs the debug build (it writes settings with
+  `run-as`), so a debug APK replaces the release one on the emulator (different key: uninstall
+  first). On a slow emulator `input text` right after a tap can lose its first character; rerun.
+- **Adult content**: unchanged from D70; the app has no detection of its own and sends the
+  Settings switch with every request.
+- Open: R8 minification; a test on a real phone; posters (`/media/{id}/poster`) were not part of
+  the integration smoke test (no TMDB token on the test server).

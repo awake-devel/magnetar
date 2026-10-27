@@ -154,6 +154,28 @@ mode, no router port opened, 10 minutes, 2026-10-26)
   checks ran; searches use Postgres meanwhile). Both happen whether or not the crawler is on.
   The next start reuses the index (ready in under 1 s).
 
+### The new Android app, in short (D79–D94, docs/APP.md)
+
+What you will notice after installing the new APK over the old app:
+
+- **It installs over the old app and keeps your settings.** Same package and signing key
+  (checked: the new APK has the same certificate as `magnetar-v0.2.0.apk`), so Android updates
+  it in place. Tested on the emulator: the server URL, API token and trust root typed into the
+  old app were all there in the new one, and *Test connection* answered "Connected, token
+  accepted" without retyping anything. Your saved searches are moved to the server once.
+- **It is a plain client of your server**: search as you type, filters with live counts, the
+  torrent page and the title page, saved searches with hourly notifications, Stats with charts,
+  graphs and a status page, and Settings. Everything comes from your server; offline the app
+  shows what it last saw, with its age.
+- **Gone**: downloads inside the app and on the server screen (*Open magnet* / *Copy magnet*
+  hand the torrent to your torrent app), the phone crawler and the offline search database.
+- **Much smaller**: the APK is 10.2 MB instead of 61.4 MB (no Rust library inside any more).
+- **Adult content**: hidden by default, shown with the *Show adult content* switch in Settings,
+  never deleted. Adult detection is exactly as before: neither the app nor this release makes
+  it stricter.
+- Needs a server from this release for saved-search notifications; an older server still works
+  with fewer features (see "Older servers and offline mode").
+
 ### App rebuild, stage 1: server (D76–D78)
 
 - **Browse is no longer flooded by unchecked DHT torrents.** The default list (no search text,
@@ -291,6 +313,19 @@ mode, no router port opened, 10 minutes, 2026-10-26)
   charts and the Graphs tab (the features of the last answer are kept), instead of "Server
   unreachable" with nothing cached.
 
+### App rebuild, final integration check (D93, D94)
+
+- `app/rebuild` now contains `main`'s DHT throughput work (merged; its decision number moved
+  from D76 to D93 because D76 was already taken on this branch). No other change to the server.
+- Checked before release, all on this laptop: Rust format, lints and the full test suite
+  (448 tests passed, 21 ignored, 0 failed, with Postgres); the Android unit tests (107 passed);
+  the emulator UI test (26 checks, including read-only searches, Stats and the web-of-trust graph
+  against the production server: typing to results 0.44–0.84 s, one first query 2.6 s); the
+  release APK signed with the existing key; the Docker image builds (167 MB) and reports
+  `magnetar-server 0.2.0`; the server from this branch answered every request the app makes.
+- Upgrade: nothing new to migrate compared with the DHT release (no new migration in the app
+  rebuild).
+
 ## Older servers and offline mode
 
 - The app asks `GET /health` for `features` and hides what the server lacks: an older server
@@ -344,8 +379,10 @@ Measured on a full copy of the production database (501 528 infohashes, 506 171 
 - During the first minutes after a start with the crawler on, while the index is rebuilt, the
   log shows about a hundred "slow statement" and "slow acquire" warnings from the database
   (114 during the 2-minute build on the production copy, then none until 4 at shutdown).
-- The new app screens (filter sheet, title page, Stats tab, graphs, history chart) were built
-  and unit-tested, but not tried on a phone or an emulator in this cycle.
+- The rebuilt app was tested on the Android emulator (UI test, settings carried over from the
+  old app), not on a phone. Release builds are not minified yet (R8 rules not checked).
+- The emulator UI test is timing-sensitive on a slow emulator: one of two runs lost the first
+  typed character of a field (an emulator input race, the test passed when run again).
 - Activity history before the upgrade only exists for "torrents added", and dates are when the
   crawler first saw a torrent: the first crawl shows as one huge day. Seed checks, relays,
   crawl events and database size start empty.
