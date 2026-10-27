@@ -1,4 +1,0 @@
-[bindings.kotlin]
-package_name = "app.magnetar.ffi"
-cdylib_name = "magnetar_ffi"
-android = true

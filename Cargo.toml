@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/server", "crates/ffi", "crates/uniffi-bindgen"]
+members = ["crates/core", "crates/server"]
 
 [workspace.package]
 version = "0.2.0"
@@ -18,8 +18,6 @@ axum = { version = "0.8.9", features = ["ws", "macros"] }
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tower-http = { version = "0.7.1", features = ["trace", "cors", "timeout", "limit"] }
-rusqlite = { version = "0.39", features = ["bundled"] }
-uniffi = { version = "0.32.2", features = ["tokio"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 serde = { version = "1.0.229", features = ["derive"] }

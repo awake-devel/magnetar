@@ -1,6 +1,7 @@
 # fmt, clippy -D warnings and the workspace tests against Postgres 18 (ARCHITECTURE.md §10, D39).
 # Network tests against real relays and trackers stay #[ignore]: run them locally with
-# scripts/test.sh --ignored. The Android app is not built here (NDK + signing key are local).
+# scripts/test.sh --ignored. The Android app is not built here (plain Gradle since D79, but the
+# release key is local; scripts/build-android.sh).
 name: ci
 
 on:
