@@ -69,6 +69,10 @@ pub struct PersistOutcome {
     pub invalid: u64,
     pub oversize: u64,
     pub failed: u64,
+    /// Country / network of the node each new row was first heard from (`dht_seen.src_*`,
+    /// D101), for the crawl map's `stored` counter; only rows triaged with geo on. Codes only.
+    #[serde(skip)]
+    pub stored_geo: Vec<crate::geo::GeoCode>,
 }
 
 /// A loggable description of a persist error that cannot carry a bound value (a torrent name):
@@ -215,7 +219,8 @@ fn display_files(f: &Fetched) -> Vec<TorrentFile> {
         .collect()
 }
 
-/// Insert a screened torrent. Returns whether a new row was written.
+/// Insert a screened torrent. Returns whether a new row was written, and (for a new row) the
+/// country / network its hash was first heard from when that was resolved (D101).
 #[allow(clippy::too_many_arguments)]
 async fn store(
     tx: &mut Transaction<'_, Postgres>,
@@ -225,7 +230,7 @@ async fn store(
     peers_seen: usize,
     fetch_known: bool,
     now: i64,
-) -> sqlx::Result<bool> {
+) -> sqlx::Result<(bool, Option<crate::geo::GeoCode>)> {
     let v1 = hex::encode(f.v1);
     let title = clean(&f.info.name);
     let files = display_files(f);
@@ -281,24 +286,32 @@ async fn store(
         .execute(&mut **tx)
         .await?;
     }
-    if f.sighted == f.v1 {
-        sqlx::query("DELETE FROM dht_seen WHERE infohash = $1")
+    let src: Option<(Option<String>, Option<i32>)> = if f.sighted == f.v1 {
+        sqlx::query_as("DELETE FROM dht_seen WHERE infohash = $1 RETURNING src_cc, src_asn")
             .bind(f.sighted.as_slice())
-            .execute(&mut **tx)
-            .await?;
+            .fetch_optional(&mut **tx)
+            .await?
     } else {
         // Keep the truncated v2 hash as a final alias row: deleting it would let it be fetched
         // again every time it is sampled (it is not in torrent_infohashes), docs/DHT.md §2.4.
-        sqlx::query(
+        sqlx::query_as(
             "UPDATE dht_seen SET status = $2, next_attempt_at = NULL, last_error = NULL
-             WHERE infohash = $1",
+             WHERE infohash = $1 RETURNING src_cc, src_asn",
         )
         .bind(f.sighted.as_slice())
         .bind(STATUS_ALIAS)
-        .execute(&mut **tx)
-        .await?;
-    }
-    Ok(inserted)
+        .fetch_optional(&mut **tx)
+        .await?
+    };
+    // NULL src_cc: triaged without geo (off, or before D101): not counted.
+    let geo = match src {
+        Some((Some(cc), asn)) if inserted => Some(crate::geo::GeoCode::from_parts(
+            Some(cc.as_str()),
+            asn.and_then(|a| u32::try_from(a).ok()),
+        )),
+        _ => None,
+    };
+    Ok((inserted, geo))
 }
 
 /// Write one batch of results in one transaction.
@@ -353,10 +366,12 @@ pub async fn persist_batch(
                         *o.blocked_by_tier.entry(tier.as_str().into()).or_default() += 1;
                     }
                     Verdict::Allow => {
-                        if store(&mut tx, f, &class, it.via, it.peers_seen, fetch_known, now)
-                            .await?
-                        {
+                        let (inserted, geo) =
+                            store(&mut tx, f, &class, it.via, it.peers_seen, fetch_known, now)
+                                .await?;
+                        if inserted {
                             o.stored += 1;
+                            o.stored_geo.extend(geo);
                             *o.categories
                                 .entry(class.category.as_str().into())
                                 .or_default() += 1;

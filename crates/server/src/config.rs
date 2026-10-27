@@ -287,6 +287,18 @@ pub struct Config {
     /// context tier. Additive only; a file that does not load stops the server.
     #[arg(long, env = "MAGNETAR_BLOCKLIST_FILE")]
     pub blocklist_file: Option<std::path::PathBuf>,
+    // --- Crawl map (docs/CRAWLMAP.md, D101–D105) ---
+    /// IP → country / network databases (DB-IP Lite, CC BY 4.0): `on` (country + ASN),
+    /// `country` (country only, smaller), `off` (no geo counting; the map says so).
+    #[arg(long, env = "MAGNETAR_GEOIP", value_enum, default_value_t = crate::geo::GeoMode::On)]
+    pub geoip: crate::geo::GeoMode,
+    /// Where the databases live (default `<state dir>/geoip`, worker `<worker state dir>/geoip`).
+    #[arg(long, env = "MAGNETAR_GEOIP_DIR")]
+    pub geoip_dir: Option<PathBuf>,
+    /// Download them on first start and refresh monthly; false = use the files in the
+    /// directory only (offline).
+    #[arg(long, env = "MAGNETAR_GEOIP_DOWNLOAD", default_value_t = true, action = clap::ArgAction::Set)]
+    pub geoip_download: bool,
     // --- Crawl workers (docs/WORKERS.md, D96–D100) ---
     /// Server: `name:token,name:token`, one token per worker (separate from
     /// MAGNETAR_API_TOKEN). Unset = no worker can connect.
@@ -390,6 +402,16 @@ impl Config {
                 .join("magnetar")
                 .join("images")
         })
+    }
+
+    /// The crawl map's database settings; `default_dir` when `MAGNETAR_GEOIP_DIR` is unset.
+    pub fn geo_config(&self, default_dir: PathBuf) -> crate::geo::GeoConfig {
+        crate::geo::GeoConfig {
+            mode: self.geoip,
+            dir: self.geoip_dir.clone().unwrap_or(default_dir),
+            download: self.geoip_download,
+            base_url: crate::geo::DEFAULT_BASE_URL.into(),
+        }
     }
 
     /// `$XDG_STATE_HOME/magnetar` or `~/.local/state/magnetar`.

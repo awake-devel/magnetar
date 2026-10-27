@@ -474,6 +474,7 @@ async fn crawler_maps_its_ports_and_reports_live_stats() {
         screen: None,
         upnp: Some(cfg(gw)),
         service: Some(svc.clone()),
+        geo: None,
     };
     let boot0 = net[0].1;
     let (tx, stop) = tokio::sync::watch::channel(false);

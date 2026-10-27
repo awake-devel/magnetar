@@ -53,6 +53,11 @@ pub mod features {
     /// Crawl workers can connect (`MAGNETAR_WORKER_TOKENS` set; D96) and `StatsResponse.workers`
     /// lists them. Not in `ALL` (it depends on the configuration).
     pub const WORKERS: &str = "workers";
+    /// `GET /api/v1/stats/sources`: DHT routes, relay sources, machines (D102).
+    pub const CRAWL_SOURCES: &str = "crawl_sources";
+    /// `GET /api/v1/stats/map` (D103): counts by country and network. Listed even when the geo
+    /// database is off; `CrawlMap.available` says whether counting runs.
+    pub const CRAWL_MAP: &str = "crawl_map";
     pub const ALL: &[&str] = &[
         FILTERS,
         FACET_SET,
@@ -64,6 +69,8 @@ pub mod features {
         ORIGIN,
         SAVED_SEARCH_POLL,
         BROWSE_CHECKED_DHT,
+        CRAWL_SOURCES,
+        CRAWL_MAP,
     ];
 }
 
@@ -612,6 +619,189 @@ pub struct Graph {
 
 /// Node cap of every graph endpoint: what a phone lays out and draws smoothly.
 pub const MAX_GRAPH_NODES: usize = 200;
+
+// ---- Crawl map (D101–D105, docs/CRAWLMAP.md). No type below has an IP address field, and
+// no string in them is ever an IP address (D101; `tests/it/crawl_map.rs` checks the JSON).
+
+/// Counts per DHT discovery route: `sample` (BEP 51 samples), `get_peers` (other nodes'
+/// lookups that reached us), `announce` (announce_peer to us).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RouteTriple {
+    pub sample: u64,
+    pub get_peers: u64,
+    pub announce: u64,
+}
+
+/// One DHT discovery route since the crawler's first run.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DhtRouteCount {
+    /// `sample` | `get_peers` | `announce`.
+    pub via: String,
+    /// Distinct infohashes first triaged through this route (`dht_seen` + stored rows).
+    pub seen: u64,
+    /// DHT torrents stored that were discovered this way (`dht_torrents.discovered_via`).
+    pub stored: u64,
+}
+
+/// One UTC hour of the per-route counters (`stats_series` `dht_seen_<via>` /
+/// `dht_stored_<via>`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DhtRouteHour {
+    pub bucket: i64,
+    pub seen: RouteTriple,
+    pub stored: RouteTriple,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DhtSources {
+    /// `sample`, `get_peers`, `announce`, in that order (always all three).
+    pub routes: Vec<DhtRouteCount>,
+    /// The last 48 hours, oldest first, one entry per hour (zeros included).
+    pub hourly: Vec<DhtRouteHour>,
+    /// Unix time the hourly per-route counters started (the migration); None = never.
+    pub hourly_since: Option<i64>,
+}
+
+/// Relays by how the crawler found them (`relays.source`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RelaySourceCount {
+    /// `seed`, `nip65`, `nip66`, `hint`, `kind3`, `manual`, …
+    pub source: String,
+    pub relays: u64,
+    pub enabled: u64,
+    /// Relays that delivered at least one new event.
+    pub delivered: u64,
+    /// New events first delivered by these relays (`relays.events_found`).
+    pub events: u64,
+    /// New torrents (kind 2003) first delivered by them, counted since `torrents_since`.
+    pub torrents: u64,
+}
+
+/// One relay and what it delivered.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RelayYield {
+    pub url: String,
+    pub source: String,
+    pub enabled: bool,
+    /// Answered within the last 24 hours.
+    pub ok_24h: bool,
+    pub events: u64,
+    pub torrents: u64,
+    /// Where its address resolved to at the last check (D104): ISO 3166 alpha-2, AS number
+    /// and AS organisation; None when unknown or the geo database is off.
+    pub country: Option<String>,
+    pub asn: Option<u32>,
+    pub as_org: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct NostrSources {
+    pub by_source: Vec<RelaySourceCount>,
+    /// The 20 relays with most events (ties: most torrents).
+    pub top_relays: Vec<RelayYield>,
+    /// Unix time per-relay torrent counting started (the migration); None = never.
+    pub torrents_since: Option<i64>,
+}
+
+/// One crawling machine: the server itself or a crawl worker (D99).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct MachineSources {
+    /// `server`, or the worker's configured name.
+    pub name: String,
+    /// `server` | `worker`.
+    pub kind: String,
+    /// The server: its DHT crawler runs. A worker: heard from in the last 2 minutes.
+    pub connected: bool,
+    /// Unix time these totals count from (server start, or the worker's first request since).
+    pub since: Option<i64>,
+    /// Distinct hashes handed to triage, and how many of them the fleet let it fetch.
+    pub dht_triaged: u64,
+    pub dht_queued: u64,
+    /// Info dicts verified, and new torrents stored from them.
+    pub dht_metadata: u64,
+    pub dht_stored: u64,
+    /// Hashes triaged per route (server: its own sightings; worker: its triage requests).
+    pub dht_triaged_by_route: RouteTriple,
+    /// Seed-check results written.
+    pub seed_checks: u64,
+    /// Over the last ~10 minutes.
+    pub stored_per_min: f64,
+}
+
+/// `GET /api/v1/stats/sources` (D102): where discoveries come from.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CrawlSources {
+    pub dht: DhtSources,
+    pub nostr: NostrSources,
+    /// The server first, then each configured worker.
+    pub machines: Vec<MachineSources>,
+    pub computed_at: i64,
+}
+
+/// One country or network row of [`CrawlMap`]; `counts` is parallel to `CrawlMap.metrics`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct GeoCount {
+    /// ISO 3166 alpha-2 (`FR`); for a network, the country most of its counts came from.
+    pub country: Option<String>,
+    /// Networks only: AS number and organisation (DB-IP ASN Lite).
+    pub asn: Option<u32>,
+    pub as_org: Option<String>,
+    pub counts: Vec<u64>,
+}
+
+/// The geo database (DB-IP Lite) the counts were resolved with.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct GeoDbInfo {
+    /// Unix build times from the MMDB metadata; `asn_build` None = country only.
+    pub country_build: Option<i64>,
+    pub asn_build: Option<i64>,
+    /// `DB-IP IP to Country Lite` / `… ASN Lite`, CC BY 4.0.
+    pub name: String,
+    pub licence: String,
+    pub url: String,
+}
+
+/// `GET /api/v1/stats/map?layer=dht|nostr&window=day|all` (D103–D105).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CrawlMap {
+    /// `dht` | `nostr`.
+    pub layer: String,
+    /// `day` (last 24 hours) | `all` (since counting started).
+    pub window: String,
+    /// The geo database is loaded and counting runs. False: `reason` says why; counts kept
+    /// from earlier runs are still returned.
+    pub available: bool,
+    /// `disabled` (MAGNETAR_GEOIP=off), `missing` (not downloaded yet / offline), `invalid`.
+    pub reason: Option<String>,
+    pub database: Option<GeoDbInfo>,
+    /// Text to show with the data (CC BY 4.0 attribution).
+    pub attribution: String,
+    /// dht: `hashes`, `stored`, `nodes`; nostr: `relays`, `events`, `torrents`.
+    pub metrics: Vec<String>,
+    /// Every country with a count, ordered by the first metric (descending).
+    pub countries: Vec<GeoCount>,
+    /// The top 50 networks by the first metric.
+    pub networks: Vec<GeoCount>,
+    /// Counts whose address had no country in the database (or no source address).
+    pub unknown: Vec<u64>,
+    /// Sums over every country and `unknown`.
+    pub totals: Vec<u64>,
+    /// Unix time counting started for this layer (None = nothing counted yet).
+    pub since: Option<i64>,
+    pub computed_at: i64,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct TrustSettings {

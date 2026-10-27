@@ -214,6 +214,11 @@ pub async fn crawl_once<S: Store + ?Sized>(
         {
             ctx.error(&run.url, &e.to_string());
         }
+        if run.torrents > 0
+            && let Err(e) = store.record_relay_torrents(&run.url, run.torrents).await
+        {
+            ctx.error(&run.url, &e.to_string());
+        }
     }
 
     if cfg.fetch_metadata && !cfg.indexers.is_empty() && Instant::now() < deadline {
@@ -347,6 +352,8 @@ struct RelayRun {
     /// A page went unanswered for the full `PAGE_TIMEOUT`.
     timed_out: bool,
     found: u64,
+    /// Of `found`, new torrent events (kind 2003): `relays.torrents_found` (D102).
+    torrents: u64,
     new_torrents: Vec<String>,
 }
 
@@ -362,6 +369,7 @@ impl RelayRun {
             refused: None,
             timed_out: false,
             found: 0,
+            torrents: 0,
             new_torrents: Vec::new(),
         }
     }
@@ -701,7 +709,10 @@ impl<'a, S: Store + ?Sized> Ctx<'a, S> {
                 r.inserted += 1;
                 run.found += 1;
                 match kind {
-                    KIND_TORRENT => run.new_torrents.push(id),
+                    KIND_TORRENT => {
+                        run.torrents += 1;
+                        run.new_torrents.push(id);
+                    }
                     KIND_TORRENT_COMMENT | KIND_COMMENT => r.comments += 1,
                     _ => r.metadata_events += 1,
                 }

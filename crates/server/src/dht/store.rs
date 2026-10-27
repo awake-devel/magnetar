@@ -38,16 +38,38 @@ pub async fn triage(
     now: i64,
     fetch_known: bool,
 ) -> sqlx::Result<TriageOutcome> {
+    triage_geo(pool, batch, &[], now, fetch_known).await
+}
+
+/// [`triage`] with, per item, the country / network of the node that told us about it (D101;
+/// parallel to `batch`, shorter = unresolved). A new row keeps it in `src_cc` / `src_asn` for
+/// the crawl map's `stored` count; a re-queued row keeps its first one. Codes only, never an
+/// address.
+pub async fn triage_geo(
+    pool: &PgPool,
+    batch: &[([u8; 20], Via)],
+    geo: &[Option<crate::geo::GeoCode>],
+    now: i64,
+    fetch_known: bool,
+) -> sqlx::Result<TriageOutcome> {
     let hashes: Vec<Vec<u8>> = batch.iter().map(|(h, _)| h.to_vec()).collect();
     let vias: Vec<i16> = batch.iter().map(|(_, v)| v.code()).collect();
+    let g = |i: usize| geo.get(i).copied().flatten();
+    let ccs: Vec<Option<String>> = (0..batch.len())
+        .map(|i| g(i).map(|c| c.cc_text()))
+        .collect();
+    let asns: Vec<Option<i32>> = (0..batch.len())
+        .map(|i| g(i).map(|c| i32::try_from(c.asn).unwrap_or(0)))
+        .collect();
     let (blocked, known, queued): (i64, i64, Vec<Vec<u8>>) = sqlx::query_as(
         r#"
         WITH input AS (
-            SELECT DISTINCT ON (h) h, via FROM unnest($1::bytea[], $2::int2[]) AS u(h, via)
+            SELECT DISTINCT ON (h) h, via, cc, asn
+            FROM unnest($1::bytea[], $2::int2[], $7::text[], $8::int4[]) AS u(h, via, cc, asn)
             WHERE length(h) = 20
             ORDER BY h, (via = 1) DESC
         ), cls AS (
-            SELECT i.h, i.via,
+            SELECT i.h, i.via, i.cc, i.asn,
                    EXISTS (SELECT 1 FROM blocked_infohashes b
                            WHERE b.infohash = encode(i.h, 'hex') COLLATE "C") AS blocked,
                    (NOT $4 AND EXISTS (SELECT 1 FROM torrent_infohashes t
@@ -55,12 +77,14 @@ pub async fn triage(
             FROM input i
         ), up AS (
             INSERT INTO dht_seen AS s (infohash, first_seen, last_seen, via, status, attempts,
-                                       next_attempt_at)
-            SELECT h, $3, $3, via, 0, 0, $3 + $5 FROM cls WHERE NOT blocked AND NOT known
+                                       next_attempt_at, src_cc, src_asn)
+            SELECT h, $3, $3, via, 0, 0, $3 + $5, cc, asn FROM cls WHERE NOT blocked AND NOT known
             ORDER BY h
             ON CONFLICT (infohash) DO UPDATE
                 SET last_seen = EXCLUDED.last_seen, status = 0, via = EXCLUDED.via,
-                    next_attempt_at = EXCLUDED.next_attempt_at
+                    next_attempt_at = EXCLUDED.next_attempt_at,
+                    src_cc = COALESCE(s.src_cc, EXCLUDED.src_cc),
+                    src_asn = CASE WHEN s.src_cc IS NULL THEN EXCLUDED.src_asn ELSE s.src_asn END
                 WHERE (s.status IN (0, 2) AND s.next_attempt_at IS NOT NULL
                        AND s.next_attempt_at <= EXCLUDED.last_seen)
                    OR (s.status = 2 AND EXCLUDED.via = 1
@@ -78,6 +102,8 @@ pub async fn triage(
     .bind(fetch_known)
     .bind(LEASE_SECS)
     .bind(ANNOUNCE_RETRY_SECS)
+    .bind(&ccs)
+    .bind(&asns)
     .fetch_one(pool)
     .await?;
     Ok(TriageOutcome {

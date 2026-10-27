@@ -26,4 +26,10 @@ interface MagnetarService {
 
     /** [path]: `wot`, `relays`, `media/{id}` or `swarm/{infohash}`. */
     suspend fun graph(path: String): Graph
+
+    /** Feature `crawl_sources`. */
+    suspend fun crawlSources(): CrawlSources
+
+    /** Feature `crawl_map`: [layer] `dht` | `nostr`, [window] `day` | `all`. */
+    suspend fun crawlMap(layer: String, window: String): CrawlMap
 }

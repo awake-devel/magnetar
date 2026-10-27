@@ -152,6 +152,10 @@ pub struct Sighting {
     pub source: Option<SocketAddrV4>,
     /// The announcing peer (a peer that has the torrent).
     pub peer: Option<SocketAddrV4>,
+    /// The node that told us about the hash: the sampled node, the node whose `get_peers`
+    /// query reached us, or the announcer. Only for counting by country / network (D101): the
+    /// server resolves it in memory and never stores, logs or sends the address.
+    pub from: Option<SocketAddrV4>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1327,6 +1331,7 @@ impl Dht {
                         via: Via::GetPeers,
                         source: None,
                         peer: None,
+                        from: Some(src),
                     });
                     let mut r = resp(s.nodes[i].routing.closest(&info_hash, K));
                     r.token = Some(token_for(&s.secrets[0], *src.ip()).to_vec());
@@ -1358,6 +1363,7 @@ impl Dht {
                             via: Via::Announce,
                             source: None,
                             peer: Some(peer),
+                            from: Some(src),
                         });
                         Body::Response(resp(Vec::new()))
                     }
@@ -1517,6 +1523,7 @@ impl Dht {
                 via: Via::Sample,
                 source: Some(addr),
                 peer: None,
+                from: Some(addr),
             });
         }
     }

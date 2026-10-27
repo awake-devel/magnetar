@@ -473,6 +473,7 @@ fn opts(ports: usize) -> DhtOptions {
         screen: None,
         upnp: None,
         service: None,
+        geo: None,
     }
 }
 

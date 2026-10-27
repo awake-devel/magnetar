@@ -181,6 +181,29 @@ class MagnetarApi(
         return get("api/v1/graphs/$p", RequestClass.STATS, Graph.serializer())
     }
 
+    /**
+     * Feature `crawl_sources`: DHT routes, relays by discovery source, top relays, machines. A
+     * relay URL whose host (or a machine name that) is an IP literal is redacted before anything
+     * shows or caches it.
+     */
+    override suspend fun crawlSources(): CrawlSources {
+        val s = get("api/v1/stats/sources", RequestClass.STATS, CrawlSources.serializer())
+        return s.copy(
+            nostr = s.nostr?.let { n -> n.copy(topRelays = n.topRelays.map { it.copy(url = redactIpHost(it.url)) }) },
+            machines = s.machines.map { it.copy(name = redactIpHost(it.name)) },
+        )
+    }
+
+    /** Feature `crawl_map`; any other [layer] or [window] is refused before a request is made. */
+    override suspend fun crawlMap(layer: String, window: String): CrawlMap {
+        if (layer !in MAP_LAYERS || window !in MAP_WINDOWS) throw ApiException.NotFound("No such map")
+        val url = url("api/v1/stats/map").newBuilder()
+            .addQueryParameter("layer", layer)
+            .addQueryParameter("window", window)
+            .build()
+        return decode(CrawlMap.serializer(), execute(Request.Builder().url(url).get().build(), RequestClass.STATS))
+    }
+
     // --- plumbing ---
 
     /** An infohash as a path segment: 40 hex digits (a deep link's value is checked again here). */
@@ -247,6 +270,23 @@ class MagnetarApi(
         }
         private val JSON_MEDIA = "application/json".toMediaType()
         private val INFOHASH = Regex("^[0-9a-f]{40}$")
+        val MAP_LAYERS = setOf("dht", "nostr")
+        val MAP_WINDOWS = setOf("day", "all")
+        private val IPV4 = Regex("""^\d{1,3}(\.\d{1,3}){3}$""")
+
+        /**
+         * [url] with an IP-literal host replaced (`wss://203.0.113.5:7447/x` → `wss://(IP address)`):
+         * the app never shows or stores an IP address. Host names are kept.
+         */
+        fun redactIpHost(url: String): String {
+            val scheme = url.substringBefore("://", "")
+            val rest = if (scheme.isEmpty()) url else url.substringAfter("://")
+            val authority = rest.substringBefore('/').substringBefore('?').substringBefore('#').substringAfterLast('@')
+            val host = if (authority.startsWith("[")) authority.substringBefore(']') + "]" else authority.substringBefore(':')
+            val ip = host.startsWith("[") || IPV4.matches(host) || authority.count { it == ':' } > 1
+            if (!ip) return url
+            return (if (scheme.isEmpty()) "" else "$scheme://") + "(IP address)"
+        }
 
         /**
          * The client for the server in Settings, or [ApiException.NotConfigured] when [serverUrl]

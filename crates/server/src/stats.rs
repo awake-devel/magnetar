@@ -41,6 +41,13 @@ pub const METRICS: &[&str] = &[
     crate::dht::status::DHT_FETCH_OK,
     crate::dht::status::DHT_FETCH_FAIL,
     crate::dht::status::DHT_BLOCKED,
+    // Per DHT route (D102): hashes first triaged, torrents stored.
+    crate::crawlmap::ROUTE_SERIES[0],
+    crate::crawlmap::ROUTE_SERIES[1],
+    crate::crawlmap::ROUTE_SERIES[2],
+    crate::crawlmap::ROUTE_SERIES[3],
+    crate::crawlmap::ROUTE_SERIES[4],
+    crate::crawlmap::ROUTE_SERIES[5],
     TORRENTS_TOTAL,
     TORRENTS_PUBLISHED,
     RELAYS_DISCOVERED,

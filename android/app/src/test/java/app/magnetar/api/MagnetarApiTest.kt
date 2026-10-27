@@ -463,4 +463,103 @@ class MagnetarApiTest {
         server.enqueue(json("""{"error":"not_found","message":"unknown media"}""", 404))
         expect<ApiException.NotFound> { runBlocking { api().graph("media/7") } }
     }
+
+    @Test
+    fun `crawl sources parse, unknown fields ignored, IP hosts redacted`() = runBlocking {
+        server.enqueue(
+            json(
+                """{"dht":{"routes":[{"via":"sample","seen":4256462,"stored":1009417},{"via":"get_peers","seen":2156244,"stored":143237},
+                {"via":"announce","seen":6369,"stored":810}],
+                "hourly":[{"bucket":1793000000,"seen":{"sample":1200,"get_peers":700,"announce":3},"stored":{"sample":300,"get_peers":40,"announce":1}}],
+                "hourly_since":1793000000},
+                "nostr":{"by_source":[{"source":"nip66","relays":1185,"enabled":900,"delivered":63,"events":179549,"torrents":120000}],
+                "top_relays":[{"url":"wss://relay.example","source":"seed","enabled":true,"ok_24h":true,"events":99150,"torrents":80000,
+                "country":"DE","asn":24940,"as_org":"Hetzner Online GmbH"},
+                {"url":"wss://203.0.113.5:7447/nostr","source":"nip66","country":null,"asn":null,"as_org":null},
+                {"url":"ws://[2001:db8::1]:80","source":"nip66"}],"torrents_since":1793000000},
+                "machines":[{"name":"server","kind":"server","connected":true,"since":1793000000,"dht_triaged":120000,"dht_queued":50000,
+                "dht_metadata":9000,"dht_stored":8000,"dht_triaged_by_route":{"sample":80000,"get_peers":39000,"announce":1000},
+                "seed_checks":30000,"stored_per_min":80.5,"future":"x"},{"name":"eee","kind":"worker"},{"name":"192.0.2.7","kind":"worker"}],
+                "computed_at":1793000000,"new_section":{"a":1}}""",
+            ),
+        )
+        val s = api().crawlSources()
+        assertEquals(server.takeRequest().url.encodedPath, "/api/v1/stats/sources")
+        assertEquals(s.dht?.routes?.map { it.via }, listOf("sample", "get_peers", "announce"))
+        assertEquals(s.dht?.hourly?.single()?.seen?.get("get_peers"), 700L)
+        assertEquals(s.nostr?.bySource?.single()?.delivered, 63L)
+        val relays = s.nostr!!.topRelays
+        assertEquals(relays[0].url, "wss://relay.example")
+        assertEquals(relays[0].asOrg, "Hetzner Online GmbH")
+        assertEquals(relays[0].asn, 24940L)
+        assertTrue(relays[0].ok24h)
+        // No IP address is ever shown or cached.
+        assertEquals(relays[1].url, "wss://(IP address)")
+        assertNull(relays[1].country)
+        assertEquals(relays[2].url, "ws://(IP address)")
+        assertEquals(s.machines[0].dhtTriagedByRoute["announce"], 1000L)
+        assertEquals(s.machines[0].storedPerMin, 80.5)
+        assertEquals(s.machines[1].kind, "worker")
+        assertEquals(s.machines[1].dhtStored, 0L)
+        assertFalse(s.machines[1].connected)
+        assertEquals(s.machines[2].name, "(IP address)")
+
+        // An answer with nothing in it still decodes (every field has a default).
+        server.enqueue(json("{}"))
+        val empty = api().crawlSources()
+        assertNull(empty.dht)
+        assertNull(empty.nostr)
+        assertTrue(empty.machines.isEmpty())
+    }
+
+    @Test
+    fun `crawl map sends layer and window, refuses others, parses partial answers`() = runBlocking {
+        server.enqueue(
+            json(
+                """{"layer":"dht","window":"day","available":true,"reason":null,
+                "database":{"country_build":1790000000,"asn_build":1790000000,"name":"DB-IP","licence":"CC BY 4.0","url":"https://db-ip.com"},
+                "attribution":"IP Geolocation by DB-IP (https://db-ip.com), CC BY 4.0","metrics":["hashes","stored","nodes"],
+                "countries":[{"country":"US","asn":null,"as_org":null,"counts":[120000,3000,40000]},{"country":"DE","counts":[5000,200,800]}],
+                "networks":[{"country":"DE","asn":24940,"as_org":"Hetzner Online GmbH","counts":[5000,200,800]}],
+                "unknown":[1000,10,50],"totals":[400000,9000,120000],"since":1793000000,"computed_at":1793000100}""",
+            ),
+        )
+        val m = api().crawlMap("dht", "day")
+        val req = server.takeRequest()
+        assertEquals(req.url.encodedPath, "/api/v1/stats/map")
+        assertEquals(req.url.queryParameter("layer"), "dht")
+        assertEquals(req.url.queryParameter("window"), "day")
+        assertTrue(m.available)
+        assertEquals(m.metrics, listOf("hashes", "stored", "nodes"))
+        assertEquals(m.countries[0].count(2), 40000L)
+        assertNull(m.countries[0].asn)
+        assertEquals(m.networks.single().asn, 24940L)
+        assertEquals(m.database?.countryBuild, 1790000000L)
+        assertEquals(m.totals[1], 9000L)
+
+        // The geo database is missing: the reason comes through, counts may be empty.
+        server.enqueue(json("""{"layer":"nostr","window":"all","available":false,"reason":"missing","metrics":["relays","events","torrents"]}"""))
+        val off = api().crawlMap("nostr", "all")
+        assertEquals(server.takeRequest().url.queryParameter("window"), "all")
+        assertFalse(off.available)
+        assertEquals(off.reason, "missing")
+        assertTrue(off.countries.isEmpty())
+        assertNull(off.database)
+
+        for ((l, w) in listOf("ip" to "day", "dht" to "week", "" to "")) {
+            expect<ApiException.NotFound> { runBlocking { api().crawlMap(l, w) } }
+        }
+        assertEquals(server.requestCount, 2)
+    }
+
+    @Test
+    fun `IP literal hosts are redacted, names kept`() {
+        assertEquals(MagnetarApi.redactIpHost("wss://relay.damus.io"), "wss://relay.damus.io")
+        assertEquals(MagnetarApi.redactIpHost("wss://nos.lol:443/path"), "wss://nos.lol:443/path")
+        assertEquals(MagnetarApi.redactIpHost("wss://1.2.3.4"), "wss://(IP address)")
+        assertEquals(MagnetarApi.redactIpHost("wss://user@10.0.0.1:7000/x"), "wss://(IP address)")
+        assertEquals(MagnetarApi.redactIpHost("wss://[::1]:7000"), "wss://(IP address)")
+        assertEquals(MagnetarApi.redactIpHost("2001:db8::1"), "(IP address)")
+        assertEquals(MagnetarApi.redactIpHost("wss://1.2.3.4.example.com"), "wss://1.2.3.4.example.com")
+    }
 }

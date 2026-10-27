@@ -193,6 +193,8 @@ struct Entry {
     heartbeat: Option<Heartbeat>,
     liveness_results: u64,
     triaged: u64,
+    /// Of `triaged`, per route: sample, get_peers, announce (D102).
+    triaged_by_route: [u64; 3],
     queued: u64,
     metadata: u64,
     stored: u64,
@@ -322,6 +324,40 @@ impl Fleet {
                         s.pressure = h.pressure;
                         s.dht = h.dht.clone();
                     }
+                }
+                s
+            })
+            .collect()
+    }
+}
+
+impl Fleet {
+    /// One entry per configured worker for `/api/v1/stats/sources` (D102); `stored_per_min`
+    /// is filled by the crawl map from its samples.
+    pub fn machines(&self, now: i64) -> Vec<magnetar_core::api::MachineSources> {
+        let m = self.entries.lock().unwrap();
+        self.cfg
+            .tokens
+            .iter()
+            .map(|t| {
+                let mut s = magnetar_core::api::MachineSources {
+                    name: t.name.clone(),
+                    kind: "worker".into(),
+                    ..Default::default()
+                };
+                if let Some(e) = m.get(&t.name) {
+                    s.connected = e.last_seen.is_some_and(|l| now - l <= CONNECTED_SECS);
+                    s.since = e.first_seen;
+                    s.dht_triaged = e.triaged;
+                    s.dht_queued = e.queued;
+                    s.dht_metadata = e.metadata;
+                    s.dht_stored = e.stored;
+                    s.dht_triaged_by_route = magnetar_core::api::RouteTriple {
+                        sample: e.triaged_by_route[0],
+                        get_peers: e.triaged_by_route[1],
+                        announce: e.triaged_by_route[2],
+                    };
+                    s.seed_checks = e.liveness_results;
                 }
                 s
             })

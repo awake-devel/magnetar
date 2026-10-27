@@ -49,6 +49,9 @@ pub struct WorkerOptions {
     pub limits: Limits,
     pub upload_buffer: usize,
     pub heartbeat_every: Duration,
+    /// Crawl map (D105): resolve DHT nodes to country / network here and send the codes
+    /// with triage requests. None = off (no database is downloaded).
+    pub geo: Option<crate::geo::GeoConfig>,
 }
 
 impl WorkerOptions {
@@ -103,6 +106,14 @@ impl WorkerOptions {
             },
             upload_buffer: (cfg.worker_upload_buffer_mb as usize) << 20,
             heartbeat_every: HEARTBEAT_EVERY,
+            geo: (cfg.geoip != crate::geo::GeoMode::Off).then(|| {
+                cfg.geo_config(
+                    cfg.worker_state_dir
+                        .clone()
+                        .unwrap_or_else(|| cfg.state_dir().join("worker"))
+                        .join("geoip"),
+                )
+            }),
         })
     }
 }
@@ -312,6 +323,20 @@ pub async fn run(
 
     let crawl = match opts.dht.clone() {
         Some(mut d) => {
+            // D105: the worker's own geo database (downloaded into its state dir), loaded in
+            // the background; until then its triage items carry no codes.
+            if let Some(g) = opts.geo.clone() {
+                let map = Arc::new(crate::crawlmap::CrawlMap::new(
+                    g.mode,
+                    crate::crawlmap::NODE_BITS_WORKER,
+                ));
+                tokio::spawn(crate::crawlmap::refresh_loop(
+                    map.clone(),
+                    g,
+                    int_rx.clone(),
+                ));
+                d.geo = Some(map);
+            }
             // The server refuses dicts above its own limit: never fetch more than that.
             if welcome.metadata_max > 0 {
                 d.metadata_max = d.metadata_max.min(welcome.metadata_max as usize);

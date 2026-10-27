@@ -248,3 +248,132 @@ data class Graph(
     val truncated: Boolean = false,
     val note: String? = null,
 )
+
+/*
+ * Where discoveries come from (feature `crawl_sources`) and the crawl map (feature `crawl_map`).
+ * Counts only: no answer carries an IP address, and the app never shows, stores or sends one
+ * (a relay URL whose host is an IP literal is redacted on decode, [MagnetarApi.crawlSources]).
+ */
+
+/** One DHT discovery route: `sample` (BEP 51), `get_peers` (lookups that reached us), `announce`. */
+@Serializable
+data class RouteCount(val via: String = "", val seen: Long = 0, val stored: Long = 0)
+
+/** One UTC hour: hashes seen and torrents stored per route. */
+@Serializable
+data class RouteHour(
+    val bucket: Long = 0,
+    val seen: Map<String, Long> = emptyMap(),
+    val stored: Map<String, Long> = emptyMap(),
+)
+
+@Serializable
+data class DhtSources(
+    val routes: List<RouteCount> = emptyList(),
+    /** The last 48 hours, oldest first. */
+    val hourly: List<RouteHour> = emptyList(),
+    @SerialName("hourly_since") val hourlySince: Long = 0,
+)
+
+/** Relays by how the server found them (`nip66`, `seed`, …). */
+@Serializable
+data class RelaySourceCount(
+    val source: String = "",
+    val relays: Long = 0,
+    val enabled: Long = 0,
+    /** Relays that delivered at least one new event. */
+    val delivered: Long = 0,
+    val events: Long = 0,
+    val torrents: Long = 0,
+)
+
+@Serializable
+data class TopRelay(
+    val url: String = "",
+    val source: String = "",
+    val enabled: Boolean = false,
+    @SerialName("ok_24h") val ok24h: Boolean = false,
+    val events: Long = 0,
+    val torrents: Long = 0,
+    /** Where the relay's host resolves (ISO 3166 alpha-2), its AS number and organisation, if known. */
+    val country: String? = null,
+    val asn: Long? = null,
+    @SerialName("as_org") val asOrg: String? = null,
+)
+
+@Serializable
+data class NostrSources(
+    @SerialName("by_source") val bySource: List<RelaySourceCount> = emptyList(),
+    @SerialName("top_relays") val topRelays: List<TopRelay> = emptyList(),
+    /** Torrent counts per relay started at this time. */
+    @SerialName("torrents_since") val torrentsSince: Long = 0,
+)
+
+/** The server or one crawl worker. */
+@Serializable
+data class CrawlMachine(
+    val name: String = "",
+    /** `server` | `worker`. */
+    val kind: String = "",
+    val connected: Boolean = false,
+    val since: Long? = null,
+    @SerialName("dht_triaged") val dhtTriaged: Long = 0,
+    @SerialName("dht_queued") val dhtQueued: Long = 0,
+    @SerialName("dht_metadata") val dhtMetadata: Long = 0,
+    @SerialName("dht_stored") val dhtStored: Long = 0,
+    @SerialName("dht_triaged_by_route") val dhtTriagedByRoute: Map<String, Long> = emptyMap(),
+    @SerialName("seed_checks") val seedChecks: Long = 0,
+    @SerialName("stored_per_min") val storedPerMin: Double = 0.0,
+)
+
+/** `GET /api/v1/stats/sources` (feature `crawl_sources`). */
+@Serializable
+data class CrawlSources(
+    val dht: DhtSources? = null,
+    val nostr: NostrSources? = null,
+    val machines: List<CrawlMachine> = emptyList(),
+    @SerialName("computed_at") val computedAt: Long = 0,
+)
+
+/** The server's IP-to-location database (DB-IP Lite, CC BY 4.0). */
+@Serializable
+data class GeoDatabase(
+    @SerialName("country_build") val countryBuild: Long? = null,
+    @SerialName("asn_build") val asnBuild: Long? = null,
+    val name: String = "",
+    val licence: String = "",
+    val url: String = "",
+)
+
+/** A country (`asn` null) or a network; [counts] are parallel to [CrawlMap.metrics]. */
+@Serializable
+data class GeoCount(
+    val country: String? = null,
+    val asn: Long? = null,
+    @SerialName("as_org") val asOrg: String? = null,
+    val counts: List<Long> = emptyList(),
+) {
+    fun count(metric: Int): Long = counts.getOrNull(metric) ?: 0
+}
+
+/** `GET /api/v1/stats/map?layer=dht|nostr&window=day|all` (feature `crawl_map`). */
+@Serializable
+data class CrawlMap(
+    val layer: String = "",
+    val window: String = "",
+    /** false: the geo database is off or missing; whatever counts came back are still drawn. */
+    val available: Boolean = false,
+    /** `disabled` | `missing` | `invalid` when not [available]. */
+    val reason: String? = null,
+    val database: GeoDatabase? = null,
+    val attribution: String = "",
+    val metrics: List<String> = emptyList(),
+    /** Every country, most [metrics]`[0]` first. */
+    val countries: List<GeoCount> = emptyList(),
+    /** The top 50 networks (AS). */
+    val networks: List<GeoCount> = emptyList(),
+    val unknown: List<Long> = emptyList(),
+    val totals: List<Long> = emptyList(),
+    val since: Long = 0,
+    @SerialName("computed_at") val computedAt: Long = 0,
+)

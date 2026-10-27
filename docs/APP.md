@@ -12,7 +12,7 @@ settings (§7).
 |---|---|
 | **Search** | Search box with instant results (search as you type); filter sheet with live facet counts (category, languages, subtitles, resolution, source, codec, HDR, audio, genre, movie/series/anime, rating, years, **Source Nostr / DHT**), sort; result list (title, media line "Title (year) · rating", attributes, size, seeders, source badge Nostr / DHT / both); torrent detail (media card with poster, French overview, release attributes, files, swarm with **Check now** and the seeder history chart, trust, *Open magnet* / *Copy magnet*); title page grouping the releases of one movie/series |
 | **Saved** | Saved searches (stored on the server), run one, edit, delete, per-search "notify"; hourly notifications through the server's stateless poll |
-| **Stats** | Health card, breakdown charts with cross-filtering, activity series, the four network graphs: web of trust, relays and publishers, title releases (from a title page), swarm (from a detail page) |
+| **Stats** | Health card, breakdown charts with cross-filtering, activity series, "Where discoveries come from" and the crawl map (§15), the four network graphs: web of trust, relays and publishers, title releases (from a title page), swarm (from a detail page) |
 | **Settings** | Server URL + API token + *Test connection*; trust root with **Get my key from Amber** (NIP-55 `get_public_key`) and nsec rejection; trust threshold (pushed to the server); *Show adult content*; saved-search notifications on/off; TMDB / IMDb attribution; version |
 
 Not in the app, by decision (D79):
@@ -43,8 +43,8 @@ Not in the app, by decision (D79):
   `accompanist-drawablepainter`, a JetBrains Compose foundation build and OkHttp 4 for ~60
   lines of work.
 - **Charts: Compose `Canvas`, no chart library (D89).** The activity series, the breakdown
-  bars/donuts, the year histogram and the graphs are all drawn with `Canvas` (own force layout,
-  no graph library). Vico 3.3.1 (Apache-2.0) was checked but not re-added (§13).
+  bars/donuts, the year histogram, the crawl map's world choropleth (§15) and the graphs are all
+  drawn with `Canvas` (own force layout, no graph or map library). Vico 3.3.1 (Apache-2.0) was checked but not re-added (§13).
 - **Background: WorkManager** for the hourly saved-search poll (§8). No foreground service.
 - **Settings: `SharedPreferences`** file `settings` (the old app's file, §7), wrapped by
   `settings.SettingsStore` exposing a `StateFlow<AppSettings>`. No DataStore: it would need a
@@ -91,13 +91,15 @@ android/app/src/main/java/app/magnetar/
   ui/
     AppShell.kt           Scaffold + bottom NavigationBar (Search, Saved, Stats, Settings) + NavHost
     theme/                MagnetarTheme, ChartColors (unchanged from the old app)
-    search/ detail/ title/ saved/ stats/ graph/ settings/ common/
+    search/ detail/ title/ saved/ stats/ graph/ crawlmap/ settings/ common/
+android/app/src/main/assets/world_110m.bin  world outline of the crawl map (§15)
 android/app/src/test/java/app/magnetar/   JVM unit tests (no emulator needed)
+android/tools/world_map.py                makes world_110m.bin from Natural Earth (§15)
 android/uitest/           emulator UI test over adb (uitest.py) + its fake server (§12)
 ```
 
 Routes: `search`, `saved`, `stats`, `settings` (tabs); `torrent/{infohash}`, `title/{mediaId}`,
-`graph?path=` pushed on top of the current tab. The deep link `magnetar://torrent/{infohash}`
+`graph?path=`, `crawl-map` pushed on top of the current tab. The deep link `magnetar://torrent/{infohash}`
 (saved-search notifications) opens the detail.
 
 ## 4. API contract, errors and timeouts
@@ -122,6 +124,8 @@ Routes: `search`, `saved`, `stats`, `settings` (tabs); `torrent/{infohash}`, `ti
 | Stats breakdowns (cross-filter) | `POST /api/v1/stats/breakdown` `{query, fields, top}` | `stats` |
 | Stats activity | `GET /api/v1/stats/timeseries?metric=…&bucket=hour\|day&since=` | `stats` |
 | Web of trust / relays graphs | `GET /api/v1/graphs/wot`, `GET /api/v1/graphs/relays` | `graphs` |
+| Stats "Where discoveries come from" | `GET /api/v1/stats/sources` | `crawl_sources` |
+| Crawl map | `GET /api/v1/stats/map?layer=dht\|nostr&window=day\|all` | `crawl_map` |
 | Settings trust root + threshold | `GET` / `PUT /api/v1/settings/trust` `{root, threshold}` | — |
 
 A query that uses a feature-gated field (release filters, rating sort, source chips) is never
@@ -405,3 +409,83 @@ the breakdowns and the web-of-trust graph, read-only (the Settings flow is never
   Settings switch with every request.
 - Open: R8 minification; a test on a real phone; posters (`/media/{id}/poster`) were not part of
   the integration smoke test (no TMDB token on the test server).
+
+## 15. Where discoveries come from, and the crawl map
+
+Two Stats additions, each shown only when `/health` lists its feature (an older server gets
+neither, and the Status tab names them under "Needs a newer server for"). Both answers are
+counts only: no IP address is in them, and the app never shows, stores or sends one (a top-relay
+URL whose host is an IP literal is redacted to `wss://(IP address)` as it is decoded, before the
+cache sees it). Both are cached per request like the other Stats answers (D83, D92) and shown
+at once with "cached · N ago", kept offline with "Offline:", cleared by any other error.
+
+**"Where discoveries come from"** (`GET /api/v1/stats/sources`, feature `crawl_sources`): a card
+on the Charts tab after Activity (`ui/stats/SourcesCard.kt`, helpers in `SourcesModel.kt`).
+
+- *DHT*: one row per route — *Sampling (BEP 51)* (`sample`), *Lookups (get_peers)* (`get_peers`,
+  hashes we saw because other nodes' lookups reached us), *Announces* (`announce`) — with two
+  one-hue bars, hashes seen and torrents stored, on one scale, and the conversion (stored / seen,
+  one decimal under 10 %). Under it the last 48 hours as stacked columns per route (categorical
+  slots in that fixed route order, legend with labels), *Seen* / *Stored*; tap a column for its
+  hour and the count per route.
+- *Nostr*: relays by how the server found them (`nip66` → "NIP-66 monitors", `seed` → "Seed
+  list", …) as bars of relays with enabled / delivered / events / torrents written under each;
+  the top relays (URL without `wss://`, events, torrents, source, answering or not, country code
+  and AS organisation when known). Torrent counts per relay started at `torrents_since`, which
+  the card says ("Torrents counted since …").
+- *Machines*: the server and each crawl worker with *connected* / *not connected* (a status dot
+  plus the word), triaged, queued, metadata fetched, stored and stored/min, seed checks.
+- A **Crawl map** button when the server also lists `crawl_map`.
+
+**Crawl map** (route `crawl-map`, `ui/crawlmap`; `GET /api/v1/stats/map`, feature `crawl_map`):
+*DHT discoveries* / *Nostr relays*, *Day* (last 24 h) / *All* (since `since`), and a chip per
+metric of the answer's `metrics` (DHT: hashes they gave us, torrents stored from them, nodes
+heard from once per UTC day; Nostr: relays, events, torrents, placed by where the relay's host
+resolves). A newer choice cancels the request in flight; another layer goes back to its first
+metric. The world is a choropleth on a Compose `Canvas`: countries filled on a sequential
+one-hue log scale (`ChartColors.mapLow` → `mapHigh`: darker = more in light theme, brighter =
+more in dark theme), countries with no count in the neutral `mapEmpty`, a legend with the
+minimum and maximum. Tap a country for its name (the phone's language), code and every metric
+with its share; tap again to clear. Pinch to zoom (up to 8×), drag to move once zoomed (unzoomed,
+a drag scrolls the page), double tap to reset. Below: *Top countries* and *Top networks (AS)*
+(AS number and organisation, country code) with the selected metric and its share of the total,
+15 rows then *Show all*, and "Location unknown: N" for the `unknown` count. When the answer says
+`available: false`, a banner gives the reason — the server's geo database is off (`disabled`),
+not downloaded yet (`missing`) or unreadable (`invalid`) — and whatever counts came back are
+still drawn. A server without the endpoint (404) gets "This server has no crawl map".
+
+**Attributions**, in a bar at the bottom of the map screen that never scrolls away: "IP
+Geolocation by DB-IP" linking to https://db-ip.com, "CC BY 4.0" and the month of the server's
+country database (`database.country_build`) when it is sent (the DB-IP Lite licence asks for a
+link back on every page that shows its results); "Map: Natural Earth (public domain)".
+
+**World outline asset**: `app/src/main/assets/world_110m.bin`, **32,137 bytes** (23,786 deflated in
+the APK; the whole feature adds ≈ 170 KB to the debug APK, 14.38 → 14.55 MB). Made by `android/tools/world_map.py` (standard library only) from
+Natural Earth 1:110m Admin 0 countries, public domain
+(`https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_110m_admin_0_countries.geojson`,
+downloaded 2026-10-27, SHA-256 `6866c877…c977f`):
+
+```sh
+python3 -I android/tools/world_map.py ne_110m_admin_0_countries.geojson android/app/src/main/assets/world_110m.bin 0.1
+# 174 countries, 280 rings, 10365 -> 7716 points, 32137 bytes (tolerance 0.1 deg)
+```
+
+Rings are clipped to 58° S – 84° N (Antarctica falls out), simplified with Douglas–Peucker at
+0.1°, projected equirectangular and quantised to 0.1° (3600 × 1420 units, `u16`). A country is
+keyed by `ISO_A2`, else `ISO_A2_EH` (France, Norway: `ISO_A2` is -99 there), else the country IP
+geolocation reports for it (N. Cyprus → CY, Somaliland → SO); features with one code are merged.
+The format is in the script's header. `WorldMapAsset` reads and parses it once per process on
+`Dispatchers.Default` into one even-odd `Path` per country; taps are hit-tested on the parsed
+rings, not on the paths.
+
+**Tests** (`CrawlMapTest`, `MagnetarApiTest`): both answers parse in full, with unknown fields and
+with missing fields (`{}`); the map's layer / window go into the query and anything else is
+refused before a request; IP-literal relay hosts are redacted; the asset parses (size under
+100 KB, FR / US / NO / XK / TW present, Antarctica absent, ring and point counts sane, all points
+inside the map), points of Paris, Oslo, Berlin, Brasília, Tokyo land in their country and the
+Atlantic in none, a truncated or padded asset is refused; the log scale, country names (en/fr),
+build month, labels and the conversion format; the Stats view model asks for sources only when
+`crawl_sources` is listed (an older server: no request, no card, no button), keeps them offline
+from the cache; the map view model per layer / window, metric reset, cancellation, selection,
+offline cache per request, 404.
+

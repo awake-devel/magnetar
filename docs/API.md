@@ -16,7 +16,8 @@ enums in `snake_case`). Checked for the app rebuild in 2026-10 (D77).
 - Feature detection: `GET /health` → `{"status","version","db","features":[…]}`. A client
   hides what the server does not list. Since this stage: `saved_search_poll` (D77) and
   `browse_checked_dht` (D76), next to `filters`, `facet_set`, `media_releases`,
-  `liveness_history`, `stats`, `graphs`, `adult_filter`, `origin`, and `dht` (crawler on).
+  `liveness_history`, `stats`, `graphs`, `adult_filter`, `origin`, `crawl_sources`, `crawl_map`
+  (D102, D103), and `dht` (crawler on).
 - Unknown query parameters are ignored; unknown JSON fields are ignored; every newer field has
   a default, so an older server's answers still parse.
 
@@ -34,7 +35,7 @@ enums in `snake_case`). Checked for the app rebuild in 2026-10 (D77).
 | Seed history chart | `GET /api/v1/torrents/{infohash}/liveness-history?days=N` | ≤ 90 days, oldest first. |
 | Title page | `GET /api/v1/media/{id}/releases` (+ search query string) or `POST` (`SearchQuery`) | `MediaReleases {media, total, truncated, groups}`; `GET /api/v1/media/{id}/torrents` = flat `SearchPage`. |
 | Posters | `GET /api/v1/media/{id}/poster` | Image bytes, `ETag` + `If-None-Match` → 304, `Cache-Control: private, max-age=604800`; 404 when there is no poster or TMDB is not configured. URL: `MediaInfo.poster` (server-relative), or built from a hit's `media_id`. No backdrops or stills. |
-| Stats tab | `GET\|POST /api/v1/stats/breakdown`, `GET /api/v1/stats/timeseries`, `GET /api/v1/stats/health`, `GET /api/v1/stats` | docs/STATS.md. Breakdowns count the whole catalogue (D76 does not apply). |
+| Stats tab | `GET\|POST /api/v1/stats/breakdown`, `GET /api/v1/stats/timeseries`, `GET /api/v1/stats/health`, `GET /api/v1/stats`, `GET /api/v1/stats/sources`, `GET /api/v1/stats/map` | docs/STATS.md. Breakdowns count the whole catalogue (D76 does not apply). |
 | Graphs | `GET /api/v1/graphs/wot`, `/relays`, `/media/{id}`, `/swarm/{infohash}` | `Graph {kind, nodes, edges, truncated, note}`. |
 | Trust settings | `GET` / `PUT /api/v1/settings/trust` (`{"root": npub-or-hex or null, "threshold": 0–100}`) | |
 | Block / trust a publisher | `PUT /api/v1/overrides/{pubkey}` (`{"action": "block"\|"trust"\|null}`) | 204. There is no list endpoint: a client that shows "blocked publishers" keeps its own list. |
@@ -73,6 +74,15 @@ enums in `snake_case`). Checked for the app rebuild in 2026-10 (D77).
   `include_adult` applies.
 - A periodic poll from Android WorkManager (e.g. 15 min) is enough; each poll is one search per
   saved search.
+
+## Crawl map (D101–D105)
+
+`GET /api/v1/stats/sources` (`CrawlSources`: DHT routes with seen/stored and 48 h per hour,
+relays by discovery source and the top relays, one line per crawling machine) and
+`GET /api/v1/stats/map?layer=dht|nostr&window=day|all` (`CrawlMap`: counts by country and the
+top 50 networks, `available`/`reason` when the geo database is off or missing, and the DB-IP
+`attribution` a client must show with a link to https://db-ip.com). Features `crawl_sources`,
+`crawl_map`. No answer contains an IP address (D101). Details: docs/CRAWLMAP.md.
 
 ## Crawl workers
 

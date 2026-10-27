@@ -6,6 +6,7 @@ mod common;
 
 mod api;
 mod cli;
+mod crawl_map;
 mod dht_classify_pg;
 mod dht_fetch_pg;
 mod dht_pg;

@@ -140,6 +140,14 @@ JSON report: `magnetar-server dht --seconds 270 [--mode aggressive] [--dry-run]`
 the laptop (aggressive, no port opened, 270 s): ~1.6 % of one core, 47 MB RSS; see
 docs/DHT.md §13.
 
+### Crawl map (docs/CRAWLMAP.md, ARCHITECTURE.md D101–D105)
+
+| Variable | Default | |
+|---|---|---|
+| `MAGNETAR_GEOIP` | `on` | DB-IP Lite databases (CC BY 4.0) for counts by country and network: `on` (country + ASN, ~18 MB in memory), `country` (~8 MB), `off` (nothing downloaded or counted). Server and worker |
+| `MAGNETAR_GEOIP_DIR` | `<state dir>/geoip` (worker: `<worker state dir>/geoip`) | where `dbip-country-lite.mmdb` / `dbip-asn-lite.mmdb` live |
+| `MAGNETAR_GEOIP_DOWNLOAD` | `true` | download on first start and refresh monthly; `false` = only read the directory (offline) |
+
 ### Crawl workers (docs/WORKERS.md, ARCHITECTURE.md D96–D100)
 
 On the **server**:

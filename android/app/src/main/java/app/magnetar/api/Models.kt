@@ -38,6 +38,8 @@ object Features {
     const val DHT = "dht"
     const val SAVED_SEARCH_POLL = "saved_search_poll"
     const val BROWSE_CHECKED_DHT = "browse_checked_dht"
+    const val CRAWL_SOURCES = "crawl_sources"
+    const val CRAWL_MAP = "crawl_map"
 }
 
 /** `{"error": "<code>", "message": "…"}` of every 4xx/5xx. */
