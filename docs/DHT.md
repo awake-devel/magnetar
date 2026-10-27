@@ -1584,3 +1584,23 @@ end at 0.45–0.49 instead of 0.36–0.42.
 (the dead set fills over hours); whether more concurrent lookups turn V1's cheaper lookups into
 throughput (the next thing to try: `PEER_LOOKUPS` above 1024 at the same QPS, KRPC was at
 ~80 % of its cap in every run); the Neufbox profile (no complete run there today).
+
+### 19.3 Production A/B (2026-10-27, 12:15–13:17, direct fiber)
+
+Production server and database, QPS 3000, FETCH_CONCURRENCY 2048, TCP_RATE 1000, TCP_MAX 4000,
+24 peers per hash, 4 s lookup timeout; crawl workers running alongside; 10 minutes per run,
+interleaved. Torrents stored in 10 minutes (answer share in the last minute):
+
+| start | build | lookups | stored | answered |
+|---|---|---|---|---|
+| 12:15 | main (`1e8f744`) | 2048 | 14 031 | 0.41 |
+| 12:26 | D95 | 2048 | 15 036 | 0.45 |
+| 12:36 | main | 2048 | 14 726 | 0.42 |
+| 12:47 | D95 | 2048 | 15 785 | 0.46 |
+| 12:57 | D95 | 4096 | 15 949 | 0.50 |
+| 13:07 | main | 4096 | 14 323 | 0.42 |
+
+D95 won every pair: +7 % at 2048 lookups, +11 % at 4096. At this load it pays off (in the
+1024-lookup runs above it did not). 4096 lookups with D95 gave only ~3 % more than 2048 and
+pushed CPU to 0.8–0.9 of a core, with the KRPC rate falling to ~2 100–2 400 q/s, so production
+stays at 2048. D95 went into production after this run.
