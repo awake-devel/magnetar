@@ -909,6 +909,44 @@ async fn saved_searches_for_a_thin_client() {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    // The notifier's write after a run that started before the edits (its copy is stale):
+    // only the watermark columns, and a watermark the edit reset is not set back.
+    let stale = SavedSearch {
+        last_seen_created_at: Some(NOW - 50),
+        last_checked: Some(NOW),
+        ..watched.clone()
+    };
+    s.record_saved_search_run(&stale, Some(NOW - 60))
+        .await
+        .unwrap();
+    let kept = api.saved_search(ubuntu.id).await.unwrap();
+    assert_eq!(
+        (kept.name.as_str(), &kept.query, kept.last_seen_created_at),
+        ("Ubuntu releases", &requery.query, None)
+    );
+    assert_eq!(kept.last_checked, Some(NOW));
+    // A run that started from the current watermark advances it, still keeping the edit.
+    s.record_saved_search_run(&stale, None).await.unwrap();
+    let advanced = api.saved_search(ubuntu.id).await.unwrap();
+    assert_eq!(advanced.last_seen_created_at, Some(NOW - 50));
+    assert_eq!(advanced.name, "Ubuntu releases");
+    // The real notifier keeps the edit too, and a search deleted meanwhile is no error.
+    magnetar_core::notify::poll_saved_searches(s, NOW)
+        .await
+        .unwrap();
+    assert_eq!(
+        api.saved_search(ubuntu.id).await.unwrap().name,
+        "Ubuntu releases"
+    );
+    s.record_saved_search_run(
+        &SavedSearch {
+            id: 999_999,
+            ..stale.clone()
+        },
+        None,
+    )
+    .await
+    .unwrap();
     // A minimal body creates (no id, no notifier fields).
     let r = http()
         .post(format!("{base}/api/v1/saved-searches"))

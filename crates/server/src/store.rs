@@ -579,6 +579,35 @@ impl PgStore {
             .collect()
     }
 
+    /// A client's edit of a saved search (`PUT /api/v1/saved-searches/{id}`, D77): name, query
+    /// and notify only, in one statement, so a notifier run finishing meanwhile keeps its
+    /// `last_checked`; `reset` (the query changed) clears `last_seen_created_at`. None = no
+    /// such id.
+    pub async fn edit_saved_search(
+        &self,
+        id: i64,
+        name: &str,
+        query: &SearchQuery,
+        notify: bool,
+        reset: bool,
+    ) -> Result<Option<SavedSearch>> {
+        let row: Option<SavedRow> = sqlx::query_as(
+            "UPDATE saved_searches SET name = $2, query = $3, notify = $4,
+                last_seen_created_at = CASE WHEN $5 THEN NULL ELSE last_seen_created_at END
+             WHERE id = $1
+             RETURNING id, name, query, notify, last_checked, last_seen_created_at",
+        )
+        .bind(id)
+        .bind(clean(name))
+        .bind(Json(query))
+        .bind(notify)
+        .bind(reset)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(row.map(Into::into))
+    }
+
     /// Union of trackers of every event that published this infohash; None if unknown. A
     /// DHT-only torrent (D51) has none: `Some([])`, checked on the default trackers and the DHT
     /// like a tracker-less Nostr torrent (before D77 a forced check of one answered 404).
@@ -1871,6 +1900,29 @@ impl Store for PgStore {
             return Err(Error::Invalid(format!("no saved search with id {}", s.id)));
         }
         Ok(s.id)
+    }
+
+    async fn record_saved_search_run(
+        &self,
+        s: &SavedSearch,
+        previous_seen: Option<i64>,
+    ) -> Result<()> {
+        // Watermark columns only (D77): a client's PUT during the run keeps its name, query
+        // and notify, and a watermark it reset (changed query) is not set back.
+        sqlx::query(
+            "UPDATE saved_searches SET last_checked = $2,
+                last_seen_created_at = CASE WHEN last_seen_created_at IS NOT DISTINCT FROM $3
+                    THEN $4 ELSE last_seen_created_at END
+             WHERE id = $1",
+        )
+        .bind(s.id)
+        .bind(s.last_checked)
+        .bind(previous_seen)
+        .bind(s.last_seen_created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(())
     }
 
     async fn delete_saved_search(&self, id: i64) -> Result<()> {

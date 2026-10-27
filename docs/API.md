@@ -40,7 +40,7 @@ enums in `snake_case`). Checked for the app rebuild in 2026-10 (D77).
 | Block / trust a publisher | `PUT /api/v1/overrides/{pubkey}` (`{"action": "block"\|"trust"\|null}`) | 204. There is no list endpoint: a client that shows "blocked publishers" keeps its own list. |
 | Publisher trust | `GET /api/v1/trust/{pubkey}` | `TrustScore`. |
 | Relays | `GET` / `PUT /api/v1/relays` (`{"url","enabled"}`) | The server's crawl relays. |
-| Saved searches | `GET /api/v1/saved-searches`, `POST` (create, `id` 0), `GET\|PUT\|DELETE /api/v1/saved-searches/{id}` | Stored on the server (`SavedSearch {id, name, query, notify, last_checked, last_seen_created_at}`). `POST {"name","query","notify"}` is enough (every field defaults). `PUT` takes name, query and notify and keeps the server notifier's watermarks (a changed query resets them). |
+| Saved searches | `GET /api/v1/saved-searches`, `POST` (create, `id` 0), `GET\|PUT\|DELETE /api/v1/saved-searches/{id}` | Stored on the server (`SavedSearch {id, name, query, notify, last_checked, last_seen_created_at}`). `POST {"name","query","notify"}` is enough (every field defaults). `PUT` takes name, query and notify and keeps the server notifier's watermarks (a changed query resets them). An edit made while the server notifier runs is kept: the notifier writes only its watermark columns. |
 | Notifications | `GET /api/v1/saved-searches/poll?since=<watermark>[&adult=1][&all=1][&id=1,2]` | See below. |
 | Server downloads | `GET\|POST /api/v1/downloads`, `POST /api/v1/downloads/{id}/{pause\|resume}`, `DELETE /api/v1/downloads/{id}` | Only when the server runs with downloads; 503 `downloads_unavailable` otherwise. |
 

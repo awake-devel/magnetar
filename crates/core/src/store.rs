@@ -112,6 +112,20 @@ pub trait Store: Send + Sync {
     async fn list_saved_searches(&self) -> Result<Vec<SavedSearch>>;
     /// id 0 = insert; returns the id.
     async fn put_saved_search(&self, s: &SavedSearch) -> Result<i64>;
+    /// The notifier's write after one run of `s` (`notify::poll_saved_searches`). A store
+    /// shared with editing clients (the server, D77) overrides it to write only
+    /// `last_checked` and `last_seen_created_at` (the latter only while it still equals
+    /// `previous_seen`, what the run started from), so an edit made during the run is not
+    /// overwritten by the notifier's stale copy and a search deleted meanwhile is no error.
+    /// The default writes the whole row.
+    async fn record_saved_search_run(
+        &self,
+        s: &SavedSearch,
+        previous_seen: Option<i64>,
+    ) -> Result<()> {
+        let _ = previous_seen;
+        self.put_saved_search(s).await.map(drop)
+    }
     async fn delete_saved_search(&self, id: i64) -> Result<()>;
 
     async fn stats(&self) -> Result<StoreStats>;

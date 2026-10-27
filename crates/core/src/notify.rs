@@ -139,6 +139,7 @@ pub async fn poll_saved_searches<S: Store + ?Sized>(
         q.offset = 0;
         q.limit = crate::query::MAX_LIMIT;
         let first_run = s.last_seen_created_at.is_none();
+        let previous_seen = s.last_seen_created_at;
         if let Some(wm) = s.last_seen_created_at {
             q.since = Some(q.since.map_or(wm + 1, |since| since.max(wm + 1)));
         }
@@ -157,7 +158,7 @@ pub async fn poll_saved_searches<S: Store + ?Sized>(
             (false, None) => s.last_seen_created_at,
         };
         s.last_checked = Some(now);
-        store.put_saved_search(&s).await?;
+        store.record_saved_search_run(&s, previous_seen).await?;
         if !first_run && !hits.is_empty() {
             out.push((s, hits));
         }

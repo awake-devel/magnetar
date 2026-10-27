@@ -151,6 +151,8 @@ mode, no router port opened, 10 minutes, 2026-10-26)
   never steals the server's ntfy notifications). Results now carry `best_peers` (tracker
   seeders or DHT peers, whichever is higher), so a DHT torrent with only DHT peers no longer
   reads as "unknown". "Check now" on a DHT-only torrent works (it answered "not found").
+- Editing a saved search while the server checks it for notifications no longer risks the edit
+  being undone: the notification check now saves only its own progress (review fix).
 - **Faster test builds**: each crate's integration tests are one test program instead of one
   per file (46 test executables → 10, `target/` 24 GB → 9.9 GB). Measured on this laptop with
   mold, each tree from scratch in its own target directory, `cargo test --workspace`:

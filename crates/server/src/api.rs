@@ -983,7 +983,7 @@ async fn update_saved_search(
     if body.name.trim().is_empty() {
         return Err(ApiError::bad_request("name must not be empty"));
     }
-    let Some(mut s) = st
+    let Some(old) = st
         .store
         .list_saved_searches()
         .await?
@@ -992,16 +992,14 @@ async fn update_saved_search(
     else {
         return Err(ApiError::not_found("no such saved search"));
     };
-    let query_changed = s.query != body.query;
-    s.name = body.name;
-    s.query = body.query;
-    s.notify = body.notify;
-    if query_changed {
-        // A new query starts over: its first notifier run records the newest match.
-        s.last_seen_created_at = None;
-    }
-    st.store.put_saved_search(&s).await?;
-    Ok(Json(s))
+    // A new query starts over: its first notifier run records the newest match. Only the
+    // edited columns are written, so a notifier run finishing meanwhile keeps its watermark.
+    let reset = old.query != body.query;
+    st.store
+        .edit_saved_search(id, &body.name, &body.query, body.notify, reset)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("no such saved search"))
 }
 
 /// `GET /api/v1/saved-searches/poll?since=&adult=&id=&all=` (D77): the new hits of the saved
