@@ -11,7 +11,7 @@
 use std::io::BufRead;
 
 use magnetar_core::model::{Category, TorrentFile};
-use magnetar_core::release::parse_release;
+use magnetar_core::release::{language_label, parse_release};
 
 fn main() {
     for line in std::io::stdin().lock().lines().map_while(Result::ok) {
@@ -25,7 +25,13 @@ fn main() {
             .unwrap_or_default();
         let category: Category = cat.parse().unwrap_or(Category::Other);
         let attrs = parse_release(title, &files, category);
-        let out = serde_json::json!({ "category": cat, "title": title, "attrs": attrs });
+        // The language group of the title page and its label (the app's Kotlin copy is
+        // checked against these, android LabelsTest).
+        let key = attrs.language_key();
+        let out = serde_json::json!({
+            "category": cat, "title": title, "attrs": attrs,
+            "language_key": key, "language_label": language_label(&key),
+        });
         println!("{out}");
     }
 }
