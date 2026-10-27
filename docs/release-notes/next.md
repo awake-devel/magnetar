@@ -204,6 +204,42 @@ mode, no router port opened, 10 minutes, 2026-10-26)
   "token cannot be sent" error instead of crashing the app; the settings migration writes to
   disk in the background instead of on app start.
 
+### App rebuild, stage 3: search side (D85–D87, docs/APP.md §12)
+
+- **Search** searches as you type (250 ms pause); a newer keystroke cancels the request in
+  flight, so an old answer never replaces a newer one. The last answer for the same search is
+  shown at once from a small cache ("cached · 5 min ago") while the server answers, and stays
+  with an "Offline" banner when the server cannot be reached. Rows show the title line
+  ("Dune (2021) · ★ 8.0 ›", tap for the title page), size, seeders (or the DHT estimate),
+  age, release attributes, the file the text matched in, and the Nostr / DHT badge.
+  "1,000+" when the server only knows a lower bound.
+- **Filter sheet** with live counts from the server next to every choice: categories, Source
+  (Nostr / DHT), audio and subtitle languages, resolution, release source, codec, HDR, audio,
+  genre, type, minimum rating, years, size, publication date, seeders, dead torrents, trust.
+  Chips keep their place while you pick (a choice that would give nothing stays, greyed);
+  Back or swiping the sheet down applies it like *Show*. Sort by relevance, date, size,
+  seeders or rating, either direction.
+- **Torrent detail**: poster, overview, rating and genres of the film or series with *All
+  releases*; release attributes; folders and files; swarm with *Check now* and a 90-day seeder
+  chart; trust (or "Found on the DHT"); *Open magnet* / *Copy magnet*. No download buttons.
+- **Title page**: every release of a film or series grouped by season/episode, quality and
+  language, with chips to narrow them; the search's filters apply ("Show all" removes them).
+- **Saved searches** (brought forward from the next stage): save the current search with its
+  filters from the star, run, delete, and switch notifications per search; an hourly
+  background check asks the server for new hits and posts one notification per search, which
+  opens the newest torrent. Needs a server with `saved_search_poll` (stage 1) for the
+  notification switch and the alerts; an older server still lists, creates and deletes. The
+  old app's saved searches (kept only on the phone) are moved to the server once, and the old
+  phone database is deleted only after all of them are there.
+- Adult content: unchanged, hidden by default, the Settings switch is sent with every search
+  and the app adds no detection of its own.
+- Measured on the Android emulator against the production server (read-only): typing to
+  results 0.33–0.85 s including the 250 ms pause (median ≈ 0.59 s over 12 queries; one cold
+  query took 3.4 s, 2.9 s of it on the server); first results 3.4–4.1 s after a cold start
+  of the debug build on the software-rendered emulator.
+- No new library: posters use the app's HTTP client and its cache instead of Coil (D85). UI
+  tests run on the emulator from `android/uitest/uitest.py` (D86).
+
 ## Older servers and offline mode
 
 - The app asks `GET /health` for `features` and hides what the server lacks: an older server

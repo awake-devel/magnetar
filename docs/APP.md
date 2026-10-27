@@ -35,10 +35,13 @@ Not in the app, by decision (D79):
 - **HTTP: OkHttp**, **JSON: kotlinx.serialization** (compiler plugin), both behind one class,
   `api.MagnetarApi`. No Retrofit (one more library for ~25 endpoints that are easier to read
   as plain functions).
-- **Images (detail / title stage): Coil 3** with its OkHttp network fetcher on the app's
-  `OkHttpClient`, so poster requests carry the bearer header (the poster endpoint needs it)
-  and share the connection pool. Coil's disk cache honours the server's
-  `Cache-Control: private, max-age=604800` + `ETag`.
+- **Images: no image library (D85).** Posters are one image per detail / title page; they are
+  fetched with the app's own `OkHttpClient` (bearer header, same pool) plus an OkHttp HTTP disk
+  cache (`cacheDir/posters`, 30 MB), which honours the server's
+  `Cache-Control: private, max-age=604800` + `ETag`, decoded with `BitmapFactory` (down-sampled
+  to ≤ ~600 px high) and kept in a 16 MB memory LRU. Coil 3.6.3 was planned (D80) but pulls
+  `accompanist-drawablepainter`, a JetBrains Compose foundation build and OkHttp 4 for ~60
+  lines of work.
 - **Charts: Vico** (kept from D47) for the time series; breakdown bars/donuts and the graphs
   are drawn with Compose `Canvas` (as before: own force layout, no graph library).
 - **Background: WorkManager** for the hourly saved-search poll (§8). No foreground service.
@@ -54,7 +57,7 @@ Not in the app, by decision (D79):
 | `org.jetbrains.kotlinx:kotlinx-serialization-json` | 1.12.0 (built with Kotlin 2.4.10) | Apache-2.0 | JSON |
 | `org.jetbrains.kotlin.plugin.serialization` (Gradle plugin) | 2.4.21 (= the Kotlin / compose plugin version) | Apache-2.0 | compiler plugin |
 | `org.jetbrains.kotlinx:kotlinx-coroutines-android` | 1.11.0 | Apache-2.0 | coroutines (kept) |
-| `io.coil-kt.coil3:coil-compose` + `coil-network-okhttp` | 3.6.3 | Apache-2.0 | posters — **added in the detail stage**, not in the skeleton |
+| ~~`io.coil-kt.coil3:coil-compose` + `coil-network-okhttp`~~ | 3.6.3 | Apache-2.0 | **not added** (D85): posters use OkHttp's cache + `BitmapFactory` |
 | `com.patrykandpatrick.vico:compose-m3` | 3.3.1 | Apache-2.0 | time-series charts (kept, D47) — re-added in the Stats stage |
 | AndroidX: compose BOM 2026.09.00, material3, material-icons-core, core-ktx 1.19.1, activity-compose 1.13.0, lifecycle-*-compose 2.11.0, navigation-compose 2.10.2, work-runtime-ktx 2.12.0 | (kept) | Apache-2.0 | UI, navigation, background work |
 | test: `org.testng:testng` | 7.12.0 | Apache-2.0 (deps: jcommander 1.83 Apache-2.0, slf4j-api 2.0.16 MIT, webjars jquery 3.7.1 MIT; guice is optional, not pulled) | unit test runner, `useTestNG()` |
@@ -80,13 +83,16 @@ android/app/src/main/java/app/magnetar/
   settings/
     AppSettings.kt        the values + checks (nsec rejection, URL normalisation)
     SettingsStore.kt      SharedPreferences "settings" + migration from the old app
-  cache/                  (search stage) PageCache: recent pages and details on disk
-  work/                   (saved stage) SavedSearchPollWorker
+  cache/PageCache.kt      recent pages and details on disk (§5)
+  data/Repository.kt      settings + service + /health features + cache, shared by the screens
+  api/MagnetarService.kt  the interface the view models call (a fake in the unit tests)
+  work/                   SavedSearchPollWorker, SavedSearchPolling (schedule), LegacyImport, PollLogic
   ui/
     AppShell.kt           Scaffold + bottom NavigationBar (Search, Saved, Stats, Settings) + NavHost
     theme/                MagnetarTheme, ChartColors (unchanged from the old app)
     search/ detail/ title/ saved/ stats/ graph/ settings/ common/
 android/app/src/test/java/app/magnetar/   JVM unit tests (no emulator needed)
+android/uitest/           emulator UI test over adb (uitest.py) + its fake server (§12)
 ```
 
 Routes: `search`, `saved`, `stats`, `settings` (tabs); `torrent/{infohash}`, `title/{mediaId}`,
@@ -189,7 +195,7 @@ adult switch). Capped at 20 MB / 500 entries, least recently used first out; And
 clear `cacheDir`. Use: show the cached answer immediately (marked "cached · 5 min ago"), then
 replace it with the server's; offline, the cached answer stays with an "Offline" banner.
 Only search pages (first page), details, title pages and Stats answers are cached; posters are
-Coil's own disk cache. Changing the server URL or token clears the cache. Nothing in the
+in OkHttp's HTTP cache (`cacheDir/posters`, D85). Changing the server URL or token clears the cache. Nothing in the
 cache comes from anywhere but the server's answers, so it never holds what the server filtered
 out (the illegal-content blocklist works on the server, docs/DHT.md §7).
 
@@ -275,10 +281,57 @@ Settings warning for `http://` to a host that is neither loopback nor Tailscale 
 1. Server: API complete for a thin client (D76–D78, done).
 2. **This document + the skeleton** (shell, theme, API client, settings store with
    migration, unit tests).
-3. Search, filter sheet, detail, title page, cache.
-4. Saved searches, the poll worker and notifications, import of the old saved searches.
+3. **Done (D85–D87)**: search, filter sheet, detail, title page, cache, and (brought forward
+   from stage 4) saved searches, the poll worker and notifications, import of the old saved
+   searches. Emulator UI test (§12).
+4. (merged into stage 3)
 5. Stats and graphs.
 6. Settings screen (test connection, Amber, threshold push, adult switch, attribution; the old
    `ui/settings/TmdbAttribution.kt` and the http warning of `SettingsViewModel.kt` are in git
    history before this stage, `res/drawable/tmdb_logo.xml` is kept).
 7. Polish, emulator UI tests, release build.
+
+## 12. Search side as built (stage 3, D85–D87)
+
+**Search** (`ui/search`). The text box feeds `SearchViewModel.onTextChange`; every change, filter,
+sort, retry or settings change becomes one `SearchRequest` in a `StateFlow`, `debounce`d by
+250 ms for keystrokes and 0 ms for the rest, then `collectLatest`: a newer request cancels the
+one in flight (and with it the OkHttp call), so a late answer can never replace a newer one.
+Each run: `/health` (cached per server) → the cached first page, if any, shown at once with
+"cached · N min ago" → `POST /search` → the live page replaces it (scroll kept if the first hit
+is the same) and is written to the cache. Offline / timeout / index building keep the cached
+page with a banner; other errors clear it. The cache key is the query with the date preset
+instead of the clock, so "7 days" hits the same entry tomorrow. Rows: media line
+"Title (year) · ★ 7.4 ›" (tap = title page), title, size · peers (tracker S/L, else "≈N peers"
+from `best_peers`) · dead · age, attribute badges (the old ffi `badges`, now `ui/common/Labels.kt`,
+checked against the Rust parser's output in `LabelsTest`), "matched in file: …", and the
+source badge (trust star / DHT / both). "1,000+" when `total_is_lower_bound`.
+
+**Filter sheet.** Opening it (and every draft change, 300 ms debounce) asks
+`POST /facets {query: draft, fields: category, origin?, language…media_kind?, size: 40}`. Chip
+order is fixed by the first counts seen (`ChipOrder`): a value that drops to 0 keeps its place,
+disabled; new values append. The adult category chip is never disabled (with the switch off its
+count is 0, and picking it is how the server shows those torrents). Back and swipe-down apply
+like *Show N*. Release filters need `filters`, Source chips `origin`, counts `facet_set`;
+`SearchFilters.supportedBy` drops what the server would ignore before anything is sent.
+
+**Detail** (`ui/detail`): media card (2:3 poster, facts, genres, overview, IMDb, *All releases*;
+asked once more after 4 s when the poster or overview is still missing, D42), attributes line,
+*Open magnet* / *Copy magnet*, swarm card (*Check now* = `POST …/liveness`, then the history is
+reloaded; seeders step chart drawn with Canvas from `liveness-history?days=90`, seeders =
+max(tracker, DHT estimate), unanswered points skipped), DHT card or trust card, file tree,
+trackers, tags, description, comments, other publishers. Cached for offline viewing.
+
+**Title page** (`ui/title`): `POST /media/{id}/releases` with the Search tab's filters (no text,
+sort seeders); "N search filters apply · Show all" clears them; in-page chips for season,
+resolution and language group narrow the server's groups without a request.
+
+**Saved** (`ui/saved`, `work/`): list (sorted by name), tap = run on the Search tab, delete,
+notify switch (`PUT`, only with `saved_search_poll`; otherwise a "needs a newer server" banner),
+create from the Search tab's star with the current text, filters, sort and adult switch. The
+poll worker and the legacy import are as §7 and §8 describe.
+
+**Emulator UI test** (`android/uitest/uitest.py`, D86): drives the debug build over adb with
+`uiautomator dump` + `input` (Compose test tags are resource ids via `testTagsAsResourceId`,
+also set inside the sheet, dialog and menu windows). Writes and deterministic checks go to the
+bundled `fake_server.py`; `--production URL` adds read-only flows and the timing measurement.

@@ -24,6 +24,18 @@ If Gradle fails with `Erreur d'entrée/sortie` / `IOException: Input/output erro
 `journalctl -k | grep -i csum`. This laptop's btrfs has logged checksum failures on freshly written
 Gradle cache files. Point `GRADLE_USER_HOME` at a fresh directory and delete the transform it names.
 
+## UI test on the emulator
+
+```sh
+python3 android/uitest/uitest.py                      # fake server only (bundled, takes the writes)
+python3 android/uitest/uitest.py --production https://<host>   # + read-only flows and timings
+```
+
+Installs nothing: install the debug APK on the emulator first
+(`adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk`). Only `emulator-*`
+serials are accepted. Start the emulator with `-dns-server 100.100.100.100` to reach a
+Tailscale name. Details: docs/APP.md §12, ARCHITECTURE.md D86.
+
 ## Release signing
 
 `assembleRelease` signs with a local key at `android/keystore/release.jks`. Its passwords are in
