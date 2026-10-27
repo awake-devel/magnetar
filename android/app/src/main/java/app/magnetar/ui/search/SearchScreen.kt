@@ -45,7 +45,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -70,7 +69,7 @@ fun SearchScreen(
     vm: SearchViewModel,
     threshold: Int,
     onOpen: (String) -> Unit,
-    onOpenMedia: (Long) -> Unit,
+    onOpenMedia: ((Long) -> Unit)?,
     onOpenSettings: () -> Unit,
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -181,7 +180,7 @@ private fun ResultList(
     state: SearchUiState,
     threshold: Int,
     onOpen: (String) -> Unit,
-    onOpenMedia: (Long) -> Unit,
+    onOpenMedia: ((Long) -> Unit)?,
     loadMore: () -> Unit,
 ) {
     val listState = rememberLazyListState()
@@ -199,7 +198,12 @@ private fun ResultList(
             last >= listState.layoutInfo.totalItemsCount - 10
         }
     }
-    LaunchedEffect(listState) { snapshotFlow { nearEnd }.collect { if (it) loadMore() } }
+    // Asked again when the page changes under a list already scrolled to its end (the cached
+    // preview, which never loads more, replaced by the live page; a page appended). Not keyed
+    // on loadingMore, so a failing next page is not retried in a loop.
+    LaunchedEffect(nearEnd, state.hits.size, state.endReached, state.cachedAtMs, state.loading) {
+        if (nearEnd) loadMore()
+    }
     LazyColumn(state = listState, modifier = Modifier.fillMaxSize().testTag("results")) {
         item {
             Text(

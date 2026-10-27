@@ -59,10 +59,12 @@ object LegacyImport {
         for (s in old) {
             val q = runCatching { MagnetarApi.JSON.decodeFromString(SearchQuery.serializer(), s.queryJson) }.getOrNull()
                 ?: SearchQuery(text = s.name)
-            if ((s.name to canon(q)) in have) continue
+            // The name it gets on the server, so a retry finds a blank-named one too.
+            val name = s.name.ifBlank { q.text.ifBlank { "Saved search" } }
+            if ((name to canon(q)) in have) continue
             try {
-                service.createSavedSearch(SavedSearch(name = s.name.ifBlank { q.text.ifBlank { "Saved search" } }, query = q.copy(offset = 0), notify = s.notify))
-                have += s.name to canon(q)
+                service.createSavedSearch(SavedSearch(name = name, query = q.copy(offset = 0), notify = s.notify))
+                have += name to canon(q)
             } catch (e: CancellationException) {
                 throw e
             } catch (_: ApiException) {

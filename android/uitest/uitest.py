@@ -28,6 +28,7 @@ import tempfile
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fake_server  # noqa: E402
@@ -52,8 +53,8 @@ def set_server(url, token):
     """Writes the app's settings file (docs/APP.md §7) with run-as; the token goes only into it."""
     xml = (
         "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<map>\n"
-        f'    <string name="server_url">{url}</string>\n'
-        f'    <string name="api_token">{token}</string>\n'
+        f'    <string name="server_url">{escape(url)}</string>\n'
+        f'    <string name="api_token">{escape(token)}</string>\n'
         '    <int name="settings_version" value="1" />\n'
         '    <int name="trust_threshold" value="20" />\n'
         '    <boolean name="show_adult" value="false" />\n'
@@ -331,6 +332,10 @@ def main():
     if not a.serial.startswith("emulator-"):
         raise SystemExit("refusing a non-emulator device: " + a.serial)
     SERIAL = a.serial
+    # Belt and braces: besides the serial name, the device itself must say it is an emulator.
+    qemu = (shell("getprop ro.kernel.qemu", check=False).strip(), shell("getprop ro.boot.qemu", check=False).strip())
+    if "1" not in qemu:
+        raise SystemExit("refusing a device that is not an emulator: " + a.serial)
     run_fake(a.port)
     if a.production:
         run_production(a.production, a.queries.split(","))

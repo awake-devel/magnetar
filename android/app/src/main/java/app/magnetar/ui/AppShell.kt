@@ -32,6 +32,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import app.magnetar.MagnetarApp
+import app.magnetar.api.Features
 import app.magnetar.ui.common.AppIcons
 import app.magnetar.ui.detail.DetailScreen
 import app.magnetar.ui.detail.DetailViewModel
@@ -69,6 +70,10 @@ fun AppShell(app: MagnetarApp, openTorrent: MutableStateFlow<String?>) {
     val pending by openTorrent.collectAsState()
     val settings by app.settingsStore.settings.collectAsState()
     val repo = app.repository
+    val health by repo.health.collectAsState()
+    // The title page needs `media_releases` (D44): an older server would answer 404.
+    val toTitle: (Long) -> Unit = { id -> nav.navigate(Routes.title(id)) }
+    val openTitle = toTitle.takeIf { health?.has(Features.MEDIA_RELEASES) == true }
 
     // Activity-scoped: the search, its filters and its scroll survive tab switches, and the
     // title page reads the active filters from it.
@@ -109,7 +114,7 @@ fun AppShell(app: MagnetarApp, openTorrent: MutableStateFlow<String?>) {
                     vm = searchVm,
                     threshold = settings.trustThreshold,
                     onOpen = { nav.navigate(Routes.torrent(it)) },
-                    onOpenMedia = { nav.navigate(Routes.title(it)) },
+                    onOpenMedia = openTitle,
                     onOpenSettings = { nav.switchTab(Tab.SETTINGS.route) },
                 )
             }
@@ -134,7 +139,7 @@ fun AppShell(app: MagnetarApp, openTorrent: MutableStateFlow<String?>) {
                     vm = vm,
                     threshold = settings.trustThreshold,
                     onBack = { nav.popBackStack() },
-                    onOpenMedia = { nav.navigate(Routes.title(it)) },
+                    onOpenMedia = openTitle,
                 )
             }
             composable(Routes.TITLE, arguments = listOf(navArgument("mediaId") { type = NavType.LongType })) { entry ->

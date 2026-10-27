@@ -86,7 +86,7 @@ private const val MAX_FILE_ROWS = 300
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DetailScreen(vm: DetailViewModel, threshold: Int, onBack: () -> Unit, onOpenMedia: (Long) -> Unit) {
+fun DetailScreen(vm: DetailViewModel, threshold: Int, onBack: () -> Unit, onOpenMedia: ((Long) -> Unit)?) {
     val state by vm.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val snackbar = remember { SnackbarHostState() }
@@ -164,7 +164,7 @@ private fun DetailBody(
     onCopy: (String, String) -> Unit,
     onOpen: () -> Unit,
     onCheck: () -> Unit,
-    onOpenMedia: (Long) -> Unit,
+    onOpenMedia: ((Long) -> Unit)?,
 ) {
     val s = detail.summary
     val tree = remember(detail.files) { buildFileTree(detail.files) }

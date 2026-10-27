@@ -182,13 +182,24 @@ class SearchViewModel(
     }
 
     private fun query(r: SearchRequest, features: Set<String>, offset: Int = 0) = buildQuery(
-        r.text, r.filters.supportedBy(features), r.sort.takeIf { it != Sort.RATING || Features.FILTERS in features } ?: Sort.RELEVANCE,
+        r.text, r.filters.supportedBy(features), supportedSort(r.sort, features),
         r.descending, repo.settings.value.showAdult, offset = offset, nowSec = clock() / 1000,
     )
 
-    /** The page cache key: the query with a fixed clock, so "7 days" is the same key tomorrow. */
-    private fun cacheKey(r: SearchRequest, features: Set<String>) =
-        repo.keyOf(SearchQuery.serializer(), query(r, features).copy(since = r.filters.date.seconds?.let { -it }))
+    /** Rating order needs the release filters (D44); an older server would reject the value. */
+    private fun supportedSort(sort: Sort, features: Set<String>) =
+        sort.takeIf { it != Sort.RATING || Features.FILTERS in features } ?: Sort.RELEVANCE
+
+    /**
+     * The page cache key: what the user asked (all filters, before [SearchFilters.supportedBy],
+     * so it is known before `/health` answers) with a fixed clock, so "7 days" is the same key
+     * tomorrow. The adult switch is in it.
+     */
+    private fun cacheKey(r: SearchRequest) = repo.keyOf(
+        SearchQuery.serializer(),
+        buildQuery(r.text, r.filters, r.sort, r.descending, repo.settings.value.showAdult, nowSec = 0)
+            .copy(since = r.filters.date.seconds?.let { -it }),
+    )
 
     private suspend fun run(r: SearchRequest) {
         moreJob?.cancel()
@@ -199,21 +210,23 @@ class SearchViewModel(
             }
             return
         }
-        val health = repo.refreshHealth()
-        val features = repo.health.value?.features?.toSet().orEmpty()
-        _state.update { it.copy(features = features) }
-        val key = cacheKey(r, features)
+        // The cached page first: offline, `/health` may take its whole timeout to fail.
+        val key = cacheKey(r)
         val cached = repo.readCache(CACHE_SEARCH, key, SearchPage.serializer())
         if (cached != null) {
+            val known = repo.health.value?.features?.toSet().orEmpty()
             _state.update {
                 it.copy(
-                    hits = visible(cached.value.hits, r, features), total = cached.value.total,
+                    hits = visible(cached.value.hits, r, known), total = cached.value.total,
                     totalIsLowerBound = cached.value.totalIsLowerBound, cachedAtMs = cached.savedAtMs,
                     endReached = true, generation = it.generation + 1,
                 )
             }
             onTiming("${clock() - r.askedAtMs} cached len=${r.text.trim().length}")
         }
+        val health = repo.refreshHealth()
+        val features = repo.health.value?.features?.toSet().orEmpty()
+        _state.update { it.copy(features = features) }
         try {
             // An invalid server URL is NotConfigured, not "unreachable".
             val service = repo.service()
@@ -312,7 +325,10 @@ class SearchViewModel(
     /** "Save search" from the current text, filters and sort (incl. the adult switch). */
     fun saveSearch(name: String, notify: Boolean) {
         val s = _state.value
-        val q = buildQuery(s.text, s.filters.supportedBy(s.features), s.sort, s.descending, repo.settings.value.showAdult, nowSec = clock() / 1000)
+        val q = buildQuery(
+            s.text, s.filters.supportedBy(s.features), supportedSort(s.sort, s.features), s.descending,
+            repo.settings.value.showAdult, nowSec = clock() / 1000,
+        )
         viewModelScope.launch {
             try {
                 repo.service().createSavedSearch(SavedSearch(name = name, query = q, notify = notify))

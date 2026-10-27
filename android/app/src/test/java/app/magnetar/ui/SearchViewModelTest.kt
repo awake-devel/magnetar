@@ -176,6 +176,42 @@ class SearchViewModelTest {
     }
 
     @Test
+    fun `the cached page does not wait for a slow health check`() = runTest {
+        val fake = FakeService()
+        val cache = PageCache(tempDir())
+        val first = vm(fake, cache = cache)
+        first.onTextChange("dune")
+        advanceUntilIdle()
+        // A new process: features unknown, and /health takes 5 s (a server that is down).
+        fake.healthDelayMs = 5_000
+        val second = vm(fake, cache = cache)
+        second.onTextChange("dune")
+        advanceTimeBy(SEARCH_DEBOUNCE_MS + 100)
+        assertEquals(second.state.value.hits.single().title, "dune")
+        assertNotNull(second.state.value.cachedAtMs)
+        advanceUntilIdle()
+        assertNull(second.state.value.cachedAtMs)
+    }
+
+    @Test
+    fun `a new server's features are asked before its first search`() = runTest {
+        val fake = FakeService()
+        val settings = MutableStateFlow(AppSettings(serverUrl = "http://server.test", apiToken = "t"))
+        val vm = vm(fake, settings = settings)
+        advanceUntilIdle()
+        assertTrue(vm.state.value.canFilterReleases)
+        val calls = fake.healthCalls
+        // The other server has no release filters: they must not be sent to it.
+        fake.features = listOf("adult_filter")
+        vm.setFilters(SearchFilters(resolutions = setOf("1080p")))
+        settings.value = settings.value.copy(serverUrl = "http://other.test")
+        advanceUntilIdle()
+        assertTrue(fake.healthCalls > calls)
+        assertFalse(vm.state.value.canFilterReleases)
+        assertEquals(fake.completedSearches.last().resolutions, emptyList<String>())
+    }
+
+    @Test
     fun `offline keeps the cached page with the error, other errors clear it`() = runTest {
         val fake = FakeService()
         val cache = PageCache(tempDir())

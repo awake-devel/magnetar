@@ -24,7 +24,7 @@ import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.StandardTestDispatcher
 
 /** A server in memory: every call is recorded; answers and delays are set per test. */
-class FakeService : MagnetarService {
+open class FakeService : MagnetarService {
     var features = listOf("filters", "facet_set", "media_releases", "liveness_history", "adult_filter", "origin", "saved_search_poll")
     var searchDelayMs: (SearchQuery) -> Long = { 0 }
     var searchAnswer: (SearchQuery) -> SearchPage = { q -> SearchPage(hits = listOf(hit(q.text.ifBlank { "browse" }))) }
@@ -43,7 +43,14 @@ class FakeService : MagnetarService {
     var checks = 0
     var updates = mutableListOf<SavedSearch>()
 
-    override suspend fun health() = Health(status = "ok", version = "test", db = true, features = features)
+    var healthDelayMs = 0L
+    var healthCalls = 0
+
+    override suspend fun health(): Health {
+        healthCalls++
+        kotlinx.coroutines.delay(healthDelayMs)
+        return Health(status = "ok", version = "test", db = true, features = features)
+    }
 
     override suspend fun search(query: SearchQuery): SearchPage {
         searches += query

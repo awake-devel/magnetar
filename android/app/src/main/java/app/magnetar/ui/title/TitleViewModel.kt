@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import app.magnetar.api.ApiException
 import app.magnetar.api.MediaReleases
 import app.magnetar.api.ReleaseGroup
+import app.magnetar.api.SearchQuery
 import app.magnetar.api.Sort
 import app.magnetar.data.Repository
 import app.magnetar.ui.common.isOffline
@@ -65,16 +66,22 @@ class TitleViewModel(
     fun refresh() {
         _state.update { it.copy(loading = true, error = null) }
         viewModelScope.launch {
-            repo.refreshHealth()
-            val features = repo.health.value?.features?.toSet().orEmpty()
-            // No text: it would narrow inside the title's releases. Filters, trust and the adult switch apply.
-            val q = buildQuery("", _state.value.filters.supportedBy(features), Sort.SEEDERS, true, repo.settings.value.showAdult)
-            val key = "$mediaId " + repo.keyOf(app.magnetar.api.SearchQuery.serializer(), q.copy(since = _state.value.filters.date.seconds?.let { -it }))
+            val filters = _state.value.filters
+            val showAdult = repo.settings.value.showAdult
+            // Key = what was asked (before /health, which offline may take its timeout to fail).
+            val key = "$mediaId " + repo.keyOf(
+                SearchQuery.serializer(),
+                buildQuery("", filters, Sort.SEEDERS, true, showAdult, nowSec = 0).copy(since = filters.date.seconds?.let { -it }),
+            )
             if (_state.value.releases == null) {
                 repo.readCache(CACHE_TITLE, key, MediaReleases.serializer())?.let { c ->
                     _state.update { if (it.releases == null) it.copy(releases = c.value, cachedAtMs = c.savedAtMs) else it }
                 }
             }
+            repo.refreshHealth()
+            val features = repo.health.value?.features?.toSet().orEmpty()
+            // No text: it would narrow inside the title's releases. Filters, trust and the adult switch apply.
+            val q = buildQuery("", filters.supportedBy(features), Sort.SEEDERS, true, showAdult)
             try {
                 val r = repo.service().mediaReleases(mediaId, q)
                 _state.update { it.copy(loading = false, releases = r, cachedAtMs = null, offline = false) }

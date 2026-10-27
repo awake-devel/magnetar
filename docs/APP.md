@@ -297,11 +297,12 @@ Settings warning for `http://` to a host that is neither loopback nor Tailscale 
 sort, retry or settings change becomes one `SearchRequest` in a `StateFlow`, `debounce`d by
 250 ms for keystrokes and 0 ms for the rest, then `collectLatest`: a newer request cancels the
 one in flight (and with it the OkHttp call), so a late answer can never replace a newer one.
-Each run: `/health` (cached per server) → the cached first page, if any, shown at once with
-"cached · N min ago" → `POST /search` → the live page replaces it (scroll kept if the first hit
+Each run: the cached first page, if any, shown at once with "cached · N min ago" (read before
+`/health`, so offline it does not wait for the health call to fail, D88) → `/health` (cached per
+server URL) → `POST /search` → the live page replaces it (scroll kept if the first hit
 is the same) and is written to the cache. Offline / timeout / index building keep the cached
-page with a banner; other errors clear it. The cache key is the query with the date preset
-instead of the clock, so "7 days" hits the same entry tomorrow. Rows: media line
+page with a banner; other errors clear it. The cache key is the query as asked (every filter,
+before dropping those the server lacks) with the date preset instead of the clock, so "7 days" hits the same entry tomorrow. Rows: media line
 "Title (year) · ★ 7.4 ›" (tap = title page), title, size · peers (tracker S/L, else "≈N peers"
 from `best_peers`) · dead · age, attribute badges (the old ffi `badges`, now `ui/common/Labels.kt`,
 checked against the Rust parser's output in `LabelsTest`), "matched in file: …", and the

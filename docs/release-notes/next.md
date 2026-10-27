@@ -239,6 +239,11 @@ mode, no router port opened, 10 minutes, 2026-10-26)
   of the debug build on the software-rendered emulator.
 - No new library: posters use the app's HTTP client and its cache instead of Coil (D85). UI
   tests run on the emulator from `android/uitest/uitest.py` (D86).
+- Review fixes (D88): offline, the cached page shows at once instead of after the server
+  check times out; scrolling to the end of a list that was first shown from the cache loads
+  the next page again; after switching servers, the new server's features are used for its
+  first search; *All releases* is only offered by servers that have title pages; old saved
+  searches without a name are not uploaded twice when the move is retried.
 
 ## Older servers and offline mode
 

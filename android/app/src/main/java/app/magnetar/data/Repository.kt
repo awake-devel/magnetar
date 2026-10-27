@@ -46,6 +46,9 @@ class Repository(
 
     private val healthLock = Mutex()
 
+    /** The server URL [_health] was answered by: a settings change can run a search before [init]'s watcher clears it. */
+    @Volatile private var healthServer: String? = null
+
     /** A search to run on the Search tab (from Saved); the Search tab clears it. */
     val pendingSearch = MutableStateFlow<SearchQuery?>(null)
 
@@ -72,11 +75,14 @@ class Repository(
      * so a later search can try again. Never throws.
      */
     suspend fun refreshHealth(force: Boolean = false): Health? = healthLock.withLock {
-        if (!force) _health.value?.let { return it }
         val key = settings.value.serverUrl
+        if (!force && healthServer == key) _health.value?.let { return it }
         try {
             val h = service().health()
-            if (settings.value.serverUrl == key) _health.value = h
+            if (settings.value.serverUrl == key) {
+                healthServer = key
+                _health.value = h
+            }
             h
         } catch (e: CancellationException) {
             throw e
