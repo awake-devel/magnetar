@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- No cloud backup or device transfer: the cache is rebuildable and settings hold an API token. -->
+<!-- No cloud backup or device transfer: settings hold an API token; the page cache is rebuildable. -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="root" />

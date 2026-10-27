@@ -3,12 +3,11 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- Saved-search alerts (docs/APP.md §8). -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- Lets us tell whether an external torrent client exists (android.md §7). -->
     <queries>
+        <!-- "Open magnet" hands the link to an external torrent app (no downloads here). -->
         <intent>
             <action android:name="android.intent.action.VIEW" />
             <data android:scheme="magnet" />
@@ -41,12 +40,7 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="magnet" />
-            </intent-filter>
+            <!-- Saved-search notifications open the torrent: magnetar://torrent/{infohash}. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
@@ -54,10 +48,5 @@
                 <data android:scheme="magnetar" android:host="torrent" />
             </intent-filter>
         </activity>
-
-        <service
-            android:name=".download.DownloadService"
-            android:exported="false"
-            android:foregroundServiceType="dataSync" />
     </application>
 </manifest>

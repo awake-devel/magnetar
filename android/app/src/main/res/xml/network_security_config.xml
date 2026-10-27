@@ -2,11 +2,9 @@
 <!--
   The server is chosen by the user at runtime (any host: a NAS on the LAN, a Raspberry Pi,
   a VPS, a Tailscale name), and a network security config cannot list hosts that are only
-  known at runtime. All server traffic also goes through the Rust client (reqwest and
-  tokio-tungstenite on raw sockets), which Android does not hold to this file anyway.
-  So cleartext is permitted here, and Settings warns when an http:// URL points at a host
-  where the traffic would be readable on the wire (ARCHITECTURE.md D39). Prefer HTTPS:
-  `tailscale serve` or a reverse proxy.
+  known at runtime. So cleartext is permitted here (OkHttp follows this file), and Settings
+  warns when an http:// URL points at a host where the traffic would be readable on the wire
+  (ARCHITECTURE.md D39, docs/APP.md §10). Prefer HTTPS: `tailscale serve` or a reverse proxy.
 -->
 <network-security-config>
     <base-config cleartextTrafficPermitted="true" />
