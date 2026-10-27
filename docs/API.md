@@ -74,6 +74,14 @@ enums in `snake_case`). Checked for the app rebuild in 2026-10 (D77).
 - A periodic poll from Android WorkManager (e.g. 15 min) is enough; each poll is one search per
   saved search.
 
+## Crawl workers
+
+`/api/v1/worker/*` is for `magnetar-server worker` only (worker tokens, docs/WORKERS.md): the
+app's API token gets 401 there. `GET /api/v1/stats` gains `workers` (one `WorkerStats` per
+configured worker: connected, version, leases held, seed results and metadata per minute, DHT
+state; empty without workers), and `/health` lists the feature `workers` when tokens are
+configured. Clients may ignore both.
+
 ## Not in the API (phone-local by design)
 
 - Pinned / hidden torrents: client state.

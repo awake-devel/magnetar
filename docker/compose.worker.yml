@@ -1,0 +1,62 @@
+# Crawl worker (docs/WORKERS.md §4, ARCHITECTURE.md D96–D100): `magnetar-server worker` only —
+# no database, no API port. It takes seed-check leases from the main server and runs its own
+# DHT crawler, talking to the server over HTTPS with its worker token. Defaults below are the
+# EEE profile (router benchmark 2026-10-26); override any of them in the env file.
+#
+#   docker compose -f docker/compose.worker.yml --env-file docker/worker.env up -d
+#
+# docker/worker.env (chmod 600) needs at least MAGNETAR_WORKER_SERVER and MAGNETAR_WORKER_TOKEN.
+# Crawling makes this host's IP visible in BitTorrent swarms. Only the DHT UDP ports are
+# published; the worker never accepts TCP connections. UPnP stays off (MAGNETAR_DHT_UPNP).
+# No ulimits needed: the server binary raises its open-files soft limit itself.
+
+name: magnetar-worker
+
+services:
+  worker:
+    image: ghcr.io/awake-devel/magnetar:${MAGNETAR_VERSION:-latest}
+    build: ..
+    command: ["worker"]
+    restart: unless-stopped
+    environment:
+      MAGNETAR_WORKER_SERVER: ${MAGNETAR_WORKER_SERVER:?set MAGNETAR_WORKER_SERVER (the main server URL)}
+      MAGNETAR_WORKER_TOKEN: ${MAGNETAR_WORKER_TOKEN:?set MAGNETAR_WORKER_TOKEN (this worker's token)}
+      MAGNETAR_WORKER_LIVENESS: ${MAGNETAR_WORKER_LIVENESS:-true}
+      MAGNETAR_WORKER_LIVENESS_BATCH: ${MAGNETAR_WORKER_LIVENESS_BATCH:-1000}
+      MAGNETAR_WORKER_MIN_FREE_MB: ${MAGNETAR_WORKER_MIN_FREE_MB:-250}
+      MAGNETAR_WORKER_RSS_MAX_MB: ${MAGNETAR_WORKER_RSS_MAX_MB:-0}
+      MAGNETAR_WORKER_UPLOAD_BUFFER_MB: ${MAGNETAR_WORKER_UPLOAD_BUFFER_MB:-16}
+      MAGNETAR_DHT: ${MAGNETAR_DHT:-aggressive}
+      # Container ports follow MAGNETAR_DHT_PORT and MAGNETAR_DHT_NODES: change them together
+      # with the `ports:` mapping below.
+      MAGNETAR_DHT_PORT: "6891"
+      MAGNETAR_DHT_NODES: "4"
+      MAGNETAR_DHT_QPS: ${MAGNETAR_DHT_QPS:-1000}
+      MAGNETAR_DHT_TCP_RATE: ${MAGNETAR_DHT_TCP_RATE:-300}
+      MAGNETAR_DHT_TCP_MAX: ${MAGNETAR_DHT_TCP_MAX:-350}
+      MAGNETAR_DHT_POOL: ${MAGNETAR_DHT_POOL:-1000000}
+      MAGNETAR_DHT_FETCH_CONCURRENCY: ${MAGNETAR_DHT_FETCH_CONCURRENCY:-128}
+      MAGNETAR_DHT_PROBE: ${MAGNETAR_DHT_PROBE:-1.1.1.1:443,9.9.9.9:443}
+      MAGNETAR_DHT_UPNP: ${MAGNETAR_DHT_UPNP:-false}
+      MAGNETAR_LIVENESS_DHT_CONCURRENCY: ${MAGNETAR_LIVENESS_DHT_CONCURRENCY:-32}
+      RUST_LOG: ${RUST_LOG:-info}
+    # Only when Docker's DNS cannot resolve a Tailscale (MagicDNS) name: set both variables
+    # (the server's name and its `tailscale ip -4`). The default entry is inert.
+    extra_hosts:
+      - "${MAGNETAR_WORKER_SERVER_HOST:-unset.magnetar.invalid}:${MAGNETAR_WORKER_SERVER_IP:-127.0.0.1}"
+    ports:
+      - "${MAGNETAR_DHT_PUBLISH:-6891-6894}:6891-6894/udp"
+    volumes:
+      # State dir: /data/state/magnetar/worker (XDG_STATE_HOME=/data/state in the image).
+      - worker-data:/data
+    healthcheck:
+      # Healthy = the server accepted a heartbeat in the last 3 minutes (the image's own check
+      # is for `serve`, which has an HTTP port).
+      test: ["CMD", "bash", "-c", "f=/data/state/magnetar/worker/heartbeat; [ -f \"$$f\" ] && [ $$(( $$(date +%s) - $$(cat \"$$f\") )) -lt 180 ]"]
+      interval: 60s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+
+volumes:
+  worker-data:

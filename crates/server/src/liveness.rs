@@ -53,6 +53,15 @@ const BACKLOG_PAUSE: Duration = Duration::from_secs(1);
 const SERVER_DHT_BUDGET: Duration = Duration::from_secs(10);
 /// `/api/v1/stats` reuses counts this fresh (two scans of ~0.5 M narrow rows each).
 const STATS_MAX_AGE: Duration = Duration::from_secs(30);
+/// Advisory lock taken by every claim of due rows (server batches and worker leases, D98), so
+/// two holders never take the same infohash.
+pub const LEASE_LOCK: i64 = 0x6d61_676e_6c65_6173; // "magnleas"
+/// Holder name of the server's own checker in `liveness_leases`.
+pub const SERVER_HOLDER: &str = "";
+/// How long the server's own batch holds its rows (a crash returns them after this).
+pub const SERVER_CLAIM_SECS: i64 = 1800;
+/// Lease rows this far past their end are removed by the hourly maintenance.
+const LEASE_KEEP_SECS: i64 = 86400;
 
 /// The checker's shared state: scraper (tracker sockets, rate limits, backoff, DHT nodes),
 /// pending boosts from the API, the last batch report.
@@ -137,9 +146,10 @@ impl LivenessService {
         Ok(n as usize)
     }
 
-    /// One batch: due rows → check → results. Returns how many were checked.
+    /// One batch: due rows → check → results. Returns how many were checked. The rows are
+    /// claimed first (D98): crawl workers never get them while this batch runs.
     pub async fn run_batch(&self, pool: &PgPool, now: i64, limit: usize) -> Result<usize> {
-        let rows = due(pool, now, limit).await?;
+        let rows = claim(pool, now, limit, SERVER_HOLDER, SERVER_CLAIM_SECS).await?;
         if rows.is_empty() {
             return Ok(0);
         }
@@ -230,7 +240,11 @@ const DUE_COLUMNS: &str = "s.infohash, s.born, s.hot_until, s.dead_streak, s.err
 
 /// Up to `limit` due infohashes: lane by lane (viewed, saved, search, rest), each in due order.
 /// Each branch is a range scan of `liveness_schedule_due` that stops at the limit.
-pub async fn due(pool: &PgPool, now: i64, limit: usize) -> Result<Vec<DueRow>> {
+pub async fn due<'c, E: sqlx::PgExecutor<'c>>(
+    pool: E,
+    now: i64,
+    limit: usize,
+) -> Result<Vec<DueRow>> {
     let lanes = [PRIO_VIEWED, PRIO_SAVED, PRIO_SEARCH, PRIO_NORMAL]
         .iter()
         .map(|p| {
@@ -255,6 +269,126 @@ pub async fn due(pool: &PgPool, now: i64, limit: usize) -> Result<Vec<DueRow>> {
         .fetch_all(pool)
         .await
         .map_err(db)
+}
+
+/// Take up to `limit` due rows for `holder` until `now + ttl` (D98): under [`LEASE_LOCK`], the
+/// due query, then `due_at` moved to the lease's end and the holder recorded in
+/// `liveness_leases`, in one transaction. Rows nobody answers for are due again at the end.
+pub async fn claim(
+    pool: &PgPool,
+    now: i64,
+    limit: usize,
+    holder: &str,
+    ttl: i64,
+) -> Result<Vec<DueRow>> {
+    let mut tx = pool.begin().await.map_err(db)?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(LEASE_LOCK)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+    let rows = due(&mut *tx, now, limit).await?;
+    if !rows.is_empty() {
+        let mut ihs: Vec<&str> = rows.iter().map(|r| r.infohash.as_str()).collect();
+        ihs.sort_unstable();
+        ihs.dedup();
+        let until = now + ttl.max(1);
+        sqlx::query(
+            "UPDATE liveness_schedule s SET due_at = $2
+             FROM unnest($1::text[]) AS u(infohash) WHERE s.infohash = u.infohash",
+        )
+        .bind(&ihs)
+        .bind(until)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        sqlx::query(
+            "INSERT INTO liveness_leases (infohash, worker, leased_at, expires_at)
+             SELECT u, $2, $3, $4 FROM unnest($1::text[]) AS u ORDER BY u
+             ON CONFLICT (infohash) DO UPDATE SET worker = EXCLUDED.worker,
+                 leased_at = EXCLUDED.leased_at, expires_at = EXCLUDED.expires_at",
+        )
+        .bind(&ihs)
+        .bind(holder)
+        .bind(now)
+        .bind(until)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+    }
+    tx.commit().await.map_err(db)?;
+    Ok(rows)
+}
+
+/// Schedule rows of the infohashes `holder` still holds a lease on (expired or not, as long as
+/// nobody took them since), for writing its results.
+pub async fn held_rows(pool: &PgPool, holder: &str, infohashes: &[String]) -> Result<Vec<DueRow>> {
+    let sql = format!(
+        "SELECT {DUE_COLUMNS} FROM liveness_schedule s
+         JOIN liveness_leases k ON k.infohash = s.infohash AND k.worker = $2
+         LEFT JOIN liveness l ON l.infohash = s.infohash
+         WHERE s.infohash = ANY($1)"
+    );
+    sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(infohashes)
+        .bind(holder)
+        .fetch_all(pool)
+        .await
+        .map_err(db)
+}
+
+/// Give back leases unchecked: due at `now`, lease rows gone. Returns how many.
+pub async fn release(pool: &PgPool, holder: &str, infohashes: &[String], now: i64) -> Result<u64> {
+    let mut ihs: Vec<&str> = infohashes.iter().map(String::as_str).collect();
+    ihs.sort_unstable();
+    ihs.dedup();
+    let mut tx = pool.begin().await.map_err(db)?;
+    let n = sqlx::query(
+        "UPDATE liveness_schedule s SET due_at = least(s.due_at, $3)
+         FROM liveness_leases k
+         WHERE k.infohash = s.infohash AND k.worker = $2 AND s.infohash = ANY($1)",
+    )
+    .bind(&ihs)
+    .bind(holder)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(db)?
+    .rows_affected();
+    sqlx::query("DELETE FROM liveness_leases WHERE infohash = ANY($1) AND worker = $2")
+        .bind(&ihs)
+        .bind(holder)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+    tx.commit().await.map_err(db)?;
+    Ok(n)
+}
+
+/// Unexpired leases per holder.
+pub async fn leases_held(pool: &PgPool, now: i64) -> Result<HashMap<String, u64>> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT worker, count(*) FROM liveness_leases WHERE expires_at > $1 GROUP BY worker",
+    )
+    .bind(now)
+    .fetch_all(pool)
+    .await
+    .map_err(db)?;
+    Ok(rows
+        .into_iter()
+        .map(|(w, n)| (w, u64::try_from(n).unwrap_or(0)))
+        .collect())
+}
+
+/// Drop lease rows a day past their end (their torrent was deleted, or nobody took the
+/// infohash again yet; either way the row says nothing any more).
+pub async fn prune_leases(pool: &PgPool, now: i64) -> Result<u64> {
+    let r = sqlx::query("DELETE FROM liveness_leases WHERE expires_at < $1")
+        .bind(now - LEASE_KEEP_SECS)
+        .execute(pool)
+        .await
+        .map_err(db)?;
+    Ok(r.rows_affected())
 }
 
 /// The schedule row of one infohash (for a single forced check).
@@ -386,6 +520,13 @@ pub async fn write_results(
     }
 
     let mut tx = pool.begin().await.map_err(db)?;
+    // A written result ends any lease on the infohash (D98): a worker's late answer for it is
+    // then ignored.
+    sqlx::query("DELETE FROM liveness_leases WHERE infohash = ANY($1)")
+        .bind(sched.iter().map(|s| s.infohash).collect::<Vec<_>>())
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
     if !live.is_empty() {
         let col = |f: &dyn Fn(&Liveness) -> Option<i32>| live.iter().map(f).collect::<Vec<_>>();
         sqlx::query(
@@ -700,6 +841,9 @@ pub async fn liveness_loop(
                         Ok(n) if n > 0 => tracing::info!("liveness: pruned {n} history points"),
                         Ok(_) => {}
                         Err(e) => tracing::warn!("liveness: prune history: {e}"),
+                    }
+                    if let Err(e) = prune_leases(store.pool(), now).await {
+                        tracing::warn!("liveness: prune leases: {e}");
                     }
                     boost_saved_searches(&store, &svc, now).await;
                 }

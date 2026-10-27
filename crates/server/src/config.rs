@@ -57,6 +57,13 @@ pub enum Command {
         #[arg(long, default_value_t = 2000)]
         limit: usize,
     },
+    /// Crawl worker (docs/WORKERS.md, D96): seed checks and DHT crawling for a main server,
+    /// without a database. Prints a JSON report when it stops.
+    Worker {
+        /// Stop after this many seconds (default: run until SIGINT/SIGTERM).
+        #[arg(long)]
+        seconds: Option<u64>,
+    },
     /// Run the DHT crawler for a bounded time and print a JSON report (docs/DHT.md §8, D58).
     Dht {
         /// Wall-clock budget in seconds.
@@ -280,6 +287,39 @@ pub struct Config {
     /// context tier. Additive only; a file that does not load stops the server.
     #[arg(long, env = "MAGNETAR_BLOCKLIST_FILE")]
     pub blocklist_file: Option<std::path::PathBuf>,
+    // --- Crawl workers (docs/WORKERS.md, D96–D100) ---
+    /// Server: `name:token,name:token`, one token per worker (separate from
+    /// MAGNETAR_API_TOKEN). Unset = no worker can connect.
+    #[arg(long, env = "MAGNETAR_WORKER_TOKENS", hide_env_values = true)]
+    pub worker_tokens: Option<String>,
+    /// Server: seed-check lease length handed to workers, seconds.
+    #[arg(long, env = "MAGNETAR_WORKER_LEASE_SECS", default_value_t = crate::fleet::DEFAULT_LEASE_SECS, value_parser = clap::value_parser!(u64).range(60..=86_400))]
+    pub worker_lease_secs: u64,
+    /// Worker: the main server's base URL, e.g. https://<host>.<tailnet>.ts.net.
+    #[arg(long, env = "MAGNETAR_WORKER_SERVER")]
+    pub worker_server: Option<String>,
+    /// Worker: this worker's token (one entry of the server's MAGNETAR_WORKER_TOKENS).
+    #[arg(long, env = "MAGNETAR_WORKER_TOKEN", hide_env_values = true)]
+    pub worker_token: Option<String>,
+    /// Worker: local state (DHT node ids and contacts), default <state dir>/worker.
+    #[arg(long, env = "MAGNETAR_WORKER_STATE_DIR")]
+    pub worker_state_dir: Option<PathBuf>,
+    /// Worker: take seed-check leases from the server.
+    #[arg(long, env = "MAGNETAR_WORKER_LIVENESS", default_value_t = true, action = clap::ArgAction::Set)]
+    pub worker_liveness: bool,
+    /// Worker: infohashes per seed-check lease.
+    #[arg(long, env = "MAGNETAR_WORKER_LIVENESS_BATCH", default_value_t = 500, value_parser = clap::value_parser!(u32).range(1..=50_000))]
+    pub worker_liveness_batch: u32,
+    /// Worker: slow down (pause discovery, halve rates, no new leases) below this much
+    /// available memory, MB; 0 = off.
+    #[arg(long, env = "MAGNETAR_WORKER_MIN_FREE_MB", default_value_t = 250)]
+    pub worker_min_free_mb: u64,
+    /// Worker: also slow down while its own RSS is above this, MB; 0 = off.
+    #[arg(long, env = "MAGNETAR_WORKER_RSS_MAX_MB", default_value_t = 0)]
+    pub worker_rss_max_mb: u64,
+    /// Worker: results (info dicts) buffered for upload at most, MB; fetching waits beyond.
+    #[arg(long, env = "MAGNETAR_WORKER_UPLOAD_BUFFER_MB", default_value_t = 16, value_parser = clap::value_parser!(u64).range(1..=1024))]
+    pub worker_upload_buffer_mb: u64,
 }
 
 impl Config {
