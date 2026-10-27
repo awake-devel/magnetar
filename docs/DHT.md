@@ -476,7 +476,7 @@ samples / announces / get_peers ──► seen filter (2 × Bloom) ──► bat
   retry loop).
 - **Consumers**: peer collection (64 workers aggressive, 8 polite,
   `MAGNETAR_DHT_PEER_LOOKUPS`): announcer, else `get_peers` to the sampling node, else an
-  iterative lookup (≤ 10 s, stops at 12 peers, `MAGNETAR_DHT_PEERS_PER_HASH`; a node silent for
+  iterative lookup (≤ 10 s, stops at 24 peers, `MAGNETAR_DHT_PEERS_PER_HASH`; a node silent for
   1.5 s no longer holds up the walk, §18). No peer at all → `failed` / `no_peers` with the
   backoff below, written by a status writer in batches (≤ 500 rows or 1 s, one statement), so a
   collector never waits on the database (§18). Hashes with peers go through a bounded channel (capacity = fetch workers, so
@@ -777,8 +777,8 @@ others are still planned (their stage in brackets).
 | `MAGNETAR_DHT_POOL` | `1000000` / `200000` | crawl pool size (nodes) |
 | `MAGNETAR_DHT_PEER_LOOKUPS` | `64` / `8` | peer collections (sampling node, then lookup) at once (D62) |
 | `MAGNETAR_DHT_FETCH_CONCURRENCY` | `128` / `16` | metadata fetches in flight |
-| `MAGNETAR_DHT_LOOKUP_TIMEOUT_MS` | `1500` | soft per-query timeout of lookups (100–4000, §18, D93) |
-| `MAGNETAR_DHT_PEERS_PER_HASH` | `12` | peers tried per hash by the fetcher, and where a lookup stops (1–64, §18) |
+| `MAGNETAR_DHT_LOOKUP_TIMEOUT_MS` | `4000` | soft per-query timeout of lookups (100–4000, §18, D93) |
+| `MAGNETAR_DHT_PEERS_PER_HASH` | `24` | peers tried per hash by the fetcher, and where a lookup stops (1–64, §18) |
 | `MAGNETAR_DHT_METADATA_MAX` | `16777216` | bytes, per info dict |
 | `MAGNETAR_DHT_TCP_RATE` | `150` | new TCP connection attempts/s, all fetches (D66) |
 | `MAGNETAR_DHT_TCP_MAX` | `350` | TCP connections open at once (D66) |
@@ -1361,7 +1361,7 @@ announces lost after the announcer's own `get_peers`, and "accept-all" fake peer
 
 ### 18.1 What changed
 
-- **Lookup soft timeout and branch widening** (`MAGNETAR_DHT_LOOKUP_TIMEOUT_MS`, default 1500,
+- **Lookup soft timeout and branch widening** (`MAGNETAR_DHT_LOOKUP_TIMEOUT_MS`, default 4000 since the production A/B in §18.5,
   `core::dht::lookup`): a lookup waits for at most 4 queries; one unanswered 1.5 s after it was
   **sent** turns *slow*: its slot goes to the next candidate and it no longer holds up the end of
   the walk (it is left out of the closest-8 test), but its answer is still used until the 4 s
@@ -1403,7 +1403,7 @@ announces lost after the announcer's own `get_peers`, and "accept-all" fake peer
   strikes are forgotten 1 h after the last one, verified metadata clears them; LRU of 50 000
   entries. Skipped peers do not use up the per-hash cap; a hash whose only peers are skipped
   fails as `fake_peers`.
-- **Peers per hash** configurable (`MAGNETAR_DHT_PEERS_PER_HASH`, default 12, 1–64): the fetcher's
+- **Peers per hash** configurable (`MAGNETAR_DHT_PEERS_PER_HASH`, default 24 since §18.5, 1–64): the fetcher's
   cap and where a lookup stops.
 - **Stats** (`DhtStats`, serde default, §10): `collected`, `from_source`, `looked_up`,
   `announce_fetches`, `announce_upgraded`, incoming queries per type, `fake_peers_skipped` /
@@ -1463,3 +1463,21 @@ seeding lookups, or only pool nodes that answered once).
 **Not verified**: the effect at production settings (QPS 3000, 2048 lookups) and over hours;
 whether the fake-peer skips reach the ~10 % of accepted handshakes the study saw (skips in
 10 min: 223, 381, 74, 305, 300 attempts in the five final runs, against ~180 k TCP attempts; 334–475 peers reached 3 strikes per run).
+
+### 18.5 Production A/B and new defaults (2026-10-27)
+
+Production server on the fiber line (QPS 3000, 2048 lookups, FETCH_CONCURRENCY 2048, TCP_RATE
+1000, TCP_MAX 4000), 10 minutes per run, all runs within the same two hours on the production
+database. Metadata stored per minute at the end of each run and the fetch success rate:
+
+| build | lookup timeout | peers per hash | metadata/min | fetch success |
+|---|---|---|---|---|
+| old (`ab51607`) | 4 s (fixed) | 12 (fixed) | ~1 690 | 23 % |
+| new | 1.5 s | 24 | ~1 340 | 25 % |
+| new | 4 s | 24 | 1 800 → 2 160 | 26 % |
+| new | 4 s | 12 | ~1 750 | 23 % |
+
+At this load the 1.5 s timeout loses a fifth to a half of the output, and 24 peers beat 12, so
+the defaults became `MAGNETAR_DHT_LOOKUP_TIMEOUT_MS=4000` and `MAGNETAR_DHT_PEERS_PER_HASH=24`.
+The same old build stored ~2 700/min the night before: the DHT varies a lot by hour, so only
+compare runs made close together.

@@ -47,7 +47,7 @@ const PERSIST_EVERY: Duration = Duration::from_secs(600);
 /// Budget of one iterative peer lookup (docs/DHT.md §4 step 1).
 const LOOKUP_BUDGET: Duration = Duration::from_secs(10);
 /// Default peers tried per hash by the fetcher, and where a lookup stops (D56, D93).
-pub const PEERS_PER_HASH: usize = 12;
+pub const PEERS_PER_HASH: usize = 24;
 /// Status writes from the collectors (D93): flushed every 500 rows or 1 s; the channel lets a
 /// collector run this far ahead of a slow database before it waits.
 const STATUS_BATCH_MAX: usize = 500;

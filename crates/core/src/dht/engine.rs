@@ -32,9 +32,9 @@ use super::routing::{K, RoutingTable, Seen};
 
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(4);
 /// Lookup queries count as slow after this (D93): the lookup stops waiting for them and asks the
-/// next candidate, but still takes a late answer until [`QUERY_TIMEOUT`]. Measured on a public
-/// line: answers p50 100 ms, p99 559 ms, 0.25 % after 1 s.
-pub const LOOKUP_TIMEOUT: Duration = Duration::from_millis(1500);
+/// next candidate, but still takes a late answer until [`QUERY_TIMEOUT`]. Default 4 s = no widening:
+/// at production load 1.5 s halved the torrents stored per minute (docs/DHT.md §18.5).
+pub const LOOKUP_TIMEOUT: Duration = Duration::from_millis(4000);
 /// `v` = "MG" (unregistered in BEP 20, checked 2026-10-26) + 2 version bytes.
 pub const VERSION: [u8; 4] = [b'M', b'G', 0, 2];
 /// Ids sharing this many leading bits with a target were made for it (D45's node-farm rule).

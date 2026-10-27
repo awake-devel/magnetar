@@ -104,7 +104,7 @@ impl Drop for Meter<'_> {
 /// sampling node answered after all) still has its counts.
 ///
 /// Branch widening (D93, like libtorrent's short timeout): at most [`ALPHA`] queries are
-/// *waited for* at once. A query unanswered after `Dht::lookup_timeout` (1.5 s by default) turns
+/// *waited for* at once. A query unanswered after `Dht::lookup_timeout` (4 s by default; 1.5 s widens the walk) turns
 /// slow: it frees its slot, so the next candidate is asked, and the walk no longer waits for it
 /// to finish; its answer is still used if it comes before the hard query timeout (4 s). Answers
 /// arrive within 1 s 99.75 % of the time, so a silent node (35–52 % of them) used to hold a
