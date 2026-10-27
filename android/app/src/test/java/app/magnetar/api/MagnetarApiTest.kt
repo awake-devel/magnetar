@@ -1,6 +1,7 @@
 package app.magnetar.api
 
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -9,6 +10,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.testng.Assert.assertEquals
 import org.testng.Assert.assertFalse
@@ -149,6 +151,33 @@ class MagnetarApiTest {
         expect<ApiException.Timeout> { runBlocking { api(timeoutMs = 300).search(SearchQuery()) } }
         val ms = (System.nanoTime() - started) / 1_000_000
         assertTrue(ms < 3_000, "took $ms ms")
+    }
+
+    @Test
+    fun `a long request class is not cut by the base read timeout`() = runBlocking {
+        // The server answers after 800 ms; the base read timeout is 200 ms, the class allows 3 s.
+        server.enqueue(json("""{"watermark":5,"results":[]}""").newBuilder().headersDelay(800, TimeUnit.MILLISECONDS).build())
+        val base = OkHttpClient.Builder().readTimeout(200, TimeUnit.MILLISECONDS).build()
+        val api = MagnetarApi.create(server.url("/").toString(), "t", base, callTimeoutMs = { 3_000 })
+        assertEquals(api.pollSavedSearches(since = 1, includeAdult = false).watermark, 5L)
+    }
+
+    @Test
+    fun `a token that cannot be sent fails the call without crashing the app`() {
+        val uncaught = AtomicReference<Throwable?>(null)
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { _, e -> uncaught.set(e) }
+        try {
+            for (bad in listOf("abc\ndef", "abc\u00a0def", "jeton-é")) {
+                val e = expect<ApiException.Unauthorized> { runBlocking { api(token = bad).search(SearchQuery()) } }
+                assertEquals(e.message, AuthInterceptor.BAD_TOKEN)
+            }
+            Thread.sleep(200)
+            assertNull(uncaught.get(), "uncaught on the dispatcher: ${uncaught.get()}")
+            assertEquals(server.requestCount, 0)
+        } finally {
+            Thread.setDefaultUncaughtExceptionHandler(previous)
+        }
     }
 
     @Test

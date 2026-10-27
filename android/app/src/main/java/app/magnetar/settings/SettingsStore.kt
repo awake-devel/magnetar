@@ -76,7 +76,10 @@ class SettingsStore(private val prefs: SharedPreferences) {
             }
             edit.remove(K_OLD_BACKGROUND).remove(K_OLD_CACHE).remove(K_OLD_RELAYS)
             edit.putInt(K_VERSION, VERSION)
-            edit.commit()
+            // apply(): visible to the reads below at once, written to disk off the main thread
+            // (the store is built in Application.onCreate). Lost on a crash before the write,
+            // the migration simply runs again: it is idempotent.
+            edit.apply()
         }
 
         fun load(prefs: SharedPreferences): AppSettings {

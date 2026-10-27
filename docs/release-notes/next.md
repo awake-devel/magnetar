@@ -198,6 +198,11 @@ mode, no router port opened, 10 minutes, 2026-10-26)
   workspace. New libraries, versions and licences checked on Maven Central: OkHttp 5.5.1,
   kotlinx.serialization 1.12.0 (Apache-2.0); unit tests run on TestNG 7.12.0 (Apache-2.0)
   instead of JUnit 4 (EPL-1.0, not on the allowed licence list).
+- Review fixes: a seed check, a Stats answer or the saved-search poll is no longer cut after
+  15 s by the read timeout (each request class now waits up to its own limit, 45 s for a seed
+  check); an API token pasted with a line break or a non-ASCII character now gives a clear
+  "token cannot be sent" error instead of crashing the app; the settings migration writes to
+  disk in the background instead of on app start.
 
 ## Older servers and offline mode
 

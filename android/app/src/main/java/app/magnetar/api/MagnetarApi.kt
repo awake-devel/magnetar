@@ -36,8 +36,17 @@ class MagnetarApi(
         .addInterceptor(AuthInterceptor(baseUrl, token.trim()))
         .build()
 
+    /**
+     * The read timeout follows the call timeout: the base client's 15 s read timeout would
+     * otherwise cut a 45 s seed check or a 60 s poll while the server is still working on the
+     * answer (it sends no byte before it is done).
+     */
     private val clients: Map<RequestClass, OkHttpClient> = RequestClass.entries.associateWith {
-        httpClient.newBuilder().callTimeout(callTimeoutMs(it), TimeUnit.MILLISECONDS).build()
+        val ms = callTimeoutMs(it)
+        httpClient.newBuilder()
+            .callTimeout(ms, TimeUnit.MILLISECONDS)
+            .readTimeout(ms, TimeUnit.MILLISECONDS)
+            .build()
     }
 
     /** `GET /health` (no auth needed): version and features. */
@@ -136,6 +145,9 @@ class MagnetarApi(
         val result = try {
             clients.getValue(cls).newCall(request).awaitText()
         } catch (e: CancellationException) {
+            throw e
+        } catch (e: ApiException) {
+            // Raised by our own interceptor (a token that cannot go into a header).
             throw e
         } catch (e: InterruptedIOException) {
             // OkHttp's call timeout and SocketTimeoutException both land here.

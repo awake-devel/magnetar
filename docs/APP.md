@@ -137,14 +137,19 @@ until it is updated the Saved tab still lists/creates/deletes searches but notif
 
 `Authorization: Bearer <token>` is added by an interceptor **only to requests whose scheme,
 host and port are the configured server's**, so a poster or a redirect to another host never
-receives the token. The token is never logged (no logging interceptor in release; the debug
-build logs method + path + status only).
+receives the token (OkHttp also drops it on a redirect to another host). The token is never
+logged: there is no logging interceptor. A token with a character that cannot go into a header
+(a pasted line break, a non-ASCII character) fails the call as `Unauthorized` with a message
+saying so, before anything is sent; OkHttp would otherwise throw on its dispatcher thread and
+kill the app.
 
 ### Timeouts and cancellation (search must never hang the UI)
 
 All calls share one `OkHttpClient` (connect 5 s, read 15 s, write 15 s); each request class
 then sets a **call timeout** (the whole request, DNS to last byte) through `newBuilder()`,
-which shares the pool and dispatcher:
+which shares the pool and dispatcher. The class also raises the read timeout to its call
+timeout, since the server sends nothing until a seed check or poll is done and a 15 s read
+timeout would cut a 45 s check:
 
 | Class | Call timeout | Endpoints |
 |---|---|---|
@@ -191,8 +196,8 @@ out (the illegal-content blocklist works on the server, docs/DHT.md §7).
 ## 6. Adult switch
 
 Off by default (fresh install and migration of an old install that never set it). It is sent
-as `include_adult: true` on every search, facet, breakdown and releases body and as `adult=1`
-on the saved-search poll when on; omitted otherwise. Adult torrents are hidden, never deleted
+as `include_adult` (`false` or `true`) on every search, facet, breakdown and releases body,
+and as `adult=1` on the saved-search poll when on (left out when off). Adult torrents are hidden, never deleted
 (D52, D70); turning the switch on shows them again. Selecting category `porn` in the filter
 sheet also shows them (server rule). For a server without `adult_filter` (pre-D52) the app
 drops `category == porn` hits from the list itself, as the old app did. Nothing else: the app

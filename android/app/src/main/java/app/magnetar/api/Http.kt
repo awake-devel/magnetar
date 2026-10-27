@@ -44,10 +44,18 @@ class AuthInterceptor(private val server: HttpUrl, private val token: String) : 
     override fun intercept(chain: Interceptor.Chain): Response {
         val request = chain.request()
         if (token.isEmpty() || !sameOrigin(request.url, server)) return chain.proceed(request)
+        // OkHttp rejects such a header value with an IllegalArgumentException, which on its
+        // dispatcher thread is rethrown and kills the app; an IOException is a normal failure.
+        if (!isHeaderSafe(token)) throw ApiException.Unauthorized(BAD_TOKEN)
         return chain.proceed(request.newBuilder().header("Authorization", "Bearer $token").build())
     }
 
     companion object {
+        const val BAD_TOKEN = "The API token contains characters that cannot be sent (a pasted line break or a non-ASCII character?)"
+
+        /** What OkHttp accepts in a header value: tab and printable ASCII. */
+        fun isHeaderSafe(value: String): Boolean = value.all { it == '\t' || it in ' '..'~' }
+
         fun sameOrigin(a: HttpUrl, b: HttpUrl): Boolean =
             a.scheme == b.scheme && a.host.equals(b.host, ignoreCase = true) && a.port == b.port
     }
