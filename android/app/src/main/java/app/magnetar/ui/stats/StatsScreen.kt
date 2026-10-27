@@ -70,7 +70,13 @@ private enum class StatsTab(val label: String, val tag: String) {
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun StatsScreen(vm: StatsViewModel, onSearch: () -> Unit, onOpenGraph: (String) -> Unit, onOpenSettings: () -> Unit) {
+fun StatsScreen(
+    vm: StatsViewModel,
+    onSearch: () -> Unit,
+    onOpenGraph: (String) -> Unit,
+    onOpenSettings: () -> Unit,
+    onOpenCrawlMap: () -> Unit = {},
+) {
     val state by vm.state.collectAsStateWithLifecycle()
     var tab by rememberSaveable { mutableIntStateOf(0) }
     val colors = chartColors()
@@ -91,7 +97,7 @@ fun StatsScreen(vm: StatsViewModel, onSearch: () -> Unit, onOpenGraph: (String) 
             when {
                 !state.hasServer -> CenteredMessage("Stats are computed by your server. Set it in Settings.", "Settings", onAction = onOpenSettings)
                 else -> when (StatsTab.entries[tab]) {
-                    StatsTab.CHARTS -> Charts(state, colors, vm, onSearch)
+                    StatsTab.CHARTS -> Charts(state, colors, vm, onSearch, onOpenCrawlMap.takeIf { state.hasCrawlMap })
                     StatsTab.GRAPHS -> Graphs(state, onOpenGraph)
                     StatsTab.STATUS -> Status(state, colors)
                 }
@@ -101,7 +107,7 @@ fun StatsScreen(vm: StatsViewModel, onSearch: () -> Unit, onOpenGraph: (String) 
 }
 
 @Composable
-private fun Charts(state: StatsUiState, colors: ChartColors, vm: StatsViewModel, onSearch: () -> Unit) {
+private fun Charts(state: StatsUiState, colors: ChartColors, vm: StatsViewModel, onSearch: () -> Unit, onOpenCrawlMap: (() -> Unit)?) {
     val set = state.breakdowns
     LazyColumn(Modifier.fillMaxSize().testTag("stats_charts")) {
         if (state.healthChecked && state.health != null && !state.hasStats) {
@@ -138,6 +144,7 @@ private fun Charts(state: StatsUiState, colors: ChartColors, vm: StatsViewModel,
             state.years?.takeIf { it.counts.isNotEmpty() }?.let { y -> item(key = "year") { BreakdownCard(y, state, colors, vm, onSearch) } }
         }
         item(key = "activity") { ActivityCard(state, colors, vm) }
+        if (state.hasCrawlSources) item(key = "sources") { SourcesCard(state, colors, onOpenCrawlMap) }
         item { Text(" ", Modifier.padding(8.dp)) }
     }
 }
@@ -363,6 +370,7 @@ private fun Status(state: StatsUiState, colors: ChartColors) {
                         val missing = listOf(
                             Features.STATS to "charts", Features.GRAPHS to "graphs", Features.SAVED_SEARCH_POLL to "saved-search alerts",
                             Features.FILTERS to "release filters", Features.ORIGIN to "Nostr / DHT source",
+                            Features.CRAWL_SOURCES to "discovery sources", Features.CRAWL_MAP to "crawl map",
                         ).filter { !health.has(it.first) }.map { it.second }
                         if (missing.isNotEmpty()) Line("Needs a newer server for", missing.joinToString(", "))
                     }

@@ -2,6 +2,8 @@ package app.magnetar.ui
 
 import app.magnetar.api.BreakdownRequest
 import app.magnetar.api.BreakdownSet
+import app.magnetar.api.CrawlMap
+import app.magnetar.api.CrawlSources
 import app.magnetar.api.FacetSet
 import app.magnetar.api.Graph
 import app.magnetar.api.StatsHealth
@@ -61,6 +63,14 @@ open class FakeService : MagnetarService {
     val timeseriesCalls = mutableListOf<Pair<List<String>, String>>()
     var graphAnswer: (String) -> Graph = { Graph() }
     val graphCalls = mutableListOf<String>()
+
+    var sourcesAnswer: () -> CrawlSources = { CrawlSources() }
+    var sourcesError: Exception? = null
+    var sourcesCalls = 0
+    var mapAnswer: (String, String) -> CrawlMap = { l, w -> CrawlMap(layer = l, window = w, available = true) }
+    var mapError: Exception? = null
+    var mapDelayMs = 0L
+    val mapCalls = mutableListOf<Pair<String, String>>()
 
     var healthDelayMs = 0L
     var healthError: Exception? = null
@@ -152,6 +162,19 @@ open class FakeService : MagnetarService {
     override suspend fun graph(path: String): Graph {
         graphCalls += path
         return graphAnswer(path)
+    }
+
+    override suspend fun crawlSources(): CrawlSources {
+        sourcesCalls++
+        sourcesError?.let { throw it }
+        return sourcesAnswer()
+    }
+
+    override suspend fun crawlMap(layer: String, window: String): CrawlMap {
+        mapCalls += layer to window
+        kotlinx.coroutines.delay(mapDelayMs)
+        mapError?.let { throw it }
+        return mapAnswer(layer, window)
     }
 
     companion object {

@@ -10,7 +10,9 @@ import androidx.compose.ui.graphics.Color
  * (adjacent pairs ΔE ≥ 8 under CVD simulation, ≥ 15 normal vision, light and dark steps chosen
  * separately); they are used in this fixed order and never cycled: past the last slot values
  * fold into "Other". Bars of one field are magnitude, so they use one hue ([bar]). Status
- * colours are reserved for seeded / dead / unknown and always come with a text label.
+ * colours are reserved for seeded / dead / unknown and always come with a text label. The crawl
+ * map is a sequential one-hue scale from [mapLow] to [mapHigh] (darker = more in light theme,
+ * brighter = more in dark theme); countries without data are [mapEmpty], borders [mapBorder].
  */
 @Immutable
 data class ChartColors(
@@ -26,6 +28,10 @@ data class ChartColors(
     val ink: Color,
     val inkMuted: Color,
     val edge: Color,
+    val mapLow: Color,
+    val mapHigh: Color,
+    val mapEmpty: Color,
+    val mapBorder: Color,
 )
 
 private val Light = ChartColors(
@@ -44,6 +50,10 @@ private val Light = ChartColors(
     ink = Color(0xFF0B0B0B),
     inkMuted = Color(0xFF52514E),
     edge = Color(0x660B0B0B),
+    mapLow = Color(0xFFCFE2F8),
+    mapHigh = Color(0xFF0B3D82),
+    mapEmpty = Color(0xFFE1E0D9),
+    mapBorder = Color(0xFFFFFFFF),
 )
 
 private val Dark = ChartColors(
@@ -62,6 +72,10 @@ private val Dark = ChartColors(
     ink = Color(0xFFF0EFEC),
     inkMuted = Color(0xFFC3C2B7),
     edge = Color(0x66F0EFEC),
+    mapLow = Color(0xFF1C3352),
+    mapHigh = Color(0xFFA9CDF7),
+    mapEmpty = Color(0xFF383835),
+    mapBorder = Color(0xFF141413),
 )
 
 @Composable

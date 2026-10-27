@@ -37,6 +37,8 @@ import app.magnetar.api.MagnetarApi
 import app.magnetar.ui.graph.GraphScreen
 import app.magnetar.ui.graph.GraphViewModel
 import app.magnetar.ui.common.AppIcons
+import app.magnetar.ui.crawlmap.CrawlMapScreen
+import app.magnetar.ui.crawlmap.CrawlMapViewModel
 import app.magnetar.ui.detail.DetailScreen
 import app.magnetar.ui.detail.DetailViewModel
 import app.magnetar.ui.saved.SavedScreen
@@ -63,6 +65,7 @@ object Routes {
     const val TORRENT = "torrent/{infohash}"
     const val TITLE = "title/{mediaId}"
     const val GRAPH = "graph?path={path}"
+    const val CRAWL_MAP = "crawl-map"
     fun torrent(infohash: String) = "torrent/$infohash"
     fun title(mediaId: Long) = "title/$mediaId"
 
@@ -146,7 +149,15 @@ fun AppShell(app: MagnetarApp, openTorrent: MutableStateFlow<String?>) {
                     onSearch = { nav.switchTab(Tab.SEARCH.route) },
                     onOpenGraph = toGraph,
                     onOpenSettings = { nav.switchTab(Tab.SETTINGS.route) },
+                    onOpenCrawlMap = { nav.navigate(Routes.CRAWL_MAP) },
                 )
+            }
+            composable(Routes.CRAWL_MAP) { entry ->
+                val vm: CrawlMapViewModel = viewModel(
+                    viewModelStoreOwner = entry,
+                    factory = viewModelFactory { initializer { CrawlMapViewModel(repo) } },
+                )
+                CrawlMapScreen(vm = vm, onBack = { nav.popBackStack() })
             }
             composable(Tab.SETTINGS.route) {
                 val vm: SettingsViewModel = viewModel(

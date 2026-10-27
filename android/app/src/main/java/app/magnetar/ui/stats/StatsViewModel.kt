@@ -6,6 +6,7 @@ import app.magnetar.api.ApiException
 import app.magnetar.api.Breakdown
 import app.magnetar.api.BreakdownRequest
 import app.magnetar.api.BreakdownSet
+import app.magnetar.api.CrawlSources
 import app.magnetar.api.Features
 import app.magnetar.api.Health
 import app.magnetar.api.SearchQuery
@@ -58,11 +59,17 @@ data class StatsUiState(
      * unreachable: the cached charts are keyed by the request, which depends on the features.
      */
     val knownFeatures: List<String>? = null,
+    /** "Where discoveries come from" (feature `crawl_sources`). */
+    val sources: CrawlSources? = null,
+    val sourcesError: String? = null,
+    val sourcesCachedAtMs: Long? = null,
 ) {
     val features: Set<String> get() = (health?.features ?: knownFeatures).orEmpty().toSet()
     val hasStats: Boolean get() = Features.STATS in features
     val hasGraphs: Boolean get() = Features.GRAPHS in features
     val hasDht: Boolean get() = Features.DHT in features || stats?.dht != null
+    val hasCrawlSources: Boolean get() = Features.CRAWL_SOURCES in features
+    val hasCrawlMap: Boolean get() = Features.CRAWL_MAP in features
 }
 
 /**
@@ -117,6 +124,7 @@ class StatsViewModel(
                 seriesRequests.value++
                 loadStats()
             }
+            if (_state.value.hasCrawlSources) loadSources() else _state.update { it.copy(sources = null, sourcesError = null, sourcesCachedAtMs = null) }
         }
     }
 
@@ -205,6 +213,28 @@ class StatsViewModel(
         }
     }
 
+    private fun loadSources() = viewModelScope.launch {
+        val cached = repo.readCache(CACHE_SOURCES, "", CrawlSources.serializer())
+        if (cached != null && _state.value.sources == null) {
+            _state.update { it.copy(sources = cached.value, sourcesCachedAtMs = cached.savedAtMs) }
+        }
+        try {
+            val s = repo.service().crawlSources()
+            repo.writeCache(CACHE_SOURCES, "", CrawlSources.serializer(), s)
+            _state.update { it.copy(sources = s, sourcesError = null, sourcesCachedAtMs = null) }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: ApiException) {
+            _state.update {
+                it.copy(
+                    sourcesError = e.userMessage(),
+                    sources = if (e.isOffline) it.sources else null,
+                    sourcesCachedAtMs = if (e.isOffline) it.sourcesCachedAtMs else null,
+                )
+            }
+        }
+    }
+
     private suspend fun loadSeries() {
         val s = _state.value
         val bucket = if (s.hourly) "hour" else "day"
@@ -277,5 +307,6 @@ class StatsViewModel(
         const val CACHE_BREAKDOWN = "stats/breakdown"
         const val CACHE_HEALTH = "stats/health"
         const val CACHE_FEATURES = "stats/features"
+        const val CACHE_SOURCES = "stats/sources"
     }
 }
