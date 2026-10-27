@@ -107,6 +107,15 @@ impl WorkerOptions {
     }
 }
 
+/// A refusal by the server that a restart cannot fix (bad token, incompatible version,
+/// workers disabled): `magnetar-server worker` exits with [`FATAL_EXIT`] so a supervisor
+/// (systemd `RestartPreventExitStatus`) does not restart it in a loop.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct Fatal(pub String);
+
+pub const FATAL_EXIT: i32 = 2;
+
 /// Lets any task stop the whole worker with a fatal error.
 #[derive(Clone)]
 pub struct Abort {
@@ -262,13 +271,14 @@ pub async fn run(
     let welcome = match connect(&client, &hello, &mut wait_rx).await {
         Ok(Some(w)) => w,
         Ok(None) => return Ok(WorkerReport::default()),
-        Err(e) => anyhow::bail!("{e}"),
+        Err(e) => return Err(Fatal(e.to_string()).into()),
     };
     if welcome.worker_api != WORKER_API {
-        anyhow::bail!(
+        return Err(Fatal(format!(
             "incompatible server: it speaks worker API {}, this worker {WORKER_API}",
             welcome.worker_api
-        );
+        ))
+        .into());
     }
     tracing::info!(
         "worker {} connected to {} (magnetar-server {}, worker API {}): seed checks {}, DHT {}",
@@ -414,7 +424,7 @@ pub async fn run_from_config(cfg: &Config, seconds: Option<u64>) -> anyhow::Resu
     let report = run(opts, stop_rx, seconds.map(Duration::from_secs), |_| {}).await?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     if let Some(e) = report.error {
-        anyhow::bail!("{e}");
+        return Err(Fatal(e).into());
     }
     Ok(())
 }

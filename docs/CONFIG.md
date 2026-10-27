@@ -13,6 +13,7 @@ magnetar-server selftest              # DB, DNS, TLS (NIP-11 of a seed relay), U
 magnetar-server enrich [--reimport] [--rematch]   # refresh IMDb datasets, link all pending torrents, JSON report
 magnetar-server liveness [--limit N]  # seed-check batches now (configured rates), one JSON line per batch
 magnetar-server attrs [--force]       # parse release attributes (language, quality, …) of torrents without current ones, JSON report
+magnetar-server worker [--seconds N]  # crawl worker for a main server: seed checks + DHT, no database (docs/WORKERS.md)
 magnetar-server --version
 ```
 
@@ -138,6 +139,23 @@ Each option also exists as a flag (`--dht aggressive`, `--dht-nodes 2`, …). Bo
 JSON report: `magnetar-server dht --seconds 270 [--mode aggressive] [--dry-run]`. Measured on
 the laptop (aggressive, no port opened, 270 s): ~1.6 % of one core, 47 MB RSS; see
 docs/DHT.md §13.
+
+### Crawl workers (docs/WORKERS.md, ARCHITECTURE.md D96–D100)
+
+On the **server**:
+
+| Variable | Default | Notes |
+|---|---|---|
+| `MAGNETAR_WORKER_TOKENS` | unset (no worker can connect) | `name:token,name:token`: one token per worker (name 1–32 of `a-z0-9_-`, token ≥ 24 characters, e.g. `openssl rand -hex 32`), separate from `MAGNETAR_API_TOKEN` (a worker token only reaches `/api/v1/worker/*`, the API token never does). The server refuses to start on a malformed list or a token equal to the API token |
+| `MAGNETAR_WORKER_LEASE_SECS` | `900` | seed-check lease length (60–86400); an unanswered lease is due again for anyone at its end |
+
+On a **worker** (`magnetar-server worker`): `MAGNETAR_WORKER_SERVER` (required, the server's
+URL), `MAGNETAR_WORKER_TOKEN` (required), `MAGNETAR_WORKER_STATE_DIR` (`<state dir>/worker`),
+`MAGNETAR_WORKER_LIVENESS` (`true`), `MAGNETAR_WORKER_LIVENESS_BATCH` (`500`),
+`MAGNETAR_WORKER_MIN_FREE_MB` (`250`), `MAGNETAR_WORKER_RSS_MAX_MB` (`0` = off),
+`MAGNETAR_WORKER_UPLOAD_BUFFER_MB` (`16`), plus the `MAGNETAR_DHT_*` and `MAGNETAR_LIVENESS_*`
+variables above (worker defaults: pool 200 000, 64 fetches, UPnP off). Profiles for the EEE
+and RPI lines: docs/WORKERS.md §3.
 
 ### Built-in seed relays (ARCHITECTURE.md §9)
 

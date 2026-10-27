@@ -858,6 +858,14 @@ when that is off. `--dry-run`: no database at all (dedupe in memory). `serve` st
   first). At 10–20 k/h this is close to D45's measured 29 k checks/h; stage 8 measures the backlog
   and may raise `MAGNETAR_LIVENESS_BATCH` or seed the first result from the fetch.
 
+## 10.1 Crawl workers
+
+Other machines can run the same crawler and report to this server (D96–D100,
+docs/WORKERS.md): their sightings are triaged here against `dht_seen` (one fetch per hash for
+the whole fleet), and every info dict they upload is verified against its infohash,
+classified and screened here, then written by `persist::persist_batch` like this crawler's
+own results. A worker's blocklist runs before upload; a blocked torrent arrives as a hash only.
+
 ## 11. What is deliberately not done
 
 IPv6 DHT (BEP 32) and uTP are later; no NAT-PMP/PCP; no `announce_peer` from us; no crawling on

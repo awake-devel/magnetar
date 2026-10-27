@@ -1,0 +1,70 @@
+# Magnetar crawl worker as a systemd service (docs/WORKERS.md §5 B). Nothing in the repo
+# installs it: copy it by hand on the machine that should run a worker (e.g. the Raspberry Pi).
+#
+#   sudo install -m 644 packaging/magnetar-worker.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now magnetar-worker
+#
+# Needs: /usr/local/bin/magnetar-server (static aarch64/x86_64 build), the system user
+# `magnetar-worker`, and /etc/magnetar/worker.env (mode 600, root) with at least
+# MAGNETAR_WORKER_SERVER and MAGNETAR_WORKER_TOKEN (template: packaging/worker.env.example).
+
+[Unit]
+Description=Magnetar crawl worker (seed checks and DHT crawling for a Magnetar server)
+Documentation=https://github.com/awake-devel/magnetar/blob/main/docs/WORKERS.md
+Wants=network-online.target
+After=network-online.target tailscaled.service
+
+[Service]
+Type=exec
+User=magnetar-worker
+Group=magnetar-worker
+EnvironmentFile=/etc/magnetar/worker.env
+# State (DHT identity, contacts, heartbeat file) in /var/lib/magnetar-worker, mode 700.
+StateDirectory=magnetar-worker
+StateDirectoryMode=0700
+Environment=MAGNETAR_WORKER_STATE_DIR=%S/magnetar-worker
+Environment=HOME=%S/magnetar-worker
+Environment=NO_COLOR=1
+ExecStart=/usr/local/bin/magnetar-server worker
+# SIGTERM: leases are given back, the state is saved, the report goes to the journal.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+Restart=on-failure
+RestartSec=30
+# Exit 2 = the server refused this worker (token, incompatible version, workers disabled):
+# restarting cannot fix it. Network errors never exit (the worker retries by itself).
+RestartPreventExitStatus=2
+# Crawling keeps hundreds of TCP connections open.
+LimitNOFILE=65536
+# Memory: the worker's own governor slows down at MAGNETAR_WORKER_RSS_MAX_MB (200 on a Pi);
+# these are the hard backstops.
+MemoryHigh=220M
+MemoryMax=300M
+
+# Hardening: no privileges, read-only system, nothing of /home, only IP sockets.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

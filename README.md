@@ -96,6 +96,7 @@ server URL (`https://<machine>.<tailnet>.ts.net`) and the API token.
 
 - Docker details (variables, volumes, upgrades, backups): [docs/DOCKER.md](docs/DOCKER.md)
 - Without Docker, with the static binary and your own Postgres: [docs/LINUX.md](docs/LINUX.md)
+- Share the crawling with other machines (seed checks and DHT, no database on them): [docs/WORKERS.md](docs/WORKERS.md)
 - Nothing here installs systemd units, timers or udev rules. Docker's restart policy keeps
   the containers up; LINUX.md has examples you can adapt if you want the binary started at
   boot.

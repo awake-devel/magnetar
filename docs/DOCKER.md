@@ -329,3 +329,9 @@ the host. **UNVERIFIED** on macOS and Windows.
 - CA certificates are included for HTTPS trackers (librqbit) and future metadata lookups.
 - Build for another architecture natively on that architecture; the Dockerfile does not
   cross-compile.
+
+## Crawl workers
+
+A second machine can share the crawling (seed checks and DHT) without a database:
+`docker/compose.worker.yml` runs only `magnetar-server worker` and publishes only its DHT UDP
+ports. Setup, tokens and profiles: docs/WORKERS.md.

@@ -86,7 +86,13 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
-        Command::Worker { seconds } => worker::run_from_config(&cli.config, seconds).await,
+        Command::Worker { seconds } => match worker::run_from_config(&cli.config, seconds).await {
+            Err(e) if e.downcast_ref::<worker::Fatal>().is_some() => {
+                eprintln!("Error: {e}");
+                std::process::exit(worker::FATAL_EXIT);
+            }
+            r => r,
+        },
         Command::Selftest => selftest::run(&cli.config).await,
         Command::Enrich { reimport, rematch } => {
             let store = server::open_store(&cli.config).await?;
