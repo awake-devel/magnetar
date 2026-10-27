@@ -95,6 +95,12 @@ fix one of them in the same change.
 | D76 | **Empty-query browse lists DHT-only torrents once seeded** (user choice, 2026-10-26; refines D73): `SearchQuery::browse_hides_unchecked_dht()` = no text (no words, no media token) and no source filter (`origins` empty or both values). Then a document with no Nostr event is left out unless `best_peers` (max of tracker seeders and the DHT peer estimate, as shown in the app) is > 0 — unknown and confirmed-dead both hide it; a check that later finds peers brings it in (the index follows `liveness` changes, D45). Applies with any sort and any other filter, so a list's membership never depends on its sort; not to text searches, media tokens (title pages / releases), the explicit `origin=dht` chip, or Stats breakdowns (`facet_tallies` clears it: they describe the catalogue). Browse facets follow the list. Index: `Filter::hide_unchecked_dht` reads the per-segment `f_origin` column and the ordinal of `nostr` (no `SCHEMA_VERSION` change, no rebuild); SQL fallback: `h.origin <> 'dht' OR coalesce(h.best_peers, 0) > 0 OR EXISTS (torrents of the infohash)` (a Nostr event below `min_trust` still counts as Nostr, as in the index). `Health.features` `browse_checked_dht`. Adult classification untouched (user: no stricter adult detection) | `tests/it/dht_search_pg.rs::empty_query_lists_dht_only_torrents_once_seeded` (both paths, 4 sorts, category filter, text, DHT chip, both chips, facets vs breakdowns, a later check) |
 | D77 | **REST API complete for a thin Kotlin client** (the app rebuild may drop the Rust ffi): checked endpoint by endpoint against what the app does (docs/API.md). Saved searches already lived on the server (CRUD + the D25 ntfy notifier) while the app kept its own copy in SQLite; added: `GET /api/v1/saved-searches/{id}`, `PUT /api/v1/saved-searches/{id}` (name/query/notify; keeps `last_checked`/`last_seen_created_at` unless the query changes, so editing never replays or skips ntfy notifications; it writes only those columns, and the notifier writes only its watermark columns after a run (`Store::record_saved_search_run`, the stored watermark only if unchanged since the run began), so an edit made while the notifier runs is not reverted by its stale copy — review fix), and **`GET /api/v1/saved-searches/poll?since=`** — stateless (`core::notify::new_hits_since`): the client keeps the watermark, so several clients and the server notifier never consume each other's hits (a stored per-search watermark would have been shared by all of them). Same "new" rule as D25 (`created_at > since`, newest 200 per search, `truncated`), `adult=1` = the client's switch, `all=1` adds notify=false searches, `id=` narrows; first poll returns the server clock. `TorrentSummary.best_peers` (serde default): max(tracker seeders, DHT estimate) of the latest check — DHT-only torrents without trackers had only the estimate, which list rows did not carry (on production 8 039 of 17 994 DHT-only torrents with peers). Fix: a forced check (`POST /torrents/{ih}/liveness`) of a DHT-only torrent answered 404 (`trackers_for` read only Nostr events); it now runs on the default trackers + DHT. `Health.features` `saved_search_poll`. Not added: a list of overrides, backdrops/stills (posters only), phone-local pin/hide | `tests/it/api.rs::saved_searches_for_a_thin_client`, `tests/it/dht_search_pg.rs` (forced check of a DHT-only row, `best_peers`); production `GET /health` and browse (read-only) |
 | D78 | **One integration-test binary per crate** (build speed): `crates/{core,server,ffi}/tests/*.rs` moved to `tests/it/<file>.rs`, one module each under `tests/it/main.rs` (support modules `common`, `support`, `api_support`, `trust_support` beside them; `tests/data` stays). Cargo now links 3 test executables instead of 42, each against the whole dependency graph. Run one former file with `cargo test -p <crate> --test it <module>::`. Sharing one process exposed two process-wide states: the blocklist (`blocklist::install` only works before the first `global()`) is installed once with the test placeholders by `common::install_test_blocklist` from every database test, and the TRACE log-capture test (`dht_fetch_pg::pipeline_blocklist_classifies_and_never_logs_names`) scopes its subscriber to its own runtime's threads (`on_thread_start` + a second live dispatcher, because tracing-core's one-dispatcher fast path takes callsite interest from the registering thread) instead of `set_global_default`. Fake-DHT `announce` helpers retry a lost KRPC query (5 ×), since the 103 server tests now run concurrently in one process. Measured (laptop, mold, each tree from scratch in its own target dir): test executables 46 → 10, `target/` 24 → 9.9 GB; `cargo test --workspace --no-run` from scratch 371 → 422 s (slower: one large test crate per package); rebuild after touching `server/src` 92 → 38 s, `core/src` 120 → 54 s, one server test file 7.9 → 16.0 s; test run with everything built 381/443 → 223/177 s (former binaries ran one after another; now each crate's tests run in parallel). Slowest test now `enrich_anime::imdb_and_anime_enrichers_run_concurrently` (up to ~120 s under load; it also failed once on the unchanged tree with a pool timeout, pre-existing) | `git log` stage 1 of the app rebuild; test counts before/after: 287 run + 19 ignored over 42 files → same tests in 3 binaries (+1 new D76 test) |
+| D79 | **The Android app is a pure server frontend** (user choice, 2026-10-27): Kotlin + Jetpack Compose + Material 3 only, talking to the REST API (docs/API.md); no Rust, uniffi or JNA in the app, no phone crawler / sync / SQLite search engine, **no downloads** (neither librqbit on the phone nor a server-download UI; *Open magnet* / *Copy magnet* hand off to an external client). Kept: search (instant, filter sheet with live facet counts incl. Source and the adult switch, sort, detail, title page), saved searches with hourly notifications via the server, Stats (charts, activity, four graphs), Settings. Only local data: settings and a small page cache. Supersedes D26 (the app parses the server's JSON itself now) and the phone parts of D44/D47/D52/D70 (offline filters, offline Stats, phone SQLite). `crates/ffi` and `crates/uniffi-bindgen` removed from the workspace (nothing else used them), with the `uniffi` and `rusqlite` workspace dependencies (Cargo.lock −461 lines); `scripts/build-android.sh` is plain Gradle (no cargo-ndk/NDK) and runs the unit tests. The server keeps its own downloads feature (librqbit in `magnetar-server`), the app just has no screen for it | docs/APP.md (design, screen → endpoint table, stages) |
+| D80 | **App libraries** (versions and licences read from the Maven Central POMs, 2026-10-27): OkHttp 5.5.1 (Apache-2.0) as the only HTTP client, kotlinx-serialization-json 1.12.0 (Apache-2.0, built with Kotlin 2.4.10) + the serialization compiler plugin 2.4.21 (= Kotlin/compose plugin version), no Retrofit; tests: mockwebserver3 5.5.1, kotlinx-coroutines-test 1.11.0, **TestNG 7.12.0** (Apache-2.0; deps jcommander 1.83 Apache-2.0, slf4j-api 2.0.16 MIT, webjars jquery 3.7.1 MIT, guice optional) via `unitTests.all { useTestNG() }` — JUnit 4.13.2's POM says EPL-1.0, outside the allowed licences. JNA removed. Planned and checked, added by their stages: Coil 3.6.3 (`coil-compose`, `coil-network-okhttp`, Apache-2.0) for posters on the app's OkHttp client; Vico 3.3.1 kept for the series (D47) | docs/APP.md §2 |
+| D81 | **Settings survive the upgrade**: same `applicationId` `app.magnetar`, same release key (`android/keystore/keystore.properties`, read by Gradle only), same SharedPreferences file `settings` and keys (`server_url`, `api_token`, `root_npub`, `trust_threshold`, `show_adult`); `settings_version` 0 → 1 maps `background_sync` → `notify_saved_searches`, removes `cache_cap_mb` / `seed_relays`, clears a private key in `root_npub`, normalises the URL, clamps the threshold; idempotent, run before any screen reads. Fresh install: adult content hidden. Leftovers removed at start: unique works `crawl-sync`, `crawl-sync-now`, channel `downloads`. The old phone-only saved searches (`magnetar.db`, table `saved_searches`) are posted to the server in the Saved stage with the platform SQLite API, then the old files are deleted | `SettingsStoreTest` (8 cases) |
+| D82 | **App networking**: one shared `OkHttpClient` (connect 5 s, read/write 15 s) with a call timeout per request class (search 10 s, detail 15 s, check now 45 s, stats/graphs 30 s, poll 60 s); the body is read on OkHttp's thread inside `suspendCancellableCoroutine`, so cancelling the coroutine (a newer keystroke via `mapLatest`, leaving the screen) cancels the call at any point; errors become a sealed `ApiException` (NotConfigured, Unauthorized, NotFound, IndexBuilding, Http(status, code), Timeout, Network, Decode), cancellation is never one. The bearer header is added only for the configured server's scheme + host + port. JSON: `ignoreUnknownKeys`, `coerceInputValues` (unknown enum → default), `explicitNulls = false`, `encodeDefaults = true` (so `include_adult` is always sent); enum-like lists inside `SearchQuery` are strings so a newer value never breaks a saved search. A server path prefix (`https://host/magnetar`) is kept | `MagnetarApiTest` (13 cases, MockWebServer) |
+| D83 | **App cache**: recent first pages, details, title pages and Stats answers as the server's JSON in `cacheDir/pages/`, key = SHA-256(server, endpoint, canonical body incl. the adult switch), cap 20 MB / 500 entries LRU, cleared on server or token change; shown at once with its age, replaced by the live answer, kept offline with a banner. Posters use Coil's disk cache. Only server answers are cached, so nothing the server filtered (blocklist) is ever on the phone | docs/APP.md §5 (search stage) |
+| D84 | **Saved-search notifications from the server**: WorkManager unique periodic work `saved-search-poll`, every 1 h, constraint network connected, only while `notify_saved_searches` is on and the server lists `saved_search_poll`; client-held watermark (prefs file `notify`, with the server URL it belongs to), `adult=1` from the switch; channel id `saved_searches` kept from the old app; one InboxStyle notification per search, tap → `magnetar://torrent/{infohash}`. Production (2026-10-27, pre-stage-1 build) does not list `saved_search_poll` yet, so the app shows "needs a newer server" there | docs/APP.md §8 (saved stage) |
 ---
 
 ## 1. Repository layout
@@ -102,11 +108,9 @@ fix one of them in the same change.
 ```
 Cargo.toml                 workspace (all dependency versions pinned here)
 Dockerfile, compose.yml    server image + Postgres stack, .env.example, docker/ (D37, docs/DOCKER.md)
-crates/core/               magnetar-core   (lib)  — no DB driver, no axum; compiles for Android
+crates/core/               magnetar-core   (lib)  — no DB driver, no axum
 crates/server/             magnetar-server (bin + lib) — Postgres, axum API, relay endpoint, daemons
-crates/ffi/                magnetar-ffi    (cdylib + lib) — SQLite store + uniffi API for Android
-crates/uniffi-bindgen/     uniffi-bindgen  (bin)
-android/                   Gradle project, app module `app`, package `app.magnetar`
+android/                   Gradle project, app module `app`, package `app.magnetar` — Kotlin client of the API (D79, docs/APP.md)
 scripts/                   build-android.sh, build-linux.sh, test.sh, release.sh, bench-search-db.sh (D43)
 .github/workflows/         ci.yml, docker.yml, release.yml (D39)
 Dockerfile, compose.yml    server image + Postgres (D37); .env.example
@@ -114,8 +118,8 @@ docs/research/             research notes + fixtures (real relay events)
 ```
 
 ### Build environment (this laptop)
-- `/usr/bin/cargo` (Arch) has no Android std. **All Android builds:**
-  `PATH=$HOME/.cargo/bin:$HOME/.local/bin:$PATH ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/29.0.14206865`.
+- The Android app needs only the SDK (`~/Android/Sdk`) and the JDK: `scripts/build-android.sh`
+  (plain Gradle since D79; no Rust, cargo-ndk or NDK).
 - Tests needing Postgres read `MAGNETAR_TEST_DATABASE_URL`
   (local: `postgres://magnetar:magnetar@127.0.0.1:54329/magnetar`, docker `postgres:18`).
   Each test creates its own schema `t_<random>` and drops it, so tests run in parallel.
@@ -326,7 +330,7 @@ pub struct EventRef { pub event_id: Hex32, pub pubkey: Hex32, pub npub: String, 
 
 ---
 
-## 4. `Store` trait (`core::store`) — implemented by `PgStore` (server) and `SqliteStore` (ffi)
+## 4. `Store` trait (`core::store`) — implemented by `PgStore` (server); `SqliteStore` lived in the ffi crate until D79
 
 ```rust
 #[async_trait::async_trait]
@@ -485,7 +489,7 @@ standard prefixes (`duplicate:`, `invalid:`, `blocked:`).
 
 ---
 
-## 7. Sync (phone → server), `core::sync`
+## 7. Sync (phone → server), `core::sync` — no phone client since D79 (the app no longer crawls)
 
 ```rust
 #[async_trait::async_trait]
@@ -506,95 +510,25 @@ until under cap; `sync_ids` rows are kept. Unsynced rows are never deleted (unit
 
 ---
 
-## 8. Android app & ffi
+## 8. Android app
 
-### 8.1 ffi API (uniffi 0.32 proc-macro, package `app.magnetar.ffi`)
-```rust
-#[derive(uniffi::Object)] pub struct Magnetar { /* SqliteStore, tokio Runtime, Config */ }
-#[uniffi::export(async_runtime = "tokio")]
-impl Magnetar {
-    #[uniffi::constructor] pub fn open(db_path: String, config: FfiConfig) -> Result<Arc<Self>, FfiError>;
-    pub fn set_config(&self, config: FfiConfig) -> Result<(), FfiError>;
-    pub async fn search(&self, query: FfiSearchQuery, prefer_server: bool) -> Result<FfiSearchPage, FfiError>; // server first, local fallback; page.source tells which
-    pub async fn detail(&self, infohash: String, prefer_server: bool) -> Result<Option<FfiTorrentDetail>, FfiError>;
-    pub async fn crawl_once(&self, max_seconds: u32) -> Result<FfiCrawlReport, FfiError>;
-    pub async fn sync_now(&self) -> Result<FfiSyncReport, FfiError>;
-    pub fn cleanup(&self) -> Result<FfiCleanupReport, FfiError>;
-    pub async fn check_liveness(&self, infohash: String) -> Result<Option<FfiLiveness>, FfiError>;
-    pub fn set_pinned(&self, infohash: String, pinned: bool) -> Result<(), FfiError>;
-    pub fn set_hidden(&self, infohash: String, hidden: bool) -> Result<(), FfiError>;
-    pub async fn block_publisher(&self, pubkey: String, blocked: bool) -> Result<(), FfiError>; // local + server if reachable
-    pub fn saved_searches(&self) -> Result<Vec<FfiSavedSearch>, FfiError>;
-    pub fn save_search(&self, s: FfiSavedSearch) -> Result<i64, FfiError>;
-    pub fn delete_saved_search(&self, id: i64) -> Result<(), FfiError>;
-    pub async fn poll_saved_searches(&self) -> Result<Vec<FfiSavedSearchHit>, FfiError>; // new results since last poll
-    pub fn stats(&self) -> Result<FfiStats, FfiError>;
-    pub async fn server_health(&self) -> Result<bool, FfiError>;
-    // D44: filter sheet counts (server only), title page (server, else cache), what the server supports
-    pub async fn facets(&self, query: FfiSearchQuery, fields: Vec<String>) -> Result<FfiFacetSet, FfiError>;
-    pub async fn media_releases(&self, media_id: i64, query: FfiSearchQuery) -> Result<FfiMediaReleases, FfiError>;
-    pub async fn server_features(&self) -> Option<Vec<String>>; // None = offline/unreachable
-    // D45: seed-check backlog for Status, per-torrent history (server only; None offline / older server)
-    pub async fn server_liveness(&self) -> Option<FfiLivenessStats>;
-    pub async fn liveness_history(&self, infohash: String, days: u32) -> Result<Option<FfiLivenessHistory>, FfiError>;
-    // D47: charts (server, else the cache's counts), series, health, graphs (server only)
-    pub async fn stats_breakdown(&self, query: FfiSearchQuery, fields: Vec<String>, top: u32) -> Result<FfiBreakdownSet, FfiError>;
-    pub async fn stats_timeseries(&self, metrics: Vec<String>, bucket: String, since: Option<i64>) -> Result<FfiTimeseriesSet, FfiError>;
-    pub async fn stats_health(&self) -> Result<FfiStatsHealth, FfiError>;
-    pub async fn graph(&self, path: String) -> Result<Option<FfiGraph>, FfiError>; // "wot" | "relays" | "media/{id}" | "swarm/{ih}"
-    // downloads (§8.3)
-    pub async fn download_start(&self, magnet: String, on_server: bool) -> Result<FfiDownload, FfiError>;
-    pub async fn downloads(&self, on_server: bool) -> Result<Vec<FfiDownload>, FfiError>;
-    pub async fn download_action(&self, id: u64, action: String, on_server: bool) -> Result<(), FfiError>;
-}
-#[uniffi::export] pub fn npub_encode(hex: String) -> Result<String, FfiError>;
-#[uniffi::export] pub fn pubkey_decode(input: String) -> Result<String, FfiError>; // npub/hex/nprofile -> hex
-#[uniffi::export] pub fn build_magnet(infohash: String, name: Option<String>, trackers: Vec<String>) -> String;
-#[uniffi::export] pub fn version() -> String;
-#[uniffi::export] pub fn facet_label(field: String, value: String) -> String;   // D44 display labels
-#[uniffi::export] pub fn filter_options(field: String) -> Vec<String>;           // D44 values without counts
-```
-`Ffi*` records mirror §3/§5 types 1:1 with uniffi-friendly fields (`u64` sizes, `Option`, enums as uniffi
-enums; tuples become `FfiKv{key,value}`). `FfiConfig { server_url: Option<String>, api_token: Option<String>,
-root_pubkey: Option<String>, trust_threshold: u8, cache_cap_mb: u32, seed_relays: Vec<String>, download_dir: String }`.
-`FfiError` variants: `Db{msg}`, `Network{msg}`, `Invalid{msg}`, `Server{status: u16, msg}`, `Other{msg}`
-(never a field named `message`).
+Since D79 the app is a Kotlin + Compose client of the REST API with no Rust inside;
+**docs/APP.md** is its design (architecture, package layout, screen → endpoint table, cache,
+timeouts, settings migration, notifications, theme, accessibility, stages). The ffi crate
+(`crates/ffi`, uniffi 0.32, SQLite store, phone crawler, phone downloads with librqbit) that
+§8.1–8.3 described until v0.2.0 was deleted with that decision; its history is in git
+(`git log -- crates/ffi`) and in docs/release-notes/v0.1.0.md.
 
-### 8.1b Android toolchain (VERIFIED in android.md §1–3)
+### 8.1 Android toolchain
 JDK 27 (system) + Gradle wrapper **9.8.2** + AGP **9.4.1** (built-in Kotlin: do NOT apply
-`org.jetbrains.kotlin.android`) + `org.jetbrains.kotlin.plugin.compose` **2.4.21**; compileSdk **37**
-(Compose BOM 2026.09.00 requires it), targetSdk 36, minSdk 26; Java/JVM target 17 via
-`compileOptions` + `kotlin { compilerOptions { jvmTarget = JVM_17 } }` (no `jvmToolchain`).
-Deps: compose-bom 2026.09.00, material3, activity-compose 1.13.0, lifecycle-*-compose 2.11.0,
-navigation-compose 2.10.2, work-runtime-ktx 2.12.0, `net.java.dev.jna:jna:5.19.1@aar`,
-kotlinx-coroutines-android 1.11.0, `com.patrykandpatrick.vico:compose-m3:3.3.1` (D47). applicationId/namespace **`app.magnetar`**, ffi package `app.magnetar.ffi`.
-`.so` built by `scripts/build-android.sh` (cargo-ndk `-t arm64-v8a -t x86_64 -P 26 -o android/app/src/main/jniLibs`),
-Kotlin bindings generated from the **unstripped host** build (`strip=true` removes uniffi metadata).
-Release: `isMinifyEnabled = false` (JNA + R8 untested). If a build dies with EIO check
+`org.jetbrains.kotlin.android`) + `org.jetbrains.kotlin.plugin.compose` and
+`org.jetbrains.kotlin.plugin.serialization` **2.4.21**; compileSdk **37** (Compose BOM
+2026.09.00 requires it), targetSdk 36, minSdk 26; Java/JVM target 17 via `compileOptions` +
+`kotlin { compilerOptions { jvmTarget = JVM_17 } }` (no `jvmToolchain`). Libraries: D80 and
+docs/APP.md §2. applicationId/namespace **`app.magnetar`**; `versionName` = `[workspace.package]
+version` of `Cargo.toml`. Release: `isMinifyEnabled = false` (R8 keep rules for
+kotlinx.serialization not checked yet). If a build dies with EIO check
 `journalctl -k | grep csum` (laptop has shown btrfs csum errors in ~/.gradle).
-
-### 8.2 App (Kotlin, Compose, no Google services)
-- Screens: Search (query, filter sheet, sort), Detail (files, trackers, infohash, npub, liveness, trust
-  explanation, comments; actions open/copy magnet, pin, hide, block publisher, download), Saved searches,
-  Downloads, Settings (server URL, token, root npub, threshold, cache cap, relays, ntfy), Stats (D47: charts,
-  graphs, and Status: local stats, last crawl/sync, seed checks, relays); graph screen (route `graph?path=`).
-- WorkManager `CrawlSyncWorker` periodic 1 h, constraints **unmetered + charging**: crawl_once → sync_now →
-  cleanup → poll_saved_searches → local notification for new hits.
-- Foreground service (`dataSync`) for phone downloads.
-- No default server (empty = offline). Cleartext permitted; Settings warns on `http://` to a host that is neither loopback nor a `*.ts.net` / Tailscale IPv6 address; `100.64.0.0/10` warns too, as it is also CGNAT (D39). HTTPS (Tailscale serve, reverse proxy) is the documented default.
-
-### 8.3 Downloads
-**Spike result (android.md §4): librqbit 9.0.1 (`default-features=false, features=["rust-tls"]`)
-compiles for arm64-v8a + x86_64 and downloaded a real torrent on the API 37 x86_64 emulator; arm64 runtime
-unverified.** So phone downloads run in the ffi crate (cargo feature `downloads`, on by default) with
-explicit app-private paths for session + DHT persistence (never `ProjectDirs`), output in
-`getExternalFilesDir(DIRECTORY_DOWNLOADS)/magnetar`. Hosted by a `dataSync` foreground service started only
-from a user tap; `onTimeout` (Android 15 6 h cap) pauses all, persists, notifies, `stopSelf()`.
-If the engine fails to start, `download_start(on_server=false)` returns `FfiError::Invalid{msg}` and the
-app falls back to an `Intent(ACTION_VIEW, magnet)` (catch `ActivityNotFoundException` → copy magnet).
-Server downloads use the same librqbit features in `magnetar-server` (output `MAGNETAR_DOWNLOAD_DIR`).
-`core::downloads` holds the shared `Downloader` wrapper (librqbit Session → `DownloadInfo`), behind
-core feature `downloads` so core stays light when it is off.
 
 ---
 
@@ -648,7 +582,7 @@ Phone crawl is bounded: max 8 relays, `max_seconds` budget, forward cursors firs
   (`tests/it/stats_bench.rs`, `#[ignore]`).
 - `core`: the release parser against a hand-checked sample of production titles with per-field
   floors (`tests/it/release_sample.rs`, D44).
-- `ffi`: SqliteStore search parity with PgStore on the fixture set; cleanup never deletes unsynced rows;
+- `ffi` (until D79, crate deleted): SqliteStore search parity with PgStore on the fixture set; cleanup never deletes unsynced rows;
   sync to a live in-process server; D44 filters, backfill and the offline title page (`tests/it/filters.rs`).
 - Layout (D78): each crate's integration tests are modules of one binary, `tests/it/main.rs`
   (`tests/it/<former file>.rs`); one module runs with `cargo test -p <crate> --test it <module>::`.
