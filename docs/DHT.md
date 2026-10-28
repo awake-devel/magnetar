@@ -334,7 +334,7 @@ deployment must opt into. The user's laptop runs `aggressive`.
 |---|---|---|
 | Discovery | BEP 51 sampling only | BEP 51 sampling **and** passive capture of incoming `get_peers` / `announce_peer` |
 | Answers queries | no: every query carries `ro=1` (BEP 43) and incoming queries are ignored | yes: full BEP 5 node (ping, find_node, get_peers, announce_peer) + BEP 51 responder; no `ro` |
-| Virtual nodes | 1 | 4 (`MAGNETAR_DHT_NODES`, 1–8) |
+| Virtual nodes | 1 | 4 (`MAGNETAR_DHT_NODES`, 1–32 since D106) |
 | UDP port | ephemeral, no mapping | `MAGNETAR_DHT_PORT`…`+NODES-1` (default 6891–6894), UPnP-mapped (§9) |
 | Outbound KRPC | 50 queries/s | 200 queries/s (`MAGNETAR_DHT_QPS`) |
 | Metadata fetches in flight | 16 | 128 (`MAGNETAR_DHT_FETCH_CONCURRENCY`) |
@@ -355,7 +355,9 @@ Both modes honour every rule of §3.4 (interval, per-IP rate, honest ids, no fak
   code and vectors, not the prose. The BEP allows "more than one node ID per external IP"
   through `r`: there are **8 valid prefixes per IPv4 address** (the other 139 bits are free), so
   a ninth virtual node would share a prefix (and keyspace region) with another one;
-  `MAGNETAR_DHT_NODES` is capped at 8 for that reason. With 4 nodes we pick the 4 `r` values
+  `MAGNETAR_DHT_NODES` was capped at 8 for that reason. Since D106 (§20) it goes to 32: nodes
+  beyond the 8th reuse the `r` values in order (valid BEP 42 ids, the rest of the id random), so
+  they add sockets and query capacity, not new keyspace regions. With 4 nodes we pick the 4 `r` values
   whose prefixes are farthest apart, so the passive nodes cover distant parts of the keyspace.
 - External IP: UPnP `GetExternalIPAddress` when available, else a vote over the BEP 42 `ip` field
   of responses (≥ 8 agreeing responders from ≥ 4 distinct /16s; once an address is known, a
@@ -384,7 +386,8 @@ Both modes honour every rule of §3.4 (interval, per-IP rate, honest ids, no fak
    Never evicted for that (bitmagnet bug, bitmagnet.md §2.4).
 3. ≤ 1 query/s per remote IP across all virtual nodes (bucket burst 2): libtorrent bans senders
    above 5 packets/s per IP for 5 min (dht-crawling.md §1.2).
-4. Global outbound token bucket `MAGNETAR_DHT_QPS` over every KRPC query (sample, find_node,
+4. Global outbound pace `MAGNETAR_DHT_QPS` over every KRPC query (since D106 a FIFO pacer whose
+   turns a cancelled query hands on, §20) (sample, find_node,
    get_peers, ping). Responses we send have their own cap (300/s, 5/s per IP; excess dropped
    silently).
 5. **Adaptive brake**: if the answered share over the last 60 s falls below half of its 10-min
@@ -774,8 +777,8 @@ others are still planned (their stage in brackets).
 |---|---|---|
 | `MAGNETAR_DHT` | `off` | `off` \| `polite` \| `aggressive` (§3.2) |
 | `MAGNETAR_DHT_PORT` | `6891` | first UDP port; virtual node *i* listens on `PORT + i` (aggressive). Polite uses an ephemeral port |
-| `MAGNETAR_DHT_NODES` | `4` (aggressive), `1` (polite) | 1–8 (BEP 42 allows 8 ids per IP) |
-| `MAGNETAR_DHT_QPS` | `200` / `50` | global outbound KRPC queries per second |
+| `MAGNETAR_DHT_NODES` | `4` (aggressive), `1` (polite) | 1–32 (BEP 42 allows 8 id prefixes per IP; beyond 8 they repeat, §3.3, §20) |
+| `MAGNETAR_DHT_QPS` | `200` / `50` | global outbound KRPC queries per second over every virtual node (1–20000, §20) |
 | `MAGNETAR_DHT_POOL` | `1000000` / `200000` | crawl pool size (nodes) |
 | `MAGNETAR_DHT_PEER_LOOKUPS` | `64` / `8` | peer collections (sampling node, then lookup) at once (D62) |
 | `MAGNETAR_DHT_FETCH_CONCURRENCY` | `128` / `16` | metadata fetches in flight |

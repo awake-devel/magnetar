@@ -479,7 +479,8 @@ mod tests {
         let default = Cli::try_parse_from(["magnetar-server", "serve"]).unwrap();
         assert_eq!(default.config.dht, DhtMode::Off);
         for bad in [
-            ["--dht-nodes", "9"],
+            ["--dht-nodes", "33"],
+            ["--dht-qps", "20001"],
             ["--dht-nodes", "0"],
             ["--dht", "loud"],
         ] {

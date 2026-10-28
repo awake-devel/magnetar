@@ -117,9 +117,9 @@ crawler shows up in `/api/v1/stats`, `/api/v1/stats/health` and `/health` (featu
 | Variable | Default | Notes |
 |---|---|---|
 | `MAGNETAR_DHT` | `off` | `off`, `polite` (BEP 51 sampling only, read-only node) or `aggressive` (sampling + passive listening on open UDP ports, UPnP). Crawling shows the host's IP in swarms: opt in deliberately |
-| `MAGNETAR_DHT_PORT` | `6891` | first UDP port (aggressive); virtual node *i* uses `PORT + i` |
-| `MAGNETAR_DHT_NODES` | `4` aggressive, `1` polite | 1–8 (BEP 42 gives 8 valid node-id prefixes per IPv4 address) |
-| `MAGNETAR_DHT_QPS` | `200` / `50` | outbound DHT queries per second, all kinds (router benchmark: 300 safe, 400 breaks the neufbox) |
+| `MAGNETAR_DHT_PORT` | `6891` | first UDP port (aggressive, 1–65504); virtual node *i* uses `PORT + i` |
+| `MAGNETAR_DHT_NODES` | `4` aggressive, `1` polite | 1–32. Each virtual node has its own UDP socket, receive task and lock (D106). BEP 42 gives 8 node-id prefixes per IPv4 address: from the 9th node on, prefixes repeat (still valid ids). Measured on the fiber line: docs/DHT.md §20 |
+| `MAGNETAR_DHT_QPS` | `200` / `50` | outbound DHT queries per second, all kinds, over every virtual node (1–20000; the engine sends ≥ 93 % of 20 000 on loopback, docs/DHT.md §20). Router benchmark: 300 safe, 400 breaks the neufbox |
 | `MAGNETAR_DHT_POOL` | `1000000` / `200000` | nodes kept for sampling (1000–20000000) |
 | `MAGNETAR_DHT_FETCH_KNOWN` | `false` | also queue infohashes already known from Nostr |
 | `MAGNETAR_DHT_PEER_LOOKUPS` | `64` / `8` | peer collections running at once (1–8192; each is a light task, the KRPC rate is the real limit) |
