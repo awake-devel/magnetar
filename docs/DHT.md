@@ -1766,3 +1766,62 @@ so it is several times ahead of what the line and the fetcher use.
 settings; runs longer than 10 minutes; `TCP_RATE` above 2 000 (config max); the Neufbox; worker
 hosts (EEE, RPI) with this build — their tests pass and defaults allocate nothing new, but no
 RSS was measured on them; 32 virtual nodes live (16 was the largest run).
+
+### 20.5 Fix: the sampler on a small pool, and the fake DHT's blind spot (D108, 2026-10-28)
+
+CI failed once after D106 on `dht_fake_network::crawler_samples_captures_and_collects_peers`:
+"sampled 26 of 30", pool 11, `sent_sample_infohashes` 11, `sent_find_node` 7 989 (the whole
+400 q/s for 20 s), `repeat_sent` 7 972. Two separate causes.
+
+- **The test's fake network had a blind spot** (why hashes were missing). A dump of every
+  routing table in a failing run (reproduced ~1 in 40 on a `current_thread` runtime): the fake
+  nodes knew only the two bootstrap nodes, the client and the crawler. A fake node only learns
+  its address from 3 voters and had 2 (its bootstrap nodes), so it queried read-only (BEP 43
+  `ro=1`, §3.3) and nobody put it in a routing table. The only table naming every fake node was
+  the client's, which had heard from all twelve, and that table holds 8 per bucket. In the dump,
+  10 of the 12 ids shared a bucket of the client's table, so 2 nodes were in no table at all. No
+  crawler could find them: the 4 hashes stored only on those two were never sampled. The odds
+  depend on the random ids (≥ 10 of 12 in one bucket ≈ 2 %) and on timing, not on the engine.
+  `b519486` passed 70/70 runs of the same dump harness, this build failed 2 of ~55, so D106 did
+  not measurably change them; the "8/8 on 2 cores" seen before was not captured with its
+  failure text. Fix: the fake nodes start with a known address (`EngineConfig::identity`, as a
+  node that has run before), so they answer and query as full nodes and spread into each
+  other's tables. The test now checks first that every fake node is in some table
+  (`assert_connected`) and also runs on a `current_thread` runtime.
+- **The sampler re-asked the same few nodes on every pace turn** (the `find_node` flood, real,
+  older than D106). When no pool node was due, the sampler took a pace turn and then sent a
+  `find_node` to a random pool node: with 11 nodes, 400 q/s at the same 11. In production the
+  per-IP limit (1 q/s) refused nearly all of these, but only after the turn was taken, and the
+  grow attempts (one per turn) always took the per-IP token before a due node's retry (every
+  2 s) could: on a fresh worker that knows a handful of nodes, sampling stalled. New test
+  `dht_shards::the_sampler_does_not_hammer_a_small_pool` (6 nodes, per-IP 1 q/s, one thread,
+  5 s), before the fix: **0** samples, 36 `find_node`, 1 746 `rate_limited`; after: 6 samples
+  (every node), 18 `find_node`, 0 `rate_limited`.
+
+  Now (`Dht::sampler_pick`): the sampler chooses its query **before** it takes a pace turn,
+  and takes one only for a query that can go out — a due node with a per-IP token free (a
+  limited one is due again in 1 s), else a pool node not asked for more nodes within
+  `GROW_REASK` (10 s) with a token free; otherwise it waits for the next due node (≤ 250 ms;
+  500 ms while nothing is known). The total cap, the per-IP limit, `share` and `priority` are
+  unchanged; on a large pool (production) something is nearly always due, so nothing changes
+  there.
+- **Test harness**: the minimal fake node of `tests/it/dht_shards.rs` sorted its whole table
+  for every query; in a debug build on 1–2 cores that starved the runtime it shares with the
+  crawler, and the D106 tests there (rate cap, lookup time, sampler priority) failed under
+  `taskset -c 0,1`. It now selects the 8 closest without a full sort.
+
+Verification: the crawler test (both runtimes) passed 10/10 under `taskset -c 0`, `-c 0,1` and
+on all 12 cores, the whole `it` binary 2/2 under each, and the one-thread variant 150/150.
+Loopback bench (release, 15 s, `main` = `f829573` interleaved with this build on the same
+machine, load average 13–22 from other work, so lower than §20.3):
+
+| nodes / cap / lookups | build | sent (of cap), each run |
+|---|---|---|
+| 4 / 3 000 / 4 096 | main | 94 %, 90 %, 88 %, 88 %, 91 % |
+| 4 / 3 000 / 4 096 | D108 | 89 %, 89 %, 91 %, 91 %, 100 % |
+| 8 / 10 000 / 8 192 | main | 21 % (busy 487 k), 93 % |
+| 8 / 10 000 / 8 192 | D108 | 91 %, 94 %, 19 % (busy 540 k), 22 % (busy 656 k) |
+
+The 8 / 10 000 runs are bimodal on both builds on this loaded machine: either ~93 % or the
+transaction map fills (`busy`) and the rate collapses, as `main` before D106 did at that load
+(§20.3). That is not caused by this change (it happens to `main` too) and was not chased here.

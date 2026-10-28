@@ -43,13 +43,19 @@ async fn fake_node(
                 Query::SampleInfohashes { target } => (target, true),
                 _ => (me.id, false),
             };
-            let mut near: Vec<CompactNode> = table
+            // One distance per entry and a partial sort: up to 1 000 entries per query in a
+            // debug build must not starve the runtime the crawler shares.
+            let mut near: Vec<([u8; 20], CompactNode)> = table
                 .iter()
-                .copied()
                 .filter(|c| c.addr != me.addr)
+                .map(|c| (distance(&c.id, &target), *c))
                 .collect();
-            near.sort_by_key(|c| distance(&c.id, &target));
-            near.truncate(8);
+            if near.len() > 8 {
+                near.select_nth_unstable_by_key(8, |(d, _)| *d);
+                near.truncate(8);
+            }
+            near.sort_unstable_by_key(|(d, _)| *d);
+            let near: Vec<CompactNode> = near.into_iter().map(|(_, c)| c).collect();
             let values = if distance(&me.id, &target)[0] == 0 {
                 peers.clone()
             } else {
@@ -74,10 +80,11 @@ async fn fake_node(
     });
 }
 
-/// `n` fake nodes on 127.0.<c>.x, ids random except that `close` of them sit next to `hash`.
+/// `n` fake nodes on 127.0.<c>.1–250 (then 127.0.<c + 1>.1–250, …), ids random except that
+/// `close` of them sit next to `hash`.
 async fn fake_net(
     c: u8,
-    n: u8,
+    n: u16,
     hash: [u8; 20],
     close: u8,
     peers: Vec<SocketAddrV4>,
@@ -85,12 +92,15 @@ async fn fake_net(
     let table: Vec<CompactNode> = (1..=n)
         .map(|i| {
             let mut id: [u8; 20] = rand::random();
-            if i <= close {
+            if i <= u16::from(close) {
                 id[..2].copy_from_slice(&hash[..2]);
             }
             CompactNode {
                 id,
-                addr: SocketAddrV4::new(Ipv4Addr::new(127, 0, c, i), 17_000),
+                addr: SocketAddrV4::new(
+                    Ipv4Addr::new(127, 0, c + ((i - 1) / 250) as u8, ((i - 1) % 250 + 1) as u8),
+                    17_000,
+                ),
             }
         })
         .collect();
@@ -237,7 +247,8 @@ async fn lookups_end_and_find_peers_with_many_shards() {
 
 /// The sampler's reserved share (D106, `MAGNETAR_DHT_SAMPLE_PRIORITY`) is sent ahead of a
 /// flood of queued queries, and the total still stays under the cap; without it the sampler
-/// waits behind the flood.
+/// waits behind the flood. 1 000 nodes: the sampler only sends useful queries (§20.5), so it
+/// needs more nodes than it can sample in the window to use its whole share.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_sampler_priority_share_goes_ahead_of_the_queue() {
     let (table, _) = fake_net(47, 250, rand::random(), 0, Vec::new()).await;
@@ -287,4 +298,32 @@ async fn the_sampler_priority_share_goes_ahead_of_the_queue() {
         rates[1] >= 3.0 * rates[0],
         "sampler without / with priority: {rates:?} q/s"
     );
+}
+
+/// A crawler that knows only a few nodes (a freshly started worker) and has sampled them all
+/// must not spend the pace re-asking them (docs/DHT.md §20.5). Before the fix the sampler's
+/// "grow" path sent a `find_node` to a random pool node on every pace turn: 400 q/s at 6 nodes,
+/// nearly all refused by the 1 q/s per-IP limit after the turn was taken, on any number of
+/// cores. Runs on one thread, as a 1-core worker would.
+#[tokio::test(flavor = "current_thread")]
+async fn the_sampler_does_not_hammer_a_small_pool() {
+    let (table, seen) = fake_net(49, 6, rand::random(), 0, Vec::new()).await;
+    let mut cfg = crawler_cfg(Ipv4Addr::new(127, 0, 50, 1), 2, 400);
+    cfg.sample = true; // per-IP limit at its production default, 1 q/s
+    cfg.bootstrap = table.iter().map(|c| c.addr).collect();
+    let (dht, _rx) = Dht::start(cfg).await.unwrap();
+    let secs = 5.0;
+    tokio::time::sleep(Duration::from_secs_f64(secs)).await;
+    let st = dht.stats();
+    let got = seen.load(Ordering::Relaxed);
+    // Every node sampled once (the fake answers carry interval 300 s).
+    assert_eq!(st.sent_sample_infohashes, 6, "{st:?}");
+    // Two self-lookups over 6 nodes, then at most one `find_node` per node per grow interval.
+    assert!(
+        got <= 60,
+        "{got} queries reached 6 nodes in {secs} s; {st:?}"
+    );
+    // Turns are not taken for queries the per-IP limit refuses.
+    assert!(st.rate_limited <= 10, "{st:?}");
+    dht.shutdown().await;
 }
