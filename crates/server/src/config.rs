@@ -225,13 +225,14 @@ pub struct Config {
     #[arg(long, env = "MAGNETAR_DHT", value_enum, default_value = "off")]
     pub dht: DhtMode,
     /// First UDP port; virtual node i listens on PORT + i (aggressive; polite is ephemeral).
-    #[arg(long, env = "MAGNETAR_DHT_PORT", default_value_t = 6891, value_parser = clap::value_parser!(u16).range(1..=65527))]
+    #[arg(long, env = "MAGNETAR_DHT_PORT", default_value_t = 6891, value_parser = clap::value_parser!(u16).range(1..=65504))]
     pub dht_port: u16,
-    /// Virtual nodes, 1–8 (default 4 aggressive, 1 polite).
-    #[arg(long, env = "MAGNETAR_DHT_NODES", value_parser = clap::value_parser!(u8).range(1..=8))]
+    /// Virtual nodes, 1–32 (default 4 aggressive, 1 polite). Each has its own socket, receive
+    /// task and lock (D106); beyond 8 the BEP 42 prefixes repeat.
+    #[arg(long, env = "MAGNETAR_DHT_NODES", value_parser = clap::value_parser!(u8).range(1..=32))]
     pub dht_nodes: Option<u8>,
     /// Outbound KRPC queries per second, all kinds (default 200 aggressive, 50 polite).
-    #[arg(long, env = "MAGNETAR_DHT_QPS", value_parser = clap::value_parser!(u32).range(1..=5000))]
+    #[arg(long, env = "MAGNETAR_DHT_QPS", value_parser = clap::value_parser!(u32).range(1..=20_000))]
     pub dht_qps: Option<u32>,
     /// Crawl pool size in nodes (default 1000000 aggressive, 200000 polite).
     #[arg(long, env = "MAGNETAR_DHT_POOL", value_parser = clap::value_parser!(u64).range(1000..=20_000_000))]

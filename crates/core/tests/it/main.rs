@@ -8,8 +8,10 @@ mod trust_support;
 
 mod api_client;
 mod crawler;
+mod dht_bench;
 mod dht_fake_network;
 mod dht_lookup;
+mod dht_shards;
 mod liveness;
 mod liveness_live;
 mod metainfo_fetch;

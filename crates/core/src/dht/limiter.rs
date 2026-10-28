@@ -1,7 +1,7 @@
 //! Rate limits (docs/DHT.md §3.4 rules 3–5, D54):
 //!
-//! - a global outbound pace over every KRPC query (`MAGNETAR_DHT_QPS`), as a GCRA schedule: each
-//!   caller reserves the next free slot and sleeps until it, so waiters are served in order;
+//! - a global outbound pace over every KRPC query (`MAGNETAR_DHT_QPS`): a FIFO of senders that
+//!   get a permit at the configured rate, cancel-safe ([`Pacer`], D106);
 //! - ≤ 1 query/s per remote IP (bucket burst 2) across all virtual nodes — libtorrent bans
 //!   senders above 5 packets/s per IP;
 //! - responses we send: 300/s globally and 5/s per IP, excess dropped silently (this bounds what a
@@ -9,7 +9,8 @@
 //! - the adaptive brake: when the answered share of the last 60 s falls below half of its 10-min
 //!   average while sending more than 50 q/s, the pace halves for 5 minutes.
 //!
-//! Every map is capped (65 536 IPs); idle buckets are full and can be forgotten.
+//! Every map is capped (65 536 IPs, over [`IP_SHARDS`] locks); idle buckets are full and can be
+//! forgotten.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
@@ -144,6 +145,12 @@ impl Brake {
         self.current.1 = self.current.1.saturating_add(1);
     }
 
+    /// Add `sent` / `answered` to the current second (the engine counts them in atomics, D106).
+    pub fn record(&mut self, sent: u32, answered: u32) {
+        self.current.0 = self.current.0.saturating_add(sent);
+        self.current.1 = self.current.1.saturating_add(answered);
+    }
+
     pub fn active(&self, now: Instant) -> bool {
         self.until.is_some_and(|u| now < u)
     }
@@ -195,7 +202,52 @@ impl Brake {
     }
 }
 
-/// The global outbound pace (GCRA): `reserve` hands out send instants `1/rate` apart.
+/// Shards of the per-IP limit: an address always maps to the same shard, so the 1 q/s rule holds
+/// exactly while queries from different virtual nodes and lookups take different locks (D106).
+pub const IP_SHARDS: usize = 16;
+
+/// [`PerIp`] split by address over [`IP_SHARDS`] locks, the same total cap.
+#[derive(Debug)]
+pub struct IpLimits {
+    shards: Vec<std::sync::Mutex<PerIp>>,
+}
+
+impl IpLimits {
+    pub fn new(rate: f64, burst: f64, cap: usize) -> Self {
+        let per = cap.div_ceil(IP_SHARDS).max(1);
+        Self {
+            shards: (0..IP_SHARDS)
+                .map(|_| std::sync::Mutex::new(PerIp::new(rate, burst, per)))
+                .collect(),
+        }
+    }
+
+    fn shard(&self, ip: &Ipv4Addr) -> std::sync::MutexGuard<'_, PerIp> {
+        // Fibonacci hashing of the address: neighbouring addresses spread over the shards.
+        let h = u32::from(*ip).wrapping_mul(0x9E37_79B1) >> 28;
+        self.shards[h as usize % IP_SHARDS].lock().unwrap()
+    }
+
+    pub fn try_take(&self, ip: Ipv4Addr, now: Instant) -> bool {
+        self.shard(&ip).try_take(ip, now)
+    }
+
+    pub fn available(&self, ip: &Ipv4Addr, now: Instant) -> bool {
+        self.shard(ip).available(ip, now)
+    }
+
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(|s| s.lock().unwrap().len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// A GCRA schedule: `reserve` hands out instants `1/rate` apart, waiters served in order. Used by
+/// the metadata fetcher's TCP connection rate; KRPC queries use [`Pacer`] (D106), because a
+/// reserved instant whose caller is cancelled is lost.
 #[derive(Debug)]
 pub struct Pace {
     interval: Duration,
@@ -220,6 +272,113 @@ impl Pace {
         };
         self.next = at + step;
         at
+    }
+}
+
+/// How often the pacer hands out send permits.
+pub const PACER_TICK: Duration = Duration::from_millis(2);
+
+/// The global outbound pace over every virtual node (D106): a FIFO of senders served at the
+/// configured rate (half while braked).
+///
+/// The earlier pace (D54) reserved a send instant per query in advance. A lookup that ended
+/// dropped its queued queries, and their instants went unused: at 4 096 lookups and a cap of
+/// 3 000 q/s only 73–75 % of the cap was sent, on the live line and on loopback alike
+/// (docs/DHT.md §20). Here a waiter takes a permit only when its turn comes; a waiter that is
+/// dropped leaves the queue, and the permit goes to the next one.
+///
+/// Permits are added every [`PACER_TICK`] by [`Pacer::refill`], at most [`Pacer::burst`]
+/// unused at a time, so an idle pacer does not bank a burst.
+#[derive(Debug)]
+pub struct Pacer {
+    sem: tokio::sync::Semaphore,
+    rate: f64,
+    burst: usize,
+    braked: std::sync::atomic::AtomicBool,
+    state: std::sync::Mutex<(f64, Instant)>,
+}
+
+impl Pacer {
+    pub fn new(qps: u32, now: Instant) -> Self {
+        let rate = f64::from(qps.max(1));
+        Self {
+            sem: tokio::sync::Semaphore::new(1),
+            rate,
+            // Two ticks' worth: a tick that comes late does not lose its permits.
+            burst: ((rate * PACER_TICK.as_secs_f64() * 2.0).ceil() as usize).max(1),
+            braked: std::sync::atomic::AtomicBool::new(false),
+            state: std::sync::Mutex::new((0.0, now)),
+        }
+    }
+
+    pub fn rate(&self) -> f64 {
+        self.rate
+    }
+
+    pub fn burst(&self) -> usize {
+        self.burst
+    }
+
+    /// Halve the rate (brake, D66) or restore it.
+    pub fn set_braked(&self, braked: bool) {
+        self.braked
+            .store(braked, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn braked(&self) -> bool {
+        self.braked.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Add the permits earned since the last refill (returns how many); at most
+    /// [`burst`](Self::burst) stay unused.
+    pub fn refill(&self, now: Instant) -> usize {
+        let mut st = self.state.lock().unwrap();
+        let (credit, at) = &mut *st;
+        let rate = if self.braked() {
+            self.rate / 2.0
+        } else {
+            self.rate
+        };
+        *credit += now.saturating_duration_since(*at).as_secs_f64() * rate;
+        *at = now;
+        let whole = credit.floor();
+        *credit -= whole;
+        // Everything earned goes to the waiters (a late tick on a busy runtime must not lose
+        // its share: capping before handing out cost ~15 % of the rate, docs/DHT.md §20); only
+        // what nobody took is cut back to `burst`.
+        let add = whole as usize;
+        if add > 0 {
+            self.sem.add_permits(add);
+            let idle = self.sem.available_permits();
+            if idle > self.burst {
+                self.sem.forget_permits(idle - self.burst);
+            }
+        }
+        add
+    }
+
+    /// Wait for a send permit (FIFO). Cancel-safe: a dropped wait consumes nothing.
+    pub async fn acquire(&self) {
+        if let Ok(p) = self.sem.acquire().await {
+            p.forget();
+        }
+    }
+
+    /// Take a permit if one is free now.
+    pub fn try_acquire(&self) -> bool {
+        self.sem.try_acquire().map(|p| p.forget()).is_ok()
+    }
+
+    /// Run [`refill`](Self::refill) every [`PACER_TICK`] until `stop` is set.
+    pub async fn run(&self, mut stop: tokio::sync::watch::Receiver<bool>) {
+        let mut tick = tokio::time::interval(PACER_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => { self.refill(Instant::now()); }
+                _ = stop.wait_for(|s| *s) => return,
+            }
+        }
     }
 }
 
@@ -269,9 +428,86 @@ mod tests {
         assert_eq!(a, t);
         assert_eq!(b - a, Duration::from_millis(10));
         assert_eq!(d - c, Duration::from_millis(20));
-        // An idle pace does not bank tokens: after a pause the next slot is "now".
         let later = t + Duration::from_secs(5);
         assert_eq!(p.reserve(later, false), later);
+    }
+
+    #[test]
+    fn pacer_rate_burst_and_brake() {
+        let t = Instant::now();
+        let p = Pacer::new(1000, t);
+        // Starts with one permit; 10 ms earn 10 but at most `burst` (4) wait unused.
+        assert!(p.try_acquire());
+        assert!(!p.try_acquire());
+        assert_eq!(p.burst(), 4);
+        assert_eq!(p.refill(t + Duration::from_millis(10)), 10);
+        for _ in 0..4 {
+            assert!(p.try_acquire());
+        }
+        assert!(!p.try_acquire());
+        // Braked: half the rate.
+        p.set_braked(true);
+        assert_eq!(p.refill(t + Duration::from_millis(14)), 2);
+        p.set_braked(false);
+        assert_eq!(p.refill(t + Duration::from_millis(16)), 2);
+    }
+
+    /// A dropped waiter consumes nothing: the permit goes to the next one (the old pace lost
+    /// the slot of every cancelled query, docs/DHT.md §20).
+    #[tokio::test]
+    async fn pacer_waiter_cancel_keeps_the_permit() {
+        let t = Instant::now();
+        let p = Pacer::new(1000, t);
+        assert!(p.try_acquire());
+        {
+            let w = p.acquire();
+            tokio::pin!(w);
+            assert!(futures::poll!(w.as_mut()).is_pending());
+        } // dropped while queued
+        p.refill(t + Duration::from_millis(1));
+        assert!(p.try_acquire());
+    }
+
+    /// A late refill hands everything earned to the queued senders (only idle permits are
+    /// capped at `burst`): capping first lost ~15 % of the rate on a busy runtime.
+    #[tokio::test]
+    async fn pacer_late_tick_serves_every_waiter_it_earned() {
+        let t = Instant::now();
+        let p = std::sync::Arc::new(Pacer::new(1000, t));
+        assert!(p.try_acquire());
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let (p, done) = (p.clone(), done.clone());
+            set.spawn(async move {
+                p.acquire().await;
+                done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            });
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(p.refill(t + Duration::from_millis(10)), 10);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(done.load(std::sync::atomic::Ordering::Relaxed), 10);
+        set.abort_all();
+    }
+
+    #[test]
+    fn ip_limits_hold_per_ip_across_shards() {
+        let l = IpLimits::new(1.0, 2.0, 1024);
+        let t = Instant::now();
+        for i in 0..200u32 {
+            let ip = Ipv4Addr::from(0x0a00_0000 + i * 7919);
+            assert!(l.try_take(ip, t));
+            assert!(l.try_take(ip, t));
+            assert!(
+                !l.try_take(ip, t),
+                "third query to {ip} in the same instant"
+            );
+            assert!(!l.available(&ip, t));
+            assert!(l.try_take(ip, t + Duration::from_secs(1)));
+        }
+        assert_eq!(l.len(), 200);
     }
 
     #[test]

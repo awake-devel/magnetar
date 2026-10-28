@@ -1,15 +1,18 @@
 //! The crawler node: one UDP socket per virtual node, transactions, the BEP 5/51 responder
 //! (aggressive), the BEP 51 sampler and maintenance (docs/DHT.md §3.2–§3.6, D54, D55).
 //!
-//! Concurrency: one receive task per socket, one sampler task, one maintenance task; queries are
-//! futures that register a transaction keyed by (virtual node, tid, remote address) and wait for
-//! the matching answer for up to [`QUERY_TIMEOUT`]. Shared state lives behind one `std` mutex that
-//! is never held across an `.await`.
+//! Concurrency (D106): one shard per virtual node — its socket, receive task, routing table and
+//! transaction map behind its own lock — plus a pacer task, one sampler task and one maintenance
+//! task. Queries are futures that wait for a permit of the global pacer, register a transaction
+//! keyed by (tid, remote address) in their shard and wait for the matching answer for up to
+//! [`QUERY_TIMEOUT`]. State shared by every shard (crawl pool, per-IP limits in 16 shards, brake,
+//! votes, peer store) has a lock of its own; no `std` lock is held across an `.await` and no
+//! two are held at once.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use rand::Rng;
@@ -20,16 +23,19 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 
 use super::addr::AddrFilter;
+use super::budget::SampleBudget;
 use super::id::{NodeId, bep42_id, common_prefix_bits, random_id_in_bucket, spread_r_values};
 use super::krpc::{
     self, Body, CompactNode, ERR_METHOD_UNKNOWN, ERR_PROTOCOL, Id, MAX_DATAGRAM, Message, Query,
     Response,
 };
-use super::limiter::{Brake, Bucket, IP_BUCKETS_CAP, Pace, PerIp};
+use super::limiter::{Brake, Bucket, IP_BUCKETS_CAP, IpLimits, Pacer, PerIp};
 use super::peerstore::{self, PeerStore};
 use super::pool::{Pool, PoolCounts, Tier};
 use super::routing::{K, RoutingTable, Seen};
 
+/// Virtual nodes (sockets) at most (D106; 8 before: one per BEP 42 prefix of an IPv4 address).
+pub const MAX_VIRTUAL_NODES: usize = 32;
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(4);
 /// Lookup queries count as slow after this (D93): the lookup stops waiting for them and asks the
 /// next candidate, but still takes a late answer until [`QUERY_TIMEOUT`]. Default 4 s = no widening:
@@ -389,11 +395,6 @@ impl From<PoolCounts> for PoolStats {
     }
 }
 
-struct VNode {
-    routing: RoutingTable,
-    ro: bool,
-}
-
 #[derive(Default)]
 struct Vote {
     responders: HashSet<Ipv4Addr>,
@@ -459,34 +460,65 @@ impl Votes {
     }
 }
 
-struct State {
-    nodes: Vec<VNode>,
-    pool: Pool,
-    peers: PeerStore,
-    pending: HashMap<PendingKey, oneshot::Sender<Reply>>,
-    pending_cap: usize,
-    pace: Pace,
-    per_ip: PerIp,
-    brake: Brake,
-    resp_global: Bucket,
-    resp_ip: PerIp,
-    filter: AddrFilter,
-    external_ip: Option<Ipv4Addr>,
-    votes: Votes,
-    votes_since: Instant,
-    secrets: [[u8; 16]; 2],
-    rr: usize,
-    /// Share of the QPS budget the sampler may use, 0–1 (D62: the server lowers it while the
-    /// fetch queue is backlogged, so discovery does not outrun what peer collection consumes).
-    sample_share: f64,
-    sample_next: Instant,
+/// One virtual node (D106): its socket, receive task, routing table and transactions. Each has
+/// its own lock, so answers arriving on different sockets and queries sent from different
+/// virtual nodes do not wait for each other.
+struct Shard {
+    socket: Arc<UdpSocket>,
+    st: Mutex<ShardState>,
 }
 
+struct ShardState {
+    routing: RoutingTable,
+    ro: bool,
+    /// Queries on the wire from this node, keyed by (tid, remote address).
+    pending: HashMap<PendingKey, oneshot::Sender<Reply>>,
+}
+
+/// The address filter and our external address (read on every send, written on an IP change).
+struct Ext {
+    filter: AddrFilter,
+    external_ip: Option<Ipv4Addr>,
+}
+
+struct VoteState {
+    votes: Votes,
+    since: Instant,
+}
+
+/// Caps on the responses we send (D54 rule 4).
+struct Responder {
+    global: Bucket,
+    per_ip: PerIp,
+}
+
+/// Engine state, split by what is used together (D106). Lock order: never hold two of these
+/// locks at once, except [`Dht::set_external`] (the vote lock is released first).
 struct Inner {
     cfg: EngineConfig,
-    sockets: Vec<Arc<UdpSocket>>,
+    shards: Vec<Shard>,
     local_ports: Vec<u16>,
-    state: Mutex<State>,
+    /// The crawl pool spans the keyspace and every virtual node: one lock, short sections.
+    pool: Mutex<Pool>,
+    peers: Mutex<PeerStore>,
+    /// 1 q/s per remote IP across every virtual node, sharded by address (exact per IP).
+    per_ip: IpLimits,
+    /// The global QPS cap over every virtual node (one FIFO, cancel-safe).
+    pacer: Pacer,
+    /// Transactions on the wire over every shard, against `pending_cap`.
+    pending: AtomicUsize,
+    pending_cap: usize,
+    brake: Mutex<Brake>,
+    /// Sent / answered in the current second, folded into `brake` once a second.
+    brake_sent: AtomicU32,
+    brake_answered: AtomicU32,
+    resp: Mutex<Responder>,
+    ext: RwLock<Ext>,
+    votes: Mutex<VoteState>,
+    secrets: RwLock<[[u8; 16]; 2]>,
+    rr: AtomicUsize,
+    /// The sampling / lookup split of the budget (D62): see [`super::budget`].
+    budget: Mutex<SampleBudget>,
     c: Counters,
     sightings: mpsc::Sender<Sighting>,
     stop: watch::Receiver<bool>,
@@ -508,18 +540,23 @@ fn token_for(secret: &[u8; 16], ip: Ipv4Addr) -> [u8; 8] {
     std::array::from_fn(|i| d[i])
 }
 
+/// BEP 42 ids for `n` virtual nodes. Beyond the 8 prefixes an IPv4 address allows, the `r`
+/// values repeat: such nodes share a 21-bit prefix with another one (D106), the rest of the id
+/// is random.
 fn ids_for(ip: Ipv4Addr, n: usize) -> Vec<NodeId> {
     let mut rng = rand::rng();
-    spread_r_values(ip, n)
-        .into_iter()
-        .map(|r| {
+    let rs = spread_r_values(ip, n.min(8));
+    (0..n)
+        .map(|i| {
+            let r = rs[i % rs.len()];
             let rand_byte = (rng.random::<u8>() & 0xf8) | r;
             bep42_id(ip, rand_byte, rng.random())
         })
         .collect()
 }
 
-type PendingKey = (usize, [u8; 2], SocketAddrV4);
+/// (tid, remote address) within one shard.
+type PendingKey = ([u8; 2], SocketAddrV4);
 
 /// Owns a query's receiver; on drop removes the transaction unless it already belongs to a newer
 /// query with the same key (its sender is then still open).
@@ -530,6 +567,7 @@ type PendingKey = (usize, [u8; 2], SocketAddrV4);
 /// and those silences would otherwise never be recorded.
 struct PendingGuard<'a> {
     dht: &'a Dht,
+    node: usize,
     key: PendingKey,
     rx: Option<oneshot::Receiver<Reply>>,
     /// Set once the datagram is sent, cleared when an answer or the hard timeout is handled.
@@ -539,15 +577,19 @@ struct PendingGuard<'a> {
 impl Drop for PendingGuard<'_> {
     fn drop(&mut self) {
         drop(self.rx.take());
-        let mut s = self.dht.inner.state.lock().unwrap();
-        if s.pending.get(&self.key).is_some_and(|tx| tx.is_closed()) {
-            s.pending.remove(&self.key);
+        let inner = &self.dht.inner;
+        {
+            let mut s = inner.shards[self.node].st.lock().unwrap();
+            if s.pending.get(&self.key).is_some_and(|tx| tx.is_closed()) {
+                s.pending.remove(&self.key);
+                inner.pending.fetch_sub(1, Ordering::Relaxed);
+            }
         }
         if self
             .waiting_since
             .is_some_and(|t| t.elapsed() >= self.dht.lookup_timeout())
         {
-            s.pool.silent(&self.key.2);
+            inner.pool.lock().unwrap().silent(&self.key.1);
         }
     }
 }
@@ -556,11 +598,11 @@ impl Dht {
     /// Bind the sockets and start the node. Returns the handle and the stream of sightings.
     pub async fn start(mut cfg: EngineConfig) -> std::io::Result<(Dht, mpsc::Receiver<Sighting>)> {
         // At least one socket (an empty port list means one ephemeral port): every virtual node
-        // owns a socket, indexed like `nodes`.
+        // owns a socket.
         if cfg.ports.is_empty() {
             cfg.ports.push(0);
         }
-        let n = cfg.ports.len().min(8);
+        let n = cfg.ports.len().min(MAX_VIRTUAL_NODES);
         let mut sockets = Vec::with_capacity(n);
         let mut local_ports = Vec::with_capacity(n);
         for &port in cfg.ports.iter().take(n) {
@@ -574,7 +616,7 @@ impl Dht {
             Some(id) => (ids_for(id.external_ip, n), Some(id.external_ip)),
             None => ((0..n).map(|_| rand::random()).collect(), None),
         };
-        let ro = |known: bool| cfg.mode == Mode::Polite || !known;
+        let ro = cfg.mode == Mode::Polite || external_ip.is_none();
         let mut filter = AddrFilter::new(cfg.allow_loopback);
         if let Some(ip) = external_ip
             && !ip.is_loopback()
@@ -582,43 +624,52 @@ impl Dht {
             filter.set_own(Some(ip));
         }
         let qps = cfg.qps.max(1);
-        let state = State {
-            nodes: ids
-                .iter()
-                .map(|id| VNode {
+        let shards = sockets
+            .into_iter()
+            .zip(&ids)
+            .map(|(socket, id)| Shard {
+                socket,
+                st: Mutex::new(ShardState {
                     routing: RoutingTable::new(*id, now),
-                    ro: ro(external_ip.is_some()),
-                })
-                .collect(),
-            pool: Pool::new(cfg.pool_cap),
-            peers: PeerStore::new(peerstore::CAP),
-            pending: HashMap::new(),
-            pending_cap: (qps as usize * cfg.query_timeout.as_secs().max(1) as usize * 2).max(64),
-            pace: Pace::new(qps, now),
-            per_ip: PerIp::new(
+                    ro,
+                    pending: HashMap::new(),
+                }),
+            })
+            .collect();
+        let (tx, rx) = mpsc::channel(cfg.sighting_capacity.max(1));
+        let (stop_tx, stop) = watch::channel(false);
+        let inner = Arc::new(Inner {
+            shards,
+            local_ports,
+            pool: Mutex::new(Pool::new(cfg.pool_cap)),
+            peers: Mutex::new(PeerStore::new(peerstore::CAP)),
+            per_ip: IpLimits::new(
                 cfg.per_ip_qps,
                 (cfg.per_ip_qps * 2.0).max(2.0),
                 IP_BUCKETS_CAP,
             ),
-            brake: Brake::default(),
-            resp_global: Bucket::new(cfg.response_rate, cfg.response_rate, now),
-            resp_ip: PerIp::new(cfg.response_per_ip, cfg.response_per_ip, IP_BUCKETS_CAP),
-            filter,
-            external_ip,
-            votes: Votes::default(),
-            votes_since: now,
-            secrets: [rand::random(), rand::random()],
-            rr: 0,
-            sample_share: 1.0,
-            sample_next: now,
-        };
-        let (tx, rx) = mpsc::channel(cfg.sighting_capacity.max(1));
-        let (stop_tx, stop) = watch::channel(false);
-        let inner = Arc::new(Inner {
+            pacer: Pacer::new(qps, now),
+            pending: AtomicUsize::new(0),
+            pending_cap: (qps as usize * cfg.query_timeout.as_secs().max(1) as usize * 2).max(64),
+            brake: Mutex::new(Brake::default()),
+            brake_sent: AtomicU32::new(0),
+            brake_answered: AtomicU32::new(0),
+            resp: Mutex::new(Responder {
+                global: Bucket::new(cfg.response_rate, cfg.response_rate, now),
+                per_ip: PerIp::new(cfg.response_per_ip, cfg.response_per_ip, IP_BUCKETS_CAP),
+            }),
+            ext: RwLock::new(Ext {
+                filter,
+                external_ip,
+            }),
+            votes: Mutex::new(VoteState {
+                votes: Votes::default(),
+                since: now,
+            }),
+            secrets: RwLock::new([rand::random(), rand::random()]),
+            rr: AtomicUsize::new(0),
+            budget: Mutex::new(SampleBudget::new(now)),
             cfg,
-            sockets,
-            local_ports,
-            state: Mutex::new(state),
             c: Counters::default(),
             sightings: tx,
             stop,
@@ -629,10 +680,15 @@ impl Dht {
             tasks: Arc::new(Mutex::new(Vec::new())),
         };
         let mut tasks = Vec::new();
-        for i in 0..dht.inner.sockets.len() {
+        for i in 0..dht.inner.shards.len() {
             let d = dht.clone();
             tasks.push(tokio::spawn(async move { d.recv_loop(i).await }));
         }
+        let d = dht.clone();
+        tasks.push(tokio::spawn(async move {
+            let stop = d.inner.stop.clone();
+            d.inner.pacer.run(stop).await
+        }));
         let d = dht.clone();
         tasks.push(tokio::spawn(async move { d.maintenance_loop().await }));
         if dht.inner.cfg.sample {
@@ -667,7 +723,7 @@ impl Dht {
     }
 
     pub fn virtual_nodes(&self) -> usize {
-        self.inner.sockets.len()
+        self.inner.shards.len()
     }
 
     pub fn mode(&self) -> Mode {
@@ -675,33 +731,41 @@ impl Dht {
     }
 
     pub fn ids(&self) -> Vec<NodeId> {
-        let s = self.inner.state.lock().unwrap();
-        s.nodes.iter().map(|n| n.routing.own_id()).collect()
+        self.inner
+            .shards
+            .iter()
+            .map(|s| s.st.lock().unwrap().routing.own_id())
+            .collect()
     }
 
     /// The voted (or persisted) external IP and current ids.
     pub fn identity(&self) -> Option<Identity> {
-        let s = self.inner.state.lock().unwrap();
-        s.external_ip.map(|ip| Identity {
+        let ip = self.inner.ext.read().unwrap().external_ip?;
+        Some(Identity {
             external_ip: ip,
-            ids: s.nodes.iter().map(|n| n.routing.own_id()).collect(),
+            ids: self.ids(),
         })
     }
 
     /// Good routing contacts and recently answering pool nodes, for the next start.
     pub fn nodes_to_save(&self, n: usize) -> Vec<CompactNode> {
-        let s = self.inner.state.lock().unwrap();
         let now = Instant::now();
         let mut out: Vec<CompactNode> = Vec::new();
         let mut seen = HashSet::new();
-        for v in &s.nodes {
-            for c in v.routing.good(now, n) {
+        for sh in &self.inner.shards {
+            for c in sh.st.lock().unwrap().routing.good(now, n) {
                 if seen.insert(c.addr) {
                     out.push(c);
                 }
             }
         }
-        for c in s.pool.answered_recently(now, Duration::from_secs(3600), n) {
+        let recent =
+            self.inner
+                .pool
+                .lock()
+                .unwrap()
+                .answered_recently(now, Duration::from_secs(3600), n);
+        for c in recent {
             if out.len() >= n {
                 break;
             }
@@ -713,14 +777,18 @@ impl Dht {
         out
     }
 
+    /// The `k` closest routing contacts of every virtual node.
+    fn routing_closest(&self, target: &Id, k: usize) -> Vec<CompactNode> {
+        self.inner
+            .shards
+            .iter()
+            .flat_map(|s| s.st.lock().unwrap().routing.closest(target, k))
+            .collect()
+    }
+
     /// The `k` closest routing contacts over every virtual node.
     pub fn closest(&self, target: &Id, k: usize) -> Vec<CompactNode> {
-        let s = self.inner.state.lock().unwrap();
-        let mut all: Vec<CompactNode> = s
-            .nodes
-            .iter()
-            .flat_map(|v| v.routing.closest(target, k))
-            .collect();
+        let mut all = self.routing_closest(target, k);
         all.sort_by_key(|c| super::id::distance(&c.id, target));
         all.dedup_by_key(|c| c.addr);
         all.truncate(k);
@@ -730,14 +798,8 @@ impl Dht {
     /// Lookup seeds: the `k` closest contacts of the routing tables **and** the crawl pool
     /// (D61), nearest first, one per address.
     pub fn closest_known(&self, target: &Id, k: usize) -> Vec<CompactNode> {
-        let s = self.inner.state.lock().unwrap();
-        let mut all: Vec<CompactNode> = s
-            .nodes
-            .iter()
-            .flat_map(|v| v.routing.closest(target, k))
-            .chain(s.pool.closest(target, k))
-            .collect();
-        drop(s);
+        let mut all = self.routing_closest(target, k);
+        all.extend(self.inner.pool.lock().unwrap().closest(target, k));
         all.sort_by_key(|c| (super::id::distance(&c.id, target), c.addr));
         let mut seen = std::collections::HashSet::new();
         all.retain(|c| seen.insert(c.addr));
@@ -752,30 +814,31 @@ impl Dht {
     pub fn lookup_seeds(&self, target: &Id, k: usize) -> Vec<super::lookup::SeedCand> {
         use super::lookup::SeedCand;
         let now = Instant::now();
-        let s = self.inner.state.lock().unwrap();
-        let mut all: Vec<SeedCand> = s
-            .pool
-            .closest_ranked(target, k * SEED_SPREAD, now)
-            .into_iter()
-            .map(|(node, tier)| SeedCand {
-                node,
-                tier,
-                limited: false,
-            })
-            .collect();
-        for v in &s.nodes {
-            for (node, t) in v.routing.closest_ranked(target, k, now) {
-                all.push(SeedCand {
+        let mut routed: Vec<(CompactNode, Tier)> = Vec::new();
+        for sh in &self.inner.shards {
+            routed.extend(sh.st.lock().unwrap().routing.closest_ranked(target, k, now));
+        }
+        let mut all: Vec<SeedCand> = {
+            let pool = self.inner.pool.lock().unwrap();
+            let mut all: Vec<SeedCand> = pool
+                .closest_ranked(target, k * SEED_SPREAD, now)
+                .into_iter()
+                .map(|(node, tier)| SeedCand {
                     node,
-                    tier: s.pool.tier_of(&node.addr, now).unwrap_or(t),
+                    tier,
                     limited: false,
-                });
-            }
-        }
+                })
+                .collect();
+            all.extend(routed.into_iter().map(|(node, t)| SeedCand {
+                node,
+                tier: pool.tier_of(&node.addr, now).unwrap_or(t),
+                limited: false,
+            }));
+            all
+        };
         for c in &mut all {
-            c.limited = !s.per_ip.available(c.node.addr.ip(), now);
+            c.limited = !self.inner.per_ip.available(c.node.addr.ip(), now);
         }
-        drop(s);
         let out = super::lookup::rank_seeds(all, target, k);
         for c in &out {
             match c.tier {
@@ -791,46 +854,42 @@ impl Dht {
     /// Whether our per-IP limit would refuse a query to each address right now (D95).
     pub fn limited(&self, addrs: &[SocketAddrV4]) -> Vec<bool> {
         let now = Instant::now();
-        let s = self.inner.state.lock().unwrap();
         addrs
             .iter()
-            .map(|a| !s.per_ip.available(a.ip(), now))
+            .map(|a| !self.inner.per_ip.available(a.ip(), now))
             .collect()
     }
 
     /// The pool's tier of each address (unknown to the pool → [`Tier::Unknown`]), one lock.
     pub fn tiers_of(&self, addrs: &[SocketAddrV4]) -> Vec<Tier> {
         let now = Instant::now();
-        let s = self.inner.state.lock().unwrap();
+        let pool = self.inner.pool.lock().unwrap();
         addrs
             .iter()
-            .map(|a| s.pool.tier_of(a, now).unwrap_or(Tier::Unknown))
+            .map(|a| pool.tier_of(a, now).unwrap_or(Tier::Unknown))
             .collect()
     }
 
     /// Halve the KRPC query rate until `until` (router health probe, D66). Extends an active
     /// brake, never shortens it.
     pub fn brake_until(&self, until: Instant) {
-        self.inner.state.lock().unwrap().brake.engage_until(until);
+        let mut b = self.inner.brake.lock().unwrap();
+        b.engage_until(until);
+        self.inner.pacer.set_braked(b.active(Instant::now()));
     }
 
     /// Set the sampler's share of the QPS budget (clamped to 0–1; 0 pauses sampling, the
-    /// rest of the node keeps running).
+    /// rest of the node keeps running). The split itself lives in [`super::budget`].
     pub fn set_sample_share(&self, share: f64) {
-        let mut s = self.inner.state.lock().unwrap();
-        let share = if share.is_nan() {
-            1.0
-        } else {
-            share.clamp(0.0, 1.0)
-        };
-        if share != s.sample_share {
-            s.sample_share = share;
-            s.sample_next = Instant::now();
-        }
+        self.inner
+            .budget
+            .lock()
+            .unwrap()
+            .set_share(share, Instant::now());
     }
 
     pub fn sample_share(&self) -> f64 {
-        self.inner.state.lock().unwrap().sample_share
+        self.inner.budget.lock().unwrap().share()
     }
 
     pub fn bootstrap_addrs(&self) -> &[SocketAddrV4] {
@@ -839,16 +898,32 @@ impl Dht {
 
     /// Round-robin virtual node for the next query.
     pub fn next_node(&self) -> usize {
-        let mut s = self.inner.state.lock().unwrap();
-        s.rr = s.rr.wrapping_add(1);
-        s.rr % s.nodes.len()
+        self.inner
+            .rr
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
+            % self.inner.shards.len()
     }
 
     pub fn stats(&self) -> EngineStats {
         let c = &self.inner.c;
         let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
-        let s = self.inner.state.lock().unwrap();
         let now = Instant::now();
+        let routing: Vec<usize> = self
+            .inner
+            .shards
+            .iter()
+            .map(|s| s.st.lock().unwrap().routing.len())
+            .collect();
+        let (brake_active, brake_engaged) = {
+            let b = self.inner.brake.lock().unwrap();
+            (b.active(now), b.engaged)
+        };
+        let (peer_store_hashes, peer_store_peers) = {
+            let p = self.inner.peers.lock().unwrap();
+            (p.hashes(), p.peers())
+        };
+        let pool = self.inner.pool.lock().unwrap().counts().into();
         EngineStats {
             queries_sent: c.sent.iter().map(g).sum(),
             sent_ping: g(&c.sent[0]),
@@ -882,16 +957,16 @@ impl Dht {
             nodes_learnt: g(&c.nodes_learnt),
             nodes_filtered: g(&c.nodes_filtered),
             nodes_farm: g(&c.nodes_farm),
-            external_ip_known: s.external_ip.is_some(),
+            external_ip_known: self.inner.ext.read().unwrap().external_ip.is_some(),
             external_ip_changes: g(&c.ip_changes),
-            brake_active: s.brake.active(now),
-            sample_share: s.sample_share,
-            brake_engaged: s.brake.engaged,
-            pending: s.pending.len(),
-            routing: s.nodes.iter().map(|n| n.routing.len()).collect(),
-            pool: s.pool.counts().into(),
-            peer_store_hashes: s.peers.hashes(),
-            peer_store_peers: s.peers.peers(),
+            brake_active,
+            sample_share: self.sample_share(),
+            brake_engaged,
+            pending: self.inner.pending.load(Ordering::Relaxed),
+            routing,
+            pool,
+            peer_store_hashes,
+            peer_store_peers,
             udp_bytes_in: g(&c.udp_bytes_in),
             udp_bytes_out: g(&c.udp_bytes_out),
             lookups: g(&c.lookups),
@@ -958,13 +1033,15 @@ impl Dht {
         }
     }
 
+    /// Our own sockets on loopback (tests) are never a destination.
+    fn is_own(&self, a: &SocketAddrV4) -> bool {
+        a.ip().is_loopback() && self.inner.local_ports.contains(&a.port())
+    }
+
     /// Keep only the addresses we may hand the fetcher (one lock for the whole list).
     pub fn retain_allowed(&self, v: &mut Vec<SocketAddrV4>) {
-        let s = self.inner.state.lock().unwrap();
-        v.retain(|a| {
-            s.filter.allows(a)
-                && !(a.ip().is_loopback() && self.inner.local_ports.contains(&a.port()))
-        });
+        let ext = self.inner.ext.read().unwrap();
+        v.retain(|a| ext.filter.allows(a) && !self.is_own(a));
     }
 
     fn sight(&self, s: Sighting) {
@@ -1004,93 +1081,85 @@ impl Dht {
         pace: bool,
         on_sent: impl FnOnce(),
     ) -> Result<Response, QueryError> {
-        let c = &self.inner.c;
+        let inner = &*self.inner;
+        let c = &inner.c;
         if self.is_stopped() {
             return Err(QueryError::Stopped);
         }
         let kind = query_kind(&q);
-        let (node, at, age, repeat) = {
-            let mut s = self.inner.state.lock().unwrap();
-            let node = node % s.nodes.len();
-            let now = Instant::now();
-            if !s.filter.allows(&to)
-                || (to.ip().is_loopback() && self.inner.local_ports.contains(&to.port()))
-            {
-                bump(&c.filtered);
-                return Err(QueryError::Filtered);
-            }
-            if !s.per_ip.try_take(*to.ip(), now) {
-                bump(&c.rate_limited);
-                return Err(QueryError::RateLimited);
-            }
-            if s.pending.len() >= s.pending_cap {
-                bump(&c.busy);
-                return Err(QueryError::Busy);
-            }
-            let (age, repeat) = match s.pool.get(&to) {
-                None => (AGE_UNPOOLED, false),
-                Some(e) => (
-                    if now.saturating_duration_since(e.added) < YOUNG_NODE {
-                        AGE_YOUNG
-                    } else {
-                        AGE_OLD
-                    },
-                    e.last_answer.is_some(),
-                ),
-            };
-            let braked = s.brake.active(now);
-            let at = if pace {
-                s.pace.reserve(now, braked)
-            } else {
-                now
-            };
-            (node, at, age, repeat)
+        let node = node % inner.shards.len();
+        let now = Instant::now();
+        if !self.allows(&to) {
+            bump(&c.filtered);
+            return Err(QueryError::Filtered);
+        }
+        if !inner.per_ip.try_take(*to.ip(), now) {
+            bump(&c.rate_limited);
+            return Err(QueryError::RateLimited);
+        }
+        if inner.pending.load(Ordering::Relaxed) >= inner.pending_cap {
+            bump(&c.busy);
+            return Err(QueryError::Busy);
+        }
+        let (age, repeat) = match inner.pool.lock().unwrap().get(&to) {
+            None => (AGE_UNPOOLED, false),
+            Some(e) => (
+                if now.saturating_duration_since(e.added) < YOUNG_NODE {
+                    AGE_YOUNG
+                } else {
+                    AGE_OLD
+                },
+                e.last_answer.is_some(),
+            ),
         };
-        // Wait for the pace slot *before* the transaction exists (D93): the pending map then
-        // holds only queries on the wire (≤ QPS × timeout), not the pace queue as well (which,
-        // with many lookups, filled the cap and turned queries into `Busy`).
-        if at > Instant::now() {
-            let mut stop = self.inner.stop.clone();
+        // Wait for a send permit *before* the transaction exists (D93): the pending map then
+        // holds only queries on the wire. A query dropped while it waits gives its turn to the
+        // next one (D106).
+        if pace {
+            let mut stop = inner.stop.clone();
             tokio::select! {
-                _ = tokio::time::sleep_until(at) => {}
+                _ = inner.pacer.acquire() => {}
                 _ = stop.wait_for(|s| *s) => return Err(QueryError::Stopped),
             }
         }
-        let (key, rx, wire) = {
-            let mut s = self.inner.state.lock().unwrap();
-            if s.pending.len() >= s.pending_cap {
-                bump(&c.busy);
-                return Err(QueryError::Busy);
-            }
+        if inner.pending.load(Ordering::Relaxed) >= inner.pending_cap {
+            bump(&c.busy);
+            return Err(QueryError::Busy);
+        }
+        let shard = &inner.shards[node];
+        let (tid, rx, own, ro) = {
+            let mut s = shard.st.lock().unwrap();
             let mut tid: [u8; 2] = rand::random();
-            while s.pending.contains_key(&(node, tid, to)) {
+            while s.pending.contains_key(&(tid, to)) {
                 tid = rand::random();
             }
             let (tx, rx) = oneshot::channel();
-            s.pending.insert((node, tid, to), tx);
-            let v = &s.nodes[node];
-            let wire = krpc::encode(&Message {
-                tid: tid.to_vec(),
-                body: Body::Query {
-                    id: v.routing.own_id(),
-                    query: q,
-                    ro: v.ro,
-                },
-                ip: None,
-                version: Some(VERSION.to_vec()),
-            });
-            ((node, tid, to), rx, wire)
+            s.pending.insert((tid, to), tx);
+            (tid, rx, s.routing.own_id(), s.ro)
         };
+        inner.pending.fetch_add(1, Ordering::Relaxed);
+        let wire = krpc::encode(&Message {
+            tid: tid.to_vec(),
+            body: Body::Query {
+                id: own,
+                query: q,
+                ro,
+            },
+            ip: None,
+            version: Some(VERSION.to_vec()),
+        });
         // Removes the transaction however this future ends, cancellation included (a lookup
         // that stops early drops its in-flight queries; without this they leaked until the
         // map's cap turned every later query into `Busy`).
         let mut guard = PendingGuard {
             dht: self,
-            key,
+            node,
+            key: (tid, to),
             rx: Some(rx),
             waiting_since: None,
         };
-        if self.inner.sockets[key.0]
+        if shard
+            .socket
             .send_to(&wire, SocketAddr::V4(to))
             .await
             .is_err()
@@ -1102,22 +1171,17 @@ impl Dht {
         bump(&c.sent[kind.min(4)]);
         c.udp_bytes_out
             .fetch_add(wire.len() as u64, Ordering::Relaxed);
-        self.inner.state.lock().unwrap().brake.sent();
+        inner.brake_sent.fetch_add(1, Ordering::Relaxed);
         bump(&c.age_sent[age]);
         if repeat {
             bump(&c.repeat_sent);
         }
         let rx = guard.rx.as_mut().expect("receiver until drop");
-        let r = tokio::time::timeout(self.inner.cfg.query_timeout, rx).await;
+        let r = tokio::time::timeout(inner.cfg.query_timeout, rx).await;
         guard.waiting_since = None;
         if let Ok(Ok(_)) = &r {
             // Any answer, error replies included, shows the node is alive (D95).
-            self.inner
-                .state
-                .lock()
-                .unwrap()
-                .pool
-                .heard(&to, Instant::now());
+            inner.pool.lock().unwrap().heard(&to, Instant::now());
         }
         match r {
             Ok(Ok(Reply::Response(r))) => {
@@ -1132,24 +1196,22 @@ impl Dht {
             Err(_) => {
                 drop(guard);
                 bump(&c.timeouts);
-                let mut s = self.inner.state.lock().unwrap();
-                s.nodes[key.0].routing.failed(&to);
-                s.pool.silent(&to);
+                shard.st.lock().unwrap().routing.failed(&to);
+                inner.pool.lock().unwrap().silent(&to);
                 Err(QueryError::Timeout)
             }
         }
     }
 
     /// Learnt contacts → the crawl pool, after the address filter and the node-farm rule.
-    fn learn(&self, s: &mut State, nodes: &[CompactNode], target: &Id, now: Instant) {
+    fn learn(&self, pool: &mut Pool, nodes: &[CompactNode], target: &Id, now: Instant) {
+        let ext = self.inner.ext.read().unwrap();
         for n in nodes {
-            if !s.filter.allows(&n.addr)
-                || (n.addr.ip().is_loopback() && self.inner.local_ports.contains(&n.addr.port()))
-            {
+            if !ext.filter.allows(&n.addr) || self.is_own(&n.addr) {
                 bump(&self.inner.c.nodes_filtered);
             } else if common_prefix_bits(&n.id, target) >= FARM_PREFIX_BITS {
                 bump(&self.inner.c.nodes_farm);
-            } else if s.pool.add(*n, now) {
+            } else if pool.add(*n, now) {
                 bump(&self.inner.c.nodes_learnt);
             }
         }
@@ -1157,24 +1219,24 @@ impl Dht {
 
     /// Record contacts learnt from a lookup answer (pool only; routing takes nodes that answer).
     pub fn learn_nodes(&self, nodes: &[CompactNode], target: &Id) {
-        let mut s = self.inner.state.lock().unwrap();
-        self.learn(&mut s, nodes, target, Instant::now());
+        let mut pool = self.inner.pool.lock().unwrap();
+        self.learn(&mut pool, nodes, target, Instant::now());
     }
 
     /// [`learn_nodes`](Self::learn_nodes), returning each contact's tier afterwards (D95), in
     /// the same lock.
     pub fn learn_ranked(&self, nodes: &[CompactNode], target: &Id) -> Vec<Tier> {
         let now = Instant::now();
-        let mut s = self.inner.state.lock().unwrap();
-        self.learn(&mut s, nodes, target, now);
+        let mut pool = self.inner.pool.lock().unwrap();
+        self.learn(&mut pool, nodes, target, now);
         nodes
             .iter()
-            .map(|n| s.pool.tier_of(&n.addr, now).unwrap_or(Tier::Unknown))
+            .map(|n| pool.tier_of(&n.addr, now).unwrap_or(Tier::Unknown))
             .collect()
     }
 
     async fn recv_loop(&self, i: usize) {
-        let sock = self.inner.sockets[i].clone();
+        let sock = self.inner.shards[i].socket.clone();
         let mut stop = self.inner.stop.clone();
         let mut buf = vec![0u8; MAX_DATAGRAM + 1];
         loop {
@@ -1213,17 +1275,15 @@ impl Dht {
             bump(&c.unmatched);
             return;
         };
-        let mut s = self.inner.state.lock().unwrap();
-        let Some(tx) = s.pending.remove(&(i, tid, src)) else {
-            bump(&c.unmatched);
-            return;
-        };
-        s.brake.answered();
-        match &reply {
-            Reply::Response(r) => {
-                bump(&c.answered);
-                let now = Instant::now();
-                s.nodes[i].routing.insert(
+        let now = Instant::now();
+        let tx = {
+            let mut s = self.inner.shards[i].st.lock().unwrap();
+            let Some(tx) = s.pending.remove(&(tid, src)) else {
+                bump(&c.unmatched);
+                return;
+            };
+            if let Reply::Response(r) = &reply {
+                s.routing.insert(
                     CompactNode {
                         id: r.id,
                         addr: src,
@@ -1231,155 +1291,192 @@ impl Dht {
                     Seen::Answered,
                     now,
                 );
+            }
+            tx
+        };
+        self.inner.pending.fetch_sub(1, Ordering::Relaxed);
+        self.inner.brake_answered.fetch_add(1, Ordering::Relaxed);
+        match &reply {
+            Reply::Response(_) => {
+                bump(&c.answered);
                 if let Some(ip) = msg.ip {
-                    self.vote(&mut s, *ip.ip(), *src.ip(), now);
+                    self.vote(*ip.ip(), *src.ip(), now);
                 }
             }
             Reply::Error(_) => bump(&c.errors),
         }
-        drop(s);
         let _ = tx.send(reply);
     }
 
     /// Whether we may send to (or hand the fetcher) this address.
     pub fn allows(&self, a: &SocketAddrV4) -> bool {
-        let s = self.inner.state.lock().unwrap();
-        s.filter.allows(a) && !(a.ip().is_loopback() && self.inner.local_ports.contains(&a.port()))
+        self.inner.ext.read().unwrap().filter.allows(a) && !self.is_own(a)
     }
 
     /// BEP 42 external IP vote (see [`Votes`]).
-    fn vote(&self, s: &mut State, seen_as: Ipv4Addr, responder: Ipv4Addr, now: Instant) {
+    fn vote(&self, seen_as: Ipv4Addr, responder: Ipv4Addr, now: Instant) {
         let usable = super::addr::is_global(seen_as)
             || (self.inner.cfg.allow_loopback && seen_as.is_loopback());
         if !usable {
             return;
         }
-        if now.saturating_duration_since(s.votes_since) >= VOTE_WINDOW {
-            s.votes.clear();
-            s.votes_since = now;
-        }
-        let current = s.external_ip;
-        if let Some(ip) = s.votes.record(
-            seen_as,
-            responder,
-            current,
-            self.inner.cfg.vote_responders,
-            self.inner.cfg.vote_prefixes,
-        ) {
-            self.set_external(s, ip, now);
+        let current = self.inner.ext.read().unwrap().external_ip;
+        let switch = {
+            let mut v = self.inner.votes.lock().unwrap();
+            if now.saturating_duration_since(v.since) >= VOTE_WINDOW {
+                v.votes.clear();
+                v.since = now;
+            }
+            v.votes.record(
+                seen_as,
+                responder,
+                current,
+                self.inner.cfg.vote_responders,
+                self.inner.cfg.vote_prefixes,
+            )
+        };
+        if let Some(ip) = switch {
+            self.set_external(ip, now);
         }
     }
 
-    fn set_external(&self, s: &mut State, ip: Ipv4Addr, now: Instant) {
-        let ids = ids_for(ip, s.nodes.len());
+    fn set_external(&self, ip: Ipv4Addr, now: Instant) {
+        {
+            let mut ext = self.inner.ext.write().unwrap();
+            // Two answers may carry the winning vote at once: the first one switches.
+            if ext.external_ip == Some(ip) {
+                return;
+            }
+            if !ip.is_loopback() {
+                ext.filter.set_own(Some(ip));
+            }
+            ext.external_ip = Some(ip);
+        }
+        let ids = ids_for(ip, self.inner.shards.len());
         let polite = self.inner.cfg.mode == Mode::Polite;
-        for (v, id) in s.nodes.iter_mut().zip(ids) {
-            v.routing.rebuild(id, now);
-            v.ro = polite;
+        for (sh, id) in self.inner.shards.iter().zip(ids) {
+            let mut s = sh.st.lock().unwrap();
+            s.routing.rebuild(id, now);
+            s.ro = polite;
         }
-        if !ip.is_loopback() {
-            s.filter.set_own(Some(ip));
+        {
+            let mut v = self.inner.votes.lock().unwrap();
+            v.votes.clear();
+            v.since = now;
         }
-        s.external_ip = Some(ip);
-        s.votes.clear();
-        s.votes_since = now;
         bump(&self.inner.c.ip_changes);
         tracing::info!("DHT: external address voted, BEP 42 ids derived");
     }
 
     fn respond(&self, i: usize, src: SocketAddrV4, tid: Vec<u8>, id: Id, q: Query, ro: bool) {
-        let c = &self.inner.c;
+        let inner = &*self.inner;
+        let c = &inner.c;
         bump(&c.incoming[query_kind(&q)]);
-        if self.inner.cfg.mode == Mode::Polite {
+        if inner.cfg.mode == Mode::Polite {
             // BEP 43: a read-only node "no longer responds to 'query' messages".
             bump(&c.incoming_ignored);
             return;
         }
         let now = Instant::now();
-        let mut sighting = None;
-        let body = {
-            let mut s = self.inner.state.lock().unwrap();
-            if !s.filter.allows(&src) {
-                bump(&c.incoming_ignored);
-                return;
-            }
-            if !s.resp_global.try_take(now) || !s.resp_ip.try_take(*src.ip(), now) {
+        if !inner.ext.read().unwrap().filter.allows(&src) {
+            bump(&c.incoming_ignored);
+            return;
+        }
+        {
+            let mut r = inner.resp.lock().unwrap();
+            if !r.global.try_take(now) || !r.per_ip.try_take(*src.ip(), now) {
                 bump(&c.responses_dropped);
                 return;
             }
-            let sender = CompactNode { id, addr: src };
+        }
+        let sender = CompactNode { id, addr: src };
+        // The routing table of the node queried: insert the sender, read what the answer needs.
+        let near = |target: Option<&Id>| -> (Id, Vec<CompactNode>) {
+            let mut s = inner.shards[i].st.lock().unwrap();
             if !ro {
-                s.nodes[i].routing.insert(sender, Seen::Queried, now);
-                if s.pool.add(sender, now) {
-                    bump(&c.nodes_learnt);
-                }
+                s.routing.insert(sender, Seen::Queried, now);
             }
-            let own = s.nodes[i].routing.own_id();
-            let resp = |nodes: Vec<CompactNode>| Response {
-                id: own,
-                nodes,
-                ..Default::default()
-            };
-            match q {
-                Query::Ping => Body::Response(resp(Vec::new())),
-                Query::FindNode { target } => {
-                    Body::Response(resp(s.nodes[i].routing.closest(&target, K)))
-                }
-                Query::GetPeers { info_hash } => {
+            let nodes = target.map(|t| s.routing.closest(t, K)).unwrap_or_default();
+            (s.routing.own_id(), nodes)
+        };
+        let target = match &q {
+            Query::FindNode { target } | Query::SampleInfohashes { target } => Some(*target),
+            Query::GetPeers { info_hash } => Some(*info_hash),
+            _ => None,
+        };
+        let (own, nodes) = near(target.as_ref());
+        if !ro && inner.pool.lock().unwrap().add(sender, now) {
+            bump(&c.nodes_learnt);
+        }
+        let resp = |nodes: Vec<CompactNode>| Response {
+            id: own,
+            nodes,
+            ..Default::default()
+        };
+        let mut sighting = None;
+        let body = match q {
+            Query::Ping => Body::Response(resp(Vec::new())),
+            Query::FindNode { .. } => Body::Response(resp(nodes)),
+            Query::GetPeers { info_hash } => {
+                sighting = Some(Sighting {
+                    info_hash,
+                    via: Via::GetPeers,
+                    source: None,
+                    peer: None,
+                    from: Some(src),
+                });
+                let mut r = resp(nodes);
+                let secret = inner.secrets.read().unwrap()[0];
+                r.token = Some(token_for(&secret, *src.ip()).to_vec());
+                r.values = inner
+                    .peers
+                    .lock()
+                    .unwrap()
+                    .get(&info_hash, now, krpc::MAX_VALUES);
+                Body::Response(r)
+            }
+            Query::AnnouncePeer {
+                info_hash,
+                port,
+                implied_port,
+                token,
+            } => {
+                let secrets = *inner.secrets.read().unwrap();
+                let valid = secrets
+                    .iter()
+                    .any(|sec| token_for(sec, *src.ip()).as_slice() == token.as_slice());
+                let port = if implied_port { src.port() } else { port };
+                if !valid || port == 0 {
+                    bump(&c.bad_tokens);
+                    Body::Error {
+                        code: ERR_PROTOCOL,
+                        message: "bad token".into(),
+                    }
+                } else {
+                    let peer = SocketAddrV4::new(*src.ip(), port);
+                    inner.peers.lock().unwrap().announce(info_hash, peer, now);
                     sighting = Some(Sighting {
                         info_hash,
-                        via: Via::GetPeers,
+                        via: Via::Announce,
                         source: None,
-                        peer: None,
+                        peer: Some(peer),
                         from: Some(src),
                     });
-                    let mut r = resp(s.nodes[i].routing.closest(&info_hash, K));
-                    r.token = Some(token_for(&s.secrets[0], *src.ip()).to_vec());
-                    r.values = s.peers.get(&info_hash, now, krpc::MAX_VALUES);
-                    Body::Response(r)
+                    Body::Response(resp(Vec::new()))
                 }
-                Query::AnnouncePeer {
-                    info_hash,
-                    port,
-                    implied_port,
-                    token,
-                } => {
-                    let valid = s
-                        .secrets
-                        .iter()
-                        .any(|sec| token_for(sec, *src.ip()).as_slice() == token.as_slice());
-                    let port = if implied_port { src.port() } else { port };
-                    if !valid || port == 0 {
-                        bump(&c.bad_tokens);
-                        Body::Error {
-                            code: ERR_PROTOCOL,
-                            message: "bad token".into(),
-                        }
-                    } else {
-                        let peer = SocketAddrV4::new(*src.ip(), port);
-                        s.peers.announce(info_hash, peer, now);
-                        sighting = Some(Sighting {
-                            info_hash,
-                            via: Via::Announce,
-                            source: None,
-                            peer: Some(peer),
-                            from: Some(src),
-                        });
-                        Body::Response(resp(Vec::new()))
-                    }
-                }
-                Query::SampleInfohashes { target } => {
-                    let mut r = resp(s.nodes[i].routing.closest(&target, K));
-                    r.samples = Some(s.peers.sample(krpc::MAX_SAMPLES));
-                    r.interval = Some(SAMPLE_INTERVAL_SERVED);
-                    r.num = Some(s.peers.hashes() as i64);
-                    Body::Response(r)
-                }
-                Query::Unknown(_) => Body::Error {
-                    code: ERR_METHOD_UNKNOWN,
-                    message: "Method Unknown".into(),
-                },
             }
+            Query::SampleInfohashes { .. } => {
+                let mut r = resp(nodes);
+                let p = inner.peers.lock().unwrap();
+                r.samples = Some(p.sample(krpc::MAX_SAMPLES));
+                r.interval = Some(SAMPLE_INTERVAL_SERVED);
+                r.num = Some(p.hashes() as i64);
+                Body::Response(r)
+            }
+            Query::Unknown(_) => Body::Error {
+                code: ERR_METHOD_UNKNOWN,
+                message: "Method Unknown".into(),
+            },
         };
         let wire = krpc::encode(&Message {
             tid,
@@ -1387,7 +1484,8 @@ impl Dht {
             ip: Some(src),
             version: Some(VERSION.to_vec()),
         });
-        if self.inner.sockets[i]
+        if inner.shards[i]
+            .socket
             .try_send_to(&wire, SocketAddr::V4(src))
             .is_ok()
         {
@@ -1406,20 +1504,14 @@ impl Dht {
         let qps = f64::from(self.inner.cfg.qps.max(1));
         loop {
             while inflight.try_join_next().is_some() {}
-            // The sampler's own share of the budget (paused at 0), then a global pace slot.
-            let own = {
-                let mut s = self.inner.state.lock().unwrap();
-                let now = Instant::now();
-                if s.sample_share <= 0.0 {
-                    None
-                } else {
-                    let at = s.sample_next.max(now);
-                    if s.sample_share < 1.0 {
-                        s.sample_next = at + Duration::from_secs_f64(1.0 / (qps * s.sample_share));
-                    }
-                    Some(at)
-                }
-            };
+            // The sampler's own share of the budget (paused at 0, `super::budget`), then a
+            // permit of the global pacer.
+            let own = self
+                .inner
+                .budget
+                .lock()
+                .unwrap()
+                .next_slot(qps, Instant::now());
             let Some(own) = own else {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_millis(250)) => {}
@@ -1433,35 +1525,22 @@ impl Dht {
                     _ = stop.wait_for(|s| *s) => break,
                 }
             }
-            let at = {
-                let mut s = self.inner.state.lock().unwrap();
-                let now = Instant::now();
-                let braked = s.brake.active(now);
-                s.pace.reserve(now, braked)
-            };
             tokio::select! {
-                _ = tokio::time::sleep_until(at) => {}
+                _ = self.inner.pacer.acquire() => {}
                 _ = stop.wait_for(|s| *s) => break,
             }
             let now = Instant::now();
             let (due, grow) = {
-                let mut s = self.inner.state.lock().unwrap();
-                match s.pool.pop_due(now) {
+                let mut pool = self.inner.pool.lock().unwrap();
+                match pool.pop_due(now) {
                     Some(e) => (Some(e), None),
-                    None => {
-                        let mut seeds = s.pool.random(1);
-                        if seeds.is_empty() {
-                            let t: Id = rand::random();
-                            seeds = s
-                                .nodes
-                                .iter()
-                                .flat_map(|v| v.routing.closest(&t, 1))
-                                .collect();
-                        }
-                        (None, seeds.first().map(|n| n.addr))
-                    }
+                    None => (None, pool.random(1).first().map(|n| n.addr)),
                 }
             };
+            let grow = grow.or_else(|| {
+                let t: Id = rand::random();
+                self.routing_closest(&t, 1).first().map(|n| n.addr)
+            });
             let node = self.next_node();
             if let Some(e) = due {
                 let d = self.clone();
@@ -1496,21 +1575,20 @@ impl Dht {
         let now = Instant::now();
         let mut found = Vec::new();
         {
-            let mut s = self.inner.state.lock().unwrap();
+            let mut pool = self.inner.pool.lock().unwrap();
             match r {
                 Ok(r) => {
-                    s.pool
-                        .answered(&addr, r.id, r.samples.is_some(), r.interval, now);
-                    self.learn(&mut s, &r.nodes, &target, now);
+                    pool.answered(&addr, r.id, r.samples.is_some(), r.interval, now);
+                    self.learn(&mut pool, &r.nodes, &target, now);
                     found = r.samples.unwrap_or_default();
                 }
-                Err(QueryError::Remote(_)) => s.pool.unsupported(&addr, now),
+                Err(QueryError::Remote(_)) => pool.unsupported(&addr, now),
                 Err(QueryError::Timeout) => {
-                    s.pool.failed(&addr, now);
+                    pool.failed(&addr, now);
                 }
-                Err(QueryError::Filtered) => s.pool.remove(&addr),
+                Err(QueryError::Filtered) => pool.remove(&addr),
                 Err(QueryError::Stopped) => {}
-                Err(_) => s.pool.reschedule(&addr, now + Duration::from_secs(2)),
+                Err(_) => pool.reschedule(&addr, now + Duration::from_secs(2)),
             }
         }
         self.inner
@@ -1535,7 +1613,7 @@ impl Dht {
         let mut last_rotation = started;
         // Bootstrap: find the nodes closest to each own id (BEP 5).
         let mut boot = JoinSet::new();
-        for i in 0..self.inner.sockets.len() {
+        for i in 0..self.inner.shards.len() {
             let d = self.clone();
             boot.spawn(async move { d.self_lookup(i).await });
         }
@@ -1548,45 +1626,48 @@ impl Dht {
             while boot.try_join_next().is_some() {}
             let now = Instant::now();
             {
-                let mut s = self.inner.state.lock().unwrap();
-                if s.brake.tick(now) {
+                let sent = self.inner.brake_sent.swap(0, Ordering::Relaxed);
+                let answered = self.inner.brake_answered.swap(0, Ordering::Relaxed);
+                let mut b = self.inner.brake.lock().unwrap();
+                b.record(sent, answered);
+                if b.tick(now) {
                     tracing::warn!(
                         "DHT: answered share collapsed, halving the query rate for 5 min"
                     );
                 }
-                if now.saturating_duration_since(last_rotation) >= SECRET_ROTATION {
-                    s.secrets[1] = s.secrets[0];
-                    s.secrets[0] = rand::random();
-                    last_rotation = now;
-                }
+                self.inner.pacer.set_braked(b.active(now));
+            }
+            if now.saturating_duration_since(last_rotation) >= SECRET_ROTATION {
+                let mut s = self.inner.secrets.write().unwrap();
+                s[1] = s[0];
+                s[0] = rand::random();
+                last_rotation = now;
             }
             if now.saturating_duration_since(last_minute) < Duration::from_secs(60) {
                 continue;
             }
             last_minute = now;
+            self.inner.peers.lock().unwrap().purge(now);
             let mut work: Vec<(usize, SocketAddrV4, Query)> = Vec::new();
             let mut thin = Vec::new();
-            {
-                let mut s = self.inner.state.lock().unwrap();
-                s.peers.purge(now);
-                for (i, v) in s.nodes.iter_mut().enumerate() {
-                    if v.routing.len() < 16 {
-                        thin.push(i);
+            for (i, sh) in self.inner.shards.iter().enumerate() {
+                let mut v = sh.st.lock().unwrap();
+                if v.routing.len() < 16 {
+                    thin.push(i);
+                }
+                for bits in v.routing.stale_buckets(now).into_iter().take(4) {
+                    let target = random_id_in_bucket(&v.routing.own_id(), bits, rand::random());
+                    if let Some(n) = v.routing.closest(&target, 1).first() {
+                        work.push((i, n.addr, Query::FindNode { target }));
                     }
-                    for bits in v.routing.stale_buckets(now).into_iter().take(4) {
-                        let target = random_id_in_bucket(&v.routing.own_id(), bits, rand::random());
-                        if let Some(n) = v.routing.closest(&target, 1).first() {
-                            work.push((i, n.addr, Query::FindNode { target }));
-                        }
-                        v.routing.touch_bucket(bits, now);
-                    }
-                    for addr in v.routing.questionable(now, 4) {
-                        work.push((i, addr, Query::Ping));
-                    }
+                    v.routing.touch_bucket(bits, now);
+                }
+                for addr in v.routing.questionable(now, 4) {
+                    work.push((i, addr, Query::Ping));
                 }
             }
             for i in thin {
-                if boot.len() < self.inner.sockets.len() {
+                if boot.len() < self.inner.shards.len() {
                     let d = self.clone();
                     boot.spawn(async move { d.self_lookup(i).await });
                 }
@@ -1610,7 +1691,7 @@ impl Dht {
     /// Iterative `find_node` towards a virtual node's own id from the bootstrap routers, the
     /// saved nodes and the routing table.
     async fn self_lookup(&self, i: usize) {
-        let own = self.ids()[i];
+        let own = self.inner.shards[i].st.lock().unwrap().routing.own_id();
         let mut seeds: Vec<CompactNode> = self.closest(&own, 16);
         let mut extra: Vec<SocketAddrV4> = self.inner.cfg.bootstrap.clone();
         extra.extend(self.inner.cfg.known_nodes.iter().map(|n| n.addr));

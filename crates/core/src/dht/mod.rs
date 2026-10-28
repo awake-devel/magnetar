@@ -6,6 +6,7 @@
 //! for peer collection. The server (`server::dht`) owns triage, the persisted queue and stats.
 
 pub mod addr;
+pub mod budget;
 pub mod engine;
 pub mod id;
 pub mod krpc;

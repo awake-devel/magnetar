@@ -265,14 +265,22 @@ pub async fn lookup_into(
         {
             due.pop_front();
         }
-        let wake = due.front().map_or(deadline, |(t, _)| (*t).min(deadline));
-        let next = tokio::select! {
-            Some(a) = sent_rx.recv() => {
-                due.push_back((Instant::now() + soft, a));
-                continue;
+        // A send report only starts a soft timer: wait on without rebuilding the window (D106:
+        // with thousands of lookups, rebuilding it on every report was a large share of CPU).
+        let next = loop {
+            let wake = due.front().map_or(deadline, |(t, _)| (*t).min(deadline));
+            tokio::select! {
+                Some(a) = sent_rx.recv() => {
+                    due.push_back((Instant::now() + soft, a));
+                    continue;
+                }
+                n = inflight.next() => break Some(n),
+                _ = tokio::time::sleep_until(wake) => break None,
             }
-            n = inflight.next() => n,
-            _ = tokio::time::sleep_until(wake) => {
+        };
+        let next = match next {
+            Some(n) => n,
+            None => {
                 let now = Instant::now();
                 while let Some(&(t, a)) = due.front() {
                     if t > now {

@@ -108,7 +108,7 @@ impl DhtOptions {
         let nodes = cfg
             .dht_nodes
             .unwrap_or(if aggressive { 4 } else { 1 })
-            .clamp(1, 8);
+            .clamp(1, magnetar_core::dht::engine::MAX_VIRTUAL_NODES as u8);
         let ports = (0..nodes)
             .map(|i| {
                 if aggressive {
