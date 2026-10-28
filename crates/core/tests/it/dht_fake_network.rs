@@ -8,7 +8,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 
 use magnetar_core::dht::krpc::Query;
-use magnetar_core::dht::{Dht, EngineConfig, Mode, Sighting, Via, collect_peers};
+use magnetar_core::dht::{Dht, EngineConfig, Identity, Mode, Sighting, Via, collect_peers};
 use tokio::sync::mpsc;
 
 fn cfg(mode: Mode, ip: Ipv4Addr, ports: usize, bootstrap: Vec<SocketAddrV4>) -> EngineConfig {
@@ -35,6 +35,16 @@ async fn fake_network(n: u8) -> Vec<(Dht, SocketAddrV4)> {
         let ip = Ipv4Addr::new(127, 0, 1, 10 + i);
         let mut c = cfg(Mode::Aggressive, ip, 1, boot.clone());
         c.sample = false;
+        // Each fake node knows its address from the start, as a node that has run before
+        // does. Otherwise it would query read-only (BEP 43, until 3 responders have voted on
+        // its address, which 2 bootstrap nodes cannot give): nobody would put it in a routing
+        // table, only the client's table (K = 8 per bucket) would name it, and when more than
+        // 8 of the 12 ids fell in one bucket of that table the crawler had no way to find the
+        // rest (CI, 2026-10-28: "sampled 26 of 30", pool 11; docs/DHT.md §20.5).
+        c.identity = Some(Identity {
+            external_ip: ip,
+            ids: Vec::new(),
+        });
         let (d, _rx) = Dht::start(c).await.expect("bind fake node");
         let addr = SocketAddrV4::new(ip, d.local_ports()[0]);
         if boot.len() < 2 {
@@ -89,8 +99,38 @@ async fn drain_until(
     }
 }
 
+/// Every fake node is named by some routing table the crawler can reach (the fake nodes' and
+/// the client's): otherwise no crawler could sample it.
+fn assert_connected(net: &[(Dht, SocketAddrV4)], client: &Dht) {
+    let t = [0u8; 20];
+    let named: HashSet<SocketAddrV4> = net
+        .iter()
+        .map(|(d, _)| d)
+        .chain([client])
+        .flat_map(|d| d.closest(&t, 256))
+        .map(|c| c.addr)
+        .collect();
+    let missing: Vec<_> = net.iter().filter(|(_, a)| !named.contains(a)).collect();
+    assert!(
+        missing.is_empty(),
+        "{} fake nodes in no routing table",
+        missing.len()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn crawler_samples_captures_and_collects_peers() {
+    crawl_fake_network().await;
+}
+
+/// The same on one thread, as on a 1-core worker (the CI failure of 2026-10-28 came on a
+/// 2-core runner).
+#[tokio::test(flavor = "current_thread")]
+async fn crawler_samples_captures_and_collects_peers_on_one_thread() {
+    crawl_fake_network().await;
+}
+
+async fn crawl_fake_network() {
     let net = fake_network(12).await;
     // A client that has 30 torrents announces each to two network nodes.
     let client_ip = Ipv4Addr::new(127, 0, 2, 1);
@@ -103,6 +143,7 @@ async fn crawler_samples_captures_and_collects_peers() {
             announce(&client, net[j].1, *h, k % 2 == 0).await;
         }
     }
+    assert_connected(&net, &client);
 
     // The crawler: aggressive, two virtual nodes on one address, bootstrapped from node 0.
     let crawler_ip = Ipv4Addr::new(127, 0, 3, 1);
@@ -347,15 +388,18 @@ async fn cancelled_queries_release_their_transactions() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sampling_can_be_paused_and_throttled() {
-    let net = fake_network(4).await;
+    let net = fake_network(12).await;
     let ip = Ipv4Addr::new(127, 0, 9, 1);
     let (d, _rx) = Dht::start(cfg(Mode::Aggressive, ip, 1, vec![net[0].1]))
         .await
         .unwrap();
     d.set_sample_share(0.0);
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // A send the sampler picked before the pause may still go out; nothing after it.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let paused = d.stats().sent_sample_infohashes;
+    tokio::time::sleep(Duration::from_millis(1400)).await;
     let st = d.stats();
-    assert_eq!(st.sent_sample_infohashes, 0, "{st:?}");
+    assert_eq!(st.sent_sample_infohashes, paused, "{st:?}");
     assert_eq!(st.sample_share, 0.0);
     // Lookups still work while sampling is paused.
     assert!(d.query(0, net[1].1, Query::Ping).await.is_ok());
@@ -368,9 +412,15 @@ async fn sampling_can_be_paused_and_throttled() {
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let n = sampler(&d.stats()) - before;
     assert!((2..=8).contains(&n), "{n}");
+    // At the full share every node still due is sampled at once. (Once none is due the
+    // sampler only asks each pool node for more nodes every `GROW_REASK`, docs/DHT.md §20.5,
+    // so the sent count no longer tells the share.)
     d.set_sample_share(1.0);
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(sampler(&d.stats()) - before > n + 20);
+    let st = d.stats();
+    assert!(st.pool.size >= 6, "{st:?}");
+    assert_eq!(st.pool.bep51_unknown, 0, "{st:?}");
+    assert!(st.sent_sample_infohashes >= st.pool.size as u64, "{st:?}");
     d.shutdown().await;
     for (d, _) in net {
         d.shutdown().await;
