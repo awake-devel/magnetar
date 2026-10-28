@@ -125,6 +125,7 @@ crawler shows up in `/api/v1/stats`, `/api/v1/stats/health` and `/health` (featu
 | `MAGNETAR_DHT_PEER_LOOKUPS` | `64` / `8` | peer collections running at once (1–8192; each is a light task, the KRPC rate is the real limit) |
 | `MAGNETAR_DHT_LOOKUP_TIMEOUT_MS` | `4000` | soft per-query timeout of peer lookups, ms (100–4000; D93). A node silent this long no longer holds up the lookup: the next node is asked, and its answer is still used if it comes within the 4 s hard timeout. Also applies to the `get_peers` sent to the node that sampled a hash. 4000 = no widening (the old behaviour) |
 | `MAGNETAR_DHT_PEERS_PER_HASH` | `24` | peers the metadata fetcher tries per infohash (1–64), 4 at once; a lookup stops once it knows this many (D93) |
+| `MAGNETAR_DHT_SAMPLE_PRIORITY` | `0` | share of the KRPC budget (0–1) reserved for BEP 51 sampling and sent ahead of the lookups' queue, charged to the same cap (D106, docs/DHT.md §20). 0 = the sampler queues behind every lookup query (about 1 % of the queries at 2048 lookups); D62 backpressure still pauses it |
 | `MAGNETAR_DHT_FETCH_CONCURRENCY` | `128` / `16` | metadata fetches in flight (1–2048); each opens ≤ 4 TCP connections at once, within the two limits below |
 | `MAGNETAR_DHT_TCP_RATE` | `150` | new TCP connection attempts per second, all fetches (1–2000). Each attempt is a NAT entry on the router: on the user's SFR neufbox 200/s was safe and 400/s cut the line (docs/research/router-bench.md) |
 | `MAGNETAR_DHT_TCP_MAX` | `350` | TCP connections open at once (1–10000); the same router held ~440 |

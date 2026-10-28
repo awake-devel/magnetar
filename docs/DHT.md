@@ -310,6 +310,7 @@ core/src/dht/          (feature "dht-crawl")
   routing.rs     BEP 5 K=8 bucket table per virtual node (good/questionable/bad, 15 min)
   pool.rs        crawl pool: nodes to sample, next_sample_at, bep51 state, bounded
   sampler.rs     due nodes → sample_infohashes(random target); keyspace traversal from `nodes`
+  budget.rs      (D106) the sampling / lookup split of the KRPC budget: share and priority
   lookup.rs      iterative get_peers (generalised from liveness::dht::walk) for peer discovery
   peerstore.rs   honest store of announced peers (served back in get_peers / sample_infohashes)
   limiter.rs     global token bucket + per-remote-IP bucket + adaptive brake
@@ -781,6 +782,7 @@ others are still planned (their stage in brackets).
 | `MAGNETAR_DHT_QPS` | `200` / `50` | global outbound KRPC queries per second over every virtual node (1–20000, §20) |
 | `MAGNETAR_DHT_POOL` | `1000000` / `200000` | crawl pool size (nodes) |
 | `MAGNETAR_DHT_PEER_LOOKUPS` | `64` / `8` | peer collections (sampling node, then lookup) at once (D62) |
+| `MAGNETAR_DHT_SAMPLE_PRIORITY` | `0` | share of the KRPC budget reserved for sampling ahead of the queue (0–1, §20, D106) |
 | `MAGNETAR_DHT_FETCH_CONCURRENCY` | `128` / `16` | metadata fetches in flight |
 | `MAGNETAR_DHT_LOOKUP_TIMEOUT_MS` | `4000` | soft per-query timeout of lookups (100–4000, §18, D93) |
 | `MAGNETAR_DHT_PEERS_PER_HASH` | `24` | peers tried per hash by the fetcher, and where a lookup stops (1–64, §18) |
@@ -1607,3 +1609,160 @@ D95 won every pair: +7 % at 2048 lookups, +11 % at 4096. At this load it pays of
 1024-lookup runs above it did not). 4096 lookups with D95 gave only ~3 % more than 2048 and
 pushed CPU to 0.8–0.9 of a core, with the KRPC rate falling to ~2 100–2 400 q/s, so production
 stays at 2048. D95 went into production after this run.
+
+## 20. More cores, more virtual nodes (D106, 2026-10-28)
+
+Question: production at `QPS 3000` / 4 nodes used ~0.9 core, and at 4 096 lookups the sent rate
+fell from ~2 800 to ~2 100–2 400 q/s. Was some part of the crawler bound to one core, and how far
+does it scale on the direct fiber line once that is fixed?
+
+### 20.1 Profile: nothing was bound to one core; the pace lost its turns
+
+Tools: `perf` 7.2.11 (installed for this, `perf record -F 999 -g -p` on the release `dht`
+command, line tables kept), per-thread CPU from `/proc/<pid>/task/*/stat` every 10 s, and a new
+loopback bench (`tests/it/dht_bench.rs`, ignored by default).
+
+- **Live, `main`, 4 nodes, `QPS 3000`, 4 096 lookups** (fresh scratch database, probe on): 0.6–1.0
+  core over 12 tokio workers; the four busiest threads within ~10 % of each other, none above
+  ~0.15 core. Flat profile (20 s, 13 086 samples): kernel 32 % (UDP/TCP syscalls, the USB NIC's
+  `xhci` ring, conntrack), malloc/free 16 %, blocklist screen + classifier + Unicode
+  normalisation 15 %, **DHT engine and lookups 13 %** (`Pool::closest` 0.7 %, `PerIp::available`
+  1.2 %, the lookup loop ~3 %), tokio 5 %, SHA-1/SHA-256 5 %; no symbol above 5.3 %, and futex
+  calls were rare (~600/s, mostly idle workers parking). The single engine mutex was not the
+  bottleneck at this load.
+- **Live, `main`, `QPS 5000`, 4 096 lookups, probe off**: 2 659 q/s sent (53 % of the cap) at
+  0.76 core. Sampling was paused (D62 backpressure) for 207 of 300 s and got 0.8 % of the
+  queries; 45 767 lookups at 8.3 s means only ~1 270 lookups ran at a time — the other
+  collectors waited for a free fetcher.
+- **Loopback bench** (1 000 fake nodes, a quarter of the answers also name a silent address,
+  15 s, no network, no pipeline): `main` sent **66–73 % of a 3 000 q/s cap** at 4 096 lookups
+  with the busiest thread at 0.05–0.06 core — the live symptom, with no network and no CPU
+  limit. Cause: the D54 pace was a GCRA schedule; each query reserved a send instant, and a
+  lookup that ended dropped its queued queries, whose instants then went unused. At 8 192
+  lookups / 10 000 q/s `main` sent 25 % of the cap and filled the transaction map (500 k
+  `busy`).
+
+### 20.2 What changed (`core::dht::{engine, limiter, budget, lookup}`)
+
+- **One shard per virtual node**: socket, receive task, routing table and transaction map
+  behind its own lock. Shared state is split by use: the crawl pool (one lock, short sections),
+  the per-IP limit in 16 shards by address (`IpLimits`: an address always maps to the same
+  shard, so 1 q/s per IP holds exactly), the brake (sent/answered counted in atomics, folded
+  once a second), votes, external address and filter (`RwLock`), token secrets, peer store,
+  response caps. No two locks are held at once except when the external address changes.
+- **Global pacer** (`limiter::Pacer`): a FIFO of senders (a tokio semaphore) refilled every
+  2 ms at the cap (half while braked). A waiter takes a permit only when its turn comes; a
+  dropped waiter leaves the queue and its turn goes to the next one. Everything earned in a
+  tick goes to the waiters (capping first lost ~15 % of the rate when a tick came late on a
+  busy runtime); only unused permits are trimmed to two ticks' worth, so an idle pacer banks no
+  burst. The total cap is one pacer over every shard. The fetcher's TCP attempt pace keeps the
+  old `Pace` (not changed here).
+- **Budget split in one place** (`dht::budget::SampleBudget`): the D62 `share` (backpressure)
+  and a new `priority` share (`MAGNETAR_DHT_SAMPLE_PRIORITY`, default 0 = unchanged): the
+  sampler spaces itself at `qps × share × priority` and sends ahead of the queue, charged to the
+  pacer (`Pacer::take_ahead`), so the total still holds. Setters: `Dht::set_sample_share`,
+  `Dht::set_sample_priority`. A balancer only needs those (or `SampleBudget::next_slot`).
+- **Up to 32 virtual nodes** (`MAGNETAR_DHT_NODES` 1–32, first port ≤ 65504); ids beyond the 8
+  BEP 42 prefixes reuse the `r` values in order (§3.3). `MAGNETAR_DHT_QPS` up to 20 000.
+- **Lookup loop**: a send report (which only starts a soft timer) no longer rebuilds the walk's
+  window and re-reads the per-IP limits.
+- D95's ranking is unchanged (`lookup_seeds`, `rank_seeds`, tiers, dead set).
+- Defaults unchanged; no new per-entry memory (worker profiles unaffected).
+
+### 20.3 Loopback bench, `main` against this build
+
+`DHT_BENCH_*` as in the file header, 15 s, release, the same machine (production crawler and
+another agent's test crawler running). CPU = crawler threads only.
+
+| nodes / cap / lookups | build | sent q/s (of cap) | answered/s | lookups/s | CPU (busiest thread) | UDP receive-buffer drops |
+|---|---|---|---|---|---|---|
+| 4 / 3 000 / 4 096 | main | 1 973 (66 %) | 1 063 | 330 | 0.36 (0.05) | 1 098 |
+| 4 / 3 000 / 4 096 | D106 | 3 000 (100 %) | 1 291 | 369 | 0.43 (0.06) | 384 |
+| 4 / 5 000 / 4 096 | main | 3 484 (70 %) | 1 649 | 340 | 0.56 (0.07) | 3 290 |
+| 4 / 5 000 / 4 096 | D106 | 4 601 (92 %) | 2 110 | 362 | 0.54 (0.07) | 2 587 |
+| 8 / 10 000 / 8 192 | main | 2 508 (25 %, 500 k busy) | 382 | 2 159 | 1.49 (0.19) | 22 885 |
+| 8 / 10 000 / 8 192 | D106 | 9 467 (95 %) | 3 277 | 725 | 1.04 (0.13) | 5 073 |
+| 8 / 20 000 / 8 192 | D106 | 18 503 (93 %) | 7 793 | 981 | 1.82 (0.23) | |
+| 16 / 20 000 / 8 192 | D106 | 18 629 (93 %) | 7 227 | 975 | 2.04 (0.26) | |
+| 16 / 40 000 / 16 384 | D106 | 24 601 (62 %) | 4 562 | 1 405 | 2.38 (0.30) | |
+
+At 40 000 the fake network (6 threads) and the loopback socket buffers stop keeping up, not the
+crawler; no thread of the crawler ever passed 0.3 core.
+
+### 20.4 Live ramp on the direct fiber line (2026-10-28, 01:12–04:04)
+
+Release `dht --mode aggressive --seconds 600`, a fresh scratch database each on `magnetar-pg`, UDP
+47891+ (`main` = `b519486`) / 48891+ and 49891+ (this build: `6bafe50`, from 02:23 `3f50861`,
+the same engine plus the sampler priority option), probe on, no UPnP, `FETCH_CONCURRENCY 2048`,
+`TCP_MAX 4000` (8000 with `TCP_RATE 2000`). `ip route get 1.1.1.1` showed the fiber source
+address before every run. The production crawler (`QPS 3000`, 4 nodes, `TCP_RATE 1000`) ran on
+the same line the whole time, and until ~02:50 another agent's 10-minute test crawler (`QPS
+3000`, 4 nodes) too. CPU = this process, mean over the run / highest 10-s sample; the
+busiest tokio worker never had more than ~0.3 core. "Sample queries" = `sample_infohashes`
+share of all queries sent.
+
+| start | build | nodes | QPS | lookups | TCP rate | metadata/min | hashes/min | collected/min | answered | sent q/s (of cap) | sample queries | sampling paused | TCP attempts/s | fetch success | CPU (cores) | RSS MB | conntrack max | 1.1.1.1 connect median / max |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 01:12 | main | 4 | 3000 | 2048 | 1000 | 2925 | 12852 | 11945 | 0.48 | 2714 (90 %) | 0.9 % | 192 s | 949 | 32.4 % | 0.95 / 1.31 | 572 | 566k | 15 / 17 ms |
+| 01:22 | D106 | 4 | 3000 | 2048 | 1000 | 3356 | 13619 | 13392 | 0.47 | 2993 (100 %) | 0.9 % | 54 s | 1042 | 33.1 % | 0.99 / 1.30 | 571 | 559k | 15 / 16 ms |
+| 01:32 | D106 | 8 | 3000 | 2048 | 1000 | 3186 | 13365 | 13175 | 0.47 | 2996 (100 %) | 0.8 % | 0 s | 1041 | 32.0 % | 0.93 / 1.25 | 539 | 575k | 15 / 22 ms |
+| 01:43 | main | 4 | 3000 | 2048 | 1000 | 3188 | 13216 | 13039 | 0.48 | 2791 (93 %) | 0.9 % | 202 s | 1024 | 32.1 % | 1.04 / 1.35 | 569 | 555k | 15 / 19 ms |
+| 01:53 | D106 | 8 | 5000 | 2048 | 1000 | 3104 | 13225 | 12252 | 0.45 | 3674 (73 %) | 0.6 % | 574 s | 1021 | 32.6 % | 0.89 / 1.36 | 573 | 553k | 15 / 28 ms |
+| 02:03 | D106 | 16 | 8000 | 2048 | 1000 | 3242 | 13688 | 12898 | 0.45 | 3937 (49 %) | 0.6 % | 588 s | 1048 | 32.3 % | 0.95 / 1.31 | 617 | 424k | 15 / 16 ms |
+| 02:13 | main | 4 | 3000 | 2048 | 1000 | 3196 | 13363 | 13073 | 0.48 | 2799 (93 %) | 1.0 % | 150 s | 1030 | 32.1 % | 0.90 / 1.23 | 589 | 392k | 15 / 16 ms |
+| 02:23 | D106 | 16 | 8000 | 4096 | 1000 | 3181 | 15035 | 13227 | 0.44 | 3936 (49 %) | 0.7 % | 580 s | 1051 | 31.8 % | 0.87 / 1.52 | 563 | 439k | 15 / 15 ms |
+| 02:33 | main | 4 | 3000 | 2048 | 1000 | 3206 | 13374 | 13121 | 0.48 | 2801 (93 %) | 0.8 % | 0 s | 1037 | 32.0 % | 0.78 / 0.93 | 546 | 379k | 15 / 15 ms |
+| 02:43 | D106 | 16 | 12000 | 8192 | 1000 | 3121 | 14700 | 13691 | 0.44 | 4025 (34 %) | 0.6 % | 575 s | 1054 | 31.4 % | 0.95 / 2.33 | 647 | 503k | 14 / 15 ms |
+| 02:53 | D106 (priority 0.1) | 16 | 8000 | 4096 | 1000 | 3196 | 14838 | 13484 | 0.44 | 4001 (50 %) | 0.7 % | 572 s | 1047 | 31.3 % | 0.93 / 1.47 | 605 | 472k | 15 / 15 ms |
+| 03:03 | D106 | 8 | 5000 | 4096 | 2000 | 6177 | 25503 | 24596 | 0.45 | 4994 (100 %) | 1.0 % | 112 s | 1966 | 32.6 % | 1.45 / 1.70 | 697 | 538k | 15 / 16 ms |
+| 03:14 | main | 4 | 3000 | 2048 | 1000 | 3134 | 13194 | 12895 | 0.48 | 2795 (93 %) | 0.9 % | 0 s | 1024 | 31.7 % | 0.73 / 1.13 | 542 | 478k | 14 / 15 ms |
+| 03:24 | main | 8 | 5000 | 4096 | 2000 | 5474 | 22487 | 22149 | 0.45 | 4566 (91 %) | 1.0 % | 94 s | 1734 | 32.2 % | 1.51 / 1.81 | 770 | 515k | 14 / 15 ms |
+| 03:34 | D106 | 16 | 8000 | 4096 | 2000 | 6164 | 24664 | 23727 | 0.42 | 6918 (86 %) | 0.7 % | 562 s | 1981 | 33.1 % | 1.82 / 2.11 | 814 | 605k | 15 / 15 ms |
+| 03:44 | main | 8 | 5000 | 4096 | 2000 | 5608 | 22447 | 22092 | 0.46 | 4496 (90 %) | 0.9 % | 59 s | 1724 | 33.2 % | 1.49 / 1.82 | 759 | 523k | 14 / 15 ms |
+| 03:54 | D106 | 8 | 5000 | 4096 | 2000 | 6098 | 24787 | 24293 | 0.45 | 4995 (100 %) | 0.9 % | 101 s | 1946 | 32.3 % | 1.44 / 1.72 | 764 | 540k | 14 / 15 ms |
+
+No run met the latency guard (two connect times to 1.1.1.1 above 0.1 s) or the D66 probe brake;
+the highest connect time measured was 28 ms. Conntrack peaked at 605 k of 4 M.
+
+**Reading it.**
+
+- **At `TCP_RATE 1000` the engine is not the limit**: TCP connection attempts sit at the cap
+  (949–1 054/s) in every run, and metadata/min stays at ~3 100–3 350 whatever the KRPC side does.
+  `main` 4 / 3000: 2 925, 3 188, 3 196, 3 206, 3 134; this build 4 / 3000: 3 356; 8 / 3000:
+  3 186; 8 / 5000: 3 104; 16 / 8000: 3 242 and 3 181; 16 / 12000 with 8 192 lookups: 3 121. This
+  build sends the full cap at 3 000 (2 993–2 996 q/s against `main`'s 2 714–2 801); above that,
+  2 048–8 192 collectors wait for a free fetcher, lookups fall to ~13 k/min and the KRPC rate to
+  ~3 700–4 000 q/s, and D62 backpressure pauses sampling for most of the run.
+- **With `TCP_RATE 2000` (`TCP_MAX 8000`, 4 096 lookups) metadata/min doubles**: this build
+  6 177 and 6 098 at 8 / 5000, 6 164 at 16 / 8000; `main` at 8 / 5000 5 474 and 5 608, interleaved.
+  Here the engine matters: `main` sends 90–91 % of the cap (lost pace turns) and reaches only
+  1 724–1 734 TCP attempts/s, this build sends 100 % and reaches 1 946–1 981/s, +10–13 %
+  metadata. 16 nodes and 8 000 q/s add nothing over 8 / 5000 (TCP-bound again). CPU 1.4–1.8
+  cores, RSS 700–810 MB, latency unchanged (14–16 ms median).
+- **More virtual nodes** (8, 16) gave nothing measurable on a fresh identity: sampling is not
+  the scarce input here (the queue is full, sampling paused 560–590 s in the 16-node runs), and
+  passive capture needs an identity that has been in other nodes' routing tables for a while
+  (incoming `get_peers` ~6/s in these runs). Sampling already gets all it can use.
+- **Sampler priority** (`0.1`, 16 / 8000): no change (3 196); backpressure paused sampling for
+  572 s, so the reserved share was unused most of the run. It is a mechanism for a balancer, not
+  a gain by itself on this line.
+- Sampling share of all queries is ~1 % in every run; each answered sample yields ~9 hashes and
+  each hash costs ~16 `get_peers` in its lookup, so hashes per minute are set by lookups, and
+  stored torrents by TCP attempts.
+
+**Recommended production settings on the fiber line** (this build): `MAGNETAR_DHT_NODES=8`,
+`MAGNETAR_DHT_QPS=5000`, `MAGNETAR_DHT_PEER_LOOKUPS=4096`, `MAGNETAR_DHT_TCP_RATE=2000`,
+`MAGNETAR_DHT_TCP_MAX=8000`, `MAGNETAR_DHT_FETCH_CONCURRENCY=2048`, `MAGNETAR_DHT_SAMPLE_PRIORITY`
+unset. Expected ~6 000 metadata/min on a scratch database (production deduplicates against 6 M+
+stored torrents, so its stored/min is lower) for ~1.5 cores. `NODES 4` is as good in these runs;
+8 costs nothing measurable. Not for the Neufbox (D66: 200 TCP attempts/s safe).
+
+**What limits next**: `MAGNETAR_DHT_TCP_RATE` (its configured maximum is 2 000; metadata/min
+followed it 1:1 here), then fetch quality (68 % of hashes with peers fail; ~85 % of TCP
+attempts never connect). The KRPC engine sends ≥ 93 % of 20 000 q/s on loopback at ~2 cores,
+so it is several times ahead of what the line and the fetcher use.
+
+**Not verified**: production (6 M rows, long-lived identity, real passive capture) with these
+settings; runs longer than 10 minutes; `TCP_RATE` above 2 000 (config max); the Neufbox; worker
+hosts (EEE, RPI) with this build — their tests pass and defaults allocate nothing new, but no
+RSS was measured on them; 32 virtual nodes live (16 was the largest run).

@@ -206,7 +206,7 @@ them. Workers reach the server the way the phone does (Tailscale serve, reverse 
 | `MAGNETAR_WORKER_RSS_MAX_MB` | `0` (off) | governor ceiling for the worker's own RSS |
 | `MAGNETAR_WORKER_UPLOAD_BUFFER_MB` | `16` | results waiting for upload |
 | `MAGNETAR_DHT` | `off` | `aggressive` (4 nodes on open UDP ports, passive capture) or `polite`; off = seed checks only |
-| `MAGNETAR_DHT_PORT`, `_NODES`, `_QPS`, `_TCP_RATE`, `_TCP_MAX`, `_PROBE`, `_POOL`, `_FETCH_CONCURRENCY`, `_METADATA_MAX`, `_PEER_LOOKUPS`, `_LOOKUP_TIMEOUT_MS`, `_PEERS_PER_HASH` | as the server (docs/CONFIG.md), except pool 200 000 and fetches 64 | |
+| `MAGNETAR_DHT_PORT`, `_NODES`, `_QPS`, `_TCP_RATE`, `_TCP_MAX`, `_PROBE`, `_POOL`, `_FETCH_CONCURRENCY`, `_METADATA_MAX`, `_PEER_LOOKUPS`, `_LOOKUP_TIMEOUT_MS`, `_PEERS_PER_HASH`, `_SAMPLE_PRIORITY` | as the server (docs/CONFIG.md), except pool 200 000 and fetches 64 | |
 | `MAGNETAR_DHT_UPNP` | **off** for workers | `true` maps the UDP ports on the router (it is somebody else's router: ask first) |
 | `MAGNETAR_LIVENESS_TRACKER_RPS`, `_TRACKER_CONCURRENCY`, `_DHT`, `_DHT_CONCURRENCY` | as the server | the worker's seed checker |
 | `MAGNETAR_BLOCKLIST_FILE` | unset | extra blocklist terms, as on the server (the server screens again anyway) |
