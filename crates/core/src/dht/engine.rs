@@ -888,6 +888,16 @@ impl Dht {
             .set_share(share, Instant::now());
     }
 
+    /// Reserve `priority` (0–1) of the QPS budget for the sampler, sent ahead of the pacer's
+    /// queue (D106; 0 = the sampler queues like every query). See [`super::budget`].
+    pub fn set_sample_priority(&self, priority: f64) {
+        self.inner
+            .budget
+            .lock()
+            .unwrap()
+            .set_priority(priority, Instant::now());
+    }
+
     pub fn sample_share(&self) -> f64 {
         self.inner.budget.lock().unwrap().share()
     }
@@ -1505,14 +1515,15 @@ impl Dht {
         loop {
             while inflight.try_join_next().is_some() {}
             // The sampler's own share of the budget (paused at 0, `super::budget`), then a
-            // permit of the global pacer.
+            // permit of the global pacer, or a send ahead of its queue charged to it (priority).
+            let braked = if self.inner.pacer.braked() { 0.5 } else { 1.0 };
             let own = self
                 .inner
                 .budget
                 .lock()
                 .unwrap()
-                .next_slot(qps, Instant::now());
-            let Some(own) = own else {
+                .next_slot(qps * braked, Instant::now());
+            let Some((own, ahead)) = own else {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_millis(250)) => {}
                     _ = stop.wait_for(|s| *s) => break,
@@ -1525,9 +1536,13 @@ impl Dht {
                     _ = stop.wait_for(|s| *s) => break,
                 }
             }
-            tokio::select! {
-                _ = self.inner.pacer.acquire() => {}
-                _ = stop.wait_for(|s| *s) => break,
+            if ahead {
+                self.inner.pacer.take_ahead();
+            } else {
+                tokio::select! {
+                    _ = self.inner.pacer.acquire() => {}
+                    _ = stop.wait_for(|s| *s) => break,
+                }
             }
             let now = Instant::now();
             let (due, grow) = {

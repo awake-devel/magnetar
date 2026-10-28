@@ -716,6 +716,7 @@ pub async fn start(
     let (dht, rx) = Dht::start(cfg.clone())
         .await
         .map_err(|e| anyhow::anyhow!("DHT: binding UDP {:?}: {e}", opts.ports))?;
+    dht.set_sample_priority(opts.sample_priority);
     tracing::info!(
         "worker DHT {:?}: {} node(s) on UDP {:?}, {} q/s, pool {}, {} fetches, TCP {}/s ≤ {}{}",
         opts.mode,

@@ -1,6 +1,7 @@
 //! The engine split per virtual node (D106, docs/DHT.md §20): the global brakes hold across
 //! shards (total QPS cap, 1 q/s per remote IP), the pacer gives a cancelled query's turn to the
-//! next one, and lookups still end and find peers with many virtual nodes.
+//! next one, lookups still end and find peers with many virtual nodes, and the sampler's
+//! reserved share goes ahead of the queue.
 #![cfg(feature = "dht-crawl")]
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -36,10 +37,11 @@ async fn fake_node(
             let Body::Query { query, .. } = msg.body else {
                 continue;
             };
-            let target = match query {
-                Query::GetPeers { info_hash } => info_hash,
-                Query::FindNode { target } => target,
-                _ => me.id,
+            let (target, sample) = match query {
+                Query::GetPeers { info_hash } => (info_hash, false),
+                Query::FindNode { target } => (target, false),
+                Query::SampleInfohashes { target } => (target, true),
+                _ => (me.id, false),
             };
             let mut near: Vec<CompactNode> = table
                 .iter()
@@ -60,6 +62,8 @@ async fn fake_node(
                     nodes: near,
                     values,
                     token: Some(vec![1]),
+                    samples: sample.then(|| vec![rand::random()]),
+                    interval: sample.then_some(300),
                     ..Default::default()
                 }),
                 ip: Some(src),
@@ -229,4 +233,58 @@ async fn lookups_end_and_find_peers_with_many_shards() {
     assert_eq!(st.lookups, 32, "{st:?}");
     assert!(st.routing.iter().all(|&n| n > 0), "{st:?}");
     dht.shutdown().await;
+}
+
+/// The sampler's reserved share (D106, `MAGNETAR_DHT_SAMPLE_PRIORITY`) is sent ahead of a
+/// flood of queued queries, and the total still stays under the cap; without it the sampler
+/// waits behind the flood.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_sampler_priority_share_goes_ahead_of_the_queue() {
+    let (table, _) = fake_net(47, 250, rand::random(), 0, Vec::new()).await;
+    let table = Arc::new(table);
+    let mut rates = Vec::new();
+    for (k, priority) in [0.0, 0.25].into_iter().enumerate() {
+        let mut cfg = crawler_cfg(Ipv4Addr::new(127, 0, 48, 1 + k as u8), 4, 400);
+        cfg.per_ip_qps = 10_000.0;
+        cfg.sample = true;
+        cfg.bootstrap = table.iter().take(8).map(|c| c.addr).collect();
+        let (dht, _rx) = Dht::start(cfg).await.unwrap();
+        dht.set_sample_priority(priority);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut set = tokio::task::JoinSet::new();
+        // A flood of queued queries, ~5 × the cap.
+        for i in 0..2000usize {
+            let d = dht.clone();
+            let table = table.clone();
+            set.spawn(async move {
+                while Instant::now() < deadline {
+                    let to = table[(i * 7) % table.len()].addr;
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(500),
+                        d.query(i % 4, to, Query::Ping),
+                    )
+                    .await;
+                }
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let s0 = dht.stats();
+        let t0 = Instant::now();
+        while set.join_next().await.is_some() {}
+        let el = t0.elapsed().as_secs_f64();
+        let s1 = dht.stats();
+        let sampler = (s1.sent_sample_infohashes + s1.sent_find_node)
+            - (s0.sent_sample_infohashes + s0.sent_find_node);
+        let total = (s1.queries_sent - s0.queries_sent) as f64;
+        assert!(total <= 400.0 * el + 32.0, "sent {total} in {el:.2} s");
+        rates.push(sampler as f64 / el);
+        dht.shutdown().await;
+    }
+    // 0.25 × 400 = 100 q/s reserved; queued behind the flood the sampler gets a fraction.
+    assert!(rates[1] >= 70.0, "sampler with priority: {rates:?} q/s");
+    assert!(
+        rates[1] >= 3.0 * rates[0],
+        "sampler without / with priority: {rates:?} q/s"
+    );
 }

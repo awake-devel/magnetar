@@ -463,6 +463,7 @@ async fn crawler_maps_its_ports_and_reports_live_stats() {
         peer_lookups: 4,
         lookup_timeout: Duration::from_millis(1500),
         peers_per_hash: 12,
+        sample_priority: 0.0,
         dry_run: false,
         bloom_bits: 1 << 20,
         queue_cap: 1000,

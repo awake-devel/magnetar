@@ -84,6 +84,9 @@ pub struct DhtOptions {
     pub lookup_timeout: Duration,
     /// Peers tried per hash, and where a lookup stops (`MAGNETAR_DHT_PEERS_PER_HASH`).
     pub peers_per_hash: usize,
+    /// Share of the KRPC budget reserved for sampling ahead of the queue
+    /// (`MAGNETAR_DHT_SAMPLE_PRIORITY`, D106; 0 = none).
+    pub sample_priority: f64,
     /// No database: dedupe in memory only, nothing read or written.
     pub dry_run: bool,
     pub bloom_bits: u64,
@@ -134,6 +137,11 @@ impl DhtOptions {
                 .unwrap_or(if aggressive { 64 } else { 8 }),
             lookup_timeout: Duration::from_millis(u64::from(cfg.dht_lookup_timeout_ms)),
             peers_per_hash: cfg.dht_peers_per_hash as usize,
+            sample_priority: if cfg.dht_sample_priority.is_finite() {
+                cfg.dht_sample_priority.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
             dry_run: false,
             bloom_bits: seen::DEFAULT_BITS,
             queue_cap: queue::DEFAULT_CAP,
@@ -1139,6 +1147,7 @@ pub async fn run(
     let (dht, rx) = Dht::start(cfg.clone())
         .await
         .map_err(|e| anyhow::anyhow!("DHT: binding UDP {:?}: {e}", opts.ports))?;
+    dht.set_sample_priority(opts.sample_priority);
     tracing::info!(
         "DHT crawler {:?}: {} virtual node(s) on UDP {:?}, {} q/s, {} bootstrap + {} saved nodes{}",
         opts.mode,

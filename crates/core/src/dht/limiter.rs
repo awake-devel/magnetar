@@ -296,6 +296,8 @@ pub struct Pacer {
     burst: usize,
     braked: std::sync::atomic::AtomicBool,
     state: std::sync::Mutex<(f64, Instant)>,
+    /// Sends taken ahead of the queue since the last refill ([`Pacer::take_ahead`]).
+    ahead: std::sync::atomic::AtomicU64,
 }
 
 impl Pacer {
@@ -308,6 +310,7 @@ impl Pacer {
             burst: ((rate * PACER_TICK.as_secs_f64() * 2.0).ceil() as usize).max(1),
             braked: std::sync::atomic::AtomicBool::new(false),
             state: std::sync::Mutex::new((0.0, now)),
+            ahead: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -341,7 +344,11 @@ impl Pacer {
         };
         *credit += now.saturating_duration_since(*at).as_secs_f64() * rate;
         *at = now;
-        let whole = credit.floor();
+        // Sends taken ahead of the queue came out of this budget too (at most one second of
+        // debt is carried, so a burst of them cannot silence the queue for long).
+        let ahead = self.ahead.swap(0, std::sync::atomic::Ordering::Relaxed);
+        *credit = (*credit - ahead as f64).max(-rate);
+        let whole = credit.floor().max(0.0);
         *credit -= whole;
         // Everything earned goes to the waiters (a late tick on a busy runtime must not lose
         // its share: capping before handing out cost ~15 % of the rate, docs/DHT.md §20); only
@@ -362,6 +369,14 @@ impl Pacer {
         if let Ok(p) = self.sem.acquire().await {
             p.forget();
         }
+    }
+
+    /// Send now, ahead of the queue, and charge the send to the shared budget: the next refills
+    /// hand out that many permits fewer, so the total stays at the rate. For a sender with a
+    /// reserved share that spaces itself (the sampler's priority share, [`super::budget`]).
+    pub fn take_ahead(&self) {
+        self.ahead
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Take a permit if one is free now.
@@ -490,6 +505,24 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(done.load(std::sync::atomic::Ordering::Relaxed), 10);
         set.abort_all();
+    }
+
+    /// Sends taken ahead of the queue are charged to it: the total stays at the rate.
+    #[test]
+    fn pacer_sends_ahead_are_charged() {
+        let t = Instant::now();
+        let p = Pacer::new(1000, t);
+        assert!(p.try_acquire());
+        for _ in 0..4 {
+            p.take_ahead();
+        }
+        assert_eq!(p.refill(t + Duration::from_millis(10)), 6);
+        // More ahead than earned: the debt is carried to the next refill.
+        for _ in 0..15 {
+            p.take_ahead();
+        }
+        assert_eq!(p.refill(t + Duration::from_millis(20)), 0);
+        assert_eq!(p.refill(t + Duration::from_millis(30)), 5);
     }
 
     #[test]

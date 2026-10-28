@@ -251,6 +251,11 @@ pub struct Config {
     /// Peers tried per infohash by the metadata fetcher; a lookup stops once it knows this many.
     #[arg(long, env = "MAGNETAR_DHT_PEERS_PER_HASH", default_value_t = 24, value_parser = clap::value_parser!(u32).range(1..=64))]
     pub dht_peers_per_hash: u32,
+    /// Share of the KRPC budget reserved for BEP 51 sampling, sent ahead of the lookups' queue
+    /// (D106, 0–1). 0 = the sampler queues behind every lookup query (about 1 % of the queries
+    /// at 2048 lookups on the fiber line, docs/DHT.md §20).
+    #[arg(long, env = "MAGNETAR_DHT_SAMPLE_PRIORITY", default_value_t = 0.0)]
+    pub dht_sample_priority: f64,
     /// BEP 9 metadata fetches in flight (default 128 aggressive, 16 polite).
     #[arg(long, env = "MAGNETAR_DHT_FETCH_CONCURRENCY", value_parser = clap::value_parser!(u32).range(1..=2048))]
     pub dht_fetch_concurrency: Option<u32>,
