@@ -12,7 +12,8 @@ What was removed before committing (the repo is public):
   real torrent infohashes;
 - binaries, `perf` data files, test-suite logs and sample `.torrent` files.
 
-Those originals stay only on the machine that produced them.
+The raw captures and node lists have since been deleted; the other excluded files stay only on
+the machine that produced them.
 
 | Folder | Date | What | Headline | Docs |
 |---|---|---|---|---|
