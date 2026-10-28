@@ -1,0 +1,4 @@
+{"down_1_mbps": 650.7, "down_4_mbps": 900.6, "up_1_mbps": 356.7, "up_2_mbps": 685.1,
+ "probe_under_load": {"down_4": {"tcp_med_ms": 17.8, "icmp_med_ms": 19.7}, "up_2": {"tcp_med_ms": 6.7}},
+ "method": "speed.cloudflare.com __down 6x25MB per stream (100MB requests return 403), __up 50MB per stream; short tests, see tp.log",
+ "note": "first baseline run's down values (0.0) were invalid due to the 403; tp.log is authoritative"}

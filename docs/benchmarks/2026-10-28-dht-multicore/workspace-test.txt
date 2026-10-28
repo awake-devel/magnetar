@@ -1,0 +1,8 @@
+test result: ok. 147 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 23.05s
+test result: ok. 153 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 15.53s
+test result: ok. 75 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 15.84s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test dht_upnp::a_failed_renewal_still_removes_earlier_mappings_at_stop ... ok
+test result: ok. 118 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 143.99s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

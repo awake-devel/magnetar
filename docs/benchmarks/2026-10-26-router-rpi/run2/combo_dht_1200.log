@@ -1,0 +1,6 @@
+pool=36934 conntrack=25210 baseline={'tcp': 6.1, 'udp': 7.2, 'gwtcp': 1.1, 'icmp': 6.0}
+== DHT 1200 q/s ==
+{"rate": 1200, "send_rate": 1199.8, "reply_rate": 0.661, "sendfail": 0, "dur": 60.0, "pool": 40000, "aborted": null}
+   tcp {'n': 197, 'loss': 0.0, 'med': 6.9, 'p95': 11.0, 'max': 1025.4} gw {'n': 203, 'loss': 0.0, 'med': 1.9, 'p95': 6.4, 'max': 7.3} udp {'n': 194, 'loss': 0.005, 'med': 8.4, 'p95': 14.9, 'max': 23.8} icmp {'n': 201, 'loss': 0.0, 'med': 6.6, 'p95': 7.8, 'max': 8.7}
+   pi {'n': 61, 'cpu_mean': 27.6, 'cpu_max': 31.0, 'soft_mean': 3.6, 'core_max': [52.6, 51.5, 51.5, 50.0], 'core_mean': [27.9, 28.1, 28.3, 25.8], 'coresoft_mean': [3.6, 3.7, 3.7, 3.3], 'self_cpu_mean': 50.9, 'self_cpu_max': 64.7, 'mem_avail_min': 500, 'load1_max': 1.23, 'rx_mbps_mean': 3.0, 'tx_mbps_mean': 2.14, 'rx_pps_mean': 1278, 'tx_pps_mean': 2298, 'thr_now_or': '0x0', 'ct_max': 54803, 'ct_end': 54803, 'ct_limit': 65536, 'udp_inerr_d': 0, 'udp_rcvbuf_d': 0, 'udp_sndbuf_d': 0}
+  recovery 4.0s (conntrack 54755)

@@ -1,0 +1,7 @@
+peers=10611 reachable_known=1712 mode=conc nofile=(8192, 1048576) conntrack=19797
+== TCP conc 200 ==
+{"N": 200, "attempts": 1879, "connect_ok": 1542, "established_after_open": 115, "held_min": 104, "held_max": 113, "aborted": null, "cpu": {"busy_avg": 5.6, "busy_max": 25.0, "iowait_avg": 0.5, "self_core_avg": 4.3, "self_core_max": 10.0, "load1_max": 0.36}}
+   tcp {'n': 152, 'loss': 0.0, 'med': 5.99, 'p95': 6.48, 'max': 6.84} udp {'n': 152, 'loss': 0.0, 'med': 6.84, 'p95': 8.54, 'max': 21.56} icmp {'n': 92, 'loss': 0.0, 'med': 5.71, 'p95': 6.31, 'max': 6.51} gw {'n': 155, 'loss': 0.0, 'med': 0.79, 'p95': 1.0, 'max': 6.92} svc {'n': 23, 'loss': 0.0, 'med': 8.52, 'p95': 10.72, 'max': 11.74} ct 19856 -> 22091
+  recovery 5.0s (conntrack 20942)
+  could only hold 113 of 200 (peer reachability); stop
+DONE

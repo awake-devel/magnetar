@@ -1,0 +1,21 @@
+2026-10-26T23:27:21+01:00 passive capture 60s udp dst ports 6891-6894 (read-only)
+2026-10-26T23:30:37+01:00 exported 400 alive (dht_torrents fetched <30min) + 100 queued (dht_seen status0 via0) hashes, SELECT only
+2026-10-26T23:30:43+01:00 exported 400 alive (dht_torrents fetched <30min) + 100 queued (dht_seen status0 via0) hashes, SELECT only
+2026-10-26T23:32:15+01:00 LIVE RUN start: capture 40s incoming prod UDP, then exp.py (bounds: TCP<=150/s, <=1500 open, KRPC<=150q/s, wall<=9min)
+2026-10-26T23:32:58 +   0.0s start: alive=400 queued=100 pcap=cap2.tsv
+2026-10-26T23:33:12 +  13.5s P4 querier/announcer probes: 1529, TCP attempts 1529
+2026-10-26T23:33:34 +  35.4s bootstrap: 7926 nodes known, 2790 queries
+2026-10-26T23:34:30 +  91.6s P1 lookups done: 350 lookups, 7176 queries, answered share 0.65
+2026-10-26T23:35:05 + 126.6s P2 probes done: 2581 TCP attempts
+2026-10-26T23:35:05 + 126.6s good peers: 408 distinct; multi-swarm (>=2 of our hashes): 11
+2026-10-26T23:42:00 + 541.6s P3 cross test: 18705 pairs, 18705 TCP attempts, hits 1095
+2026-10-26T23:42:00 + 541.9s end: krpc 9966 sent / 6519 answered, TCP attempts 22815
+2026-10-26T23:43:59 +   0.0s PEX follow-up start: 120 peers, hold 75 s
+2026-10-26T23:45:16 +  76.1s PEX follow-up end: 120 attempts
+2026-10-26T23:45:29 +   0.0s PEX follow-up start: 120 peers, hold 75 s
+2026-10-26T23:46:45 +  76.3s PEX follow-up end: 120 attempts
+2026-10-26T23:47:26 +   0.0s source test start
+2026-10-26T23:47:49 +  22.9s bootstrap: 8352 nodes known, 2909 queries
+2026-10-26T23:47:55 +  28.8s sample_infohashes: 300 asked, 169 answered, 110 with samples
+2026-10-26T23:48:19 +  52.5s get_peers to source: 550 queries
+2026-10-26T23:48:26 +  59.8s source test end: {'asked': 300, 'answered': 169, 'with_samples': 110, 'gp_queries': 550, 'gp_answered': 524, 'gp_with_values': 252, 'values_per_hit': [15, 7, 2, 5, 1, 1, 1, 2, 1, 1, 1, 2, 5, 14, 1, 1, 1, 1, 3, 1, 9, 8, 1, 1, 1, 2, 1, 2, 3, 1, 2, 1, 7, 1, 1, 8, 1, 1, 4, 1, 1, 31, 1, 1, 2, 1, 1, 9, 2, 2, 1, 1, 3, 1, 6, 3, 36, 5, 3, 1, 9, 1, 4, 1, 2, 3, 2, 1, 2, 22, 1, 2, 2, 1, 1, 1, 2, 1, 1, 1, 4, 2, 1, 1, 5, 2, 3, 1, 1, 44, 3, 1, 1, 2, 1, 1, 1, 1, 1, 1, 5, 1, 1, 7, 8, 1, 5, 1, 1, 1, 5, 2, 1, 1, 5, 1, 2, 19, 1, 1, 4, 1, 1, 10, 1, 4, 1, 3, 1, 2, 1, 1, 2, 1, 1, 1, 1, 11, 5, 3, 1, 1, 4, 1, 2, 1, 2, 4, 1, 4, 5, 1, 3, 1, 2, 2, 1, 1, 2, 1, 1, 1, 1, 9, 1, 2, 2, 1, 1, 2, 1, 1, 1, 1, 1, 3, 14, 1, 7, 1, 1, 1, 1, 2, 7, 1, 1, 1, 1, 1, 1, 1, 4, 3, 1, 1, 3, 26, 4, 1, 1, 1, 1, 2, 1, 2, 2, 1, 3, 1, 1, 8, 1, 4, 1, 2, 1, 1, 1, 5, 1, 3, 1, 1, 1, 1, 6, 7, 3, 2, 1, 1, 1, 1, 1, 1, 31, 3, 2, 1, 2, 1, 1, 1, 3, 1, 1, 1, 1, 1, 1, 1], 'probes': 400, 'probe_out': Counter({'connect': 296, 'hs_ok': 79, 'closed_no_hs': 11, 'wrong_ih': 6, 'reset_no_hs': 4, 'hs_timeout': 4}), 'probe_real': 53, 'hashes_real': 47, 'hashes_probed': 243}

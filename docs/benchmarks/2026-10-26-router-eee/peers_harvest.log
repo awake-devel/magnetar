@@ -1,0 +1,6 @@
+  t=10s sent=1967 replies=1339 peers=5954
+  t=20s sent=3955 replies=2707 peers=6078
+  t=30s sent=5951 replies=4112 peers=6179
+  t=40s sent=7956 replies=5493 peers=6190
+  t=51s sent=9955 replies=6931 peers=6234
+harvested 6248 fresh peers, 10611 after merging laptop list (sent 11745, replies 8162, 189 q/s)

@@ -1,0 +1,14 @@
+pool=40119 conntrack=18140 baseline tcp={'n': 196, 'loss': 0.0, 'med': 6.09, 'p95': 6.64, 'max': 10.88}
+== DHT 1000 q/s ==
+{"rate": 1000, "send_rate": 1000.0, "reply_rate": 0.696, "sendfail": 0, "dur": 45.0, "aborted": null, "cpu": {"busy_avg": 11.0, "busy_max": 23.0, "iowait_avg": 0.4, "self_core_avg": 23.8, "self_core_max": 25.0, "load1_max": 0.52}}
+   tcp {'n': 151, 'loss': 0.0, 'med': 5.94, 'p95': 6.79, 'max': 7.04} udp {'n': 145, 'loss': 0.0069, 'med': 6.81, 'p95': 8.94, 'max': 10.08} icmp {'n': 91, 'loss': 0.0, 'med': 5.78, 'p95': 6.6, 'max': 6.98} gw {'n': 153, 'loss': 0.0, 'med': 0.76, 'p95': 1.33, 'max': 1.98} svc {'n': 23, 'loss': 0.0, 'med': 8.58, 'p95': 14.98, 'max': 47.74} svc2 {'n': 23, 'loss': 0.0, 'med': 1.08, 'p95': 1.13, 'max': 18.61} ct 7612 -> 40446
+  recovery 5.0s (conntrack 40571)
+== DHT 1300 q/s ==
+{"rate": 1300, "send_rate": 1300.1, "reply_rate": 0.673, "sendfail": 0, "dur": 45.0, "aborted": null, "cpu": {"busy_avg": 12.3, "busy_max": 33.2, "iowait_avg": 0.6, "self_core_avg": 26.6, "self_core_max": 30.0, "load1_max": 0.35}}
+   tcp {'n': 151, 'loss': 0.0, 'med': 5.95, 'p95': 6.79, 'max': 7.11} udp {'n': 145, 'loss': 0.0069, 'med': 6.63, 'p95': 8.56, 'max': 12.2} icmp {'n': 91, 'loss': 0.0, 'med': 5.75, 'p95': 6.47, 'max': 7.42} gw {'n': 153, 'loss': 0.0, 'med': 0.79, 'p95': 1.34, 'max': 2.04} svc {'n': 23, 'loss': 0.0, 'med': 8.71, 'p95': 12.2, 'max': 24.96} svc2 {'n': 23, 'loss': 0.0, 'med': 1.07, 'p95': 1.27, 'max': 1.41} ct 23510 -> 40942
+  recovery 5.0s (conntrack 41072)
+== DHT 1600 q/s ==
+{"rate": 1600, "send_rate": 1600.2, "reply_rate": 0.65, "sendfail": 0, "dur": 45.0, "aborted": null, "cpu": {"busy_avg": 13.2, "busy_max": 31.8, "iowait_avg": 1.0, "self_core_avg": 29.9, "self_core_max": 33.0, "load1_max": 0.37}}
+   tcp {'n': 147, 'loss': 0.0, 'med': 6.1, 'p95': 7.08, 'max': 1045.65} udp {'n': 150, 'loss': 0.0, 'med': 6.88, 'p95': 8.61, 'max': 15.46} icmp {'n': 91, 'loss': 0.0, 'med': 5.86, 'p95': 6.96, 'max': 7.49} gw {'n': 153, 'loss': 0.0, 'med': 0.85, 'p95': 1.47, 'max': 2.15} svc {'n': 23, 'loss': 0.0, 'med': 8.96, 'p95': 21.85, 'max': 32.22} svc2 {'n': 23, 'loss': 0.0, 'med': 1.09, 'p95': 8.45, 'max': 20.99} ct 32079 -> 40920
+  recovery 5.0s (conntrack 41064)
+DONE

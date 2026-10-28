@@ -1,0 +1,265 @@
+{
+  "mode": "aggressive",
+  "dry_run": false,
+  "seconds": 600.001264571,
+  "virtual_nodes": 4,
+  "ports": [
+    57891,
+    57892,
+    57893,
+    57894
+  ],
+  "sightings": 134761,
+  "unique_hashes": 126412,
+  "unique_hashes_per_min": 12641.173357231277,
+  "bloom_skipped": 8223,
+  "triaged": 126528,
+  "blocked": 0,
+  "known": 2,
+  "queued": 126409,
+  "queued_per_min": 12640.873357863562,
+  "retried": 0,
+  "marked_no_peers": 27209,
+  "triage_errors": 0,
+  "triage_flushes": 580,
+  "triage_mean_ms": 134.19827586206895,
+  "triage_max_ms": 4808,
+  "triage_dropped": 0,
+  "queue_len": 1307,
+  "queue_lanes": [
+    12,
+    1295,
+    0
+  ],
+  "queue_overflow": 0,
+  "sampling_paused_secs": 116.0,
+  "peers": {
+    "hashes": 123054,
+    "with_peers": 95852,
+    "share_with_peers": 0.7789425780551628,
+    "mean": 8.96582801046695,
+    "median": 2,
+    "p90": 30,
+    "max": 72,
+    "from_announcer": 6,
+    "from_sampling_node": 2765,
+    "iterative_lookups": 120283,
+    "queries_per_hash": 16.562013425000405,
+    "lookups": 120283,
+    "lookup_mean_ms": 8674.381400530416,
+    "queries_per_lookup": 16.091326288835496,
+    "lookup_slow_share": 0.08295475153098945,
+    "lookup_late": 0,
+    "announce_upgraded": 5,
+    "announce_attached": 3,
+    "announce_retriaged": 118,
+    "announce_fetches": 9,
+    "status_write_errors": 0,
+    "lookup_answered_share": 0.39906887734672924,
+    "lookup_seeds_fresh_share": 0.2700735486562086,
+    "queries_per_stored": 52.727823171327195,
+    "lookup_dead_skipped": 71835
+  },
+  "fetch": {
+    "hashes": 95845,
+    "ok": 31022,
+    "hybrid": 236,
+    "private": 29,
+    "v2_only": 3,
+    "invalid": 1,
+    "failed": 62741,
+    "oversize": 1,
+    "peers_tried": 595196,
+    "connected": 88948,
+    "peer_errors": [
+      [
+        "connect",
+        411082
+      ],
+      [
+        "timeout",
+        6485
+      ],
+      [
+        "closed",
+        38931
+      ],
+      [
+        "handshake",
+        1091
+      ],
+      [
+        "no_extensions",
+        13
+      ],
+      [
+        "no_ut_metadata",
+        2492
+      ],
+      [
+        "no_metadata",
+        1293
+      ],
+      [
+        "oversize",
+        6
+      ],
+      [
+        "reject",
+        262
+      ],
+      [
+        "bad_block",
+        1
+      ],
+      [
+        "hash_mismatch",
+        5
+      ]
+    ],
+    "tcp_bytes_in": 2175486750,
+    "tcp_bytes_out": 15560654,
+    "metadata_bytes": 1735699710,
+    "ok_mean_ms": 7683.953549094192,
+    "fake_strikes": 20743,
+    "fake_banned": 1658,
+    "fake_skipped": 2885,
+    "fake_tracked": 18558
+  },
+  "metadata_per_min": 3105.4934548050605,
+  "fetch_success_rate": 0.33108734820943103,
+  "persist": {
+    "stored": 30719,
+    "not_new": 0,
+    "alias": 84,
+    "blocked": 305,
+    "blocked_by_tier": {
+      "age": 27,
+      "context": 217,
+      "hard": 61
+    },
+    "categories": {
+      "anime": 1555,
+      "application": 1140,
+      "audio": 3074,
+      "book": 2302,
+      "game": 631,
+      "other": 1865,
+      "picture": 328,
+      "porn": 5434,
+      "video": 14390
+    },
+    "unscreened": 0,
+    "private": 29,
+    "v2_only": 3,
+    "invalid": 1,
+    "oversize": 1,
+    "failed": 62755
+  },
+  "reclassified": {
+    "rows": 0,
+    "changed": 0,
+    "blocked": 0
+  },
+  "persist_errors": 0,
+  "bandwidth": {
+    "udp_in": 267757854,
+    "udp_out": 171819091,
+    "tcp_in": 2175486750,
+    "tcp_out": 15560654,
+    "mbit_per_sec_in": 32.57652606111644,
+    "mbit_per_sec_out": 2.49839133434462
+  },
+  "health": {
+    "probes": 121,
+    "failed": 0,
+    "baseline_ms": 14.401196,
+    "last_median_ms": 14.476422,
+    "brakes": 0
+  },
+  "engine": {
+    "queries_sent": 1634064,
+    "sent_ping": 74,
+    "sent_find_node": 57,
+    "sent_get_peers": 1619746,
+    "sent_sample_infohashes": 14187,
+    "answered": 792482,
+    "errors": 994,
+    "timeouts": 490263,
+    "unmatched": 23425,
+    "decode_errors": 23796,
+    "too_long": 59,
+    "filtered": 1851,
+    "rate_limited": 328934,
+    "busy": 0,
+    "incoming_ping": 779,
+    "incoming_find_node": 2064,
+    "incoming_get_peers": 3693,
+    "incoming_announce_peer": 126,
+    "incoming_sample_infohashes": 31,
+    "incoming_unknown": 7,
+    "incoming_ignored": 0,
+    "responses_sent": 6677,
+    "responses_dropped": 23,
+    "bad_tokens": 0,
+    "samples_received": 130962,
+    "sightings_sample": 130962,
+    "sightings_announce": 126,
+    "sightings_get_peers": 3673,
+    "sightings_dropped": 0,
+    "nodes_learnt": 1470705,
+    "nodes_filtered": 9346,
+    "nodes_farm": 819,
+    "external_ip_known": true,
+    "external_ip_changes": 1,
+    "brake_active": false,
+    "sample_share": 1.0,
+    "brake_engaged": 0,
+    "pending": 4089,
+    "routing": [
+      177,
+      140,
+      150,
+      172
+    ],
+    "pool": {
+      "size": 1000000,
+      "bep51_yes": 6363,
+      "bep51_no": 1316,
+      "bep51_unknown": 992321,
+      "evicted": 400883,
+      "dropped_silent": 0,
+      "dropped_dead": 69822,
+      "dead_known": 69709
+    },
+    "peer_store_hashes": 20,
+    "peer_store_peers": 21,
+    "udp_bytes_in": 267757854,
+    "udp_bytes_out": 171819091,
+    "lookups": 120283,
+    "lookup_ms_total": 1043380618,
+    "lookup_queries": 1935513,
+    "lookup_slow": 160560,
+    "lookup_late": 0,
+    "by_node_age": {
+      "unpooled_sent": 92536,
+      "unpooled_answered": 51852,
+      "young_sent": 1342888,
+      "young_answered": 590446,
+      "old_sent": 198640,
+      "old_answered": 149625,
+      "repeat_sent": 43096,
+      "repeat_answered": 41494
+    },
+    "lookup_answered": 772403,
+    "lookup_seeds_fresh": 528333,
+    "lookup_seeds_unknown": 1427356,
+    "lookup_seeds_struck": 567,
+    "lookup_dead_skipped": 71835
+  },
+  "answered_share": 0.4849761086469073,
+  "queries_per_sec": 2723.434260040024,
+  "cpu_seconds": 627.17,
+  "rss_peak_mb": 562.2890625,
+  "rss_mb": 562.2890625
+}

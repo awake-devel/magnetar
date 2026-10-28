@@ -1,0 +1,17 @@
+peers=6218 mode=conc nofile=(8192, 524288) conntrack=5034 baseline={'tcp': 6.1, 'udp': 7.2, 'gwtcp': 1.1, 'icmp': 6.0}
+== TCP conc 200 ==
+{"N": 200, "attempted": 2092, "connect_ok": 441, "held_peak": 201, "held_last15s_min": 189, "reached_N_at": 14.0, "peer_closed": 248, "aborted": null}
+   tcp {'n': 150, 'loss': 0.0, 'med': 6.5, 'p95': 7.0, 'max': 7.7} gw {'n': 153, 'loss': 0.0, 'med': 1.3, 'p95': 1.7, 'max': 3.8} icmp {'n': 150, 'loss': 0.0, 'med': 6.3, 'p95': 6.8, 'max': 8.0}
+   pi {'n': 46, 'cpu_mean': 3.1, 'cpu_max': 9.9, 'soft_mean': 0.3, 'core_max': [13.4, 34.3, 24.0, 24.0], 'core_mean': [2.2, 4.3, 3.9, 2.1], 'coresoft_mean': [0.3, 0.3, 0.4, 0.2], 'self_cpu_mean': 10.9, 'self_cpu_max': 34.8, 'mem_avail_min': 541, 'load1_max': 0.24, 'ct_max': 5355, 'ct_end': 2729, 'ct_limit': 7680, 'udp_inerr_d': 0, 'udp_rcvbuf_d': 0, 'udp_sndbuf_d': 0}
+  recovery 4.0s (conntrack 2783)
+== TCP conc 400 ==
+{"N": 400, "attempted": 4201, "connect_ok": 859, "held_peak": 400, "held_last15s_min": 381, "reached_N_at": 28.0, "peer_closed": 469, "aborted": null}
+   tcp {'n': 151, 'loss': 0.0, 'med': 6.5, 'p95': 7.1, 'max': 42.4} gw {'n': 153, 'loss': 0.0, 'med': 1.2, 'p95': 1.8, 'max': 3.0} icmp {'n': 151, 'loss': 0.0, 'med': 6.3, 'p95': 7.1, 'max': 8.5}
+   pi {'n': 46, 'cpu_mean': 5.2, 'cpu_max': 10.5, 'soft_mean': 0.4, 'core_max': [32.7, 26.7, 35.7, 22.4], 'core_mean': [7.5, 7.4, 3.7, 2.3], 'coresoft_mean': [0.4, 0.5, 0.4, 0.4], 'self_cpu_mean': 18.7, 'self_cpu_max': 36.7, 'mem_avail_min': 540, 'load1_max': 0.24, 'ct_max': 6246, 'ct_end': 6106, 'ct_limit': 7680, 'udp_inerr_d': 0, 'udp_rcvbuf_d': 0, 'udp_sndbuf_d': 0}
+  recovery 4.0s (conntrack 6158)
+== TCP conc 800 ==
+{"N": 800, "attempted": 4497, "connect_ok": 919, "held_peak": 416, "held_last15s_min": 405, "reached_N_at": null, "peer_closed": 509, "aborted": null}
+   tcp {'n': 150, 'loss': 0.0, 'med': 6.4, 'p95': 8.1, 'max': 33.6} gw {'n': 153, 'loss': 0.0, 'med': 1.2, 'p95': 2.1, 'max': 7.0} icmp {'n': 151, 'loss': 0.0, 'med': 6.3, 'p95': 7.1, 'max': 12.1}
+   pi {'n': 46, 'cpu_mean': 5.5, 'cpu_max': 9.9, 'soft_mean': 0.4, 'core_max': [7.1, 31.2, 25.8, 34.3], 'core_mean': [1.7, 6.0, 4.3, 9.8], 'coresoft_mean': [0.3, 0.5, 0.3, 0.4], 'self_cpu_mean': 19.8, 'self_cpu_max': 33.9, 'mem_avail_min': 538, 'load1_max': 0.2, 'ct_max': 7680, 'ct_end': 6812, 'ct_limit': 7680, 'udp_inerr_d': 0, 'udp_rcvbuf_d': 0, 'udp_sndbuf_d': 0}
+  recovery 4.0s (conntrack 6871)
+DONE

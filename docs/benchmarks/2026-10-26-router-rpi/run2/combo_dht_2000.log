@@ -1,0 +1,8 @@
+pool=36934 conntrack=9479 baseline={'tcp': 6.1, 'udp': 7.2, 'gwtcp': 1.1, 'icmp': 6.0}
+== DHT 2000 q/s ==
+{"rate": 2000, "send_rate": 1998.5, "reply_rate": 0.592, "sendfail": 0, "dur": 12.0, "pool": 40000, "aborted": {"tmed": 147.7, "t9med": 154.8, "tloss": 0.0, "umed": 153.1, "uloss": 0, "gmed": 149.1, "gloss": 0, "imed": 7.6, "lat_rise": true, "pi_bad": false, "ct_full": false, "mem": 509, "load1": 0.3, "cpu": 41.0, "core": [77.6, 61.1, 7.3, 17.5], "ct": 36132}}
+   tcp {'n': 34, 'loss': 0.0, 'med': 120.3, 'p95': 164.9, 'max': 165.9} gw {'n': 33, 'loss': 0.03, 'med': 105.9, 'p95': 158.4, 'max': 161.3} udp {'n': 34, 'loss': 0.0, 'med': 120.8, 'p95': 170.4, 'max': 175.5} icmp {'n': 44, 'loss': 0.0, 'med': 7.3, 'p95': 8.9, 'max': 10.6}
+   pi {'n': 14, 'cpu_mean': 34.1, 'cpu_max': 41.0, 'soft_mean': 4.9, 'core_max': [77.6, 61.1, 65.6, 68.1], 'core_mean': [49.5, 27.7, 24.0, 34.7], 'coresoft_mean': [5.3, 4.2, 4.9, 5.0], 'self_cpu_mean': 59.2, 'self_cpu_max': 79.3, 'mem_avail_min': 506, 'load1_max': 0.3, 'rx_mbps_mean': 3.9, 'tx_mbps_mean': 3.02, 'rx_pps_mean': 1647, 'tx_pps_mean': 3187, 'thr_now_or': '0x0', 'ct_max': 38047, 'ct_end': 38047, 'ct_limit': 65536, 'udp_inerr_d': 0, 'udp_rcvbuf_d': 0, 'udp_sndbuf_d': 0}
+  recovery 4.0s (conntrack 38158)
+  ABORT at 2000 q/s
+DONE

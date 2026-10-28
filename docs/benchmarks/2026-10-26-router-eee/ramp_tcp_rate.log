@@ -1,0 +1,41 @@
+peers=10611 reachable_known=0 mode=rate nofile=(8192, 1048576) conntrack=32735
+== TCP rate 10 ==
+{"rate": 10, "attempt_rate": 10.0, "connect_ok": 76, "connect_ok_rate": 0.18, "hs_ok": 22, "aborted": null, "cpu": {"busy_avg": 5.6, "busy_max": 32.6, "iowait_avg": 0.5, "self_core_avg": 5.2, "self_core_max": 6.0, "load1_max": 0.5}}
+   tcp {'n': 151, 'loss': 0.0, 'med': 6.03, 'p95': 6.6, 'max': 6.81} udp {'n': 150, 'loss': 0.0, 'med': 7.03, 'p95': 9.75, 'max': 19.13} icmp {'n': 91, 'loss': 0.0, 'med': 5.92, 'p95': 6.38, 'max': 6.88} gw {'n': 153, 'loss': 0.0, 'med': 0.79, 'p95': 0.99, 'max': 1.28} svc {'n': 23, 'loss': 0.0, 'med': 8.42, 'p95': 11.25, 'max': 16.61} ct 32780 -> 33642 cf {'ConnectionRefusedError': 56, 'OSError': 8, 'TimeoutError': 283}
+  recovery 5.0s (conntrack 23203)
+== TCP rate 25 ==
+{"rate": 25, "attempt_rate": 25.0, "connect_ok": 170, "connect_ok_rate": 0.161, "hs_ok": 63, "aborted": null, "cpu": {"busy_avg": 5.9, "busy_max": 19.1, "iowait_avg": 1.3, "self_core_avg": 5.9, "self_core_max": 7.0, "load1_max": 0.33}}
+   tcp {'n': 151, 'loss': 0.0, 'med': 6.04, 'p95': 6.57, 'max': 8.04} udp {'n': 150, 'loss': 0.0, 'med': 7.11, 'p95': 9.42, 'max': 15.66} icmp {'n': 91, 'loss': 0.0, 'med': 5.9, 'p95': 6.32, 'max': 9.12} gw {'n': 153, 'loss': 0.0, 'med': 0.74, 'p95': 0.92, 'max': 1.97} svc {'n': 23, 'loss': 0.0, 'med': 8.63, 'p95': 23.68, 'max': 24.3} ct 23259 -> 24491 cf {'OSError': 14, 'ConnectionRefusedError': 139, 'TimeoutError': 734}
+  recovery 5.0s (conntrack 2695)
+== TCP rate 50 ==
+{"rate": 50, "attempt_rate": 50.0, "connect_ok": 330, "connect_ok_rate": 0.157, "hs_ok": 122, "aborted": null, "cpu": {"busy_avg": 8.0, "busy_max": 28.7, "iowait_avg": 17.5, "self_core_avg": 6.9, "self_core_max": 8.0, "load1_max": 1.36}}
+   tcp {'n': 151, 'loss': 0.0, 'med': 6.04, 'p95': 6.66, 'max': 7.2} udp {'n': 150, 'loss': 0.0, 'med': 7.16, 'p95': 10.87, 'max': 20.76} icmp {'n': 91, 'loss': 0.0, 'med': 5.88, 'p95': 6.23, 'max': 6.44} gw {'n': 153, 'loss': 0.0, 'med': 0.76, 'p95': 0.97, 'max': 2.83} svc {'n': 23, 'loss': 0.0, 'med': 8.49, 'p95': 8.99, 'max': 9.59} ct 2756 -> 5405 cf {'ConnectionRefusedError': 287, 'OSError': 24, 'TimeoutError': 1464}
+  recovery 5.0s (conntrack 4277)
+== TCP rate 100 ==
+{"rate": 100, "attempt_rate": 100.0, "connect_ok": 705, "connect_ok_rate": 0.167, "hs_ok": 248, "aborted": null, "cpu": {"busy_avg": 9.7, "busy_max": 30.9, "iowait_avg": 14.8, "self_core_avg": 8.9, "self_core_max": 11.0, "load1_max": 1.83}}
+   tcp {'n': 151, 'loss': 0.0, 'med': 5.91, 'p95': 6.51, 'max': 8.47} udp {'n': 145, 'loss': 0.0069, 'med': 6.95, 'p95': 9.43, 'max': 18.51} icmp {'n': 91, 'loss': 0.0, 'med': 5.83, 'p95': 6.47, 'max': 7.41} gw {'n': 153, 'loss': 0.0, 'med': 0.73, 'p95': 1.01, 'max': 3.33} svc {'n': 23, 'loss': 0.0, 'med': 8.65, 'p95': 11.19, 'max': 18.1} ct 4369 -> 8883 cf {'OSError': 49, 'ConnectionRefusedError': 569, 'TimeoutError': 2887}
+  recovery 5.0s (conntrack 9300)
+== TCP rate 150 ==
+{"rate": 150, "attempt_rate": 150.0, "connect_ok": 1031, "connect_ok_rate": 0.163, "hs_ok": 341, "aborted": null, "cpu": {"busy_avg": 10.2, "busy_max": 68.4, "iowait_avg": 12.3, "self_core_avg": 10.5, "self_core_max": 14.0, "load1_max": 1.81}}
+   tcp {'n': 150, 'loss': 0.0, 'med': 5.98, 'p95': 7.69, 'max': 9.9} udp {'n': 150, 'loss': 0.0, 'med': 7.02, 'p95': 9.26, 'max': 24.36} icmp {'n': 91, 'loss': 0.0, 'med': 5.86, 'p95': 6.35, 'max': 6.59} gw {'n': 153, 'loss': 0.0, 'med': 0.73, 'p95': 1.34, 'max': 5.18} svc {'n': 23, 'loss': 0.0, 'med': 8.58, 'p95': 15.99, 'max': 24.61} ct 6911 -> 13119 cf {'OSError': 98, 'ConnectionRefusedError': 853, 'TimeoutError': 4338}
+  recovery 5.0s (conntrack 13660)
+== TCP rate 200 ==
+{"rate": 200, "attempt_rate": 200.0, "connect_ok": 1381, "connect_ok_rate": 0.164, "hs_ok": 458, "aborted": null, "cpu": {"busy_avg": 7.5, "busy_max": 26.1, "iowait_avg": 1.1, "self_core_avg": 12.3, "self_core_max": 15.8, "load1_max": 1.39}}
+   tcp {'n': 150, 'loss': 0.0, 'med': 5.97, 'p95': 9.45, 'max': 11.13} udp {'n': 150, 'loss': 0.0, 'med': 6.95, 'p95': 9.26, 'max': 10.7} icmp {'n': 91, 'loss': 0.0, 'med': 5.84, 'p95': 6.47, 'max': 6.68} gw {'n': 153, 'loss': 0.0, 'med': 0.72, 'p95': 3.31, 'max': 5.95} svc {'n': 23, 'loss': 0.0, 'med': 8.61, 'p95': 20.53, 'max': 43.88} ct 13719 -> 18176 cf {'OSError': 131, 'ConnectionRefusedError': 1113, 'TimeoutError': 5787}
+  recovery 5.0s (conntrack 18817)
+== TCP rate 300 ==
+{"rate": 300, "attempt_rate": 300.0, "connect_ok": 2082, "connect_ok_rate": 0.165, "hs_ok": 694, "aborted": null, "cpu": {"busy_avg": 8.9, "busy_max": 24.2, "iowait_avg": 0.6, "self_core_avg": 16.0, "self_core_max": 20.0, "load1_max": 0.84}}
+   tcp {'n': 150, 'loss': 0.0, 'med': 6.02, 'p95': 12.25, 'max': 24.59} udp {'n': 145, 'loss': 0.0069, 'med': 7.03, 'p95': 14.39, 'max': 24.07} icmp {'n': 91, 'loss': 0.0, 'med': 5.82, 'p95': 6.49, 'max': 7.3} gw {'n': 153, 'loss': 0.0, 'med': 0.77, 'p95': 6.18, 'max': 10.11} svc {'n': 23, 'loss': 0.0, 'med': 8.92, 'p95': 22.54, 'max': 57.3} ct 18872 -> 25133 cf {'OSError': 202, 'ConnectionRefusedError': 1668, 'TimeoutError': 8702}
+  recovery 5.0s (conntrack 25997)
+== TCP rate 400 ==
+{"rate": 400, "attempt_rate": 400.0, "connect_ok": 2758, "connect_ok_rate": 0.164, "hs_ok": 907, "aborted": null, "cpu": {"busy_avg": 10.2, "busy_max": 26.3, "iowait_avg": 1.1, "self_core_avg": 19.1, "self_core_max": 24.0, "load1_max": 1.6}}
+   tcp {'n': 146, 'loss': 0.0, 'med': 6.08, 'p95': 17.85, 'max': 1056.93} udp {'n': 144, 'loss': 0.0069, 'med': 7.21, 'p95': 18.07, 'max': 22.53} icmp {'n': 91, 'loss': 0.0, 'med': 5.79, 'p95': 6.87, 'max': 9.25} gw {'n': 149, 'loss': 0.0067, 'med': 0.77, 'p95': 10.87, 'max': 15.41} svc {'n': 23, 'loss': 0.0, 'med': 8.6, 'p95': 15.35, 'max': 30.0} ct 26047 -> 32625 cf {'OSError': 270, 'ConnectionRefusedError': 2219, 'TimeoutError': 11598}
+  recovery 5.0s (conntrack 33749)
+== TCP rate 600 ==
+   degraded {'tmed': 19.27, 'tloss': 0, 'umed': 18.85, 'uloss': 0, 'imed': 6.05, 'gmed': 13.05, 'gloss': 0, 'smed': 8.88, 'sloss': 0, 's2med': 1.08, 's2loss': 0, 'reasons': ['gw_lat'], 'lat_rise': True}
+   degraded {'tmed': 19.11, 'tloss': 0, 'umed': 18.7, 'uloss': 0, 'imed': 5.71, 'gmed': 12.39, 'gloss': 0.04, 'smed': 9.95, 'sloss': 0, 's2med': 1.08, 's2loss': 0, 'reasons': ['gw_lat'], 'lat_rise': True}
+{"rate": 600, "attempt_rate": 599.8, "connect_ok": 1372, "connect_ok_rate": 0.19, "hs_ok": 439, "aborted": {"tmed": 19.11, "tloss": 0, "umed": 18.7, "uloss": 0, "imed": 5.71, "gmed": 12.39, "gloss": 0.04, "smed": 9.95, "sloss": 0, "s2med": 1.08, "s2loss": 0, "reasons": ["gw_lat"], "lat_rise": true}, "cpu": {"busy_avg": 11.7, "busy_max": 22.2, "iowait_avg": 0.7, "self_core_avg": 24.9, "self_core_max": 34.0, "load1_max": 1.03}}
+   tcp {'n': 51, 'loss': 0.0, 'med': 17.17, 'p95': 28.38, 'max': 40.22} udp {'n': 51, 'loss': 0.0, 'med': 16.15, 'p95': 27.91, 'max': 58.05} icmp {'n': 32, 'loss': 0.0, 'med': 5.91, 'p95': 6.81, 'max': 7.53} gw {'n': 48, 'loss': 0.0208, 'med': 6.7, 'p95': 26.77, 'max': 42.8} svc {'n': 8, 'loss': 0.0, 'med': 8.89, 'p95': 35.96, 'max': 35.96} ct 33801 -> 41020 cf {'OSError': 110, 'ConnectionRefusedError': 1060, 'TimeoutError': 4669}
+  recovery 5.0s (conntrack 41113)
+  ABORT at 600
+DONE

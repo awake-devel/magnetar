@@ -1,0 +1,8 @@
+  t=5 sent=540 replies=345 peers=4613 cpu=3.8 ct=7575
+  t=10 sent=1080 replies=691 peers=5876 cpu=3.5 ct=7621
+  t=15 sent=1620 replies=1016 peers=6039 cpu=3.3 ct=6299
+  t=20 sent=2160 replies=1396 peers=6093 cpu=3.5 ct=6706
+  t=25 sent=2700 replies=1786 peers=6133 cpu=3.8 ct=7120
+  t=30 sent=3240 replies=2142 peers=6162 cpu=3.8 ct=7576
+  t=36 sent=3780 replies=2529 peers=6213 cpu=3.8 ct=7679
+KEYED 6218 {"sent": 4212, "replies": 2805, "pi": {"n": 42, "cpu_mean": 3.4, "cpu_max": 4.3, "soft_mean": 0.2, "core_max": [13.9, 5.0, 12.7, 12.0], "core_mean": [4.6, 1.1, 4.5, 3.1], "coresoft_mean": [0.2, 0.2, 0.1, 0.3], "self_cpu_mean": 11.4, "self_cpu_max": 13.9, "mem_avail_min": 540, "load1_max": 0.16, "ct_max": 7680, "ct_end": 7675, "ct_limit": 7680, "udp_inerr_d": 0, "udp_rcvbuf_d": 0, "udp_sndbuf_d": 0}}

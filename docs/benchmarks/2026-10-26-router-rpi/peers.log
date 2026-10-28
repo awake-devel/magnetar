@@ -1,0 +1,12 @@
+  t=5 sent=540 replies=332 peers=4769 cpu=3.6 ct=7121
+  t=10 sent=1080 replies=690 peers=5945 cpu=2.8 ct=6950
+  t=15 sent=1620 replies=1037 peers=6035 cpu=3.3 ct=6975
+  t=20 sent=2160 replies=1426 peers=6124 cpu=2.8 ct=7122
+  t=25 sent=2700 replies=1772 peers=6161 cpu=3.1 ct=7391
+  t=30 sent=3240 replies=2093 peers=6177 cpu=3.0 ct=7680
+  t=36 sent=3780 replies=2463 peers=6194 cpu=2.8 ct=7680
+  t=41 sent=4320 replies=2829 peers=6229 cpu=3.8 ct=7678
+  t=46 sent=4860 replies=3219 peers=6242 cpu=3.0 ct=6963
+  t=51 sent=5400 replies=3592 peers=6286 cpu=3.3 ct=7407
+  t=56 sent=5940 replies=3936 peers=6292 cpu=3.5 ct=7679
+PEERS {"fresh": 6294, "merged": 10644, "sent": 6318, "replies": 4175, "pi": {"n": 62, "cpu_mean": 3.2, "cpu_max": 4.5, "soft_mean": 0.2, "core_max": [3.0, 12.1, 11.9, 13.9], "core_mean": [0.9, 3.3, 4.3, 4.1], "coresoft_mean": [0.2, 0.2, 0.2, 0.1], "self_cpu_mean": 11.3, "self_cpu_max": 13.9, "mem_avail_min": 547, "load1_max": 0.33, "ct_max": 7680, "ct_end": 7678, "ct_limit": 7680, "udp_inerr_d": 0, "udp_rcvbuf_d": 0, "udp_sndbuf_d": 0}, "tcp": {"n": 200, "loss": 0.0, "med": 6.5, "p95": 7.2, "max": 1022.7}}

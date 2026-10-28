@@ -1,0 +1,19 @@
+peers=5313 mode=conc nofile=(8192, 524288) conntrack=7894 baseline={'tcp': 6.1, 'udp': 7.2, 'gwtcp': 1.1, 'icmp': 6.0}
+== TCP conc 300 ==
+{"N": 300, "attempted": 2908, "connect_ok": 681, "held_peak": 302, "held_last15s_min": 287, "reached_N_at": 24.3, "peer_closed": 385, "aborted": null}
+   tcp {'n': 150, 'loss': 0.0, 'med': 6.5, 'p95': 7.4, 'max': 10.1} gw {'n': 153, 'loss': 0.0, 'med': 1.2, 'p95': 1.7, 'max': 3.5} icmp {'n': 151, 'loss': 0.0, 'med': 6.3, 'p95': 7.1, 'max': 40.6}
+   pi {'n': 46, 'cpu_mean': 4.3, 'cpu_max': 8.8, 'soft_mean': 0.4, 'core_max': [25.8, 16.3, 19.4, 24.0], 'core_mean': [6.1, 2.7, 3.7, 4.9], 'coresoft_mean': [0.4, 0.5, 0.4, 0.5], 'self_cpu_mean': 15.2, 'self_cpu_max': 28.9, 'mem_avail_min': 538, 'load1_max': 0.14, 'rx_mbps_mean': 0.21, 'tx_mbps_mean': 0.22, 'rx_pps_mean': 141, 'tx_pps_mean': 318, 'thr_now_or': '0x0', 'ct_max': 7864, 'ct_end': 3157, 'ct_limit': 65536, 'udp_inerr_d': 0, 'udp_rcvbuf_d': 0, 'udp_sndbuf_d': 0}
+  recovery 4.0s (conntrack 3219)
+  conntrack drain wait 0.0s -> 3219
+== TCP conc 500 ==
+{"N": 500, "attempted": 3597, "connect_ok": 879, "held_peak": 366, "held_last15s_min": 351, "reached_N_at": null, "peer_closed": 522, "aborted": null}
+   tcp {'n': 151, 'loss': 0.0, 'med': 6.5, 'p95': 7.3, 'max': 21.1} gw {'n': 153, 'loss': 0.0, 'med': 1.2, 'p95': 1.8, 'max': 2.7} icmp {'n': 151, 'loss': 0.0, 'med': 6.4, 'p95': 7.1, 'max': 7.9}
+   pi {'n': 46, 'cpu_mean': 5.2, 'cpu_max': 8.9, 'soft_mean': 0.5, 'core_max': [20.2, 29.3, 24.2, 33.0], 'core_mean': [2.3, 7.4, 4.4, 6.8], 'coresoft_mean': [0.4, 0.6, 0.4, 0.5], 'self_cpu_mean': 17.9, 'self_cpu_max': 31.8, 'mem_avail_min': 535, 'load1_max': 0.19, 'rx_mbps_mean': 0.26, 'tx_mbps_mean': 0.26, 'rx_pps_mean': 171, 'tx_pps_mean': 385, 'thr_now_or': '0x0', 'ct_max': 6358, 'ct_end': 6349, 'ct_limit': 65536, 'udp_inerr_d': 0, 'udp_rcvbuf_d': 0, 'udp_sndbuf_d': 0}
+  recovery 4.0s (conntrack 6409)
+  conntrack drain wait 0.0s -> 6409
+== TCP conc 800 ==
+{"N": 800, "attempted": 3598, "connect_ok": 916, "held_peak": 393, "held_last15s_min": 383, "reached_N_at": null, "peer_closed": 527, "aborted": null}
+   tcp {'n': 151, 'loss': 0.0, 'med': 6.5, 'p95': 7.4, 'max': 21.4} gw {'n': 153, 'loss': 0.0, 'med': 1.2, 'p95': 1.9, 'max': 2.9} icmp {'n': 151, 'loss': 0.0, 'med': 6.4, 'p95': 7.2, 'max': 7.9}
+   pi {'n': 46, 'cpu_mean': 5.2, 'cpu_max': 9.3, 'soft_mean': 0.5, 'core_max': [20.2, 20.2, 27.6, 26.5], 'core_mean': [4.1, 2.7, 5.1, 8.9], 'coresoft_mean': [0.5, 0.5, 0.4, 0.5], 'self_cpu_mean': 18.2, 'self_cpu_max': 30.9, 'mem_avail_min': 533, 'load1_max': 0.3, 'rx_mbps_mean': 0.28, 'tx_mbps_mean': 0.27, 'rx_pps_mean': 175, 'tx_pps_mean': 387, 'thr_now_or': '0x0', 'ct_max': 8657, 'ct_end': 8644, 'ct_limit': 65536, 'udp_inerr_d': 0, 'udp_rcvbuf_d': 0, 'udp_sndbuf_d': 0}
+  recovery 4.0s (conntrack 8692)
+DONE

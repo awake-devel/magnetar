@@ -1,0 +1,8 @@
+peers=5313 mode=rate nofile=(8192, 524288) conntrack=9469 baseline={'tcp': 6.1, 'udp': 7.2, 'gwtcp': 1.1, 'icmp': 6.0}
+== TCP rate 400 ==
+{"rate": 400, "attempt_rate": 399.6, "connect_ok": 1153, "connect_fail": 2909, "connect_ok_rate": 0.284, "hs_ok": 818, "aborted": {"tmed": 156.4, "t9med": 142.8, "tloss": 0.0, "umed": 161.0, "uloss": 0.091, "gmed": 150.7, "gloss": 0.071, "imed": 7.3, "lat_rise": true, "pi_bad": false, "ct_full": false, "mem": 509, "load1": 0.3, "cpu": 40.6, "core": [74.0, 61.9, 8.2, 17.7], "ct": 35325}}
+   tcp {'n': 34, 'loss': 0.0, 'med': 112.8, 'p95': 191.3, 'max': 198.4} gw {'n': 31, 'loss': 0.065, 'med': 89.3, 'p95': 159.9, 'max': 166.1} icmp {'n': 39, 'loss': 0.026, 'med': 7.1, 'p95': 8.1, 'max': 8.8} cf {'ConnectionRefusedError': 522, 'OSError': 75, 'TimeoutError': 2312}
+   pi {'n': 14, 'cpu_mean': 33.9, 'cpu_max': 40.6, 'soft_mean': 4.9, 'core_max': [74.0, 62.6, 50.0, 76.0], 'core_mean': [49.4, 27.6, 23.8, 34.4], 'coresoft_mean': [5.3, 4.2, 4.8, 5.0], 'self_cpu_mean': 61.1, 'self_cpu_max': 78.2, 'mem_avail_min': 507, 'load1_max': 0.3, 'rx_mbps_mean': 3.89, 'tx_mbps_mean': 3.0, 'rx_pps_mean': 1639, 'tx_pps_mean': 3174, 'thr_now_or': '0x0', 'ct_max': 38034, 'ct_end': 38034, 'ct_limit': 65536, 'udp_inerr_d': 0, 'udp_rcvbuf_d': 0, 'udp_sndbuf_d': 0}
+  recovery 4.0s (conntrack 38152)
+  ABORT at 400
+DONE

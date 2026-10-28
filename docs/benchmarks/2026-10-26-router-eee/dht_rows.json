@@ -1,0 +1,236 @@
+[
+  {
+    "rate": 1000,
+    "sent": 45003,
+    "send_rate": 1000.0,
+    "recv": 31305,
+    "reply_rate": 0.696,
+    "sendfail": 0,
+    "skipped_same_ip": 712,
+    "dur": 45.0,
+    "aborted": null,
+    "cpu": {
+      "busy_avg": 11.0,
+      "busy_max": 23.0,
+      "iowait_avg": 0.4,
+      "self_core_avg": 23.8,
+      "self_core_max": 25.0,
+      "load1_max": 0.52
+    },
+    "tcp": {
+      "n": 151,
+      "loss": 0.0,
+      "med": 5.94,
+      "p95": 6.79,
+      "max": 7.04
+    },
+    "tcp9": {
+      "n": 151,
+      "loss": 0.0,
+      "med": 5.07,
+      "p95": 5.77,
+      "max": 6.33
+    },
+    "gwtcp": {
+      "n": 153,
+      "loss": 0.0,
+      "med": 0.76,
+      "p95": 1.33,
+      "max": 1.98
+    },
+    "1.1.1.1": {
+      "n": 145,
+      "loss": 0.0069,
+      "med": 6.81,
+      "p95": 8.94,
+      "max": 10.08
+    },
+    "icmp": {
+      "n": 91,
+      "loss": 0.0,
+      "med": 5.78,
+      "p95": 6.6,
+      "max": 6.98
+    },
+    "gwicmp": {
+      "n": 92,
+      "loss": 0.0,
+      "med": 0.49,
+      "p95": 1.04,
+      "max": 1.58
+    },
+    "svc": {
+      "n": 23,
+      "loss": 0.0,
+      "med": 8.58,
+      "p95": 14.98,
+      "max": 47.74
+    },
+    "svc2": {
+      "n": 23,
+      "loss": 0.0,
+      "med": 1.08,
+      "p95": 1.13,
+      "max": 18.61
+    },
+    "conntrack_start": 7612,
+    "conntrack_peak": 40446,
+    "recovery_s": 5.0
+  },
+  {
+    "rate": 1300,
+    "sent": 58506,
+    "send_rate": 1300.1,
+    "recv": 39381,
+    "reply_rate": 0.673,
+    "sendfail": 0,
+    "skipped_same_ip": 1051,
+    "dur": 45.0,
+    "aborted": null,
+    "cpu": {
+      "busy_avg": 12.3,
+      "busy_max": 33.2,
+      "iowait_avg": 0.6,
+      "self_core_avg": 26.6,
+      "self_core_max": 30.0,
+      "load1_max": 0.35
+    },
+    "tcp": {
+      "n": 151,
+      "loss": 0.0,
+      "med": 5.95,
+      "p95": 6.79,
+      "max": 7.11
+    },
+    "tcp9": {
+      "n": 148,
+      "loss": 0.0,
+      "med": 5.13,
+      "p95": 5.85,
+      "max": 1025.04
+    },
+    "gwtcp": {
+      "n": 153,
+      "loss": 0.0,
+      "med": 0.79,
+      "p95": 1.34,
+      "max": 2.04
+    },
+    "1.1.1.1": {
+      "n": 145,
+      "loss": 0.0069,
+      "med": 6.63,
+      "p95": 8.56,
+      "max": 12.2
+    },
+    "icmp": {
+      "n": 91,
+      "loss": 0.0,
+      "med": 5.75,
+      "p95": 6.47,
+      "max": 7.42
+    },
+    "gwicmp": {
+      "n": 92,
+      "loss": 0.0,
+      "med": 0.54,
+      "p95": 1.23,
+      "max": 1.48
+    },
+    "svc": {
+      "n": 23,
+      "loss": 0.0,
+      "med": 8.71,
+      "p95": 12.2,
+      "max": 24.96
+    },
+    "svc2": {
+      "n": 23,
+      "loss": 0.0,
+      "med": 1.07,
+      "p95": 1.27,
+      "max": 1.41
+    },
+    "conntrack_start": 23510,
+    "conntrack_peak": 40942,
+    "recovery_s": 5.0
+  },
+  {
+    "rate": 1600,
+    "sent": 72012,
+    "send_rate": 1600.2,
+    "recv": 46821,
+    "reply_rate": 0.65,
+    "sendfail": 0,
+    "skipped_same_ip": 1536,
+    "dur": 45.0,
+    "aborted": null,
+    "cpu": {
+      "busy_avg": 13.2,
+      "busy_max": 31.8,
+      "iowait_avg": 1.0,
+      "self_core_avg": 29.9,
+      "self_core_max": 33.0,
+      "load1_max": 0.37
+    },
+    "tcp": {
+      "n": 147,
+      "loss": 0.0,
+      "med": 6.1,
+      "p95": 7.08,
+      "max": 1045.65
+    },
+    "tcp9": {
+      "n": 151,
+      "loss": 0.0,
+      "med": 5.2,
+      "p95": 6.08,
+      "max": 7.54
+    },
+    "gwtcp": {
+      "n": 153,
+      "loss": 0.0,
+      "med": 0.85,
+      "p95": 1.47,
+      "max": 2.15
+    },
+    "1.1.1.1": {
+      "n": 150,
+      "loss": 0.0,
+      "med": 6.88,
+      "p95": 8.61,
+      "max": 15.46
+    },
+    "icmp": {
+      "n": 91,
+      "loss": 0.0,
+      "med": 5.86,
+      "p95": 6.96,
+      "max": 7.49
+    },
+    "gwicmp": {
+      "n": 92,
+      "loss": 0.0,
+      "med": 0.53,
+      "p95": 1.39,
+      "max": 1.66
+    },
+    "svc": {
+      "n": 23,
+      "loss": 0.0,
+      "med": 8.96,
+      "p95": 21.85,
+      "max": 32.22
+    },
+    "svc2": {
+      "n": 23,
+      "loss": 0.0,
+      "med": 1.09,
+      "p95": 8.45,
+      "max": 20.99
+    },
+    "conntrack_start": 32079,
+    "conntrack_peak": 40920,
+    "recovery_s": 5.0
+  }
+]

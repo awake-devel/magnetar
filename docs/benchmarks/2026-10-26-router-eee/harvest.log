@@ -1,0 +1,10 @@
+boot resolve fail router.bitcomet.com [Errno -2] Name or service not known
+  t=5s pool=4911 sent=954 recv=680 q=3942
+  t=10s pool=10422 sent=1937 recv=1418 q=8453
+  t=15s pool=15791 sent=2927 recv=2228 q=12822
+  t=20s pool=20694 sent=3920 recv=2965 q=16725
+  t=25s pool=25423 sent=4902 recv=3667 q=20454
+  t=30s pool=30327 sent=5893 recv=4396 q=24358
+  t=35s pool=34872 sent=6858 recv=5095 q=27903
+  t=40s pool=39848 sent=7839 recv=5839 q=31879
+harvested 40119 distinct nodes (sent 7874, recv 5879)

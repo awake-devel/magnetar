@@ -1,0 +1,318 @@
+{
+ "idle": {
+  "tcp": {
+   "n": 97,
+   "loss": 0.0,
+   "med": 6.1,
+   "p95": 6.7,
+   "max": 7.0
+  },
+  "tcp9": {
+   "n": 97,
+   "loss": 0.0,
+   "med": 5.7,
+   "p95": 6.5,
+   "max": 6.7
+  },
+  "gwtcp": {
+   "n": 99,
+   "loss": 0.0,
+   "med": 1.1,
+   "p95": 1.4,
+   "max": 1.4
+  },
+  "udp": {
+   "n": 97,
+   "loss": 0.0,
+   "med": 7.2,
+   "p95": 9.2,
+   "max": 21.3
+  },
+  "icmp": {
+   "n": 97,
+   "loss": 0.0,
+   "med": 6.0,
+   "p95": 6.5,
+   "max": 7.0
+  },
+  "icmpgw": {
+   "n": 99,
+   "loss": 0.0,
+   "med": 1.0,
+   "p95": 1.2,
+   "max": 2.3
+  }
+ },
+ "idle_res": {
+  "n": 29,
+  "cpu_mean": 0.9,
+  "cpu_max": 1.5,
+  "soft_mean": 0.1,
+  "core_max": [
+   1.0,
+   2.0,
+   3.0,
+   2.0
+  ],
+  "core_mean": [
+   0.3,
+   0.7,
+   1.6,
+   0.7
+  ],
+  "coresoft_mean": [
+   0.1,
+   0.1,
+   0.2,
+   0.1
+  ],
+  "self_cpu_mean": 1.6,
+  "self_cpu_max": 3.0,
+  "mem_avail_min": 562,
+  "load1_max": 0.0,
+  "ct_max": 408,
+  "ct_end": 408,
+  "ct_limit": 7680,
+  "udp_inerr_d": 0,
+  "udp_rcvbuf_d": 0,
+  "udp_sndbuf_d": 0
+ },
+ "throughput": {
+  "down_1x": {
+   "mbps": 80.4,
+   "secs": 4.0,
+   "tcp_loaded": {
+    "n": 13,
+    "loss": 0.0,
+    "med": 14.1,
+    "p95": 25.3,
+    "max": 25.3
+   },
+   "gw_loaded": {
+    "n": 13,
+    "loss": 0.0,
+    "med": 9.5,
+    "p95": 11.8,
+    "max": 11.8
+   },
+   "icmp_loaded": {
+    "n": 13,
+    "loss": 0.0,
+    "med": 13.6,
+    "p95": 26.2,
+    "max": 26.2
+   },
+   "pi": {
+    "n": 4,
+    "cpu_mean": 16.6,
+    "cpu_max": 23.3,
+    "soft_mean": 2.9,
+    "core_max": [
+     36.2,
+     11.7,
+     26.4,
+     51.6
+    ],
+    "core_mean": [
+     21.0,
+     5.3,
+     11.1,
+     28.4
+    ],
+    "coresoft_mean": [
+     3.7,
+     2.1,
+     3.0,
+     2.9
+    ],
+    "self_cpu_mean": 2.0,
+    "self_cpu_max": 3.0,
+    "mem_avail_min": 557,
+    "load1_max": 0.08,
+    "ct_max": 461,
+    "ct_end": 461,
+    "ct_limit": 7680,
+    "udp_inerr_d": 0,
+    "udp_rcvbuf_d": 0,
+    "udp_sndbuf_d": 0
+   }
+  },
+  "down_4x": {
+   "mbps": 90.6,
+   "secs": 8.8,
+   "tcp_loaded": {
+    "n": 28,
+    "loss": 0.0,
+    "med": 19.9,
+    "p95": 32.4,
+    "max": 53.3
+   },
+   "gw_loaded": {
+    "n": 28,
+    "loss": 0.0,
+    "med": 14.8,
+    "p95": 28.6,
+    "max": 44.8
+   },
+   "icmp_loaded": {
+    "n": 28,
+    "loss": 0.0,
+    "med": 19.7,
+    "p95": 33.3,
+    "max": 57.6
+   },
+   "pi": {
+    "n": 9,
+    "cpu_mean": 32.9,
+    "cpu_max": 39.1,
+    "soft_mean": 11.0,
+    "core_max": [
+     41.2,
+     39.6,
+     38.3,
+     41.1
+    ],
+    "core_mean": [
+     33.3,
+     32.5,
+     33.6,
+     32.2
+    ],
+    "coresoft_mean": [
+     11.8,
+     10.8,
+     10.5,
+     11.0
+    ],
+    "self_cpu_mean": 1.9,
+    "self_cpu_max": 3.0,
+    "mem_avail_min": 549,
+    "load1_max": 0.15,
+    "ct_max": 625,
+    "ct_end": 625,
+    "ct_limit": 7680,
+    "udp_inerr_d": 0,
+    "udp_rcvbuf_d": 0,
+    "udp_sndbuf_d": 0
+   }
+  },
+  "up_1x": {
+   "mbps": 79.0,
+   "secs": 2.5,
+   "tcp_loaded": {
+    "n": 8,
+    "loss": 0.0,
+    "med": 9.7,
+    "p95": 10.4,
+    "max": 10.4
+   },
+   "gw_loaded": {
+    "n": 9,
+    "loss": 0.0,
+    "med": 4.4,
+    "p95": 4.6,
+    "max": 4.6
+   },
+   "icmp_loaded": {
+    "n": 8,
+    "loss": 0.0,
+    "med": 9.4,
+    "p95": 10.8,
+    "max": 10.8
+   },
+   "pi": {
+    "n": 3,
+    "cpu_mean": 21.8,
+    "cpu_max": 28.5,
+    "soft_mean": 6.2,
+    "core_max": [
+     30.2,
+     24.2,
+     60.0,
+     10.6
+    ],
+    "core_mean": [
+     21.7,
+     12.9,
+     42.8,
+     9.3
+    ],
+    "coresoft_mean": [
+     7.0,
+     5.6,
+     6.7,
+     5.6
+    ],
+    "self_cpu_mean": 2.0,
+    "self_cpu_max": 3.0,
+    "mem_avail_min": 515,
+    "load1_max": 0.14,
+    "ct_max": 542,
+    "ct_end": 542,
+    "ct_limit": 7680,
+    "udp_inerr_d": 0,
+    "udp_rcvbuf_d": 0,
+    "udp_sndbuf_d": 0
+   }
+  },
+  "up_3x": {
+   "mbps": 82.9,
+   "secs": 3.5,
+   "tcp_loaded": {
+    "n": 11,
+    "loss": 0.0,
+    "med": 11.0,
+    "p95": 13.1,
+    "max": 13.1
+   },
+   "gw_loaded": {
+    "n": 11,
+    "loss": 0.0,
+    "med": 5.6,
+    "p95": 7.8,
+    "max": 7.8
+   },
+   "icmp_loaded": {
+    "n": 11,
+    "loss": 0.0,
+    "med": 11.0,
+    "p95": 12.6,
+    "max": 12.6
+   },
+   "pi": {
+    "n": 3,
+    "cpu_mean": 27.5,
+    "cpu_max": 43.4,
+    "soft_mean": 4.6,
+    "core_max": [
+     40.4,
+     53.1,
+     40.6,
+     39.2
+    ],
+    "core_mean": [
+     28.9,
+     33.5,
+     30.1,
+     17.4
+    ],
+    "coresoft_mean": [
+     3.6,
+     4.6,
+     5.3,
+     4.3
+    ],
+    "self_cpu_mean": 2.3,
+    "self_cpu_max": 3.0,
+    "mem_avail_min": 480,
+    "load1_max": 0.11,
+    "ct_max": 637,
+    "ct_end": 637,
+    "ct_limit": 7680,
+    "udp_inerr_d": 0,
+    "udp_rcvbuf_d": 0,
+    "udp_sndbuf_d": 0
+   }
+  }
+ }
+}

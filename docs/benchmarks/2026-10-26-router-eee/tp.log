@@ -1,0 +1,9 @@
+down_1 650.7 Mbps {'tcp': {'n': 5, 'loss': 0.0, 'med': 11.7, 'p95': 15.41, 'max': 15.41}, 'svc': {'n': 0, 'loss': None, 'med': None, 'p95': None, 'max': None}, 'icmp': {'n': 3, 'loss': 0.0, 'med': 5.99, 'p95': 10.9, 'max': 10.9}}
+down_4 900.6 Mbps {'tcp': {'n': 17, 'loss': 0.0, 'med': 17.82, 'p95': 25.43, 'max': 25.43}, 'svc': {'n': 2, 'loss': 0.0, 'med': 11.74, 'p95': 11.74, 'max': 11.74}, 'icmp': {'n': 10, 'loss': 0.0, 'med': 19.7, 'p95': 25.3, 'max': 25.3}}
+up_1 356.7 Mbps {'tcp': {'n': 4, 'loss': 0.0, 'med': 6.59, 'p95': 6.78, 'max': 6.78}, 'svc': {'n': 0, 'loss': None, 'med': None, 'p95': None, 'max': None}, 'icmp': {'n': 2, 'loss': 0.0, 'med': 6.24, 'p95': 6.24, 'max': 6.24}}
+up_2 685.1 Mbps {'tcp': {'n': 4, 'loss': 0.0, 'med': 6.69, 'p95': 6.89, 'max': 6.89}, 'svc': {'n': 1, 'loss': 0.0, 'med': 11.44, 'p95': 11.44, 'max': 11.44}, 'icmp': {'n': 2, 'loss': 0.0, 'med': 6.02, 'p95': 6.02, 'max': 6.02}}
+Traceback (most recent call last):
+  File "/home/server/router-bench/baseline.py", line 59, in <module>
+    tp["note"] = (f"background traffic during idle sample: {res['background_mbps']} Mbps "
+                                                            ^^^
+NameError: name 'res' is not defined

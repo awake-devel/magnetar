@@ -1,0 +1,255 @@
+[
+  {
+    "phase": "rate",
+    "rate": 10,
+    "attempted": 450,
+    "attempt_rate": 10.0,
+    "connect_ok": 55,
+    "connect_fail": 359,
+    "connect_ok_rate": 0.133,
+    "hs_ok": 12,
+    "dur": 45.0,
+    "aborted": null,
+    "cf": {
+      "ConnectionRefusedError": 26,
+      "TimeoutError": 302,
+      "OSError": 31
+    },
+    "tcp": {
+      "n": 94,
+      "loss": 0.0851,
+      "med": 16.991853713989258,
+      "p95": 22.919893264770508,
+      "max": 1046.9441413879395
+    },
+    "udp": {
+      "n": 93,
+      "loss": 0.1183,
+      "med": 18.88132095336914,
+      "p95": 23.25129508972168,
+      "max": 25.794029235839844
+    },
+    "gwtcp": {
+      "n": 137,
+      "loss": 0.0365,
+      "med": 0.8945465087890625,
+      "p95": 1.4913082122802734,
+      "max": 4.81724739074707
+    },
+    "conntrack_start": 14788,
+    "conntrack_peak": 21916,
+    "recovery_s": 10.0
+  },
+  {
+    "phase": "rate",
+    "rate": 25,
+    "attempted": 1125,
+    "attempt_rate": 25.0,
+    "connect_ok": 186,
+    "connect_fail": 866,
+    "connect_ok_rate": 0.177,
+    "hs_ok": 44,
+    "dur": 45.0,
+    "aborted": null,
+    "cf": {
+      "ConnectionRefusedError": 123,
+      "TimeoutError": 722,
+      "OSError": 21
+    },
+    "tcp": {
+      "n": 132,
+      "loss": 0.0,
+      "med": 16.92819595336914,
+      "p95": 19.829511642456055,
+      "max": 1072.4585056304932
+    },
+    "udp": {
+      "n": 126,
+      "loss": 0.0317,
+      "med": 18.553733825683594,
+      "p95": 23.97608757019043,
+      "max": 51.87702178955078
+    },
+    "gwtcp": {
+      "n": 143,
+      "loss": 0.021,
+      "med": 0.7991790771484375,
+      "p95": 1.3141632080078125,
+      "max": 4.740476608276367
+    },
+    "conntrack_start": 19447,
+    "conntrack_peak": 22516,
+    "recovery_s": 5.0
+  },
+  {
+    "phase": "rate",
+    "rate": 50,
+    "attempted": 2250,
+    "attempt_rate": 50.0,
+    "connect_ok": 362,
+    "connect_fail": 1738,
+    "connect_ok_rate": 0.172,
+    "hs_ok": 94,
+    "dur": 45.0,
+    "aborted": null,
+    "cf": {
+      "ConnectionRefusedError": 242,
+      "OSError": 32,
+      "TimeoutError": 1464
+    },
+    "tcp": {
+      "n": 134,
+      "loss": 0.0,
+      "med": 16.955852508544922,
+      "p95": 19.778013229370117,
+      "max": 1065.398931503296
+    },
+    "udp": {
+      "n": 127,
+      "loss": 0.0236,
+      "med": 18.614768981933594,
+      "p95": 22.920608520507812,
+      "max": 95.98994255065918
+    },
+    "gwtcp": {
+      "n": 140,
+      "loss": 0.0286,
+      "med": 0.8299350738525391,
+      "p95": 1.1947154998779297,
+      "max": 1.676321029663086
+    },
+    "conntrack_start": 25338,
+    "conntrack_peak": 27701,
+    "recovery_s": 5.0
+  },
+  {
+    "phase": "rate",
+    "rate": 100,
+    "attempted": 4500,
+    "attempt_rate": 100.0,
+    "connect_ok": 689,
+    "connect_fail": 3522,
+    "connect_ok_rate": 0.164,
+    "hs_ok": 187,
+    "dur": 45.0,
+    "aborted": null,
+    "cf": {
+      "ConnectionRefusedError": 513,
+      "OSError": 60,
+      "TimeoutError": 2949
+    },
+    "tcp": {
+      "n": 141,
+      "loss": 0.0,
+      "med": 16.824960708618164,
+      "p95": 19.05059814453125,
+      "max": 1077.0580768585205
+    },
+    "udp": {
+      "n": 120,
+      "loss": 0.0333,
+      "med": 18.666505813598633,
+      "p95": 22.383689880371094,
+      "max": 24.672269821166992
+    },
+    "gwtcp": {
+      "n": 143,
+      "loss": 0.021,
+      "med": 0.6866455078125,
+      "p95": 1.142740249633789,
+      "max": 2.3441314697265625
+    },
+    "conntrack_start": 25593,
+    "conntrack_peak": 32747,
+    "recovery_s": 5.0
+  },
+  {
+    "phase": "rate",
+    "rate": 200,
+    "attempted": 9000,
+    "attempt_rate": 200.0,
+    "connect_ok": 1388,
+    "connect_fail": 7018,
+    "connect_ok_rate": 0.165,
+    "hs_ok": 378,
+    "dur": 45.0,
+    "aborted": null,
+    "cf": {
+      "ConnectionRefusedError": 1027,
+      "OSError": 108,
+      "TimeoutError": 5883
+    },
+    "tcp": {
+      "n": 129,
+      "loss": 0.0078,
+      "med": 16.64590835571289,
+      "p95": 19.085407257080078,
+      "max": 1074.697732925415
+    },
+    "udp": {
+      "n": 130,
+      "loss": 0.0231,
+      "med": 18.741130828857422,
+      "p95": 21.194934844970703,
+      "max": 31.156301498413086
+    },
+    "gwtcp": {
+      "n": 150,
+      "loss": 0.0067,
+      "med": 0.6549358367919922,
+      "p95": 1.0540485382080078,
+      "max": 2.650737762451172
+    },
+    "conntrack_start": 23316,
+    "conntrack_peak": 36103,
+    "recovery_s": 5.0
+  },
+  {
+    "phase": "rate",
+    "rate": 400,
+    "attempted": 10810,
+    "attempt_rate": 400.0,
+    "connect_ok": 206,
+    "connect_fail": 9008,
+    "connect_ok_rate": 0.022,
+    "hs_ok": 52,
+    "dur": 27.0,
+    "aborted": {
+      "tmed": 0,
+      "tloss": 1.0,
+      "umed": 148,
+      "uloss": 0.88,
+      "gmed": 1.3,
+      "lat_rise": true
+    },
+    "cf": {
+      "OSError": 97,
+      "TimeoutError": 8775,
+      "ConnectionRefusedError": 136
+    },
+    "tcp": {
+      "n": 12,
+      "loss": 1.0,
+      "med": null,
+      "p95": null,
+      "max": null
+    },
+    "udp": {
+      "n": 16,
+      "loss": 0.9375,
+      "med": 147.57513999938965,
+      "p95": 147.57513999938965,
+      "max": 147.57513999938965
+    },
+    "gwtcp": {
+      "n": 78,
+      "loss": 0.0513,
+      "med": 1.0170936584472656,
+      "p95": 5.335807800292969,
+      "max": 75.04701614379883
+    },
+    "conntrack_start": 22271,
+    "conntrack_peak": 39856,
+    "recovery_s": 5.0
+  }
+]

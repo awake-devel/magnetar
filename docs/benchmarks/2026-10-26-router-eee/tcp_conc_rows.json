@@ -1,0 +1,322 @@
+[
+  {
+    "phase": "conc",
+    "N": 200,
+    "attempts": 452,
+    "connect_ok": 393,
+    "connect_fail": 59,
+    "hs_ok": 294,
+    "established_after_open": 200,
+    "held_min": 185,
+    "held_max": 193,
+    "open_secs": 4.8,
+    "aborted": null,
+    "cpu": {
+      "busy_avg": 8.5,
+      "busy_max": 30.4,
+      "iowait_avg": 10.2,
+      "self_core_avg": 3.0,
+      "self_core_max": 10.0,
+      "load1_max": 1.34
+    },
+    "tcp": {
+      "n": 93,
+      "loss": 0.0,
+      "med": 6.05,
+      "p95": 6.59,
+      "max": 6.75
+    },
+    "tcp9": {
+      "n": 93,
+      "loss": 0.0,
+      "med": 5.23,
+      "p95": 5.59,
+      "max": 14.9
+    },
+    "gwtcp": {
+      "n": 95,
+      "loss": 0.0,
+      "med": 0.8,
+      "p95": 1.03,
+      "max": 1.2
+    },
+    "1.1.1.1": {
+      "n": 92,
+      "loss": 0.0,
+      "med": 7.14,
+      "p95": 8.85,
+      "max": 19.6
+    },
+    "icmp": {
+      "n": 56,
+      "loss": 0.0,
+      "med": 5.77,
+      "p95": 6.22,
+      "max": 6.47
+    },
+    "gwicmp": {
+      "n": 57,
+      "loss": 0.0,
+      "med": 0.58,
+      "p95": 0.69,
+      "max": 0.76
+    },
+    "svc": {
+      "n": 14,
+      "loss": 0.0,
+      "med": 8.39,
+      "p95": 50.62,
+      "max": 50.62
+    },
+    "svc2": {
+      "n": 14,
+      "loss": 0.0,
+      "med": 1.08,
+      "p95": 1.13,
+      "max": 1.13
+    },
+    "conntrack_start": 9217,
+    "conntrack_peak": 9217,
+    "recovery_s": 5.0
+  },
+  {
+    "phase": "conc",
+    "N": 350,
+    "attempts": 795,
+    "connect_ok": 690,
+    "connect_fail": 105,
+    "hs_ok": 529,
+    "established_after_open": 350,
+    "held_min": 339,
+    "held_max": 347,
+    "open_secs": 8.5,
+    "aborted": null,
+    "cpu": {
+      "busy_avg": 5.5,
+      "busy_max": 15.9,
+      "iowait_avg": 0.7,
+      "self_core_avg": 4.2,
+      "self_core_max": 11.0,
+      "load1_max": 1.33
+    },
+    "tcp": {
+      "n": 105,
+      "loss": 0.0,
+      "med": 5.98,
+      "p95": 6.5,
+      "max": 6.78
+    },
+    "tcp9": {
+      "n": 105,
+      "loss": 0.0,
+      "med": 5.13,
+      "p95": 5.54,
+      "max": 31.54
+    },
+    "gwtcp": {
+      "n": 107,
+      "loss": 0.0,
+      "med": 0.75,
+      "p95": 0.96,
+      "max": 1.13
+    },
+    "1.1.1.1": {
+      "n": 104,
+      "loss": 0.0,
+      "med": 6.79,
+      "p95": 9.15,
+      "max": 12.4
+    },
+    "icmp": {
+      "n": 63,
+      "loss": 0.0,
+      "med": 5.81,
+      "p95": 6.23,
+      "max": 6.4
+    },
+    "gwicmp": {
+      "n": 64,
+      "loss": 0.0,
+      "med": 0.6,
+      "p95": 0.74,
+      "max": 1.07
+    },
+    "svc": {
+      "n": 16,
+      "loss": 0.0,
+      "med": 8.52,
+      "p95": 22.27,
+      "max": 22.27
+    },
+    "svc2": {
+      "n": 16,
+      "loss": 0.0,
+      "med": 1.07,
+      "p95": 1.21,
+      "max": 1.21
+    },
+    "conntrack_start": 4151,
+    "conntrack_peak": 4472,
+    "recovery_s": 5.0
+  },
+  {
+    "phase": "conc",
+    "N": 500,
+    "attempts": 1872,
+    "connect_ok": 984,
+    "connect_fail": 888,
+    "hs_ok": 753,
+    "established_after_open": 478,
+    "held_min": 465,
+    "held_max": 474,
+    "open_secs": 20.0,
+    "aborted": null,
+    "cpu": {
+      "busy_avg": 6.2,
+      "busy_max": 21.3,
+      "iowait_avg": 1.3,
+      "self_core_avg": 5.5,
+      "self_core_max": 12.0,
+      "load1_max": 0.85
+    },
+    "tcp": {
+      "n": 142,
+      "loss": 0.0,
+      "med": 5.93,
+      "p95": 6.52,
+      "max": 9.41
+    },
+    "tcp9": {
+      "n": 143,
+      "loss": 0.0,
+      "med": 5.11,
+      "p95": 5.69,
+      "max": 35.27
+    },
+    "gwtcp": {
+      "n": 145,
+      "loss": 0.0,
+      "med": 0.76,
+      "p95": 0.99,
+      "max": 48.41
+    },
+    "1.1.1.1": {
+      "n": 142,
+      "loss": 0.0,
+      "med": 6.76,
+      "p95": 8.51,
+      "max": 53.95
+    },
+    "icmp": {
+      "n": 86,
+      "loss": 0.0,
+      "med": 5.74,
+      "p95": 6.19,
+      "max": 6.35
+    },
+    "gwicmp": {
+      "n": 87,
+      "loss": 0.0,
+      "med": 0.56,
+      "p95": 0.68,
+      "max": 0.91
+    },
+    "svc": {
+      "n": 22,
+      "loss": 0.0,
+      "med": 8.56,
+      "p95": 9.5,
+      "max": 21.89
+    },
+    "svc2": {
+      "n": 22,
+      "loss": 0.0,
+      "med": 1.1,
+      "p95": 1.26,
+      "max": 1.44
+    },
+    "conntrack_start": 2531,
+    "conntrack_peak": 4708,
+    "recovery_s": 5.0
+  },
+  {
+    "phase": "conc",
+    "N": 700,
+    "attempts": 1874,
+    "connect_ok": 988,
+    "connect_fail": 886,
+    "hs_ok": 753,
+    "established_after_open": 480,
+    "held_min": 470,
+    "held_max": 480,
+    "open_secs": 20.0,
+    "aborted": null,
+    "cpu": {
+      "busy_avg": 6.0,
+      "busy_max": 23.3,
+      "iowait_avg": 0.5,
+      "self_core_avg": 5.4,
+      "self_core_max": 13.0,
+      "load1_max": 0.8
+    },
+    "tcp": {
+      "n": 142,
+      "loss": 0.0,
+      "med": 6.01,
+      "p95": 6.52,
+      "max": 7.82
+    },
+    "tcp9": {
+      "n": 143,
+      "loss": 0.0,
+      "med": 5.09,
+      "p95": 5.57,
+      "max": 42.3
+    },
+    "gwtcp": {
+      "n": 145,
+      "loss": 0.0,
+      "med": 0.76,
+      "p95": 0.96,
+      "max": 52.77
+    },
+    "1.1.1.1": {
+      "n": 142,
+      "loss": 0.0,
+      "med": 6.73,
+      "p95": 9.26,
+      "max": 32.9
+    },
+    "icmp": {
+      "n": 86,
+      "loss": 0.0,
+      "med": 5.72,
+      "p95": 6.36,
+      "max": 7.28
+    },
+    "gwicmp": {
+      "n": 87,
+      "loss": 0.0,
+      "med": 0.53,
+      "p95": 0.66,
+      "max": 0.95
+    },
+    "svc": {
+      "n": 22,
+      "loss": 0.0,
+      "med": 8.44,
+      "p95": 8.86,
+      "max": 10.62
+    },
+    "svc2": {
+      "n": 22,
+      "loss": 0.0,
+      "med": 1.08,
+      "p95": 1.26,
+      "max": 1.32
+    },
+    "conntrack_start": 3791,
+    "conntrack_peak": 6169,
+    "recovery_s": 5.0
+  }
+]

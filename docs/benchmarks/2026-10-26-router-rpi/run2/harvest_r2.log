@@ -1,0 +1,4 @@
+  t=5s pool=12657 sent=2421 recv=1746 cpu=8.6 mem=552 ct=2617 tcp=6.4
+  t=11s pool=25280 sent=4921 recv=3650 cpu=9.4 mem=551 ct=4911 tcp=6.8
+  t=16s pool=37622 sent=7421 recv=5540 cpu=8.7 mem=550 ct=7615 tcp=6.8
+HARVEST {"pool": 40000, "sent": 7971, "recv": 5990, "secs": 20.1, "tcp": {"n": 63, "loss": 0.0, "med": 6.7, "p95": 8.8, "max": 10.2}, "pi": {"n": 19, "cpu_mean": 7.8, "cpu_max": 9.6, "soft_mean": 0.5, "core_max": [34.7, 9.2, 26.0, 32.7], "core_mean": [8.5, 2.4, 11.1, 9.3], "coresoft_mean": [0.4, 0.5, 0.6, 0.5], "self_cpu_mean": 28.3, "self_cpu_max": 33.9, "mem_avail_min": 549, "load1_max": 0.18, "thr_now_or": "0x0", "ct_max": 8436, "ct_end": 8436, "ct_limit": 65536, "udp_inerr_d": 0, "udp_rcvbuf_d": 0, "udp_sndbuf_d": 0}}

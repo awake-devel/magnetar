@@ -1,0 +1,4 @@
+BENCH nodes=4 qps=3000 lookups=4096: sent 710 q/s (24 % of cap), answered 34/s, lookups 814/s with peers 154, rate_limited 0, busy 239601, crawler CPU 0.39 cores (busiest thread ≤ 0.05), fake DHT 0.02 cores
+BENCH nodes=4 qps=5000 lookups=4096: sent 1089 q/s (22 % of cap), answered 109/s, lookups 1367/s with peers 876, rate_limited 0, busy 395470, crawler CPU 0.72 cores (busiest thread ≤ 0.09), fake DHT 0.02 cores
+BENCH nodes=8 qps=10000 lookups=8192: sent 1925 q/s (19 % of cap), answered 115/s, lookups 1847/s with peers 1082, rate_limited 0, busy 551699, crawler CPU 1.18 cores (busiest thread ≤ 0.15), fake DHT 0.03 cores
+BENCH nodes=8 qps=20000 lookups=8192: sent 11642 q/s (58 % of cap), answered 790/s, lookups 663/s with peers 3531, rate_limited 0, busy 0, crawler CPU 1.43 cores (busiest thread ≤ 0.18), fake DHT 0.09 cores

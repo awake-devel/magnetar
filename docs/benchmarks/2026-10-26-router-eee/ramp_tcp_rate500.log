@@ -1,0 +1,6 @@
+peers=10611 reachable_known=1699 mode=rate nofile=(8192, 1048576) conntrack=14953
+== TCP rate 500 ==
+{"rate": 500, "attempt_rate": 500.0, "connect_ok": 3468, "connect_ok_rate": 0.165, "hs_ok": 1167, "aborted": null, "cpu": {"busy_avg": 10.3, "busy_max": 36.1, "iowait_avg": 0.5, "self_core_avg": 23.3, "self_core_max": 32.0, "load1_max": 0.34}}
+   tcp {'n': 148, 'loss': 0.0, 'med': 7.04, 'p95': 21.48, 'max': 67.95} udp {'n': 148, 'loss': 0.0, 'med': 8.48, 'p95': 21.22, 'max': 66.84} icmp {'n': 91, 'loss': 0.0, 'med': 5.75, 'p95': 6.57, 'max': 6.99} gw {'n': 152, 'loss': 0.0, 'med': 0.81, 'p95': 14.38, 'max': 20.63} svc {'n': 23, 'loss': 0.0, 'med': 8.68, 'p95': 9.42, 'max': 25.78} ct 15010 -> 21269 cf {'ConnectionRefusedError': 2783, 'OSError': 325, 'TimeoutError': 14486}
+  recovery 5.0s (conntrack 19776)
+DONE

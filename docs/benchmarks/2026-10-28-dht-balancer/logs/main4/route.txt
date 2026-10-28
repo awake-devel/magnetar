@@ -1,0 +1,1 @@
+route check: direct fiber (expected src), ok

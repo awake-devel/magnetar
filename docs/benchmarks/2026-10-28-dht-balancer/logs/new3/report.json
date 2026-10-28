@@ -1,0 +1,286 @@
+{
+  "mode": "aggressive",
+  "dry_run": false,
+  "seconds": 600.000811934,
+  "virtual_nodes": 4,
+  "ports": [
+    57893,
+    57894,
+    57895,
+    57896
+  ],
+  "sightings": 123043,
+  "unique_hashes": 113408,
+  "unique_hashes_per_min": 11340.784653385588,
+  "bloom_skipped": 9569,
+  "triaged": 112791,
+  "blocked": 0,
+  "known": 1,
+  "queued": 112472,
+  "queued_per_min": 11247.18478004712,
+  "retried": 0,
+  "marked_no_peers": 40586,
+  "triage_errors": 0,
+  "triage_flushes": 544,
+  "triage_mean_ms": 135.31433823529412,
+  "triage_max_ms": 5417,
+  "triage_dropped": 0,
+  "queue_len": 578,
+  "queue_lanes": [
+    283,
+    295,
+    0
+  ],
+  "queue_overflow": 0,
+  "sampling_paused_secs": 46.5,
+  "peers": {
+    "hashes": 109846,
+    "with_peers": 69260,
+    "share_with_peers": 0.6305190903628717,
+    "mean": 6.993081222802833,
+    "median": 1,
+    "p90": 26,
+    "max": 73,
+    "from_announcer": 3,
+    "from_sampling_node": 2499,
+    "iterative_lookups": 107344,
+    "queries_per_hash": 12.43195018480418,
+    "lookups": 107344,
+    "lookup_mean_ms": 9174.662291325085,
+    "queries_per_lookup": 11.885135638694292,
+    "lookup_slow_share": 0.06477122553883922,
+    "lookup_late": 0,
+    "announce_upgraded": 2,
+    "announce_attached": 0,
+    "announce_retriaged": 64,
+    "announce_fetches": 3,
+    "status_write_errors": 0,
+    "lookup_answered_share": 0.4053870597069442,
+    "lookup_seeds_fresh_share": 0.27088572434478847,
+    "queries_per_stored": 49.19320104599292,
+    "lookup_dead_skipped": 44806
+  },
+  "fetch": {
+    "hashes": 69260,
+    "ok": 20195,
+    "hybrid": 133,
+    "private": 24,
+    "v2_only": 2,
+    "invalid": 0,
+    "failed": 47453,
+    "oversize": 0,
+    "peers_tried": 403326,
+    "connected": 61979,
+    "peer_errors": [
+      [
+        "connect",
+        274447
+      ],
+      [
+        "timeout",
+        4590
+      ],
+      [
+        "closed",
+        28003
+      ],
+      [
+        "handshake",
+        706
+      ],
+      [
+        "no_extensions",
+        9
+      ],
+      [
+        "no_ut_metadata",
+        1841
+      ],
+      [
+        "no_metadata",
+        1275
+      ],
+      [
+        "reject",
+        198
+      ],
+      [
+        "bad_block",
+        6
+      ],
+      [
+        "hash_mismatch",
+        5
+      ]
+    ],
+    "tcp_bytes_in": 1448015472,
+    "tcp_bytes_out": 10507198,
+    "metadata_bytes": 1148099807,
+    "ok_mean_ms": 8337.176281257736,
+    "fake_strikes": 15952,
+    "fake_banned": 976,
+    "fake_skipped": 1117,
+    "fake_tracked": 14626
+  },
+  "metadata_per_min": 2022.0972636508004,
+  "fetch_success_rate": 0.2988001300351686,
+  "persist": {
+    "stored": 19503,
+    "stored_by_route": [
+      19497,
+      6,
+      0
+    ],
+    "not_new": 0,
+    "alias": 41,
+    "blocked": 233,
+    "blocked_by_tier": {
+      "age": 16,
+      "context": 179,
+      "hard": 38
+    },
+    "categories": {
+      "anime": 1065,
+      "application": 686,
+      "audio": 1859,
+      "book": 1281,
+      "game": 386,
+      "other": 1167,
+      "picture": 213,
+      "porn": 3668,
+      "video": 9178
+    },
+    "unscreened": 0,
+    "private": 24,
+    "v2_only": 2,
+    "invalid": 0,
+    "oversize": 0,
+    "failed": 46704
+  },
+  "reclassified": {
+    "rows": 0,
+    "changed": 0,
+    "blocked": 0
+  },
+  "persist_errors": 0,
+  "bandwidth": {
+    "udp_in": 186427880,
+    "udp_out": 102209924,
+    "tcp_in": 1448015472,
+    "tcp_out": 10507198,
+    "mbit_per_sec_in": 21.792548536481494,
+    "mbit_per_sec_out": 1.5028929262502246
+  },
+  "health": {
+    "probes": 120,
+    "failed": 0,
+    "baseline_ms": 14.425834,
+    "last_median_ms": 15.466125,
+    "brakes": 1
+  },
+  "engine": {
+    "queries_sent": 972588,
+    "sent_ping": 83,
+    "sent_find_node": 53,
+    "sent_get_peers": 959415,
+    "sent_sample_infohashes": 13037,
+    "answered": 535413,
+    "errors": 875,
+    "timeouts": 253415,
+    "unmatched": 17964,
+    "decode_errors": 16352,
+    "too_long": 37,
+    "filtered": 826,
+    "rate_limited": 192812,
+    "busy": 0,
+    "incoming_ping": 458,
+    "incoming_find_node": 1121,
+    "incoming_get_peers": 2045,
+    "incoming_announce_peer": 66,
+    "incoming_sample_infohashes": 15,
+    "incoming_unknown": 0,
+    "incoming_ignored": 0,
+    "responses_sent": 3694,
+    "responses_dropped": 11,
+    "bad_tokens": 0,
+    "samples_received": 120943,
+    "sightings_sample": 120943,
+    "sightings_announce": 66,
+    "sightings_get_peers": 2034,
+    "sightings_dropped": 0,
+    "nodes_learnt": 1086125,
+    "nodes_filtered": 5423,
+    "nodes_farm": 520,
+    "external_ip_known": true,
+    "external_ip_changes": 1,
+    "brake_active": false,
+    "sample_share": 0.0094227029605056,
+    "brake_engaged": 1,
+    "pending": 4831,
+    "routing": [
+      142,
+      133,
+      128,
+      139
+    ],
+    "pool": {
+      "size": 999999,
+      "bep51_yes": 5994,
+      "bep51_no": 2720,
+      "bep51_unknown": 991285,
+      "evicted": 42730,
+      "dropped_silent": 0,
+      "dropped_dead": 43396,
+      "dead_known": 43325
+    },
+    "peer_store_hashes": 5,
+    "peer_store_peers": 5,
+    "udp_bytes_in": 186427880,
+    "udp_bytes_out": 102209924,
+    "lookups": 107344,
+    "lookup_ms_total": 984844949,
+    "lookup_queries": 1275798,
+    "lookup_slow": 82635,
+    "lookup_late": 0,
+    "by_node_age": {
+      "unpooled_sent": 41799,
+      "unpooled_answered": 25079,
+      "young_sent": 808358,
+      "young_answered": 418840,
+      "old_sent": 122431,
+      "old_answered": 90751,
+      "repeat_sent": 37569,
+      "repeat_answered": 35931
+    },
+    "lookup_answered": 517192,
+    "lookup_seeds_fresh": 473959,
+    "lookup_seeds_unknown": 1273828,
+    "lookup_seeds_struck": 1877,
+    "lookup_dead_skipped": 44806
+  },
+  "answered_share": 0.5505033991782748,
+  "queries_per_sec": 1620.9778064550094,
+  "cpu_seconds": 385.03,
+  "rss_peak_mb": 546.72265625,
+  "rss_mb": 546.75390625,
+  "balance": {
+    "mode": "auto",
+    "share": 0.0094227029605056,
+    "reason": "feed",
+    "stored_per_kq": [
+      14.212672108794424,
+      0.45059313883088614,
+      0.0
+    ]
+  },
+  "lookup_queries_by_route": [
+    1352416,
+    13184,
+    0
+  ],
+  "stored_per_kq": [
+    14.276686683952658,
+    0.4550970873786408,
+    0.0
+  ]
+}
