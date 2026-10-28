@@ -47,6 +47,29 @@ pub const VERSION: [u8; 4] = [b'M', b'G', 0, 2];
 pub const FARM_PREFIX_BITS: u32 = 64;
 const SECRET_ROTATION: Duration = Duration::from_secs(300);
 const SAMPLE_INTERVAL_SERVED: i64 = 3600;
+/// The sampler asks the same pool node for more nodes (`find_node`, when nothing is due for
+/// sampling) at most once per this interval (docs/DHT.md §20.5).
+pub const GROW_REASK: Duration = Duration::from_secs(10);
+/// Pool nodes looked at per sampler pick (due ones, then grow candidates).
+const GROW_CANDIDATES: usize = 8;
+/// Grow times remembered (one entry per node asked within `GROW_REASK`).
+const GROW_MEMORY: usize = 65_536;
+/// A due node whose IP has no per-IP token now is due again after this.
+const LIMITED_RETRY: Duration = Duration::from_secs(1);
+/// Longest sampler wait when it has nothing to send.
+const SAMPLER_IDLE: Duration = Duration::from_millis(250);
+/// Sampler wait while no node is known at all.
+const BOOTSTRAP_WAIT: Duration = Duration::from_millis(500);
+
+/// The sampler's next query.
+enum SamplerWork {
+    /// `sample_infohashes` to a node due for it.
+    Sample(SocketAddrV4),
+    /// `find_node` (random target) to grow the pool.
+    Grow(SocketAddrV4),
+    /// Nothing to send before this instant.
+    Idle(Instant),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1512,10 +1535,10 @@ impl Dht {
         let mut stop = self.inner.stop.clone();
         let mut inflight: JoinSet<()> = JoinSet::new();
         let qps = f64::from(self.inner.cfg.qps.max(1));
+        let mut grown: HashMap<SocketAddrV4, Instant> = HashMap::new();
         loop {
             while inflight.try_join_next().is_some() {}
-            // The sampler's own share of the budget (paused at 0, `super::budget`), then a
-            // permit of the global pacer, or a send ahead of its queue charged to it (priority).
+            // The sampler's own share of the budget (paused at 0, `super::budget`).
             let braked = if self.inner.pacer.braked() { 0.5 } else { 1.0 };
             let own = self
                 .inner
@@ -1536,6 +1559,18 @@ impl Dht {
                     _ = stop.wait_for(|s| *s) => break,
                 }
             }
+            // What to send is chosen before a pace turn is taken, and only a query that can go
+            // out takes one (docs/DHT.md §20.5): a node due for sampling, else a pool node not
+            // asked for more nodes within `GROW_REASK`; both with a per-IP token free.
+            let work = self.sampler_pick(Instant::now(), &mut grown);
+            if let SamplerWork::Idle(until) = work {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(until) => {}
+                    _ = stop.wait_for(|s| *s) => break,
+                }
+                continue;
+            }
+            // A permit of the global pacer, or a send ahead of its queue charged to it (priority).
             if ahead {
                 self.inner.pacer.take_ahead();
             } else {
@@ -1544,42 +1579,89 @@ impl Dht {
                     _ = stop.wait_for(|s| *s) => break,
                 }
             }
-            let now = Instant::now();
-            let (due, grow) = {
-                let mut pool = self.inner.pool.lock().unwrap();
-                match pool.pop_due(now) {
-                    Some(e) => (Some(e), None),
-                    None => (None, pool.random(1).first().map(|n| n.addr)),
-                }
-            };
-            let grow = grow.or_else(|| {
-                let t: Id = rand::random();
-                self.routing_closest(&t, 1).first().map(|n| n.addr)
-            });
             let node = self.next_node();
-            if let Some(e) = due {
-                let d = self.clone();
-                inflight.spawn(async move { d.sample_one(node, e.node.addr).await });
-            } else if let Some(addr) = grow {
-                let d = self.clone();
-                inflight.spawn(async move {
-                    let target: Id = rand::random();
-                    if let Ok(r) = d
-                        .query_inner(node, addr, Query::FindNode { target }, false, || {})
-                        .await
-                    {
-                        d.learn_nodes(&r.nodes, &target);
-                    }
-                });
-            } else {
-                // Nothing known yet: wait for the bootstrap.
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
-                    _ = stop.wait_for(|s| *s) => break,
+            let d = self.clone();
+            match work {
+                SamplerWork::Sample(addr) => {
+                    inflight.spawn(async move { d.sample_one(node, addr).await });
                 }
+                SamplerWork::Grow(addr) => {
+                    inflight.spawn(async move {
+                        let target: Id = rand::random();
+                        if let Ok(r) = d
+                            .query_inner(node, addr, Query::FindNode { target }, false, || {})
+                            .await
+                        {
+                            d.learn_nodes(&r.nodes, &target);
+                        }
+                    });
+                }
+                SamplerWork::Idle(_) => unreachable!("handled above"),
             }
         }
         inflight.shutdown().await;
+    }
+
+    /// The sampler's next query (see [`SamplerWork`]). Takes no lock while holding another.
+    fn sampler_pick(
+        &self,
+        now: Instant,
+        grown: &mut HashMap<SocketAddrV4, Instant>,
+    ) -> SamplerWork {
+        let inner = &*self.inner;
+        // Due nodes first. One whose IP has no token now (a lookup just asked it) waits a
+        // second instead of taking a turn that the per-IP limit would refuse.
+        for _ in 0..GROW_CANDIDATES {
+            let Some(e) = inner.pool.lock().unwrap().pop_due(now) else {
+                break;
+            };
+            let addr = e.node.addr;
+            if inner.per_ip.available(addr.ip(), now) {
+                return SamplerWork::Sample(addr);
+            }
+            inner
+                .pool
+                .lock()
+                .unwrap()
+                .reschedule(&addr, now + LIMITED_RETRY);
+        }
+        // Nothing due: ask a pool node for more nodes. The same node at most once per
+        // `GROW_REASK` (a small pool used to be re-asked on every pace turn, docs/DHT.md §20.5).
+        let (cands, next_due) = {
+            let pool = inner.pool.lock().unwrap();
+            (pool.random(GROW_CANDIDATES), pool.next_due())
+        };
+        let cands = if cands.is_empty() {
+            let t: Id = rand::random();
+            self.routing_closest(&t, 1)
+        } else {
+            cands
+        };
+        if cands.is_empty() {
+            // Nothing known yet: wait for the bootstrap.
+            return SamplerWork::Idle(now + BOOTSTRAP_WAIT);
+        }
+        for c in cands {
+            let a = c.addr;
+            if grown
+                .get(&a)
+                .is_some_and(|t| now.saturating_duration_since(*t) < GROW_REASK)
+                || !inner.per_ip.available(a.ip(), now)
+            {
+                continue;
+            }
+            if grown.len() >= GROW_MEMORY {
+                grown.retain(|_, t| now.saturating_duration_since(*t) < GROW_REASK);
+                if grown.len() >= GROW_MEMORY {
+                    grown.clear();
+                }
+            }
+            grown.insert(a, now);
+            return SamplerWork::Grow(a);
+        }
+        // Nothing to send: wait for the next due node, at most `SAMPLER_IDLE`.
+        let until = now + SAMPLER_IDLE;
+        SamplerWork::Idle(next_due.map_or(until, |t| t.clamp(now, until)))
     }
 
     async fn sample_one(&self, node: usize, addr: SocketAddrV4) {
