@@ -702,6 +702,7 @@ pub async fn start(
     cfg.qps = opts.qps;
     cfg.pool_cap = opts.pool_cap;
     cfg.lookup_timeout = opts.lookup_timeout;
+    cfg.pacer = opts.pacer.clone();
     let (identity, nodes) = state::load(&setup.state_dir, &opts.ports);
     cfg.identity = identity;
     cfg.known_nodes = nodes;
@@ -746,13 +747,18 @@ pub async fn start(
         ..FetchConfig::default()
     });
     let units = u32::try_from((setup.upload_buffer / 1024).max(64)).unwrap_or(u32::MAX >> 4);
+    let own_hub = opts.health.is_none();
+    let hub = opts
+        .health
+        .clone()
+        .unwrap_or_else(|| health::HealthHub::new(opts.pacer.clone()));
     let p = Arc::new(Crawl {
         client,
         queue: Mutex::new(FetchQueue::new(opts.queue_cap)),
         notify: Notify::new(),
         fetcher,
         c: Counters::default(),
-        health: Arc::default(),
+        health: hub.stats.clone(),
         governor,
         buffer: Arc::new(Semaphore::new(units as usize)),
         buffer_units: units,
@@ -801,13 +807,15 @@ pub async fn start(
         }
         drop(jobs_tx);
         drop(out_tx);
-        tasks.spawn(health::health_loop(
-            p.opts.probe.clone(),
-            dht.clone(),
-            p.fetcher.clone(),
-            p.health.clone(),
-            int_rx.clone(),
-        ));
+        // Under the worker's probe while the crawl lasts, or our own (D109).
+        let _attached = hub.attach(dht.clone(), p.fetcher.clone());
+        if own_hub {
+            tasks.spawn(health::health_loop(
+                p.opts.probe.clone(),
+                hub.clone(),
+                int_rx.clone(),
+            ));
+        }
         tasks.spawn(control(p.clone(), dht.clone(), int_rx.clone()));
         let ports = p.opts.ports.clone();
         {

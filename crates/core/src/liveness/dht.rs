@@ -7,6 +7,10 @@
 //! A long-lived checker keeps a [`NodeCache`] of nodes that answered earlier walks and starts
 //! each walk from the cached nodes closest to the target (D45): walks are a few hops shorter and
 //! the public bootstrap routers are only asked while the cache is nearly empty.
+//!
+//! A server checker passes the process's shared DHT pacer as a [`WalkPacer`] (D109): every
+//! `get_peers` of every walk then waits for a permit, so walks count against `MAGNETAR_DHT_QPS`
+//! (or the seed checker's own rate) and slow down with the router health brake.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -18,6 +22,29 @@ use tokio::time::Instant;
 
 use super::bencode::{self, Value};
 use crate::error::{Error, Result};
+
+/// Send permits for walk queries (D109). The server implements it with the DHT crawler's
+/// global pacer (`dht::limiter::Pacer`, a feature the phone library does not build).
+pub trait WalkPacer: Send + Sync + std::fmt::Debug {
+    /// Wait for one send permit. Cancel-safe: a dropped wait consumes nothing.
+    fn acquire(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+
+    /// Permits per second it hands out now (brake included), if known: the checker runs no
+    /// more walks at once than this rate can feed ([`walks_for_rate`]).
+    fn rate(&self) -> Option<f64> {
+        None
+    }
+}
+
+/// Queries a walk needs to reach a verdict: it stops once its 8 closest have answered, and a
+/// dead verdict needs 16 answers (D45: ~25–50 nodes asked per walk on the live DHT).
+pub const QUERIES_PER_WALK: f64 = 40.0;
+
+/// Walks a pace of `rate` queries/s can feed within `budget` (at least 1): more at once would
+/// split the permits so thin that none reaches a verdict before its deadline (D109).
+pub fn walks_for_rate(rate: f64, budget: Duration) -> usize {
+    ((rate * budget.as_secs_f64() / QUERIES_PER_WALK).floor() as usize).max(1)
+}
 
 pub const BOOTSTRAP: &[&str] = &[
     "router.bittorrent.com:6881",
@@ -105,7 +132,7 @@ pub async fn scrape(infohash: &[u8; 20], budget: std::time::Duration) -> crate::
     let deadline = Instant::now() + budget;
     let bootstrap = resolve_bootstrap().await?;
     let seeds = bootstrap.into_iter().map(|a| (a, None)).collect();
-    Ok(walk(seeds, infohash, deadline).await?.0)
+    Ok(walk(seeds, infohash, deadline, None).await?.0)
 }
 
 async fn resolve_bootstrap() -> Result<Vec<SocketAddr>> {
@@ -134,7 +161,9 @@ pub async fn scrape_from(
     budget: Duration,
 ) -> Result<DhtScrape> {
     let seeds = bootstrap.iter().map(|a| (*a, None)).collect();
-    Ok(walk(seeds, infohash, Instant::now() + budget).await?.0)
+    Ok(walk(seeds, infohash, Instant::now() + budget, None)
+        .await?
+        .0)
 }
 
 /// Nodes a walk starts from when the cache has them.
@@ -214,6 +243,17 @@ pub async fn scrape_cached(
     infohash: &[u8; 20],
     budget: Duration,
 ) -> Result<DhtScrape> {
+    scrape_paced(cache, infohash, budget, None).await
+}
+
+/// [`scrape_cached`] with every query waiting for a permit of `pacer` (D109). The wait counts
+/// against `budget`: a walk starved by a busy or braked pacer ends early, unanswered.
+pub async fn scrape_paced(
+    cache: &NodeCache,
+    infohash: &[u8; 20],
+    budget: Duration,
+    pacer: Option<&dyn WalkPacer>,
+) -> Result<DhtScrape> {
     let deadline = Instant::now() + budget;
     let mut seeds: Vec<(SocketAddr, Option<[u8; 20]>)> = cache
         .closest(infohash, CACHE_SEEDS)
@@ -232,7 +272,7 @@ pub async fn scrape_cached(
             Err(_) => {}
         }
     }
-    let (scrape, answered, failed) = walk(seeds, infohash, deadline).await?;
+    let (scrape, answered, failed) = walk(seeds, infohash, deadline, pacer).await?;
     cache.update(&answered, &failed);
     Ok(scrape)
 }
@@ -448,11 +488,13 @@ impl Walk {
 }
 
 /// Walk from `seeds` (address, id if known). Also returns the nodes that answered (with their
-/// ids) and those that timed out, for the [`NodeCache`].
+/// ids) and those that timed out, for the [`NodeCache`]. With a `pacer`, each query first waits
+/// for one of its permits (never past `deadline`).
 async fn walk(
     seeds: Vec<(SocketAddr, Option<[u8; 20]>)>,
     infohash: &[u8; 20],
     deadline: Instant,
+    pacer: Option<&dyn WalkPacer>,
 ) -> Result<(DhtScrape, Vec<(SocketAddr, [u8; 20])>, Vec<SocketAddr>)> {
     let sock = UdpSocket::bind(SocketAddr::from(([0u8; 4], 0)))
         .await
@@ -480,6 +522,11 @@ async fn walk(
     let mut buf = vec![0u8; 4096];
 
     loop {
+        // Answers that came in while the walk waited for a permit are read before anything
+        // is judged late: a slow pacer must not turn answered nodes into failed ones (D109).
+        while let Ok((n, src)) = sock.try_recv_from(&mut buf) {
+            w.handle(src, &buf[..n]);
+        }
         let now = Instant::now();
         if now >= deadline {
             break;
@@ -503,13 +550,45 @@ async fn walk(
             .values()
             .filter(|n| matches!(n.state, State::InFlight { .. }))
             .count();
-        for addr in &window {
-            if in_flight >= MAX_IN_FLIGHT {
-                break;
+        let fresh: Vec<SocketAddr> = window
+            .iter()
+            .filter(|a| w.nodes[*a].state == State::New)
+            .copied()
+            .collect();
+        let mut to_send: Vec<SocketAddr> = Vec::new();
+        match pacer {
+            // Unpaced: fill the in-flight slots at once.
+            None => to_send.extend(
+                fresh
+                    .iter()
+                    .take(MAX_IN_FLIGHT.saturating_sub(in_flight))
+                    .copied(),
+            ),
+            // Paced: one query per permit, and keep reading answers while waiting for it.
+            Some(p) => {
+                if in_flight < MAX_IN_FLIGHT
+                    && let Some(&addr) = fresh.first()
+                {
+                    let wake = next_wake(&w, deadline);
+                    tokio::select! {
+                        got = tokio::time::timeout_at(deadline, p.acquire()) => {
+                            if got.is_err() {
+                                continue; // deadline: the loop top ends the walk
+                            }
+                            to_send.push(addr);
+                        }
+                        r = tokio::time::timeout_at(wake, sock.recv_from(&mut buf)), if in_flight > 0 => {
+                            if let Ok(Ok((n, src))) = r {
+                                w.handle(src, &buf[..n]);
+                            }
+                            continue;
+                        }
+                    }
+                }
             }
-            if w.nodes[addr].state != State::New {
-                continue;
-            }
+        }
+        let sent = to_send.len();
+        for addr in to_send {
             let tid = next_tid.to_be_bytes();
             next_tid = next_tid.wrapping_add(1);
             let state = match sock.send_to(&get_peers(&my_id, infohash, &tid), addr).await {
@@ -517,25 +596,20 @@ async fn walk(
                     in_flight += 1;
                     State::InFlight {
                         tid,
-                        until: now + RPC_TIMEOUT,
+                        until: Instant::now() + RPC_TIMEOUT,
                     }
                 }
                 Err(_) => State::Failed,
             };
-            w.nodes.get_mut(addr).expect("in window").state = state;
+            w.nodes.get_mut(&addr).expect("in window").state = state;
         }
         if in_flight == 0 {
             break;
         }
-        let wake = w
-            .nodes
-            .values()
-            .filter_map(|n| match n.state {
-                State::InFlight { until, .. } => Some(until),
-                _ => None,
-            })
-            .min()
-            .map_or(deadline, |u| u.min(deadline));
+        if pacer.is_some() && in_flight < MAX_IN_FLIGHT && fresh.len() > sent {
+            continue; // a free slot and a node to ask: wait for the next permit (and answers)
+        }
+        let wake = next_wake(&w, deadline);
         if let Ok(Ok((n, src))) = tokio::time::timeout_at(wake, sock.recv_from(&mut buf)).await {
             w.handle(src, &buf[..n]);
         }
@@ -557,6 +631,18 @@ async fn walk(
         }
     }
     Ok((w.result(), answered, failed))
+}
+
+/// When the walk next has to look at its queries: the earliest in-flight timeout, or `deadline`.
+fn next_wake(w: &Walk, deadline: Instant) -> Instant {
+    w.nodes
+        .values()
+        .filter_map(|n| match n.state {
+            State::InFlight { until, .. } => Some(until),
+            _ => None,
+        })
+        .min()
+        .map_or(deadline, |u| u.min(deadline))
 }
 
 fn get_peers(my_id: &[u8; 20], infohash: &[u8; 20], tid: &[u8; 2]) -> Vec<u8> {

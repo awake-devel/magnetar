@@ -113,6 +113,10 @@ pub struct EngineConfig {
     /// External IP vote: agreeing responders and distinct /16s needed.
     pub vote_responders: usize,
     pub vote_prefixes: usize,
+    /// A pacer shared with other DHT senders of the process (D109: the seed checker's walks).
+    /// Its owner runs its refill task and sets its rate; `qps` must match. None: the engine
+    /// makes and runs its own at `qps`.
+    pub pacer: Option<Arc<Pacer>>,
 }
 
 impl EngineConfig {
@@ -138,6 +142,7 @@ impl EngineConfig {
             per_ip_qps: 1.0,
             response_rate: 300.0,
             response_per_ip: 5.0,
+            pacer: None,
             vote_responders: 8,
             vote_prefixes: 4,
         }
@@ -526,8 +531,11 @@ struct Inner {
     peers: Mutex<PeerStore>,
     /// 1 q/s per remote IP across every virtual node, sharded by address (exact per IP).
     per_ip: IpLimits,
-    /// The global QPS cap over every virtual node (one FIFO, cancel-safe).
-    pacer: Pacer,
+    /// The global QPS cap over every virtual node (one FIFO, cancel-safe), possibly shared
+    /// with other senders (D109).
+    pacer: Arc<Pacer>,
+    /// Whether the engine runs the pacer's refill task (false for a shared pacer).
+    owns_pacer: bool,
     /// Transactions on the wire over every shard, against `pending_cap`.
     pending: AtomicUsize,
     pending_cap: usize,
@@ -671,7 +679,11 @@ impl Dht {
                 (cfg.per_ip_qps * 2.0).max(2.0),
                 IP_BUCKETS_CAP,
             ),
-            pacer: Pacer::new(qps, now),
+            owns_pacer: cfg.pacer.is_none(),
+            pacer: cfg
+                .pacer
+                .clone()
+                .unwrap_or_else(|| Arc::new(Pacer::new(qps, now))),
             pending: AtomicUsize::new(0),
             pending_cap: (qps as usize * cfg.query_timeout.as_secs().max(1) as usize * 2).max(64),
             brake: Mutex::new(Brake::default()),
@@ -707,11 +719,13 @@ impl Dht {
             let d = dht.clone();
             tasks.push(tokio::spawn(async move { d.recv_loop(i).await }));
         }
-        let d = dht.clone();
-        tasks.push(tokio::spawn(async move {
-            let stop = d.inner.stop.clone();
-            d.inner.pacer.run(stop).await
-        }));
+        if dht.inner.owns_pacer {
+            let d = dht.clone();
+            tasks.push(tokio::spawn(async move {
+                let stop = d.inner.stop.clone();
+                d.inner.pacer.run(stop).await
+            }));
+        }
         let d = dht.clone();
         tasks.push(tokio::spawn(async move { d.maintenance_loop().await }));
         if dht.inner.cfg.sample {
@@ -899,6 +913,13 @@ impl Dht {
         let mut b = self.inner.brake.lock().unwrap();
         b.engage_until(until);
         self.inner.pacer.set_braked(b.active(Instant::now()));
+    }
+
+    /// Set the router health brake level (D109): the query rate is divided by 2^level (0 =
+    /// none, at most [`super::limiter::MAX_BRAKE_LEVEL`]). On a shared pacer this slows every
+    /// sender using it.
+    pub fn set_brake_level(&self, level: u8) {
+        self.inner.pacer.set_level(level);
     }
 
     /// Set the sampler's share of the QPS budget (clamped to 0–1; 0 pauses sampling, the
@@ -1539,7 +1560,7 @@ impl Dht {
         loop {
             while inflight.try_join_next().is_some() {}
             // The sampler's own share of the budget (paused at 0, `super::budget`).
-            let braked = if self.inner.pacer.braked() { 0.5 } else { 1.0 };
+            let braked = 1.0 / f64::from(self.inner.pacer.divisor());
             let own = self
                 .inner
                 .budget

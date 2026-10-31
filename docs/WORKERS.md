@@ -208,7 +208,7 @@ them. Workers reach the server the way the phone does (Tailscale serve, reverse 
 | `MAGNETAR_DHT` | `off` | `aggressive` (4 nodes on open UDP ports, passive capture) or `polite`; off = seed checks only |
 | `MAGNETAR_DHT_PORT`, `_NODES`, `_QPS`, `_TCP_RATE`, `_TCP_MAX`, `_PROBE`, `_POOL`, `_FETCH_CONCURRENCY`, `_METADATA_MAX`, `_PEER_LOOKUPS`, `_LOOKUP_TIMEOUT_MS`, `_PEERS_PER_HASH`, `_SAMPLE_PRIORITY` | as the server (docs/CONFIG.md), except pool 200 000 and fetches 64 | |
 | `MAGNETAR_DHT_UPNP` | **off** for workers | `true` maps the UDP ports on the router (it is somebody else's router: ask first) |
-| `MAGNETAR_LIVENESS_TRACKER_RPS`, `_TRACKER_CONCURRENCY`, `_DHT`, `_DHT_CONCURRENCY` | as the server | the worker's seed checker |
+| `MAGNETAR_LIVENESS_TRACKER_RPS`, `_TRACKER_CONCURRENCY`, `_DHT`, `_DHT_CONCURRENCY`, `_DHT_QPS` | as the server | the worker's seed checker (its walks share the worker's DHT pace, D109) |
 | `MAGNETAR_BLOCKLIST_FILE` | unset | extra blocklist terms, as on the server (the server screens again anyway) |
 | `MAGNETAR_GEOIP` | `on` | crawl map (docs/CRAWLMAP.md, D105): resolve DHT nodes to country / AS number here (database downloaded into `<state dir>/geoip`, ~18 MB in memory; `country` ~8 MB; `off` = items carry no codes). Only codes are sent, never an address |
 

@@ -475,6 +475,8 @@ fn opts(ports: usize) -> DhtOptions {
         upnp: None,
         service: None,
         geo: None,
+        pacer: None,
+        health: None,
     }
 }
 

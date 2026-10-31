@@ -59,6 +59,10 @@ pub struct LivenessConfig {
     pub dht_budget: Duration,
     /// DHT walks at the same time (only hashes no tracker answered get one).
     pub dht_concurrency: usize,
+    /// Pace of the walks' queries (D109): the server shares its DHT pacer here, so walks count
+    /// against the same queries-per-second budget as the crawler and follow its brake. None:
+    /// unpaced (one-shot checks, tests).
+    pub dht_pacer: Option<Arc<dyn dht::WalkPacer>>,
     /// Added to every torrent's own trackers.
     pub extra_trackers: Vec<String>,
     /// Scraped for torrents without any usable tracker of their own. Their answers only count
@@ -76,6 +80,7 @@ impl Default for LivenessConfig {
             use_dht: true,
             dht_budget: Duration::from_secs(12),
             dht_concurrency: 2,
+            dht_pacer: None,
             extra_trackers: Vec::new(),
             fallback_trackers: Vec::new(),
         }
@@ -397,15 +402,28 @@ impl Scraper {
             drop(tx);
         };
         let dht_nodes = &self.dht_nodes;
+        // A paced checker runs only the walks its pace can feed (D109).
+        let concurrency = match cfg.dht_pacer.as_ref().and_then(|p| p.rate()) {
+            Some(rate) => cfg
+                .dht_concurrency
+                .min(dht::walks_for_rate(rate, cfg.dht_budget)),
+            None => cfg.dht_concurrency,
+        };
         let walks = async {
             futures::stream::poll_fn(|cx| rx.poll_recv(cx))
                 .map(|i| async move {
                     (
                         i,
-                        dht::scrape_cached(dht_nodes, &raw_ref[i], cfg.dht_budget).await,
+                        dht::scrape_paced(
+                            dht_nodes,
+                            &raw_ref[i],
+                            cfg.dht_budget,
+                            cfg.dht_pacer.as_deref(),
+                        )
+                        .await,
                     )
                 })
-                .buffer_unordered(cfg.dht_concurrency.max(1))
+                .buffer_unordered(concurrency.max(1))
                 .collect::<Vec<_>>()
                 .await
         };

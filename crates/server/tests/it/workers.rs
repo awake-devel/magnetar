@@ -316,6 +316,8 @@ fn opts(
         upload_buffer: 4 << 20,
         heartbeat_every: Duration::from_secs(1),
         geo: None,
+        pacer: None,
+        probe: Vec::new(),
     }
 }
 
@@ -717,6 +719,8 @@ fn worker_dht(ports: Vec<u16>) -> DhtOptions {
         upnp: None,
         service: None,
         geo: None,
+        pacer: None,
+        health: None,
     }
 }
 

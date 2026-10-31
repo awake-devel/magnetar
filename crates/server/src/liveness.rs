@@ -214,8 +214,13 @@ impl LivenessService {
 
 /// Server checker config from `MAGNETAR_LIVENESS_*` (docs/CONFIG.md). Torrents without a
 /// tracker are scraped on the trackers their magnet links get (`magnet::DEFAULT_TRACKERS`).
-pub fn liveness_config(cfg: &Config) -> LivenessConfig {
+/// DHT walks wait for permits of `pacer`, the process's shared DHT pacer (D109).
+pub fn liveness_config(
+    cfg: &Config,
+    pacer: Option<Arc<magnetar_core::dht::limiter::Pacer>>,
+) -> LivenessConfig {
     LivenessConfig {
+        dht_pacer: pacer.map(|p| p as Arc<dyn magnetar_core::liveness::dht::WalkPacer>),
         tracker_concurrency: cfg.liveness_tracker_concurrency.max(1),
         tracker_rps: cfg.liveness_tracker_rps,
         use_dht: cfg.liveness_dht,
@@ -794,7 +799,13 @@ async fn boost_saved_searches(store: &PgStore, svc: &LivenessService, now: i64) 
 /// `magnetar-server liveness --limit N`: batches until `limit` infohashes were checked or
 /// nothing is due; one JSON report per batch on stdout (with the time the write took).
 pub async fn run_once(store: &PgStore, cfg: &Config, limit: usize) -> anyhow::Result<()> {
-    let svc = LivenessService::new(liveness_config(cfg));
+    // A bounded run paces its walks too, at the seed checker's own rate (D109).
+    let pacer = crate::dht::shared_pacer(cfg, false, true);
+    let (_stop_tx, stop_rx) = watch::channel(false);
+    if let Some(p) = pacer.clone() {
+        tokio::spawn(async move { p.run(stop_rx).await });
+    }
+    let svc = LivenessService::new(liveness_config(cfg, pacer));
     let batch = cfg.liveness_batch_size();
     let mut done = 0;
     while done < limit {

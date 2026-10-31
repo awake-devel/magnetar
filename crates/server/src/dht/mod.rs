@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use magnetar_core::dht::limiter::Pacer;
 use magnetar_core::dht::{Dht, EngineConfig, EngineStats, Mode, Sighting, Via, collect_peers};
 use magnetar_core::liveness::dht::BOOTSTRAP;
 use magnetar_core::metainfo::{FetchConfig, FetchStats, Fetcher};
@@ -68,7 +69,8 @@ pub struct DhtOptions {
     pub metadata_max: usize,
     /// The content screen (D53). None: verified metadata is never stored (fail closed).
     pub screen: Option<Arc<dyn Screen>>,
-    /// New TCP connection attempts per second (`MAGNETAR_DHT_TCP_RATE`, D66).
+    /// New TCP connection attempts per second (`MAGNETAR_DHT_TCP_RATE`, D66; default from the
+    /// query rate, D109).
     pub tcp_rate: u32,
     /// TCP connections open at once (`MAGNETAR_DHT_TCP_MAX`, D66).
     pub tcp_max: usize,
@@ -97,6 +99,32 @@ pub struct DhtOptions {
     pub service: Option<Arc<status::DhtService>>,
     /// Crawl map counters (D101): None = no counting by country / network.
     pub geo: Option<Arc<crate::crawlmap::CrawlMap>>,
+    /// The process's shared DHT pacer ([`shared_pacer`], D109), run by its owner. None: the
+    /// engine paces itself (the bounded `dht` command, tests).
+    pub pacer: Option<Arc<Pacer>>,
+    /// The process's router health probe (D109): the crawler attaches its engine and fetcher
+    /// to it while it runs. None: the crawler runs its own probe (`dht` command, tests).
+    pub health: Option<Arc<health::HealthHub>>,
+}
+
+/// Default metadata TCP attempts per second for a query rate (D109): half of it, 5–150. A SYN
+/// to a dead peer holds a router NAT entry until its timeout (120 s on the user's router), so
+/// this rate, not the query rate, fills small NAT tables first.
+pub fn default_tcp_rate(qps: u32) -> u32 {
+    (qps / 2).clamp(5, 150)
+}
+
+/// The pacer every DHT sender of the process shares (D109): the crawler's engine and the seed
+/// checker's walks. Its rate is `MAGNETAR_DHT_QPS` (or the mode's default) with the crawler on,
+/// `MAGNETAR_LIVENESS_DHT_QPS` with only seed checks; None when no DHT traffic is configured.
+/// The caller runs it ([`Pacer::run`]).
+pub fn shared_pacer(cfg: &Config, crawler: bool, seed_checks: bool) -> Option<Arc<Pacer>> {
+    let qps = match DhtOptions::from_config(cfg, cfg.dht).filter(|_| crawler) {
+        Some(o) => o.qps,
+        None if seed_checks && cfg.liveness_dht => cfg.liveness_dht_qps,
+        None => return None,
+    };
+    Some(Arc::new(Pacer::new(qps, Instant::now())))
 }
 
 impl DhtOptions {
@@ -121,10 +149,11 @@ impl DhtOptions {
                 }
             })
             .collect();
+        let qps = cfg.dht_qps.unwrap_or(if aggressive { 200 } else { 50 });
         Some(Self {
             mode,
             ports,
-            qps: cfg.dht_qps.unwrap_or(if aggressive { 200 } else { 50 }),
+            qps,
             pool_cap: cfg.dht_pool.map(|p| p as usize).unwrap_or(if aggressive {
                 1_000_000
             } else {
@@ -152,7 +181,7 @@ impl DhtOptions {
             metadata_max: cfg.dht_metadata_max as usize,
             // The process-wide blocklist (installed at start); None stores nothing.
             screen: screen::global_screen(),
-            tcp_rate: cfg.dht_tcp_rate,
+            tcp_rate: cfg.dht_tcp_rate.unwrap_or_else(|| default_tcp_rate(qps)),
             tcp_max: cfg.dht_tcp_max as usize,
             probe: health::parse_targets(&cfg.dht_probe),
             // Polite mode uses an ephemeral port: nothing to map. `serve` maps by default in
@@ -165,6 +194,8 @@ impl DhtOptions {
             }),
             service: None,
             geo: None,
+            pacer: None,
+            health: None,
         })
     }
 }
@@ -1128,6 +1159,7 @@ pub async fn run(
     cfg.qps = opts.qps;
     cfg.pool_cap = opts.pool_cap;
     cfg.lookup_timeout = opts.lookup_timeout;
+    cfg.pacer = opts.pacer.clone();
     if let Some(pool) = &db {
         cfg.known_nodes = store::load_nodes(pool).await?;
         cfg.identity = store::load_identity(pool, &opts.ports).await?;
@@ -1172,6 +1204,11 @@ pub async fn run(
         max_peers: opts.peers_per_hash.max(1),
         ..FetchConfig::default()
     });
+    let own_hub = opts.health.is_none();
+    let hub = opts
+        .health
+        .clone()
+        .unwrap_or_else(|| health::HealthHub::new(opts.pacer.clone()));
     let p = Arc::new(Pipeline {
         pool: db.clone(),
         queue: Mutex::new(FetchQueue::new(opts.queue_cap)),
@@ -1180,7 +1217,7 @@ pub async fn run(
         peer_counts: Mutex::default(),
         fetcher,
         persisted: Mutex::default(),
-        health: Arc::default(),
+        health: hub.stats.clone(),
         opts,
     });
     let (int_tx, int_rx) = watch::channel(false);
@@ -1224,13 +1261,15 @@ pub async fn run(
     if p.opts.service.is_none() {
         tasks.spawn(progress_loop(p.clone(), dht.clone(), int_rx.clone()));
     }
-    tasks.spawn(health::health_loop(
-        p.opts.probe.clone(),
-        dht.clone(),
-        p.fetcher.clone(),
-        p.health.clone(),
-        int_rx.clone(),
-    ));
+    // Under the process's probe while this run lasts (it outlives restarts), or our own.
+    let _attached = hub.attach(dht.clone(), p.fetcher.clone());
+    if own_hub {
+        tasks.spawn(health::health_loop(
+            p.opts.probe.clone(),
+            hub.clone(),
+            int_rx.clone(),
+        ));
+    }
     tasks.spawn(backpressure(p.clone(), dht.clone(), int_rx.clone()));
     if let Some(svc) = &p.opts.service {
         svc.attach(p.clone(), dht.clone(), started);
@@ -1352,6 +1391,8 @@ pub async fn dht_loop(
     cfg: Arc<Config>,
     svc: Arc<status::DhtService>,
     geo: Option<Arc<crate::crawlmap::CrawlMap>>,
+    pacer: Option<Arc<Pacer>>,
+    health: Option<Arc<health::HealthHub>>,
     mut stop: watch::Receiver<bool>,
 ) {
     let Some(mut opts) = DhtOptions::from_config(&cfg, cfg.dht) else {
@@ -1359,6 +1400,8 @@ pub async fn dht_loop(
     };
     opts.service = Some(svc.clone());
     opts.geo = geo;
+    opts.pacer = pacer;
+    opts.health = health;
     let mut failures = 0u32;
     loop {
         let started = Instant::now();
@@ -1413,6 +1456,15 @@ mod tests {
         assert!(hand(&tx, &mut batch));
         assert_eq!(rx.try_recv().unwrap().len(), 2);
         assert!(hand(&tx, &mut Vec::new()), "nothing to hand");
+    }
+
+    #[test]
+    fn tcp_rate_follows_the_query_rate() {
+        use super::default_tcp_rate;
+        assert_eq!(default_tcp_rate(75), 37);
+        assert_eq!(default_tcp_rate(200), 100);
+        assert_eq!(default_tcp_rate(1000), 150, "the measured cap");
+        assert_eq!(default_tcp_rate(4), 5, "a floor so fetching still moves");
     }
 
     #[test]

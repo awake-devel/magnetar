@@ -1044,7 +1044,12 @@ async fn fallback_trackers_only_count_seeders() {
 
 /// One fake DHT node that answers every get_peers with one peer; counts the queries.
 async fn fake_dht_node() -> (SocketAddr, Arc<AtomicUsize>) {
-    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    fake_dht_node_at("127.0.0.1").await
+}
+
+/// [`fake_dht_node`] on another loopback address (walks treat 3+ ports of one IP as a farm).
+async fn fake_dht_node_at(ip: &str) -> (SocketAddr, Arc<AtomicUsize>) {
+    let sock = UdpSocket::bind((ip, 0)).await.unwrap();
     let addr = sock.local_addr().unwrap();
     let queries = Arc::new(AtomicUsize::new(0));
     let q = queries.clone();
@@ -1102,6 +1107,112 @@ async fn dht_only_for_unanswered_and_nodes_are_cached() {
     assert_eq!((report.dht_walks, report.dht_answered), (2, 2));
     assert_eq!(queries.load(Ordering::SeqCst), 2, "one query per walk");
     assert_eq!(scraper.state().2, 1, "the answering node is cached");
+}
+
+/// A walk pacer that counts permits, grants each after `delay`, or never grants one (`closed`).
+#[derive(Debug, Default)]
+struct TestPacer {
+    granted: AtomicUsize,
+    closed: bool,
+    delay: Duration,
+}
+
+impl dht::WalkPacer for TestPacer {
+    fn acquire(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            if self.closed {
+                std::future::pending::<()>().await;
+            }
+            tokio::time::sleep(self.delay).await;
+            self.granted.fetch_add(1, Ordering::SeqCst);
+        })
+    }
+}
+
+/// D109: every walk query waits for a permit of the shared pacer, so walks count against the
+/// process's DHT rate; a pacer that grants nothing sends nothing before the budget ends.
+#[tokio::test]
+async fn dht_walk_queries_wait_for_the_pacer() {
+    for closed in [false, true] {
+        let (node, queries) = fake_dht_node().await;
+        let pacer = Arc::new(TestPacer {
+            closed,
+            ..Default::default()
+        });
+        let scraper = liveness::Scraper::with_dht_nodes(
+            LivenessConfig {
+                use_dht: true,
+                dht_budget: Duration::from_millis(300),
+                dht_concurrency: 4,
+                dht_pacer: Some(pacer.clone()),
+                ..cfg()
+            },
+            dht::NodeCache::with_bootstrap(64, vec![node]),
+        );
+        let items = items_of(&[h(6), h(7)], &[]);
+        let (out, report) = scraper.check(&items, 1).await;
+        assert_eq!(report.dht_walks, 2);
+        let sent = queries.load(Ordering::SeqCst);
+        assert_eq!(
+            pacer.granted.load(Ordering::SeqCst),
+            sent,
+            "one permit per query"
+        );
+        if closed {
+            assert_eq!(sent, 0, "no permit, no query");
+            assert_eq!(report.dht_answered, 0);
+            assert!(out.iter().all(|l| l.source == LivenessSource::None));
+        } else {
+            assert_eq!(sent, 2);
+            assert_eq!(report.dht_answered, 2);
+        }
+    }
+}
+
+/// D109 review: permits slower than the 1.2 s query timeout. The walk keeps reading while it
+/// waits, so every node that answered counts and stays cached (before the fix, answers sat
+/// unread past their timeout, the nodes were marked failed and evicted from the cache).
+#[tokio::test]
+async fn slow_pacer_keeps_answers_and_cached_nodes() {
+    let mut nodes = Vec::new();
+    let mut counters = Vec::new();
+    for i in 1..=4 {
+        let (a, q) = fake_dht_node_at(&format!("127.0.0.{i}")).await;
+        nodes.push(a);
+        counters.push(q);
+    }
+    let pacer = Arc::new(TestPacer {
+        delay: Duration::from_millis(1500),
+        ..Default::default()
+    });
+    let scraper = liveness::Scraper::with_dht_nodes(
+        LivenessConfig {
+            use_dht: true,
+            dht_budget: Duration::from_secs(9),
+            dht_concurrency: 1,
+            dht_pacer: Some(pacer.clone()),
+            ..cfg()
+        },
+        dht::NodeCache::with_bootstrap(64, nodes),
+    );
+    let (out, report) = scraper.check(&items_of(&[h(6)], &[]), 1).await;
+    let sent: usize = counters.iter().map(|q| q.load(Ordering::SeqCst)).sum();
+    assert_eq!(sent, 4, "each node asked once");
+    assert_eq!(report.dht_answered, 1);
+    assert_eq!(out[0].source, LivenessSource::DhtValues);
+    assert_eq!(
+        scraper.state().2,
+        4,
+        "every answering node is cached, none evicted"
+    );
+}
+
+#[test]
+fn walks_follow_the_pace() {
+    let ten = Duration::from_secs(10);
+    assert_eq!(dht::walks_for_rate(20.0, ten), 5);
+    assert_eq!(dht::walks_for_rate(75.0, ten), 18);
+    assert_eq!(dht::walks_for_rate(2.5, ten), 1, "always one");
 }
 
 #[test]

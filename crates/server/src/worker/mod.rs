@@ -52,6 +52,10 @@ pub struct WorkerOptions {
     /// Crawl map (D105): resolve DHT nodes to country / network here and send the codes
     /// with triage requests. None = off (no database is downloaded).
     pub geo: Option<crate::geo::GeoConfig>,
+    /// The DHT pace shared by the crawler and the seed checks (D109), run by [`run`]; the
+    /// router health probe targets that brake it.
+    pub pacer: Option<Arc<magnetar_core::dht::limiter::Pacer>>,
+    pub probe: Vec<std::net::SocketAddr>,
 }
 
 impl WorkerOptions {
@@ -66,7 +70,9 @@ impl WorkerOptions {
             .clone()
             .filter(|s| !s.trim().is_empty())
             .context("MAGNETAR_WORKER_TOKEN is required for worker")?;
+        let pacer = crate::dht::shared_pacer(cfg, cfg.dht != DhtMode::Off, cfg.worker_liveness);
         let dht = DhtOptions::from_config(cfg, cfg.dht).map(|mut o| {
+            o.pacer = pacer.clone();
             // A worker runs on small machines and has no database behind its queue: smaller
             // defaults unless set explicitly (docs/WORKERS.md §4).
             if cfg.dht_pool.is_none() {
@@ -85,7 +91,7 @@ impl WorkerOptions {
         });
         let liveness = cfg
             .worker_liveness
-            .then(|| crate::liveness::liveness_config(cfg));
+            .then(|| crate::liveness::liveness_config(cfg, pacer.clone()));
         anyhow::ensure!(
             liveness.is_some() || dht.is_some(),
             "worker: nothing to do (MAGNETAR_WORKER_LIVENESS=false and MAGNETAR_DHT=off)"
@@ -114,6 +120,8 @@ impl WorkerOptions {
                         .join("geoip"),
                 )
             }),
+            pacer,
+            probe: crate::dht::health::parse_targets(&cfg.dht_probe),
         })
     }
 }
@@ -301,6 +309,22 @@ pub async fn run(
         hello.dht.as_deref().unwrap_or("off")
     );
 
+    // The shared DHT pace (D109).
+    if let Some(p) = opts.pacer.clone() {
+        let (run, stop) = (p.clone(), int_rx.clone());
+        tokio::spawn(async move { run.run(stop).await });
+    }
+    // One router health probe for the process (D109): the crawl attaches to it while it runs.
+    let health = opts.pacer.clone().map(|p| {
+        let hub = crate::dht::health::HealthHub::new(Some(p));
+        tokio::spawn(crate::dht::health::health_loop(
+            opts.probe.clone(),
+            hub.clone(),
+            int_rx.clone(),
+        ));
+        hub
+    });
+
     let governor = Arc::new(Governor::default());
     let gov_task = tokio::spawn(governor::run(governor.clone(), opts.limits, int_rx.clone()));
 
@@ -323,6 +347,7 @@ pub async fn run(
 
     let crawl = match opts.dht.clone() {
         Some(mut d) => {
+            d.health = health.clone();
             // D105: the worker's own geo database (downloaded into its state dir), loaded in
             // the background; until then its triage items carry no codes.
             if let Some(g) = opts.geo.clone() {

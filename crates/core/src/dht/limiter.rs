@@ -264,19 +264,29 @@ impl Pace {
 
     /// The instant the caller may send at; twice as far apart while `braked`.
     pub fn reserve(&mut self, now: Instant, braked: bool) -> Instant {
+        self.reserve_slowed(now, if braked { 2 } else { 1 })
+    }
+
+    /// The instant the caller may send at, `divisor` times as far apart (a brake level, D109).
+    pub fn reserve_slowed(&mut self, now: Instant, divisor: u32) -> Instant {
         let at = self.next.max(now);
-        let step = if braked {
-            self.interval * 2
-        } else {
-            self.interval
-        };
-        self.next = at + step;
+        self.next = at + self.interval * divisor.max(1);
         at
     }
 }
 
 /// How often the pacer hands out send permits.
 pub const PACER_TICK: Duration = Duration::from_millis(2);
+
+/// Deepest router health brake (D109): 2^3 = an eighth of the configured rate.
+pub const MAX_BRAKE_LEVEL: u8 = 3;
+
+/// Rate divisor for a brake state: 2 while `braked` (the answered-share brake, or a level-1
+/// health brake), 2^level for the health brake, the larger cut wins.
+pub fn brake_divisor(braked: bool, level: u8) -> u32 {
+    let by_level = 1u32 << level.min(MAX_BRAKE_LEVEL);
+    by_level.max(if braked { 2 } else { 1 })
+}
 
 /// The global outbound pace over every virtual node (D106): a FIFO of senders served at the
 /// configured rate (half while braked).
@@ -289,12 +299,18 @@ pub const PACER_TICK: Duration = Duration::from_millis(2);
 ///
 /// Permits are added every [`PACER_TICK`] by [`Pacer::refill`], at most [`Pacer::burst`]
 /// unused at a time, so an idle pacer does not bank a burst.
+///
+/// One pacer can be shared by every DHT sender of the process (the crawler's engine and the
+/// seed checker's walks, D109): `MAGNETAR_DHT_QPS` is then the total the router sees.
 #[derive(Debug)]
 pub struct Pacer {
     sem: tokio::sync::Semaphore,
     rate: f64,
     burst: usize,
     braked: std::sync::atomic::AtomicBool,
+    /// Router health brake level (D109): the rate is divided by 2^level, [`MAX_BRAKE_LEVEL`]
+    /// at most. Combined with `braked` by taking the larger cut.
+    level: std::sync::atomic::AtomicU8,
     state: std::sync::Mutex<(f64, Instant)>,
     /// Sends taken ahead of the queue since the last refill ([`Pacer::take_ahead`]).
     ahead: std::sync::atomic::AtomicU64,
@@ -309,6 +325,7 @@ impl Pacer {
             // Two ticks' worth: a tick that comes late does not lose its permits.
             burst: ((rate * PACER_TICK.as_secs_f64() * 2.0).ceil() as usize).max(1),
             braked: std::sync::atomic::AtomicBool::new(false),
+            level: std::sync::atomic::AtomicU8::new(0),
             state: std::sync::Mutex::new((0.0, now)),
             ahead: std::sync::atomic::AtomicU64::new(0),
         }
@@ -332,16 +349,35 @@ impl Pacer {
         self.braked.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Set the router health brake level (0 = none; clamped to [`MAX_BRAKE_LEVEL`]).
+    pub fn set_level(&self, level: u8) {
+        self.level.store(
+            level.min(MAX_BRAKE_LEVEL),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    pub fn level(&self) -> u8 {
+        self.level.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// What the rate is divided by now: 2 while `braked`, 2^level from the health brake, the
+    /// larger of the two.
+    pub fn divisor(&self) -> u32 {
+        brake_divisor(self.braked(), self.level())
+    }
+
+    /// The rate in effect now (permits per second).
+    pub fn effective_rate(&self) -> f64 {
+        self.rate / f64::from(self.divisor())
+    }
+
     /// Add the permits earned since the last refill (returns how many); at most
     /// [`burst`](Self::burst) stay unused.
     pub fn refill(&self, now: Instant) -> usize {
         let mut st = self.state.lock().unwrap();
         let (credit, at) = &mut *st;
-        let rate = if self.braked() {
-            self.rate / 2.0
-        } else {
-            self.rate
-        };
+        let rate = self.effective_rate();
         *credit += now.saturating_duration_since(*at).as_secs_f64() * rate;
         *at = now;
         // Sends taken ahead of the queue came out of this budget too (at most one second of
@@ -397,9 +433,56 @@ impl Pacer {
     }
 }
 
+impl crate::liveness::dht::WalkPacer for Pacer {
+    fn acquire(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(Pacer::acquire(self))
+    }
+
+    fn rate(&self) -> Option<f64> {
+        Some(self.effective_rate())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brake_levels_divide_the_rate() {
+        assert_eq!(brake_divisor(false, 0), 1);
+        assert_eq!(brake_divisor(true, 0), 2);
+        assert_eq!(brake_divisor(true, 1), 2, "the larger cut, not both");
+        assert_eq!(brake_divisor(false, 2), 4);
+        assert_eq!(brake_divisor(true, 3), 8);
+        assert_eq!(brake_divisor(false, 9), 8, "clamped to MAX_BRAKE_LEVEL");
+        let p = Pacer::new(80, Instant::now());
+        p.set_level(2);
+        assert_eq!(p.effective_rate(), 20.0);
+        p.set_level(7);
+        assert_eq!(p.level(), MAX_BRAKE_LEVEL);
+        assert_eq!(p.effective_rate(), 10.0);
+        p.set_level(0);
+        p.set_braked(true);
+        assert_eq!(p.effective_rate(), 40.0);
+    }
+
+    #[test]
+    fn braked_pacer_hands_out_the_divided_rate() {
+        let t = Instant::now();
+        let p = Pacer::new(1000, t);
+        p.set_level(3);
+        assert_eq!(p.refill(t + Duration::from_secs(1)), 125);
+        p.set_level(0);
+        assert_eq!(p.refill(t + Duration::from_secs(2)), 1000);
+    }
+
+    #[test]
+    fn pace_slowed_spaces_by_the_divisor() {
+        let t = Instant::now();
+        let mut p = Pace::new(100, t);
+        assert_eq!(p.reserve_slowed(t, 4), t);
+        assert_eq!(p.reserve_slowed(t, 1), t + Duration::from_millis(40));
+    }
 
     #[test]
     fn per_ip_burst_two_then_one_per_second() {

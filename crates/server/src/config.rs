@@ -221,6 +221,10 @@ pub struct Config {
     /// DHT walks at the same time.
     #[arg(long, env = "MAGNETAR_LIVENESS_DHT_CONCURRENCY", default_value_t = 32)]
     pub liveness_dht_concurrency: usize,
+    /// Queries per second of the seed checker's DHT walks while the crawler is off (D109). With
+    /// the crawler on, walks share `MAGNETAR_DHT_QPS` with it instead.
+    #[arg(long, env = "MAGNETAR_LIVENESS_DHT_QPS", default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=20_000))]
+    pub liveness_dht_qps: u32,
     /// Native DHT crawler (docs/DHT.md): off, polite or aggressive.
     #[arg(long, env = "MAGNETAR_DHT", value_enum, default_value = "off")]
     pub dht: DhtMode,
@@ -262,10 +266,11 @@ pub struct Config {
     /// Largest info dict fetched, in bytes (BEP 9 sets no limit).
     #[arg(long, env = "MAGNETAR_DHT_METADATA_MAX", default_value_t = 16 * 1024 * 1024, value_parser = clap::value_parser!(u64).range(16_384..=67_108_864))]
     pub dht_metadata_max: u64,
-    /// New TCP connection attempts per second for metadata fetches (router benchmark: 200
-    /// safe, 400 breaks the user's router; docs/research/router-bench.md).
-    #[arg(long, env = "MAGNETAR_DHT_TCP_RATE", default_value_t = 150, value_parser = clap::value_parser!(u32).range(1..=2000))]
-    pub dht_tcp_rate: u32,
+    /// New TCP connection attempts per second for metadata fetches. Default: half the DHT query
+    /// rate, 5–150 (D109: an unanswered attempt holds a router NAT entry for up to 120 s; router
+    /// benchmark: 200 safe alone, 400 breaks the user's router; docs/research/router-bench.md).
+    #[arg(long, env = "MAGNETAR_DHT_TCP_RATE", value_parser = clap::value_parser!(u32).range(1..=2000))]
+    pub dht_tcp_rate: Option<u32>,
     /// TCP connections open at once for metadata fetches (benchmark: ~440 held).
     #[arg(long, env = "MAGNETAR_DHT_TCP_MAX", default_value_t = 350, value_parser = clap::value_parser!(u32).range(1..=10_000))]
     pub dht_tcp_max: u32,

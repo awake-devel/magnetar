@@ -39,6 +39,7 @@ services:
       MAGNETAR_DHT_PROBE: ${MAGNETAR_DHT_PROBE:-1.1.1.1:443,9.9.9.9:443}
       MAGNETAR_DHT_UPNP: ${MAGNETAR_DHT_UPNP:-false}
       MAGNETAR_LIVENESS_DHT_CONCURRENCY: ${MAGNETAR_LIVENESS_DHT_CONCURRENCY:-32}
+      MAGNETAR_LIVENESS_DHT_QPS: ${MAGNETAR_LIVENESS_DHT_QPS:-20}
       # Crawl map (docs/CRAWLMAP.md): on | country | off; databases in the worker state dir.
       MAGNETAR_GEOIP: ${MAGNETAR_GEOIP:-on}
       RUST_LOG: ${RUST_LOG:-info}

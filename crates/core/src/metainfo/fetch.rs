@@ -35,7 +35,7 @@ use tokio::time::Instant;
 use super::info::{InfoError, InfoSummary, parse_info};
 use super::wire::{self, ExtHandshake, MetadataMsg, WireError};
 use crate::dht::addr::AddrFilter;
-use crate::dht::limiter::Pace;
+use crate::dht::limiter::{Pace, brake_divisor};
 use crate::liveness::bencode;
 
 /// Largest `extended` message we read (a `data` message is ~50 B of dict + 16 KiB; extended
@@ -346,6 +346,8 @@ struct Inner {
     conns: Semaphore,
     /// While in the future, connection attempts are paced at half the rate (D66).
     braked_until: Mutex<Option<Instant>>,
+    /// Router health brake level (D109): attempts paced at 1/2^level of the rate.
+    brake_level: std::sync::atomic::AtomicU8,
     reputation: Mutex<Reputation>,
     c: Counters,
 }
@@ -625,6 +627,7 @@ impl Fetcher {
                 connects: Mutex::new(Pace::new(cfg.connects_per_sec.max(1), now)),
                 conns: Semaphore::new(cfg.max_connections.clamp(1, Semaphore::MAX_PERMITS)),
                 braked_until: Mutex::new(None),
+                brake_level: std::sync::atomic::AtomicU8::new(0),
                 reputation: Mutex::new(Reputation::new(
                     cfg.fake_cap,
                     cfg.fake_strikes,
@@ -642,6 +645,15 @@ impl Fetcher {
         if b.is_none_or(|u| u < until) {
             *b = Some(until);
         }
+    }
+
+    /// Set the router health brake level (D109): connection attempts at 1/2^level of the rate
+    /// (0 = none, at most [`crate::dht::limiter::MAX_BRAKE_LEVEL`]).
+    pub fn set_brake_level(&self, level: u8) {
+        self.inner.brake_level.store(
+            level.min(crate::dht::limiter::MAX_BRAKE_LEVEL),
+            Ordering::Relaxed,
+        );
     }
 
     pub fn config(&self) -> &FetchConfig {
@@ -810,7 +822,7 @@ impl Fetcher {
         }
         let cfg = &self.inner.cfg;
         // Global bounds (home router NAT, docs/DHT.md §4 step 7): open connections, then the
-        // attempt pace (halved while the health probe brakes, D66).
+        // attempt pace (slowed while the health probe brakes, D66, D109).
         let _conn = self
             .inner
             .conns
@@ -824,7 +836,13 @@ impl Fetcher {
             .lock()
             .unwrap()
             .is_some_and(|u| now < u);
-        let at = self.inner.connects.lock().unwrap().reserve(now, braked);
+        let divisor = brake_divisor(braked, self.inner.brake_level.load(Ordering::Relaxed));
+        let at = self
+            .inner
+            .connects
+            .lock()
+            .unwrap()
+            .reserve_slowed(now, divisor);
         tokio::time::sleep_until(at).await;
         let stream = tokio::time::timeout(cfg.connect_timeout, TcpStream::connect(addr))
             .await
