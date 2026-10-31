@@ -389,17 +389,23 @@ Both modes honour every rule of §3.4 (interval, per-IP rate, honest ids, no fak
    above 5 packets/s per IP for 5 min (dht-crawling.md §1.2).
 4. Global outbound pace `MAGNETAR_DHT_QPS` over every KRPC query (since D106 a FIFO pacer whose
    turns a cancelled query hands on, §20) (sample, find_node,
-   get_peers, ping). Responses we send have their own cap (300/s, 5/s per IP; excess dropped
+   get_peers, ping), **and since D109 over the seed checker's DHT walks too** (one pacer per
+   process, `dht::shared_pacer`). Responses we send have their own cap (300/s, 5/s per IP; excess dropped
    silently).
 5. **Adaptive brake**: if the answered share over the last 60 s falls below half of its 10-min
    average while > 50 q/s, halve the rate for 5 min (a full router conntrack table or an ISP
    limiter shows up as silence, not errors). Logged and counted in stats.
-   **Second trigger, the router health probe (D66)**: a TCP connect every 5 s to
-   `MAGNETAR_DHT_PROBE` (1.1.1.1:443, 9.9.9.9:443; ICMP is blocked on the user's line and
-   rate-limited by the gateway). Saturated when 3 of the last 6 probes fail or their median
-   exceeds `max(3 × baseline, baseline + 40 ms)` (baseline = 10th percentile of the last 10 min);
-   then KRPC queries **and** TCP connection attempts are halved for 5 min, extended while it
-   lasts. Benchmark: safe rates kept 17–19 ms, saturation gave 122 ms or 100 % loss.
+   **Second trigger, the router health probe (D66, D109)**: every 2 s a TCP connect to each
+   `MAGNETAR_DHT_PROBE` target at once (1.1.1.1:443, 9.9.9.9:443; ICMP is blocked on the user's
+   line and rate-limited by the gateway); the sample is the fastest answer, a failure only when
+   all failed. One probe per process, outliving crawler restarts. Saturated when 3 of the last
+   6 samples fail (judged from the third sample on) or their median exceeds `max(3 × baseline, baseline + 40 ms)` (baseline =
+   10th percentile of the last 10 min, from samples taken with no brake on). Each saturation
+   raises a brake level (at most every 12 s, up to 3): KRPC queries, seed-check walks **and**
+   TCP connection attempts run at 1/2^level; 5 calm minutes drop it by one, then one per calm
+   minute. Benchmark: safe rates kept 17–19 ms, saturation gave 122 ms or 100 % loss; on
+   2026-10-30 a 75 q/s crawl with UPnP and unpaced walks filled the router's NAT table in
+   ~20 s (D109).
 6. Responses matched on `(transaction id, source address)` (bitmagnet only checks the tid,
    bitmagnet.md §2.6). Transaction ids 2 random bytes per query.
 7. No forged ids, no neighbour trick, no fake `values` or `nodes` (dht-crawling.md §2).
@@ -787,9 +793,9 @@ others are still planned (their stage in brackets).
 | `MAGNETAR_DHT_LOOKUP_TIMEOUT_MS` | `4000` | soft per-query timeout of lookups (100–4000, §18, D93) |
 | `MAGNETAR_DHT_PEERS_PER_HASH` | `24` | peers tried per hash by the fetcher, and where a lookup stops (1–64, §18) |
 | `MAGNETAR_DHT_METADATA_MAX` | `16777216` | bytes, per info dict |
-| `MAGNETAR_DHT_TCP_RATE` | `150` | new TCP connection attempts/s, all fetches (D66) |
+| `MAGNETAR_DHT_TCP_RATE` | half of `MAGNETAR_DHT_QPS`, 5–150 | new TCP connection attempts/s, all fetches (D66, D109) |
 | `MAGNETAR_DHT_TCP_MAX` | `350` | TCP connections open at once (D66) |
-| `MAGNETAR_DHT_PROBE` | `1.1.1.1:443,9.9.9.9:443` | health probe targets, or `off` (D66) |
+| `MAGNETAR_DHT_PROBE` | `1.1.1.1:443,9.9.9.9:443` | health probe targets, all probed every 2 s (a failure = every target failed), or `off` (D66, D109) |
 | `MAGNETAR_DHT_FETCH_KNOWN` | `false` | also fetch metadata of Nostr-only infohashes |
 | `MAGNETAR_DHT_UPNP` | `true` in aggressive | map the UDP ports on the router (§9) (stage 6) |
 | `MAGNETAR_DHT_UPNP_GATEWAY` | default gateway from `/proc/net/route` | `host[:port]` for a unicast SSDP M-SEARCH (needed in Docker, §9) |
