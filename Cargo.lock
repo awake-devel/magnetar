@@ -2531,7 +2531,7 @@ checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
 
 [[package]]
 name = "magnetar-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "data-encoding",
@@ -2561,7 +2561,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-server"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anitomy-ng",
  "anyhow",
