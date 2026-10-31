@@ -131,6 +131,19 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
     };
 
     let (stop_tx, stop_rx) = watch::channel(false);
+    // One DHT pace for the whole process (D109): the crawler's queries and the seed checker's
+    // walks share it, so MAGNETAR_DHT_QPS is what the router sees, and the health probe slows
+    // both. Its refill task runs here, outliving crawler restarts.
+    let dht_pacer = crate::dht::shared_pacer(&cfg, cfg.dht != crate::config::DhtMode::Off, true);
+    // One router health probe for the process too: it brakes the walks from the start and
+    // through crawler restarts; a running crawler attaches its engine and fetcher to it.
+    let dht_health = dht_pacer
+        .clone()
+        .map(|p| crate::dht::health::HealthHub::new(Some(p)));
+    if let Some(p) = dht_pacer.clone() {
+        let stop = stop_rx.clone();
+        tokio::spawn(async move { p.run(stop).await });
+    }
     // Crawl map (D101–D105): counters by country / network; the database loads in the
     // background (download on first start), the map says "missing" meanwhile.
     let geo_cfg = cfg.geo_config(cfg.state_dir().join("geoip"));
@@ -143,6 +156,7 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
         .with_fleet(fleet)
         .with_liveness(Arc::new(LivenessService::new(liveness::liveness_config(
             &cfg,
+            dht_pacer.clone(),
         ))))
         .with_dht(match cfg.dht {
             crate::config::DhtMode::Off => None,
@@ -193,6 +207,15 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
             cfg.clone(),
             svc.clone(),
             (geo_cfg.mode != GeoMode::Off).then(|| crawlmap.clone()),
+            dht_pacer.clone(),
+            dht_health.clone(),
+            stop_rx.clone(),
+        )));
+    }
+    if let Some(hub) = dht_health.clone() {
+        daemons.push(tokio::spawn(crate::dht::health::health_loop(
+            crate::dht::health::parse_targets(&cfg.dht_probe),
+            hub,
             stop_rx.clone(),
         )));
     }
