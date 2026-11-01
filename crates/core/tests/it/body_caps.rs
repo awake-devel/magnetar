@@ -204,3 +204,116 @@ async fn relay_message_size_is_capped() {
     }
     assert!(!conn.is_open());
 }
+
+/// Relay on loopback that answers every REQ with `events` then EOSE, and keeps the connection.
+async fn paging_relay(events: Vec<Value>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let events = events.clone();
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else {
+                    return;
+                };
+                while let Some(Ok(msg)) = ws.next().await {
+                    let Message::Text(t) = msg else { continue };
+                    let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(t.as_str()) else {
+                        continue;
+                    };
+                    if arr.first().and_then(Value::as_str) != Some("REQ") {
+                        continue;
+                    }
+                    let sub = arr[1].clone();
+                    for ev in &events {
+                        let text = json!(["EVENT", sub, ev]).to_string();
+                        if ws.send(Message::Text(text.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    let eose = json!(["EOSE", sub]).to_string();
+                    if ws.send(Message::Text(eose.into())).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    url
+}
+
+/// D111 review: an honest event a little over ingest's 1 MiB (a kind 3 with ~10k follows and
+/// relay hints) failed the receive under the old 1 MiB + 16 KiB message cap, and with it the
+/// relay's whole crawl. It now reaches the page (ingest drops it as TooLarge) and paging goes
+/// on, on the same connection.
+#[tokio::test]
+async fn honest_large_event_does_not_fail_the_relay() {
+    let follow = |i: usize| {
+        vec![
+            "p".to_string(),
+            format!("{i:064x}"),
+            "wss://relay.example.invalid/".to_string(),
+            "a petname".to_string(),
+        ]
+    };
+    let follows: Vec<Vec<String>> = (0..10_500).map(follow).collect();
+    let mut big = event(1, follows, String::new());
+    big["kind"] = json!(3);
+    let big_len = big.to_string().len();
+    assert!(
+        big_len > magnetar_core::ingest::MAX_EVENT_BYTES + (16 << 10),
+        "{big_len}"
+    );
+    let events = vec![
+        event(0, vec![], "before".into()),
+        big,
+        event(2, vec![], "after".into()),
+        event(3, vec![], "after".into()),
+    ];
+    let url = paging_relay(events).await;
+    let mut conn = RelayConn::connect(&url, Duration::from_secs(5))
+        .await
+        .unwrap();
+    for round in 0..2 {
+        let page = conn
+            .fetch_page(json!({"kinds": [2003, 3]}), Duration::from_secs(10))
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: the large event failed the page: {e}"));
+        assert_eq!(page.events.len(), 4, "round {round}");
+        assert!(page.closed.is_none() && !page.timed_out, "round {round}");
+        assert!(conn.is_open());
+    }
+}
+
+/// D111 review: the page budget counted message text, so tag-heavy events (`["a","a",…]`: 4
+/// bytes of JSON, ~50 bytes of heap per string) kept ~8× the budget in heap. Each kept event
+/// is now charged its decoded size.
+#[tokio::test]
+async fn relay_page_is_charged_by_decoded_size() {
+    let strings = relay::MAX_EVENT_TAG_VALUES - 1;
+    let tags = vec![vec!["a".to_string(); strings]];
+    let events: Vec<Value> = (0..60)
+        .map(|i| event(i, tags.clone(), String::new()))
+        .collect();
+    let text_len = json!(["EVENT", "mg00000000-1", events[0]])
+        .to_string()
+        .len();
+    // By text alone the whole 60-event page (~12 MB) fits in the budget.
+    assert!(60 * text_len < relay::MAX_PAGE_BYTES);
+    let url = flooding_relay(events).await;
+    let mut conn = RelayConn::connect(&url, Duration::from_secs(5))
+        .await
+        .unwrap();
+    let page = conn
+        .fetch_page(json!({"kinds": [2003]}), Duration::from_secs(20))
+        .await
+        .unwrap();
+    let per_event = text_len + relay::DECODED_BYTES_PER_STRING * (strings + 1);
+    let most = relay::MAX_PAGE_BYTES / per_event + 1;
+    assert!(
+        !page.events.is_empty() && page.events.len() <= most,
+        "kept {} events, at most {most} expected",
+        page.events.len()
+    );
+    assert!(!page.timed_out, "the page should end on the budget");
+}
