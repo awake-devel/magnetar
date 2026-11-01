@@ -244,7 +244,13 @@ statement trigger, after the insert; `torrents` has no such FK either. The child
 
 ### 2.4 Writes (stage 4, `server::dht::persist`)
 
-One transaction per batch (≤ 500 rows or 1 s): `INSERT INTO dht_torrents … ON CONFLICT
+One transaction per batch (≤ 500 rows or 1 s), one savepoint per verified result: a row the
+database refuses (a value it rejects, a constraint) is rolled back alone, its `dht_seen` row
+closed as `invalid` with `last_error = store_error`, counted in `row_errors` (and `invalid`),
+and logged by SQLSTATE only; I/O and pool errors still fail the batch, whose hashes keep their
+lease (D110). The title is capped at 1 KiB before the insert, so `search_tsv` stays far under
+Postgres's 1 MB tsvector limit (an uncapped 2.4 MB name failed with SQLSTATE 54000 and, before
+the savepoints, took its whole batch down on every retry). `INSERT INTO dht_torrents … ON CONFLICT
 (infohash) DO NOTHING` → `INSERT INTO torrent_attrs … ON CONFLICT DO NOTHING` (release
 attributes parsed from the DHT name + files with `core::release`, first writer wins as for
 Nostr, D44) → `DELETE FROM dht_seen WHERE infohash = ANY(…)` over the hashes the fetches were
@@ -536,7 +542,17 @@ test):
   a semaphore (4 at once); before it runs, the verified bytes are scanned without allocating
   to count values: more than `metadata_max / 8` = `invalid` (`too_complex`), else the decode
   reserves `3 × size + 64 B × values` from a decode budget of its own (D67). Info dicts with
-  duplicate keys at any level are `invalid` (§4 step 6).
+  duplicate keys at any level are `invalid` (§4 step 6). The count and the decoder read string
+  lengths with the same digits-only parser (no sign: `-0:` was an empty key to the decoder and a
+  stop for the counter), and anything the counter cannot read is priced as `too_complex`
+  rather than as the short prefix before it (D110).
+- **Parse output** (D110): a BEP 52 file tree joins each leaf's whole directory prefix, twice
+  (blocklist input and display path), so one huge directory key over many tiny leaves asked for
+  prefix × leaves bytes (terabytes at 16 MiB). The walk prices each path before joining it: at
+  most 4 096 raw bytes per path (`PATH_MAX`) and `4 × size + 64 KiB` raw bytes over the whole
+  tree, else `too_complex`. The name and every display path are then cut to 1 KiB on a
+  character boundary (the Nostr title cap, `info::DISPLAY_MAX`); the blocklist input keeps the
+  full strings. The release parser's `fold` is linear (it was quadratic in the name).
 
 ## 4. Metadata fetch (D56, stage 2)
 
