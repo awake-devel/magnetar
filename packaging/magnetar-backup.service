@@ -10,7 +10,8 @@ Description=Magnetar database dump (scripts/backup.sh)
 Type=oneshot
 Environment=MAGNETAR_BACKUP_DEST=backuphost:/srv/magnetar-backups
 Environment=MAGNETAR_BACKUP_KEEP=7
-# "sudo -n docker" when the user is not in the docker group (needs NOPASSWD for docker).
+# "sudo -n docker" when the user is not in the docker group (needs NOPASSWD for docker);
+# quote the whole assignment then: Environment="DOCKER=sudo -n docker".
 Environment=DOCKER=docker
 ExecStart=%h/magnetar/scripts/backup.sh
 Nice=10
