@@ -5,7 +5,12 @@
 #
 #   docker compose -f docker/compose.worker.yml --env-file docker/worker.env up -d
 #
-# docker/worker.env (chmod 600) needs at least MAGNETAR_WORKER_SERVER and MAGNETAR_WORKER_TOKEN.
+# docker/worker.env (chmod 600, gitignored) needs at least MAGNETAR_WORKER_SERVER and
+# MAGNETAR_WORKER_TOKEN. Every setting in it reaches the container (`env_file:` below), also
+# the ones not listed under `environment:` (D113). Keep passing `--env-file` too: the listed
+# settings are `${…}` interpolations, which win over `env_file:` and read only that file (else
+# their defaults apply). MAGNETAR_DHT_PORT and MAGNETAR_DHT_NODES are fixed (they must match
+# `ports:`).
 # Crawling makes this host's IP visible in BitTorrent swarms. Only the DHT UDP ports are
 # published; the worker never accepts TCP connections. UPnP stays off (MAGNETAR_DHT_UPNP).
 # No ulimits needed: the server binary raises its open-files soft limit itself.
@@ -18,6 +23,11 @@ services:
     build: ..
     command: ["worker"]
     restart: unless-stopped
+    # Path relative to this file (docker/). Not required, so `config` works without it; the
+    # `:?` checks below still stop a start without the server URL and token.
+    env_file:
+      - path: worker.env
+        required: false
     environment:
       MAGNETAR_WORKER_SERVER: ${MAGNETAR_WORKER_SERVER:?set MAGNETAR_WORKER_SERVER (the main server URL)}
       MAGNETAR_WORKER_TOKEN: ${MAGNETAR_WORKER_TOKEN:?set MAGNETAR_WORKER_TOKEN (this worker's token)}
@@ -42,6 +52,8 @@ services:
       MAGNETAR_LIVENESS_DHT_QPS: ${MAGNETAR_LIVENESS_DHT_QPS:-20}
       # Crawl map (docs/CRAWLMAP.md): on | country | off; databases in the worker state dir.
       MAGNETAR_GEOIP: ${MAGNETAR_GEOIP:-on}
+      # Our own addresses, never contacted (D112); the crawler's vote adds the WAN IPv4 itself.
+      MAGNETAR_OWN_ADDRS: ${MAGNETAR_OWN_ADDRS:-}
       RUST_LOG: ${RUST_LOG:-info}
     # Only when Docker's DNS cannot resolve a Tailscale (MagicDNS) name: set both variables
     # (the server's name and its `tailscale ip -4`). The default entry is inert.

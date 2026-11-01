@@ -18,7 +18,7 @@ use axum::extract::Request;
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use common::*;
-use magnetar_core::dht::{Dht, EngineConfig, Mode};
+use magnetar_core::dht::{Dht, EngineConfig, Mode, Via};
 use magnetar_core::liveness::LivenessConfig;
 use magnetar_server::dht::{DhtOptions, screen};
 use magnetar_server::fleet::proto::*;
@@ -37,6 +37,16 @@ type Bodies = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
 /// The API router with workers `w1`/`w2`, recording every worker DHT request body.
 async fn spawn(store: &PgStore, lease_secs: i64) -> (String, Bodies) {
+    spawn_cap(
+        store,
+        lease_secs,
+        magnetar_server::fleet::DEFAULT_TRIAGE_NEW_PER_HOUR,
+    )
+    .await
+}
+
+/// [`spawn`] with an hourly new-hash triage cap per worker.
+async fn spawn_cap(store: &PgStore, lease_secs: i64, triage_new_per_hour: u64) -> (String, Bodies) {
     let fleet = Fleet::new(
         FleetConfig {
             tokens: parse_tokens(&format!("w1:{W1},w2:{W2}"), Some(TOKEN)).unwrap(),
@@ -44,6 +54,7 @@ async fn spawn(store: &PgStore, lease_secs: i64) -> (String, Bodies) {
             max_lease: 100,
             metadata_max: 1 << 20,
             fetch_known: false,
+            triage_new_per_hour,
         },
         screen::global_screen(),
     );
@@ -249,6 +260,75 @@ async fn tokens_are_separated_and_versions_checked() {
     });
     let (s, j) = post(&format!("http://{a}"), HELLO, W1, v, json!({})).await;
     assert_eq!((s, j["error"].as_str()), (403, Some("workers_disabled")));
+}
+
+/// D111: hello/heartbeat text is stored and served without control characters and cut to
+/// MAX_WORKER_LABEL, port lists to MAX_WORKER_PORTS, and the small calls refuse large bodies.
+#[tokio::test]
+async fn worker_hello_and_heartbeat_are_bounded() {
+    use magnetar_server::fleet::{MAX_WORKER_LABEL, MAX_WORKER_PORTS, SMALL_BODY_LIMIT};
+    let Some(db) = test_db().await else { return };
+    let (base, _) = spawn(&db.store, 900).await;
+    let v = Some("1");
+    let forged = format!(
+        "0.3.1\n2026-11-01T00:00:00Z INFO forged\x1b[31m{}",
+        "v".repeat(500)
+    );
+    let ports: Vec<u16> = (0..1000).collect();
+    let (s, _) = post(
+        &base,
+        HELLO,
+        W1,
+        v,
+        json!({"version": forged, "arch": "a\r\nb".repeat(100), "dht": "polite\n", "dht_ports": ports}),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, _) = post(
+        &base,
+        HEARTBEAT,
+        W1,
+        v,
+        json!({"uptime_secs": 1, "dht": {"mode": "x\n".repeat(100), "ports": ports}}),
+    )
+    .await;
+    assert_eq!(s, 204);
+    let st: J = http()
+        .get(format!("{base}/api/v1/stats"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let w = &st["workers"][0];
+    assert_eq!(w["name"], "w1");
+    for text in [&w["version"], &w["arch"], &w["dht"]["mode"]] {
+        let text = text.as_str().unwrap();
+        assert!(text.chars().count() <= MAX_WORKER_LABEL, "{text}");
+        assert!(!text.chars().any(char::is_control), "{text:?}");
+    }
+    assert!(
+        w["version"]
+            .as_str()
+            .unwrap()
+            .starts_with("0.3.12026-11-01")
+    );
+    assert_eq!(
+        w["dht"]["ports"].as_array().unwrap().len(),
+        MAX_WORKER_PORTS
+    );
+    // A hello body above the small limit is refused (the 32 MiB limit is for uploads).
+    let (s, _) = post(
+        &base,
+        HELLO,
+        W1,
+        v,
+        json!({"version": "x".repeat(SMALL_BODY_LIMIT)}),
+    )
+    .await;
+    assert_eq!(s, 413);
 }
 
 #[tokio::test]
@@ -696,6 +776,436 @@ async fn uploads_are_verified_classified_and_screened_by_the_server() {
     assert_eq!(w[1]["stored_total"], 1, "{w}");
 }
 
+/// D113: a worker's dicts and status reports apply only to hashes it holds (queued for it by
+/// its own triage). Another worker's hash, a hash nobody triaged, or one the server's retry
+/// loop took back are ignored; a block report blocks only the sighted hash, never a claimed v1.
+#[tokio::test]
+async fn uploads_apply_only_to_hashes_the_worker_holds() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    let (base, _) = spawn(s, 900).await;
+    let c1 = Client::new(&base, W1).unwrap();
+    let c2 = Client::new(&base, W2).unwrap();
+    let stored = |h: [u8; 20]| async move {
+        count(
+            s,
+            "SELECT count(*) FROM dht_torrents WHERE infohash = $1",
+            &hex::encode(h),
+        )
+        .await
+    };
+    let blocked_n = |h: String| async move {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM blocked_infohashes WHERE infohash = $1")
+            .bind(h)
+            .fetch_one(s.pool())
+            .await
+            .unwrap()
+    };
+    let status = |h: [u8; 20]| async move {
+        sqlx::query_scalar::<_, i16>("SELECT status FROM dht_seen WHERE infohash = $1")
+            .bind(h.as_slice())
+            .fetch_one(s.pool())
+            .await
+            .unwrap()
+    };
+    let report = |h: [u8; 20], outcome: DhtOutcome| DhtResult {
+        sighted: hex::encode(h),
+        via: "sample".into(),
+        peers_seen: 1,
+        outcome,
+    };
+
+    // h is w1's: w2 can neither store its dict nor finalise it.
+    let plain = info("Held.Film.2024.1080p", "0");
+    let h = sha1(&plain);
+    triage_one(&c1, h).await;
+    let a = upload(&c2, vec![meta(h, &plain)]).await;
+    assert_eq!((a.stored, a.ignored), (0, 1), "not w2's hash");
+    assert_eq!(stored(h).await, 0);
+    for o in [
+        DhtOutcome::Private,
+        DhtOutcome::Failed {
+            code: "no_peers".into(),
+        },
+        DhtOutcome::Blocked {
+            v1: None,
+            tier: "hard".into(),
+            rule_version: 1,
+        },
+    ] {
+        let a = upload(&c2, vec![report(h, o)]).await;
+        assert_eq!((a.applied, a.blocked, a.ignored), (0, 0, 1));
+    }
+    assert_eq!(status(h).await, 0, "still queued for w1");
+    assert_eq!(blocked_n(hex::encode(h)).await, 0);
+
+    // A self-made dict under a hash nobody triaged: ignored, not injected.
+    let forged = info("Injected.Film.2024.1080p", "0");
+    let hx = sha1(&forged);
+    let a = upload(&c2, vec![meta(hx, &forged)]).await;
+    assert_eq!((a.stored, a.ignored), (0, 1));
+    assert_eq!(stored(hx).await, 0);
+
+    // A block report for a hash w2 holds blocks that hash only (origin worker), not the
+    // claimed hybrid v1.
+    let hs = [0x51u8; 20];
+    let victim = [0x52u8; 20];
+    triage_one(&c2, hs).await;
+    let a = upload(
+        &c2,
+        vec![report(
+            hs,
+            DhtOutcome::Blocked {
+                v1: Some(hex::encode(victim)),
+                tier: "hard".into(),
+                rule_version: 1,
+            },
+        )],
+    )
+    .await;
+    assert_eq!(a.blocked, 1);
+    let origin: String =
+        sqlx::query_scalar("SELECT origin FROM blocked_infohashes WHERE infohash = $1")
+            .bind(hex::encode(hs))
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+    assert_eq!(origin, "worker");
+    assert_eq!(
+        blocked_n(hex::encode(victim)).await,
+        0,
+        "claimed v1 not blocked"
+    );
+
+    // The holder itself is accepted.
+    let a = upload(&c1, vec![meta(h, &plain)]).await;
+    assert_eq!((a.stored, a.ignored), (1, 0));
+
+    // A lease the server's retry loop took back is no longer the worker's.
+    let late = info("Late.Film.2024.1080p", "0");
+    let hl = sha1(&late);
+    triage_one(&c1, hl).await;
+    sqlx::query("UPDATE dht_seen SET next_attempt_at = 0 WHERE infohash = $1")
+        .bind(hl.as_slice())
+        .execute(s.pool())
+        .await
+        .unwrap();
+    let taken = magnetar_server::dht::store::take_due(s.pool(), magnetar_core::now(), 10)
+        .await
+        .unwrap();
+    assert!(taken.iter().any(|(t, _)| *t == hl));
+    let a = upload(&c1, vec![meta(hl, &late)]).await;
+    assert_eq!((a.stored, a.ignored), (0, 1), "the server holds it now");
+}
+
+async fn triage_many(c: &Client, hs: &[[u8; 20]], via: &str) -> TriageResponse {
+    c.post(
+        TRIAGE,
+        &TriageRequest {
+            items: hs
+                .iter()
+                .map(|h| TriageItem {
+                    h: hex::encode(h),
+                    via: via.into(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+}
+
+/// D113, what a worker token can still do and what bounds it: a worker chooses what it triages,
+/// so it can queue hashes of dicts it made and upload them. Each new hash costs it one unit of
+/// its hourly cap (`MAGNETAR_WORKER_TRIAGE_NEW_PER_HOUR`), re-queued rows do not, and every row
+/// it got stored records it in `supplied_by`, so they can be removed after a token leak.
+#[tokio::test]
+async fn self_triaged_dicts_are_capped_and_traced_to_their_worker() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    let (base, _) = spawn_cap(s, 900, 3).await;
+    let c1 = Client::new(&base, W1).unwrap();
+    let c2 = Client::new(&base, W2).unwrap();
+    let dicts: Vec<Vec<u8>> = (0..5)
+        .map(|i| info(&format!("Self.Made.{i}.2024.1080p"), "0"))
+        .collect();
+    let hs: Vec<[u8; 20]> = dicts.iter().map(|d| sha1(d)).collect();
+    let r = triage_many(&c2, &hs, "sample").await;
+    assert_eq!((r.fetch.len(), r.capped), (3, 2), "3 new hashes an hour");
+    let r = triage_many(&c2, &hs, "sample").await;
+    assert_eq!((r.fetch.len(), r.capped), (0, 2), "budget spent");
+    // The cap is per worker.
+    let r = triage_many(&c1, &hs[3..], "sample").await;
+    assert_eq!((r.fetch.len(), r.capped), (2, 0));
+    // The self-made dicts are stored (the server cannot tell them from real ones), each
+    // recording the worker that supplied it.
+    let items: Vec<DhtResult> = (0..3).map(|i| meta(hs[i], &dicts[i])).collect();
+    let a = upload(&c2, items).await;
+    assert_eq!(a.stored, 3);
+    let a = upload(&c1, vec![meta(hs[3], &dicts[3])]).await;
+    assert_eq!(a.stored, 1);
+    let by: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT infohash, supplied_by FROM dht_torrents ORDER BY infohash")
+            .fetch_all(s.pool())
+            .await
+            .unwrap();
+    assert_eq!(by.len(), 4);
+    for (h, w) in &by {
+        let want = if *h == hex::encode(hs[3]) { "w1" } else { "w2" };
+        assert_eq!(w.as_deref(), Some(want), "{h}");
+    }
+    // The documented clean-up after a leak of w2's token (docs/WORKERS.md §7): seed-check
+    // schedule rows first, so the fakes are not handed out for checks afterwards.
+    let w2_hashes: Vec<String> =
+        sqlx::query_scalar("SELECT infohash FROM dht_torrents WHERE supplied_by = 'w2'")
+            .fetch_all(s.pool())
+            .await
+            .unwrap();
+    let scheduled: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM liveness_schedule WHERE infohash = ANY($1)")
+            .bind(&w2_hashes)
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+    assert!(scheduled > 0, "the fakes were scheduled for seed checks");
+    sqlx::query(
+        "DELETE FROM liveness_schedule s USING dht_torrents d \
+          WHERE d.infohash = s.infohash AND d.supplied_by = 'w2' \
+            AND NOT EXISTS (SELECT 1 FROM torrent_infohashes t \
+                             WHERE t.infohash = s.infohash AND t.events > 0)",
+    )
+    .execute(s.pool())
+    .await
+    .unwrap();
+    let gone = sqlx::query("DELETE FROM dht_torrents WHERE supplied_by = 'w2'")
+        .execute(s.pool())
+        .await
+        .unwrap()
+        .rows_affected();
+    assert_eq!(gone, 3);
+    let left: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM liveness_schedule WHERE infohash = ANY($1)")
+            .bind(&w2_hashes)
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+    assert_eq!(left, 0, "no seed checks left for the removed fakes");
+    // The server's own crawler records no supplier.
+    let own = info("Server.Own.2024.1080p", "0");
+    let ho = sha1(&own);
+    magnetar_server::dht::store::triage(s.pool(), &[(ho, Via::Sample)], NOW, false)
+        .await
+        .unwrap();
+    let o = magnetar_server::dht::persist::persist_batch(
+        s.pool(),
+        &[magnetar_server::dht::persist::FetchResult {
+            sighted: ho,
+            via: Via::Sample,
+            peers_seen: 1,
+            result: Ok(magnetar_core::metainfo::outcome_from_raw(ho, &own, 1 << 20).unwrap()),
+        }],
+        screen::global_screen().as_deref(),
+        false,
+        NOW,
+    )
+    .await
+    .unwrap();
+    assert_eq!(o.stored, 1);
+    let w: Option<String> =
+        sqlx::query_scalar("SELECT supplied_by FROM dht_torrents WHERE infohash = $1")
+            .bind(hex::encode(ho))
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+    assert_eq!(w, None);
+}
+
+/// D113: a block on a worker's word only (origin `worker`) keeps the DHT from fetching the hash
+/// but does not stop a Nostr event for it: a worker could otherwise triage any hash first and
+/// block it. A block by the server's own screen then takes the row over (origin `nostr`).
+#[tokio::test]
+async fn worker_blocks_do_not_stop_nostr_ingest() {
+    use magnetar_core::store::Store;
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    let (base, _) = spawn(s, 900).await;
+    let c2 = Client::new(&base, W2).unwrap();
+    let victim = ih(0x777);
+    let v: [u8; 20] = hex::decode(&victim).unwrap().try_into().unwrap();
+    triage_one(&c2, v).await;
+    let a = upload(
+        &c2,
+        vec![DhtResult {
+            sighted: victim.clone(),
+            via: "sample".into(),
+            peers_seen: 1,
+            outcome: DhtOutcome::Blocked {
+                v1: None,
+                tier: "hard".into(),
+                rule_version: 1,
+            },
+        }],
+    )
+    .await;
+    assert_eq!(a.blocked, 1);
+    // The DHT side honours it: nobody is handed the hash again.
+    let r = triage_many(&c2, &[v], "announce").await;
+    assert_eq!((r.fetch.len(), r.blocked), (0, 1));
+    // Nostr does not.
+    assert!(!s.is_blocked(&victim, "some-event").await.unwrap());
+    put(s, torrent(0x777, 1, NOW, 0x777, "a nostr torrent")).await;
+    // The server's own block replaces the worker's word, and then holds for Nostr too.
+    s.put_blocked(&victim, "other-event", 3).await.unwrap();
+    let (origin, ver): (String, i16) =
+        sqlx::query_as("SELECT origin, rule_version FROM blocked_infohashes WHERE infohash = $1")
+            .bind(&victim)
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+    assert_eq!((origin.as_str(), ver), ("nostr", 3));
+    assert!(s.is_blocked(&victim, "some-event").await.unwrap());
+}
+
+/// D113: a due row another worker holds (an expired lease, or a failure's backoff over) is not
+/// handed to a second worker until it is `TAKEOVER_GRACE_SECS` past due, even when the server's
+/// retry loop (`take_due`) never runs (the main server runs with its DHT off). The holder itself
+/// and the server's own triage may take it at once.
+#[tokio::test]
+async fn due_rows_of_another_worker_are_not_taken_over_before_the_grace() {
+    use magnetar_server::dht::store::TAKEOVER_GRACE_SECS;
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    let (base, _) = spawn(s, 900).await;
+    let c1 = Client::new(&base, W1).unwrap();
+    let c2 = Client::new(&base, W2).unwrap();
+    let now = magnetar_core::now();
+    let due_at = |h: [u8; 20], t: i64| async move {
+        sqlx::query("UPDATE dht_seen SET next_attempt_at = $2, last_seen = $2 WHERE infohash = $1")
+            .bind(h.as_slice())
+            .bind(t)
+            .execute(s.pool())
+            .await
+            .unwrap();
+    };
+    let holder = |h: [u8; 20]| async move {
+        sqlx::query_scalar::<_, Option<String>>("SELECT holder FROM dht_seen WHERE infohash = $1")
+            .bind(h.as_slice())
+            .fetch_one(s.pool())
+            .await
+            .unwrap()
+    };
+
+    // An expired lease of w1.
+    let h = [0x61u8; 20];
+    triage_one(&c1, h).await;
+    due_at(h, now - 10).await;
+    for via in ["sample", "announce"] {
+        let r = triage_many(&c2, &[h], via).await;
+        assert!(r.fetch.is_empty(), "{via}: still w1's");
+    }
+    assert_eq!(holder(h).await.as_deref(), Some("w1"));
+    // w2 cannot finalise it either.
+    let a = upload(
+        &c2,
+        vec![DhtResult {
+            sighted: hex::encode(h),
+            via: "sample".into(),
+            peers_seen: 1,
+            outcome: DhtOutcome::Private,
+        }],
+    )
+    .await;
+    assert_eq!((a.applied, a.ignored), (0, 1));
+    // The holder itself may renew it.
+    let r = triage_many(&c1, &[h], "sample").await;
+    assert_eq!(r.fetch.len(), 1);
+    // Long past due (its worker is gone): anyone may.
+    due_at(h, now - TAKEOVER_GRACE_SECS - 1).await;
+    let r = triage_many(&c2, &[h], "sample").await;
+    assert_eq!(r.fetch.len(), 1);
+    assert_eq!(holder(h).await.as_deref(), Some("w2"));
+
+    // A failure w1 reported, its backoff over, sighted by w2 with a live peer.
+    let hf = [0x62u8; 20];
+    triage_one(&c1, hf).await;
+    let a = upload(
+        &c1,
+        vec![DhtResult {
+            sighted: hex::encode(hf),
+            via: "sample".into(),
+            peers_seen: 0,
+            outcome: DhtOutcome::Failed {
+                code: "no_peers".into(),
+            },
+        }],
+    )
+    .await;
+    assert_eq!(a.applied, 1);
+    due_at(hf, now - 700).await;
+    let r = triage_many(&c2, &[hf], "announce").await;
+    assert!(r.fetch.is_empty(), "w1's failed row");
+    // The server's own crawler is not held back.
+    let o = magnetar_server::dht::store::triage(s.pool(), &[(hf, Via::Announce)], now, false)
+        .await
+        .unwrap();
+    assert_eq!(o.queued, vec![hf]);
+    assert_eq!(holder(hf).await, None);
+}
+
+/// D113: within one upload, each hash counts once, for its first item that decodes and
+/// verifies: a malformed or forged copy does not shadow a good one after it.
+#[tokio::test]
+async fn a_bad_copy_does_not_shadow_a_good_one() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    let (base, _) = spawn(s, 900).await;
+    let c1 = Client::new(&base, W1).unwrap();
+    let plain = info("Twice.Film.2024.1080p", "0");
+    let h = sha1(&plain);
+    triage_one(&c1, h).await;
+    let other = info("Other.Bytes.2024.1080p", "0");
+    let a = upload(
+        &c1,
+        vec![
+            DhtResult {
+                outcome: DhtOutcome::Metadata { raw: "@@@".into() },
+                ..meta(h, &plain)
+            },
+            meta(h, &other),
+            DhtResult {
+                outcome: DhtOutcome::Failed {
+                    code: "bogus".into(),
+                },
+                ..meta(h, &plain)
+            },
+            meta(h, &plain),
+            meta(h, &plain),
+        ],
+    )
+    .await;
+    assert_eq!((a.stored, a.rejected, a.ignored), (1, 3, 1));
+    // A valid status first wins over a later dict (which is then not even verified).
+    let late = info("Status.First.2024.1080p", "0");
+    let hl = sha1(&late);
+    triage_one(&c1, hl).await;
+    let a = upload(
+        &c1,
+        vec![
+            DhtResult {
+                outcome: DhtOutcome::Failed {
+                    code: "no_peers".into(),
+                },
+                ..meta(hl, &late)
+            },
+            meta(hl, &late),
+        ],
+    )
+    .await;
+    assert_eq!((a.applied, a.stored, a.ignored), (1, 0, 1));
+}
+
 fn worker_dht(ports: Vec<u16>) -> DhtOptions {
     DhtOptions {
         mode: Mode::Aggressive,
@@ -789,6 +1299,8 @@ async fn two_workers_share_seed_checks_and_the_dht() {
         use_dht: false,
         tracker_rps: 100.0,
         tracker_timeout: Duration::from_millis(300),
+        // The fake tracker lives on 127.0.0.1 (D112 test seam).
+        addr_policy: magnetar_core::liveness::AddrPolicy::loopback_for_tests(),
         ..Default::default()
     };
     let (_tx, stop) = tokio::sync::watch::channel(false);

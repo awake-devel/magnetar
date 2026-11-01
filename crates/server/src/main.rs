@@ -24,6 +24,9 @@ async fn main() -> anyhow::Result<()> {
     // D53: the hard blocklist is loaded before any command; a list that does not load stops
     // the process (fail closed).
     dht::screen::install_from_config(&cli.config)?;
+    // D112: our own addresses are refused like private ones; a bad entry stops the process.
+    magnetar_core::netaddr::OWN
+        .configure(magnetar_core::netaddr::parse_nets(&cli.config.own_addrs)?);
     match cli.command {
         Command::Serve => server::serve(cli.config).await,
         Command::Migrate => {

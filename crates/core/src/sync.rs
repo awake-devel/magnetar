@@ -25,7 +25,10 @@ pub const NEG_TIMEOUT: Duration = Duration::from_secs(10);
 /// Later reconciliation rounds and OKs may take longer on a busy server.
 const ROUND_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_MESSAGE_BYTES: usize = 16 << 20;
+/// Largest message accepted from the server (D111): it sends NEG-MSG frames of at most
+/// `FRAME_SIZE_LIMIT` bytes (120 KB as hex), OKs and NOTICEs, so 1 MiB is 8× the largest real
+/// message. Was 16 MiB, the pattern the relay client dropped.
+const MAX_MESSAGE_BYTES: usize = 1 << 20;
 /// Unsynced rows outside the reconciled set (stored after the negentropy snapshot) are re-sent,
 /// up to this many per run, so their `OK duplicate:` / `OK true` marks them synced.
 const RESEND_UNSYNCED: usize = 500;
@@ -439,4 +442,38 @@ impl Ws {
 /// URL without its query string (never log the API token).
 fn redact(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D111 review: a server message above MAX_MESSAGE_BYTES fails the receive instead of being
+    /// buffered (the old 16 MiB limit took it). Loopback only.
+    #[tokio::test]
+    async fn server_message_size_is_capped() {
+        // The largest real message, a full NEG-MSG, fits.
+        let neg = json!(["NEG-MSG", SUB_ID, "ab".repeat(FRAME_SIZE_LIMIT as usize)]).to_string();
+        assert!(neg.len() < MAX_MESSAGE_BYTES);
+        let big = json!(["NOTICE", "x".repeat(2 << 20)]).to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for text in [neg, big] {
+                if ws.send(Message::text(text)).await.is_err() {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let mut ws = Ws::connect(&url).await.unwrap();
+        let first = ws.recv(Duration::from_secs(5)).await.unwrap();
+        assert!(matches!(first, Some(RelayMsg::NegMsg { .. })), "{first:?}");
+        match ws.recv(Duration::from_secs(5)).await {
+            Err(e) => assert!(e.to_string().contains("ws recv"), "{e}"),
+            Ok(m) => panic!("2 MiB message accepted: {m:?}"),
+        }
+    }
 }

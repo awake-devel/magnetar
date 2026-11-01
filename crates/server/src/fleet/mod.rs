@@ -15,7 +15,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -34,8 +34,42 @@ use proto::*;
 pub const BODY_LIMIT: usize = 32 << 20;
 pub const MAX_TRIAGE: usize = 2000;
 pub const MAX_RESULTS: usize = 1000;
+/// Upload requests (`dht/results`, `liveness/results`) read at once, server-wide (D113). One at
+/// the [`BODY_LIMIT`] holds about 90 MB while it is parsed (the body, its JSON strings, the
+/// decoded dicts), so 4 bound uploads to ~360 MB on the home server; a worker's uploader sends
+/// one batch at a time, so the two crawl workers never wait on each other in normal running.
+pub const UPLOAD_CONCURRENCY: usize = 4;
+/// Upload requests of one worker read at once: its DHT uploader and its seed-check results.
+pub const UPLOAD_CONCURRENCY_PER_WORKER: usize = 2;
+/// Body limit of the other two non-upload routes, `dht/triage` and `liveness/release` (D113):
+/// a full triage (2000 items, and the crawl map's node counts and AS names the worker sends
+/// with it, at most [`crate::crawlmap::UPLOAD_ROWS_PER_TRIAGE`] /
+/// [`crate::crawlmap::UPLOAD_NAMES_PER_TRIAGE`]) is under ~800 KB; a release of 2000 hashes is
+/// ~90 KB. The 32 MiB [`BODY_LIMIT`] is for the two upload routes only.
+pub const TRIAGE_BODY_LIMIT: usize = 1 << 20;
+/// Non-upload requests (hello, heartbeat, lease, release, triage) of one worker read at once
+/// (D113). An honest worker has at most ~4 in flight (heartbeat, lease, triage, hello).
+pub const SMALL_CONCURRENCY_PER_WORKER: usize = 6;
+/// The same, server-wide: with at most [`TRIAGE_BODY_LIMIT`] each, ~16 MiB of bodies.
+pub const SMALL_CONCURRENCY: usize = 16;
+/// `Retry-After` of a 503 when a worker's small-request slots are full.
+pub const SMALL_RETRY_AFTER_SECS: u64 = 1;
+/// Default `MAGNETAR_WORKER_TRIAGE_NEW_PER_HOUR` (D113): new `dht_seen` rows one worker's
+/// triage may create per hour. The 2026-10-27 laptop worker (aggressive, docs/WORKERS.md §6)
+/// queued ~11 100 new hashes in 600 s (~66 k/h).
+pub const DEFAULT_TRIAGE_NEW_PER_HOUR: u64 = 100_000;
+/// `Retry-After` of a 503 when the upload slots are full: about one batch's processing time.
+pub const UPLOAD_RETRY_AFTER_SECS: u64 = 5;
 /// Default `MAGNETAR_WORKER_LEASE_SECS`.
 pub const DEFAULT_LEASE_SECS: u64 = 900;
+/// Body limit of the small worker calls (hello, heartbeat, lease) (D111): their JSON is a few
+/// hundred bytes; the 32 MiB [`BODY_LIMIT`] is for info dict uploads only.
+pub const SMALL_BODY_LIMIT: usize = 64 << 10;
+/// Longest `version` / `arch` / DHT `mode` kept from a worker (D111): real ones are
+/// `0.3.1`, `aarch64`, `polite`. Longer text is cut, control characters are dropped.
+pub const MAX_WORKER_LABEL: usize = 64;
+/// Most DHT ports kept from a heartbeat or hello (D111): a worker runs one port per shard.
+pub const MAX_WORKER_PORTS: usize = 64;
 /// A worker heard from this recently counts as connected.
 const CONNECTED_SECS: i64 = 120;
 /// Rates are averaged over this many one-minute buckets.
@@ -119,6 +153,9 @@ pub struct FleetConfig {
     /// The server's `MAGNETAR_DHT_METADATA_MAX`: uploads above it are refused.
     pub metadata_max: usize,
     pub fetch_known: bool,
+    /// `MAGNETAR_WORKER_TRIAGE_NEW_PER_HOUR`: new hashes one worker's triage may queue per
+    /// hour (token bucket, burst = one hour's worth); 0 = no cap.
+    pub triage_new_per_hour: u64,
 }
 
 impl Default for FleetConfig {
@@ -129,6 +166,7 @@ impl Default for FleetConfig {
             max_lease: 2000,
             metadata_max: 16 << 20,
             fetch_known: false,
+            triage_new_per_hour: DEFAULT_TRIAGE_NEW_PER_HOUR,
         }
     }
 }
@@ -145,6 +183,7 @@ impl FleetConfig {
             max_lease: cfg.liveness_batch_size(),
             metadata_max: cfg.dht_metadata_max as usize,
             fetch_known: cfg.dht_fetch_known,
+            triage_new_per_hour: cfg.worker_triage_new_per_hour,
         })
     }
 }
@@ -202,6 +241,11 @@ struct Entry {
     rejected: u64,
     results_rate: Rate,
     metadata_rate: Rate,
+    /// New hashes its triage may still queue ([`Fleet::reserve_new`]), and when it was filled.
+    triage_budget: Option<(f64, i64)>,
+    /// New hashes its triage was refused by the hourly cap, and when that was last logged.
+    triage_capped: u64,
+    capped_logged_at: i64,
 }
 
 /// What the fleet endpoints share: tokens, limits, and what each worker did.
@@ -212,6 +256,21 @@ pub struct Fleet {
     screen: Option<Arc<dyn Screen>>,
     /// One verification batch at a time (bounded memory: D67 pricing per dict).
     verify: tokio::sync::Semaphore,
+    /// Upload requests being read and processed, server-wide (D113: [`UPLOAD_CONCURRENCY`]).
+    uploads: Arc<tokio::sync::Semaphore>,
+    /// The same per worker ([`UPLOAD_CONCURRENCY_PER_WORKER`]), created on first use.
+    worker_uploads: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    /// Non-upload requests being read and processed ([`SMALL_CONCURRENCY`]), and per worker.
+    small: Arc<tokio::sync::Semaphore>,
+    worker_small: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+}
+
+/// Held while one worker request is read and processed ([`Fleet::upload_permit`],
+/// [`Fleet::small_permit`]).
+#[derive(Debug)]
+pub struct UploadPermit {
+    _global: tokio::sync::OwnedSemaphorePermit,
+    _worker: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl Default for Fleet {
@@ -239,7 +298,93 @@ impl Fleet {
             entries: Mutex::default(),
             screen,
             verify: tokio::sync::Semaphore::new(1),
+            uploads: Arc::new(tokio::sync::Semaphore::new(UPLOAD_CONCURRENCY)),
+            worker_uploads: Mutex::default(),
+            small: Arc::new(tokio::sync::Semaphore::new(SMALL_CONCURRENCY)),
+            worker_small: Mutex::default(),
         }
+    }
+
+    /// A slot for one non-upload request of `worker` ([`SMALL_CONCURRENCY_PER_WORKER`],
+    /// [`SMALL_CONCURRENCY`]), or None when full (503, as for uploads).
+    pub fn small_permit(&self, worker: &str) -> Option<UploadPermit> {
+        let w = self
+            .worker_small
+            .lock()
+            .unwrap()
+            .entry(worker.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(SMALL_CONCURRENCY_PER_WORKER)))
+            .clone();
+        let worker = w.try_acquire_owned().ok()?;
+        let global = self.small.clone().try_acquire_owned().ok()?;
+        Some(UploadPermit {
+            _global: global,
+            _worker: worker,
+        })
+    }
+
+    /// Reserve up to `want` new hashes of `worker`'s hourly triage cap (D113); `None` = no cap.
+    /// The caller gives back what it did not use with [`Fleet::refund_new`], so concurrent
+    /// triages of one token cannot both spend the same budget.
+    pub fn reserve_new(&self, worker: &str, want: usize, now: i64) -> Option<usize> {
+        let cap = self.cfg.triage_new_per_hour;
+        if cap == 0 {
+            return None;
+        }
+        Some(self.with(worker, |e| {
+            let (tokens, at) = e.triage_budget.get_or_insert((cap as f64, now));
+            let elapsed = (now - *at).max(0) as f64;
+            *tokens = (*tokens + elapsed * cap as f64 / 3600.0).min(cap as f64);
+            *at = now;
+            let n = (tokens.floor() as usize).min(want);
+            *tokens -= n as f64;
+            n
+        }))
+    }
+
+    /// Give back reserved new-hash budget that a triage did not use.
+    pub fn refund_new(&self, worker: &str, unused: usize) {
+        let cap = self.cfg.triage_new_per_hour as f64;
+        if cap == 0.0 || unused == 0 {
+            return;
+        }
+        self.with(worker, |e| {
+            if let Some((tokens, _)) = &mut e.triage_budget {
+                *tokens = (*tokens + unused as f64).min(cap);
+            }
+        });
+    }
+
+    /// Count new hashes refused by the cap; true when it is time to log it (once a minute).
+    fn note_capped(&self, worker: &str, n: u64, now: i64) -> bool {
+        self.with(worker, |e| {
+            e.triage_capped += n;
+            if now - e.capped_logged_at >= 60 {
+                e.capped_logged_at = now;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    /// A slot to read one upload of `worker`, or None when the server-wide or the worker's
+    /// slots are all taken (the caller answers 503 at once: waiting would hold the connection
+    /// and its body anyway).
+    pub fn upload_permit(&self, worker: &str) -> Option<UploadPermit> {
+        let w = self
+            .worker_uploads
+            .lock()
+            .unwrap()
+            .entry(worker.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(UPLOAD_CONCURRENCY_PER_WORKER)))
+            .clone();
+        let worker = w.try_acquire_owned().ok()?;
+        let global = self.uploads.clone().try_acquire_owned().ok()?;
+        Some(UploadPermit {
+            _global: global,
+            _worker: worker,
+        })
     }
 
     /// From the configuration, with the process-wide screen.
@@ -365,6 +510,32 @@ impl Fleet {
     }
 }
 
+/// Worker-supplied text as it is logged, stored and shown in `/api/v1/stats` (D111): control
+/// characters (newlines that would forge log lines, ANSI escapes) dropped, at most
+/// [`MAX_WORKER_LABEL`] characters.
+pub fn clean_label(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_WORKER_LABEL)
+        .collect()
+}
+
+fn clean_hello(mut h: Hello) -> Hello {
+    h.version = clean_label(&h.version);
+    h.arch = clean_label(&h.arch);
+    h.dht = h.dht.as_deref().map(clean_label);
+    h.dht_ports.truncate(MAX_WORKER_PORTS);
+    h
+}
+
+fn clean_heartbeat(mut h: Heartbeat) -> Heartbeat {
+    if let Some(d) = &mut h.dht {
+        d.mode = clean_label(&d.mode);
+        d.ports.truncate(MAX_WORKER_PORTS);
+    }
+    h
+}
+
 fn api_error(status: StatusCode, code: &'static str, msg: impl Into<String>) -> Response {
     ApiError::new(status, code, msg).into_response()
 }
@@ -403,6 +574,33 @@ pub async fn worker_auth(State(st): State<AppState>, mut req: Request, next: Nex
         );
     }
     st.fleet.touch(&name, magnetar_core::now());
+    // Uploads take a slot before their body is read (D113), held until the answer is built.
+    let path = req.uri().path();
+    // Every other worker route takes a small slot (its body is at most 1 MiB, D113).
+    let upload = path == DHT_RESULTS || path == LIVENESS_RESULTS;
+    let permit = if upload {
+        st.fleet.upload_permit(&name)
+    } else {
+        st.fleet.small_permit(&name)
+    };
+    let Some(_permit) = permit else {
+        tracing::debug!(worker = %name, upload, "worker request refused: slots full");
+        let mut r = api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            "the server is processing other requests of this worker; retry later",
+        );
+        let after = if upload {
+            UPLOAD_RETRY_AFTER_SECS
+        } else {
+            SMALL_RETRY_AFTER_SECS
+        };
+        r.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from(after),
+        );
+        return r;
+    };
     req.extensions_mut().insert(WorkerName(name));
     next.run(req).await
 }
@@ -410,12 +608,27 @@ pub async fn worker_auth(State(st): State<AppState>, mut req: Request, next: Nex
 /// The worker routes (auth and body limits are added by `api::router`).
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route(HELLO, post(hello))
-        .route(HEARTBEAT, post(heartbeat))
-        .route(LEASE, post(lease))
+        .route(
+            HELLO,
+            post(hello).layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
+        )
+        .route(
+            HEARTBEAT,
+            post(heartbeat).layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
+        )
+        .route(
+            LEASE,
+            post(lease).layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
+        )
         .route(LIVENESS_RESULTS, post(liveness_results))
-        .route(RELEASE, post(release))
-        .route(TRIAGE, post(ingest::triage))
+        .route(
+            RELEASE,
+            post(release).layer(DefaultBodyLimit::max(TRIAGE_BODY_LIMIT)),
+        )
+        .route(
+            TRIAGE,
+            post(ingest::triage).layer(DefaultBodyLimit::max(TRIAGE_BODY_LIMIT)),
+        )
         .route(DHT_RESULTS, post(ingest::dht_results))
 }
 
@@ -430,7 +643,7 @@ async fn hello(
     Extension(WorkerName(name)): Extension<WorkerName>,
     body: Result<Json<Hello>, axum::extract::rejection::JsonRejection>,
 ) -> ApiResult<Json<HelloResponse>> {
-    let h = json(body)?;
+    let h = clean_hello(json(body)?);
     tracing::info!(
         worker = %name,
         version = %h.version,
@@ -459,7 +672,7 @@ async fn heartbeat(
     Extension(WorkerName(name)): Extension<WorkerName>,
     body: Result<Json<Heartbeat>, axum::extract::rejection::JsonRejection>,
 ) -> ApiResult<StatusCode> {
-    let h = json(body)?;
+    let h = clean_heartbeat(json(body)?);
     st.fleet.with(&name, |e| e.heartbeat = Some(h));
     Ok(StatusCode::NO_CONTENT)
 }
@@ -614,6 +827,218 @@ mod tests {
         let e = parse_tokens(&format!("eee:{T1}"), Some(T1)).unwrap_err();
         assert!(e.to_string().contains("differ"), "{e}");
         assert!(parse_tokens("", None).unwrap().is_empty());
+    }
+
+    /// An API router whose database is never reachable (lazy pool to a closed port, short
+    /// acquire timeout): enough for everything decided before a query runs. No network beyond
+    /// loopback.
+    pub(crate) fn offline_state(fleet: Fleet) -> AppState {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(300))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/none")
+            .unwrap();
+        AppState::new(
+            Arc::new(crate::store::PgStore::from_pool(pool)),
+            "phone-token",
+        )
+        .with_fleet(Arc::new(fleet))
+    }
+
+    async fn serve(state: AppState) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = crate::api::router(state);
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    /// An upload whose body never finishes: it holds its slot while the server waits for it.
+    async fn stalled_upload(addr: std::net::SocketAddr, token: &str) -> tokio::net::TcpStream {
+        use tokio::io::AsyncWriteExt;
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = format!(
+            "POST {DHT_RESULTS} HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {token}\r\n\
+             {API_HEADER}: {WORKER_API}\r\ncontent-type: application/json\r\n\
+             content-length: 1000\r\n\r\n{{\"items\": ["
+        );
+        s.write_all(head.as_bytes()).await.unwrap();
+        s
+    }
+
+    async fn upload_status(addr: std::net::SocketAddr, token: &str) -> (u16, Option<String>) {
+        let r = reqwest::Client::new()
+            .post(format!("http://{addr}{DHT_RESULTS}"))
+            .bearer_auth(token)
+            .header(API_HEADER, WORKER_API.to_string())
+            .json(&serde_json::json!({"items": []}))
+            .send()
+            .await
+            .unwrap();
+        let ra = r
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .map(|v| v.to_str().unwrap().to_string());
+        (r.status().as_u16(), ra)
+    }
+
+    /// D113: uploads are bounded per worker and server-wide before their bodies are read; a
+    /// full server answers 503 with Retry-After at once, and a freed slot is usable again.
+    #[tokio::test]
+    async fn uploads_are_bounded_before_their_bodies_are_read() {
+        let t3 = "cccccccccccccccccccccccccccccccc";
+        let tokens = parse_tokens(&format!("w1:{T1},w2:{T2},w3:{t3}"), None).unwrap();
+        let addr = serve(offline_state(Fleet::new(
+            FleetConfig {
+                tokens,
+                ..Default::default()
+            },
+            None,
+        )))
+        .await;
+        // w1 fills its own slots: its next upload is refused, another worker's is not.
+        let mut held = Vec::new();
+        for _ in 0..UPLOAD_CONCURRENCY_PER_WORKER {
+            held.push(stalled_upload(addr, T1).await);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let (code, ra) = upload_status(addr, T1).await;
+        assert_eq!(code, 503, "w1 is over its own limit");
+        assert_eq!(ra, Some(UPLOAD_RETRY_AFTER_SECS.to_string()));
+        // w2 fills the rest of the server-wide slots: now w3 is refused too.
+        for _ in UPLOAD_CONCURRENCY_PER_WORKER..UPLOAD_CONCURRENCY {
+            held.push(stalled_upload(addr, T2).await);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let (code, ra) = upload_status(addr, t3).await;
+        assert_eq!(code, 503, "the server-wide slots are full");
+        assert!(ra.is_some());
+        // A stalled upload goes away: its slot comes back (the request then fails on the
+        // unreachable database, which is past the limit).
+        drop(held.pop());
+        let mut code = 503;
+        for _ in 0..50 {
+            code = upload_status(addr, t3).await.0;
+            if code != 503 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_ne!(code, 503, "a freed slot is reused");
+    }
+
+    /// A small worker request whose body never finishes: it holds a small slot.
+    async fn stalled_small(addr: std::net::SocketAddr, token: &str) -> tokio::net::TcpStream {
+        use tokio::io::AsyncWriteExt;
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = format!(
+            "POST {TRIAGE} HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {token}\r\n\
+             {API_HEADER}: {WORKER_API}\r\ncontent-type: application/json\r\n\
+             content-length: 1000\r\n\r\n{{\"items\": ["
+        );
+        s.write_all(head.as_bytes()).await.unwrap();
+        s
+    }
+
+    async fn worker_post(
+        addr: std::net::SocketAddr,
+        path: &str,
+        token: &str,
+        body: Vec<u8>,
+    ) -> (u16, Option<String>) {
+        let r = reqwest::Client::new()
+            .post(format!("http://{addr}{path}"))
+            .bearer_auth(token)
+            .header(API_HEADER, WORKER_API.to_string())
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        let ra = r
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .map(|v| v.to_str().unwrap().to_string());
+        (r.status().as_u16(), ra)
+    }
+
+    /// D113: triage and release bodies are limited to 1 MiB (the 32 MiB limit is for the two
+    /// upload routes), and every non-upload request takes a small slot before its body is read.
+    #[tokio::test]
+    async fn small_routes_have_small_bodies_and_slots() {
+        let tokens = parse_tokens(&format!("w1:{T1},w2:{T2}"), None).unwrap();
+        let addr = serve(offline_state(Fleet::new(
+            FleetConfig {
+                tokens,
+                ..Default::default()
+            },
+            None,
+        )))
+        .await;
+        // Valid JSON just over the limit: refused before it is parsed (the old limit read it,
+        // then went to the database).
+        let big = |key: &str| {
+            let pad = "x".repeat(TRIAGE_BODY_LIMIT + 1);
+            match key {
+                "triage" => format!(r#"{{"items":[],"as_names":[{{"asn":1,"org":"{pad}"}}]}}"#),
+                _ => format!(r#"{{"infohashes":["{pad}"]}}"#),
+            }
+            .into_bytes()
+        };
+        assert_eq!(worker_post(addr, TRIAGE, T1, big("triage")).await.0, 413);
+        assert_eq!(worker_post(addr, RELEASE, T1, big("release")).await.0, 413);
+
+        // w1 fills its small slots: its next triage is refused at once, w2's is not.
+        let mut held = Vec::new();
+        for _ in 0..SMALL_CONCURRENCY_PER_WORKER {
+            held.push(stalled_small(addr, T1).await);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let (code, ra) = worker_post(addr, TRIAGE, T1, br#"{"items":[]}"#.to_vec()).await;
+        assert_eq!(code, 503, "w1 is over its small-request limit");
+        assert_eq!(ra, Some(SMALL_RETRY_AFTER_SECS.to_string()));
+        let (code, _) = worker_post(addr, HEARTBEAT, T1, b"{}".to_vec()).await;
+        assert_eq!(code, 503, "every non-upload route counts");
+        let (code, _) = worker_post(addr, HEARTBEAT, T2, b"{}".to_vec()).await;
+        assert_eq!(code, 204, "another worker is not held back");
+        drop(held);
+    }
+
+    /// D113: the hourly new-hash budget of a worker's triage: reserved before the query (two
+    /// concurrent triages cannot spend it twice), refunded when unused, refilled over the hour.
+    #[test]
+    fn triage_budget_is_reserved_refunded_and_refilled() {
+        let f = Fleet::new(
+            FleetConfig {
+                triage_new_per_hour: 10,
+                ..Default::default()
+            },
+            None,
+        );
+        let t0 = 100_000;
+        assert_eq!(f.reserve_new("w1", 8, t0), Some(8));
+        assert_eq!(f.reserve_new("w1", 8, t0), Some(2), "only 2 left");
+        assert_eq!(f.reserve_new("w2", 8, t0), Some(8), "per worker");
+        f.refund_new("w1", 2);
+        assert_eq!(f.reserve_new("w1", 8, t0), Some(2));
+        assert_eq!(f.reserve_new("w1", 8, t0 + 359), Some(0));
+        assert_eq!(
+            f.reserve_new("w1", 8, t0 + 720),
+            Some(2),
+            "10 an hour (fractions kept)"
+        );
+        assert_eq!(
+            f.reserve_new("w1", 100, t0 + 100_000),
+            Some(10),
+            "burst = 1 h"
+        );
+        let off = Fleet::new(
+            FleetConfig {
+                triage_new_per_hour: 0,
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(off.reserve_new("w1", 8, t0), None, "0 = no cap");
     }
 
     #[test]

@@ -21,7 +21,9 @@ One batch (`MAGNETAR_LIVENESS_BATCH`, default 2000 infohashes):
    and its connection id (reused for 60 s, as BEP 15 allows), so a busy tracker sees one
    connect a minute. A tracker that fails (timeout, error action, HTTP error, bad answer) is
    skipped for 2 min, doubling per failure in a row up to 6 h; while it backs off its hashes
-   count as unanswered for it.
+   count as unanswered for it. An HTTP scrape answer is read in chunks up to 256 KiB and
+   decoded only if it holds at most 4096 bencode values (D111); a larger one fails the tracker
+   like any bad answer, without being buffered.
 3. **Torrents without a tracker** (two thirds of production) are scraped on the trackers
    their magnet links get (`magnet::DEFAULT_TRACKERS`: opentrackr, stealth.si,
    torrent.eu.org). Those answers only count when they report seeders: zero from a tracker
@@ -40,6 +42,39 @@ One batch (`MAGNETAR_LIVENESS_BATCH`, default 2000 infohashes):
 Batches run back to back while a full batch is due; otherwise the loop sleeps
 `MAGNETAR_LIVENESS_INTERVAL_SECS` (default 60). The `liveness.enabled` setting still turns
 the checker off.
+
+### Which addresses are contacted (D112)
+
+Tracker URLs come from Nostr events and DHT `nodes` from other peers, so a hostile publisher
+or node could aim checks at the home router, Postgres on 127.0.0.1, a tailnet service or any
+LAN host. Every target is checked against one policy (`netaddr::is_public`: no loopback,
+RFC 1918, 100.64/10 CGNAT/Tailscale, link-local, ULA fd00::/8 and the rest of fc00::/7,
+multicast, documentation, benchmarking or reserved ranges, and no IPv4-mapped, NAT64 or 6to4
+address carrying one of those) on the address actually connected to, after DNS. Our own
+public addresses are refused too: this host's public interface addresses and the /64 of each
+public IPv6 one (where the other LAN hosts live), the WAN address the DHT crawler or UPnP
+learns, and `MAGNETAR_OWN_ADDRS`. Any IPv4 spelling a resolver accepts (`127.1`,
+`2130706433`, `0x7f.0.0.1`, a trailing dot) counts as the address it spells.
+
+- HTTP trackers: an IP-literal host is checked before the request; a name goes through a DNS
+  resolver that keeps only public addresses, so the connect goes to a checked one. Up to 3
+  redirects are followed, each hop checked the same way (a 4th, or a hop to a refused
+  address, is a failed scrape). No proxy is used: a proxy would resolve the name itself, past
+  the check, so `HTTP_PROXY`/`HTTPS_PROXY` do not apply to scrapes.
+- UDP trackers: the name is resolved through the policy and the socket is connected to the
+  checked address.
+- DHT walks: seeds and every `nodes` entry are checked before a query is sent; the node cache
+  only holds nodes that passed.
+- At ingest, trackers with a non-public IP literal (in any spelling) or a `localhost` name are
+  not stored, so workers never lease them either.
+
+A refused tracker fails like an unreachable one (`Error::Refused`) and backs off. There is no
+setting to allow private targets; only in-process tests use a loopback seam.
+
+The server container on the Docker bridge has only private interface addresses and, with
+`MAGNETAR_DHT=off`, no DHT vote: it knows the line's WAN address only from UPnP or from
+`MAGNETAR_OWN_ADDRS` (set it to the WAN IPv4 to close the hairpin case). Workers learn it from
+their crawler's vote once it settles.
 
 ### Node farms on the DHT
 
@@ -75,8 +110,18 @@ and the dead badge) until it is replaced.
 an hour the first 100 results of every saved search (lane 2). The API only records boosts in
 memory; the loop writes them before its next batch. A boost also makes the torrent due at
 once when its last check is older than 1 h (viewed), 6 h (saved search) or 12 h (search).
-A forced check (`POST /api/v1/torrents/{ih}/liveness`, the app's "Check" button) is one-shot,
-outside the rate limits, and goes through the same schedule.
+A forced check (`POST /api/v1/torrents/{ih}/liveness`, the app's "Check" button) runs at once
+and goes through the same schedule. Since D113 it uses the checker's own scraper (its
+per-tracker rate limits and backoff, UDP connections, DHT nodes and pace), so it may wait for a
+tracker the running batch is scraping (at most 30 s, then the stored answer); the same
+infohash is scraped at most once a minute (a repeat gets the stored answer); at most 20 forced
+checks a minute and 2 at once server-wide, past that `429` with `Retry-After`.
+
+**Trackers per torrent (D113).** At most 30 distinct trackers are scraped for one torrent (its
+own first, then the extra trackers): events can list made-up trackers by the thousand, and each
+is a new flow through the router. Each tracker contact of a batch also waits for a permit of
+the process's shared DHT pacer when there is one (D109: the crawler or `MAGNETAR_LIVENESS_DHT`
+on), so scrapes slow down with the router health brake like the walks.
 
 ## History
 

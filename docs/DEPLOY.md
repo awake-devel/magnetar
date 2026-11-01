@@ -23,7 +23,7 @@ file), and neither installs systemd units, timers or udev rules.
 |---|---|---|
 | Linux PC or home server (x86_64 or arm64) | Docker Compose, or the native binary if you already run Postgres | Any distribution with Docker Engine and the compose plugin |
 | Synology NAS, x86_64 models | Docker Compose through **Container Manager** (DSM 7.2+): Project > Create, point it at a folder with `compose.yml` and `.env` | Keep the data on a volume, not on the system partition. ARM Synology models are not a target: the arm64 image may run on the aarch64 ones but this is **UNVERIFIED**, and 32-bit ARM has no image |
-| Raspberry Pi 4 / 5 | Docker Compose, or the native `aarch64` binary | Needs a **64-bit** OS (`uname -m` prints `aarch64`). Put Postgres on an SSD rather than the SD card: the crawler writes constantly. Not yet run on a real Pi (**UNVERIFIED**) |
+| Raspberry Pi 4 / 5 | Docker Compose, or the native `aarch64` binary | Needs a **64-bit** OS (`uname -m` prints `aarch64`). Put Postgres on an SSD rather than the SD card: the crawler writes constantly. The full server has not run on a real Pi (**UNVERIFIED**); the `aarch64` binary runs as a crawl worker on a Pi 3B (v0.3.1, 2026-10-31), see docs/WORKERS.md |
 | VPS | Docker Compose | Never publish port 8787 on the public interface without TLS: use Tailscale or a reverse proxy with HTTPS (below) |
 | Mac (Intel or Apple Silicon) / Windows | Docker Desktop (WSL 2 backend on Windows), Docker Compose | Docker pulls the right architecture by itself. Only useful while the machine is on |
 

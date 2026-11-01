@@ -1,0 +1,17 @@
+# Nightly database dump (scripts/backup.sh), as a systemd *user* unit on the compose host.
+# Install: copy this file and magnetar-backup.timer to ~/.config/systemd/user/, edit the
+# paths and MAGNETAR_BACKUP_DEST below, then:
+#   systemctl --user daemon-reload && systemctl --user enable --now magnetar-backup.timer
+# The ssh destination needs key login (BatchMode). Restore: docs/DOCKER.md "Backups".
+[Unit]
+Description=Magnetar database dump (scripts/backup.sh)
+
+[Service]
+Type=oneshot
+Environment=MAGNETAR_BACKUP_DEST=backuphost:/srv/magnetar-backups
+Environment=MAGNETAR_BACKUP_KEEP=7
+# "sudo -n docker" when the user is not in the docker group (needs NOPASSWD for docker).
+Environment=DOCKER=docker
+ExecStart=%h/magnetar/scripts/backup.sh
+Nice=10
+IOSchedulingClass=idle

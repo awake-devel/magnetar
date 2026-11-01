@@ -103,6 +103,42 @@ async fn auth_required_everywhere_but_health() {
 }
 
 #[tokio::test]
+async fn search_offset_has_a_maximum() {
+    // D110: every result up to offset + limit is kept while ranking, so the offset is capped.
+    use magnetar_core::query::MAX_OFFSET;
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    put(s, torrent(1, 1, NOW - 10, 1, "Some.Title.2020")).await;
+    let base = spawn_server(s).await;
+
+    let ok = get(
+        &base,
+        &format!("/api/v1/search?min_trust=0&offset={MAX_OFFSET}"),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::OK);
+    let page: SearchPage = ok.json().await.unwrap();
+    assert!(page.hits.is_empty());
+    let deep = MAX_OFFSET + 1;
+    assert_eq!(
+        error_code(get(&base, &format!("/api/v1/search?offset={deep}")).await).await,
+        (StatusCode::BAD_REQUEST, "invalid".to_string())
+    );
+    assert_eq!(
+        error_code(get(&base, "/api/v1/search?offset=4000000000").await).await,
+        (StatusCode::BAD_REQUEST, "invalid".to_string())
+    );
+    let r = http()
+        .post(format!("{base}/api/v1/search"))
+        .bearer_auth(TOKEN)
+        .json(&json!({"text": "title", "offset": deep}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(error_code(r).await.0, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn search_and_errors() {
     let Some(db) = test_db().await else { return };
     let s = &db.store;
@@ -391,6 +427,50 @@ async fn recv(ws: &mut Ws) -> Value {
             return serde_json::from_str(t.as_str()).unwrap();
         }
     }
+}
+
+/// D111: a REQ with more than MAX_FILTERS_PER_REQ filters, or a list longer than
+/// MAX_FILTER_VALUES, is CLOSED with `blocked:` before any query runs.
+#[tokio::test]
+async fn relay_req_filter_caps() {
+    use magnetar_server::filter::MAX_FILTER_VALUES;
+    use magnetar_server::relay::MAX_FILTERS_PER_REQ;
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    put(s, torrent(1, 1, NOW - 30, 1, "a")).await;
+    let base = spawn_server(s).await;
+    let mut ws = ws_connect(&base).await;
+
+    let mut req = vec![json!("REQ"), json!("many")];
+    req.extend(std::iter::repeat_n(json!({}), MAX_FILTERS_PER_REQ + 1));
+    send(&mut ws, Value::Array(req)).await;
+    let m = recv(&mut ws).await;
+    assert_eq!(
+        (m[0].as_str(), m[1].as_str()),
+        (Some("CLOSED"), Some("many")),
+        "{m}"
+    );
+    assert!(m[2].as_str().unwrap().starts_with("blocked:"), "{m}");
+
+    let ids = vec![hex64(7); MAX_FILTER_VALUES + 1];
+    send(&mut ws, json!(["REQ", "long", {"ids": ids}])).await;
+    let m = recv(&mut ws).await;
+    assert_eq!(
+        (m[0].as_str(), m[1].as_str()),
+        (Some("CLOSED"), Some("long")),
+        "{m}"
+    );
+    assert!(m[2].as_str().unwrap().starts_with("blocked:"), "{m}");
+
+    // At the caps it is served.
+    let mut req = vec![json!("REQ"), json!("ok")];
+    req.extend(std::iter::repeat_n(
+        json!({"kinds": [2003]}),
+        MAX_FILTERS_PER_REQ,
+    ));
+    send(&mut ws, Value::Array(req)).await;
+    assert_eq!(recv(&mut ws).await[0], "EVENT");
+    assert_eq!(recv(&mut ws).await, json!(["EOSE", "ok"]));
 }
 
 #[tokio::test]

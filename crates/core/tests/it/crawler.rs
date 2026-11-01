@@ -770,6 +770,28 @@ async fn nip65_relays_discovered_this_pass_are_selected() {
     assert_eq!(known("wss://inbox.example.org"), None);
 }
 
+/// D112: a row stored as `seed` stays in the table after the seed is removed from the config;
+/// it is no longer trusted, so a loopback (or LAN) URL there gets no connect. The configured
+/// seed still does.
+#[tokio::test]
+async fn removed_seed_is_not_trusted() {
+    let configured = FakeRelay::start(Vec::new(), Behaviour::default()).await;
+    let removed = FakeRelay::start(Vec::new(), Behaviour::default()).await;
+    let store = MemStore::default();
+    store.upsert_relay(&removed.url, "seed").await.unwrap();
+    let c = cfg(&[&configured.url]);
+    let sel = select_relays(&store, &c, now()).await.unwrap();
+    assert!(!sel.contains(&removed.url), "{sel:?}");
+    crawl_once(&store, &c).await.unwrap();
+    let conns = |r: &FakeRelay| r.state.lock().unwrap().connections;
+    assert_eq!(conns(&configured), 1);
+    assert_eq!(
+        conns(&removed),
+        0,
+        "a removed seed was connected as trusted"
+    );
+}
+
 #[tokio::test]
 async fn continuous_crawl_rotates_through_new_and_idle_relays() {
     let publisher = Keys::generate();

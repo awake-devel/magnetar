@@ -17,6 +17,7 @@ the machine that produced them.
 
 | Folder | Date | What | Headline | Docs |
 |---|---|---|---|---|
+| `2026-10-31-worker-collectors/` | 2026-10-31 | Worker ramps on eee and rpi lines: q/s, TCP, then peer collections | The fixed 64 collectors capped real sends at ~180 q/s; stored grows linearly with collectors (eee 384 → 2,734/5 min, rpi 256 → 1,931) until the router faults | its `README.md`, D114 |
 | `2026-10-28-dht-nodes-4-vs-16/` | 2026-10-28 | Production A/B: 4 vs 16 DHT nodes, fiber, 5,000 q/s | 16 nodes stored 61–63 % more (12,667 vs 7,805 per 10 min) for +0.2–0.4 core and ~0.6 GB | its `README.md` |
 | `2026-10-28-dht-multicore/` | 2026-10-28 | D106 multi-core engine: `perf` profile, loopback bench, 17 live runs on fiber | No single-core bottleneck; a pacer bug wasted booked slots. New engine sends 100 % of its cap; at TCP 2,000/s ~6,100–6,200 metadata/min vs ~5,500–5,600 for main (empty database) | DHT.md §20, D106 |
 | `2026-10-28-dht-balancer/` | 2026-10-28 | D107 sampling/lookup balancer, 10 interleaved runs on fiber | Parity with main within noise (scratch databases); sampling is ~1 % of queries either way | branch `dht/balance` (not merged) |

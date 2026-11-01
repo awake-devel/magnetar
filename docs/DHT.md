@@ -244,7 +244,15 @@ statement trigger, after the insert; `torrents` has no such FK either. The child
 
 ### 2.4 Writes (stage 4, `server::dht::persist`)
 
-One transaction per batch (≤ 500 rows or 1 s): `INSERT INTO dht_torrents … ON CONFLICT
+One transaction per batch (≤ 500 rows or 1 s), one savepoint per verified result: a row the
+database refuses for its values (SQLSTATE class 22 data, 23 constraint, 54 limit, P0 raise) or
+that cannot be encoded is rolled back alone, its `dht_seen` row closed as `invalid` with
+`last_error = store_error`, counted in `row_errors` (and `invalid`), and logged by SQLSTATE
+only. Errors a retry can clear (40 deadlock or serialization, 53 resources, 55 lock timeout,
+57 cancel or statement timeout), unknown SQLSTATEs, and I/O or pool errors fail the batch,
+whose hashes keep their lease for a retry (D110). The title is capped at 1 KiB before the insert, so `search_tsv` stays far under
+Postgres's 1 MB tsvector limit (an uncapped 2.4 MB name failed with SQLSTATE 54000 and, before
+the savepoints, took its whole batch down on every retry). `INSERT INTO dht_torrents … ON CONFLICT
 (infohash) DO NOTHING` → `INSERT INTO torrent_attrs … ON CONFLICT DO NOTHING` (release
 attributes parsed from the DHT name + files with `core::release`, first writer wins as for
 Nostr, D44) → `DELETE FROM dht_seen WHERE infohash = ANY(…)` over the hashes the fetches were
@@ -369,8 +377,21 @@ Both modes honour every rule of §3.4 (interval, per-IP rate, honest ids, no fak
 - Each virtual node is a separate UDP socket on its own port: queries carry no recipient id, so
   a remote node identifies "us" by (IP, port). Remote libtorrent nodes keep one routing slot per
   IP (`restrict_routing_ips`, dht-crawling.md §1.2), so more than a few virtual nodes add little.
-- `v` = `MG` + 2 version bytes (`MG` is unregistered in BEP 20's list, checked 2026-10-26). BEP 9
-  peer id: Azureus style `-MG0300-` + 12 random bytes.
+- **Identity (D115): one honest name on every protocol, never another client's**, so any node,
+  peer, tracker or relay can recognise the crawler and block it. Everything comes from the crate
+  version (`crates/core/src/identity.rs`):
+  - KRPC `v` = `MG` + major + `minor << 4 | patch` (0.3.1 → `MG 00 31`), on the crawler's
+    queries and on the seed checker's DHT walks (`MG` is unregistered in BEP 20's list,
+    checked 2026-10-26);
+  - BEP 20 peer id: Azureus style `-MG` + major, minor, patch + `0-` (`-MG0310-`) + 12 random
+    bytes;
+  - BEP 10 extended handshake `v` = `Magnetar 0.3.1`;
+  - HTTP (trackers, TMDB, GeoIP) and the relay WebSocket handshake: User-Agent
+    `magnetar/0.3.1 (+https://github.com/awake-devel/magnetar)`; librqbit downloads use it as
+    their client name.
+
+  The crawler only fetches info dicts (BEP 9) and never uploads file data: it has no pieces.
+  To block it: KRPC `v` starting with `MG`, peer ids starting with `-MG`, or the User-Agent.
 
 ### 3.4 Politeness and protocol rules (D54, D55)
 
@@ -518,7 +539,11 @@ test):
   sampler or the metadata fetcher would then spray them. Before any UDP send or TCP connect,
   addresses in 0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.0.0/24, 192.168/16,
   198.18/15, 224/4, 240/4 and our own external address are dropped (the bootstrap routers are
-  resolved names and pass the same check). Counted in stats, never logged per address.
+  resolved names and pass the same check). Counted in stats, never logged per address. The
+  ranges are the crate-wide policy `netaddr::is_public` (D112), which also drops the
+  documentation nets and 192.88.99/24, and which the seed checker's DHT walk, tracker scrapes,
+  untrusted relays and librqbit's peer blocklist use too. The external address the vote settles
+  on is also handed to that policy (`netaddr::OWN`), so those other paths refuse it as well.
 - **Reflection**: our responses are at most a few hundred bytes larger than the query; the
   response caps of §3.4 rule 4 (300/s, 5/s per IP) bound what a spoofed-source flood can
   reflect.
@@ -535,8 +560,33 @@ test):
   `Value` tree tens of times its size (2-byte values, ≥ 32 B each decoded). Decoding runs under
   a semaphore (4 at once); before it runs, the verified bytes are scanned without allocating
   to count values: more than `metadata_max / 8` = `invalid` (`too_complex`), else the decode
-  reserves `3 × size + 64 B × values` from a decode budget of its own (D67). Info dicts with
-  duplicate keys at any level are `invalid` (§4 step 6).
+  reserves `3 × size + 112 B × values` plus the parse's string bound
+  (`min(3 × metadata_max, 8 × size + 1 MiB)`, below) from a decode budget of its own
+  (`6 × metadata_max` per decode slot, D67, D110). Info dicts with
+  duplicate keys at any level are `invalid` (§4 step 6). The count and the decoder read string
+  lengths with the same digits-only parser (no sign: `-0:` was an empty key to the decoder and a
+  stop for the counter), and anything the counter cannot read is priced as `too_complex`
+  rather than as the short prefix before it (D110).
+- **Parse output** (D110): a BEP 52 file tree joins each leaf's whole directory prefix, twice
+  (blocklist input and display path), so one huge directory key over many tiny leaves asked for
+  prefix × leaves bytes (terabytes at 16 MiB), and lossy decoding makes each invalid byte a
+  3-byte U+FFFD. Every string the parse builds (names, blocklist input, v1 and v2 paths) is
+  priced in real decoded bytes plus 64 B per string and 48 B per file entry (measured against a
+  counting allocator, `tests/parse_memory.rs`) before it is allocated, against
+  `info::output_bound` = `min(output_max, 8 × size + 1 MiB)`, where the absolute cap
+  `output_max` = 3 × `MAGNETAR_DHT_METADATA_MAX` (48 MiB at the default, at least 4 MiB) does
+  not grow when the dict is padded, and the size-relative term keeps what a small dict builds
+  small: results are held long after the decode (a worker upload holds up to 1 000 before
+  persisting, the pipeline a channel and a 500-row batch), and a 44 KB dict built 24.7 MB under
+  the cap alone. The decode price above reserves the bound. A BEP 52 path over 4 096 raw bytes
+  (`PATH_MAX`) or a parse over the bound is `too_complex`. The name and
+  every display path are built cut to 1 KiB on a character boundary (the Nostr title cap,
+  `info::DISPLAY_MAX`); the blocklist input keeps the full strings. A v2 manga pack with long
+  directory names builds ~4.7 × its size in strings, ~7.8 × with the per-string and per-file
+  prices, so that shape fits the size-relative bound and, at the default cap, up to a ~6 MB
+  dict (larger: UNVERIFIED). The release parser is linear in the name (`fold` and the per-bracket
+  facts were quadratic), and `parse_release` / `classify` read at most 1 KiB of a title
+  (`release::NAME_MAX`), also for rows stored before D110.
 
 ## 4. Metadata fetch (D56, stage 2)
 
@@ -787,7 +837,7 @@ others are still planned (their stage in brackets).
 | `MAGNETAR_DHT_NODES` | `4` (aggressive), `1` (polite) | 1–32 (BEP 42 allows 8 id prefixes per IP; beyond 8 they repeat, §3.3, §20) |
 | `MAGNETAR_DHT_QPS` | `200` / `50` | global outbound KRPC queries per second over every virtual node (1–20000, §20) |
 | `MAGNETAR_DHT_POOL` | `1000000` / `200000` | crawl pool size (nodes) |
-| `MAGNETAR_DHT_PEER_LOOKUPS` | `64` / `8` | peer collections (sampling node, then lookup) at once (D62) |
+| `MAGNETAR_DHT_PEER_LOOKUPS` | 0.4 × QPS (8–4096) / `8` | peer collections (sampling node, then lookup) at once (D62, D114) |
 | `MAGNETAR_DHT_SAMPLE_PRIORITY` | `0` | share of the KRPC budget reserved for sampling ahead of the queue (0–1, §20, D106) |
 | `MAGNETAR_DHT_FETCH_CONCURRENCY` | `128` / `16` | metadata fetches in flight |
 | `MAGNETAR_DHT_LOOKUP_TIMEOUT_MS` | `4000` | soft per-query timeout of lookups (100–4000, §18, D93) |

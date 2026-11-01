@@ -176,6 +176,42 @@ struct Tok {
     sep_before: String,
     /// Bracket instance this token is in (0 = none).
     bracket: u32,
+    /// Tokens in that bracket instance (set by [`bracket_stats`]; 0 until then). Counted once,
+    /// not per token: a per-token count made a name of many brackets quadratic (D110).
+    bracket_len: usize,
+}
+
+/// What [`parse_one`] asks of a whole bracket instance, computed in one pass (D110).
+#[derive(Clone, Copy)]
+struct Bracket {
+    /// Every token is a number.
+    all_digits: bool,
+    /// Every token is a language word (`[ENG]`, `[Hindi+English]`, `(French)`).
+    lang_only: bool,
+}
+
+/// Fill each token's `bracket_len` and return per-instance facts, indexed by bracket id.
+fn bracket_stats(toks: &mut [Tok]) -> Vec<Bracket> {
+    let ids = toks.iter().map(|t| t.bracket as usize).max().unwrap_or(0) + 1;
+    let mut lens = vec![0usize; ids];
+    let mut out = vec![
+        Bracket {
+            all_digits: true,
+            lang_only: true,
+        };
+        ids
+    ];
+    for t in toks.iter() {
+        let b = t.bracket as usize;
+        lens[b] += 1;
+        out[b].all_digits &= t.digits().is_some();
+        out[b].lang_only &= language(&t.low).is_some()
+            || matches!(t.low.as_str(), "dub" | "dubbed" | "audio" | "sub" | "subs");
+    }
+    for t in toks.iter_mut() {
+        t.bracket_len = lens[t.bracket as usize];
+    }
+    out
 }
 
 impl Tok {
@@ -241,27 +277,84 @@ const FOLDS: &[(&str, &str)] = &[
     ("24-bit", "24bit"),
 ];
 
-/// ASCII-case-insensitive replace of every `from` (lowercase) by `to`.
+/// ASCII-case-insensitive replace of every `from` (lowercase) by `to`, pattern by pattern in
+/// [`FOLDS`] order, leftmost matches first (a later pattern sees the earlier replacements).
+///
+/// Linear (D110): the name is lowercased once and each pattern is one scan that rebuilds both
+/// strings, so the cost is |FOLDS| × the name's length. It used to re-lowercase the whole
+/// string and `replace_range` once per match, quadratic on a hostile DHT name.
 fn fold(name: &str) -> String {
+    // Lowercasing can change byte lengths for non-ASCII text (`İ`, the Kelvin sign): match
+    // positions are only usable when every character keeps its length; otherwise nothing is
+    // folded (as before).
+    let mut low = name.to_lowercase();
+    if low.len() != name.len()
+        || (!name.is_ascii()
+            && name
+                .chars()
+                .any(|c| c.to_lowercase().map(char::len_utf8).sum::<usize>() != c.len_utf8()))
+    {
+        return name.to_string();
+    }
     let mut out = name.to_string();
+    let mut pairs = Bigrams::of(low.as_bytes());
     for (from, to) in FOLDS {
-        let mut search_from = 0;
-        loop {
-            let lower = out.to_lowercase();
-            // Lowercasing can change byte lengths for non-ASCII text: only use positions when
-            // both strings line up.
-            if lower.len() != out.len() {
-                break;
-            }
-            let Some(rel) = lower[search_from..].find(from) else {
-                break;
-            };
-            let at = search_from + rel;
-            out.replace_range(at..at + from.len(), to);
-            search_from = at + to.len();
+        // Most patterns are absent: the bigram table rules them out without a scan.
+        if !pairs.may_contain(from.as_bytes()) || !low.contains(from) {
+            continue;
         }
+        let mut next_out = String::with_capacity(out.len());
+        let mut next_low = String::with_capacity(low.len());
+        let mut last = 0;
+        // A replacement brings its own pairs, and new ones at its edges, where a later
+        // pattern may now match: they are added (stale pairs only cost a `contains`).
+        pairs.add(to.as_bytes());
+        let (first, end) = (to.as_bytes()[0], to.as_bytes()[to.len() - 1]);
+        for (at, _) in low.match_indices(from) {
+            next_out.push_str(&out[last..at]);
+            next_low.push_str(&low[last..at]);
+            if let Some(&b) = next_low.as_bytes().last() {
+                pairs.add(&[b, first]);
+            }
+            next_out.push_str(to);
+            next_low.push_str(to); // every `to` is lowercase ASCII
+            last = at + from.len();
+            if let Some(&b) = low.as_bytes().get(last) {
+                pairs.add(&[end, b]);
+            }
+        }
+        next_out.push_str(&out[last..]);
+        next_low.push_str(&low[last..]);
+        out = next_out;
+        low = next_low;
     }
     out
+}
+
+/// Which byte pairs occur in a string: one bit per pair (8 KiB), built in one pass.
+struct Bigrams(Vec<u64>);
+
+impl Bigrams {
+    fn of(s: &[u8]) -> Self {
+        let mut b = Bigrams(vec![0u64; (1 << 16) / 64]);
+        b.add(s);
+        b
+    }
+
+    fn add(&mut self, s: &[u8]) {
+        for w in s.windows(2) {
+            let i = usize::from(w[0]) << 8 | usize::from(w[1]);
+            self.0[i / 64] |= 1 << (i % 64);
+        }
+    }
+
+    /// False when some pair of `pat` never occurs (so `pat` cannot either).
+    fn may_contain(&self, pat: &[u8]) -> bool {
+        pat.windows(2).all(|w| {
+            let i = usize::from(w[0]) << 8 | usize::from(w[1]);
+            self.0[i / 64] & (1 << (i % 64)) != 0
+        })
+    }
 }
 
 fn tokenize(name: &str) -> Vec<Tok> {
@@ -279,6 +372,7 @@ fn tokenize(name: &str) -> Vec<Tok> {
                     raw: std::mem::take(&mut cur),
                     sep_before: std::mem::take(&mut sep),
                     bracket: current_bracket,
+                    bracket_len: 0,
                 });
             }
             if opens(c) {
@@ -304,6 +398,7 @@ fn tokenize(name: &str) -> Vec<Tok> {
             raw: cur,
             sep_before: sep,
             bracket: current_bracket,
+            bracket_len: 0,
         });
     }
     toks
@@ -553,7 +648,7 @@ fn bare_height_bracket(toks: &[Tok], i: usize) -> bool {
             toks[i].low.as_str(),
             "1080" | "720" | "576" | "480" | "2160"
         )
-        && toks.iter().filter(|t| t.bracket == b).count() == 1
+        && toks[i].bracket_len == 1
 }
 
 /// `2nd`, `4th`, `3rd`, `1st` → 2, 4, 3, 1 (seasons up to 99).
@@ -952,6 +1047,7 @@ fn parse_one(name: &str, ctx: &Ctx) -> ReleaseAttrs {
     if toks.is_empty() {
         return a;
     }
+    let brackets = bracket_stats(&mut toks);
     // The title starts after a leading "[Group]" bracket.
     let title_start = if toks[0].bracket != 0 {
         let b = toks[0].bracket;
@@ -968,13 +1064,7 @@ fn parse_one(name: &str, ctx: &Ctx) -> ReleaseAttrs {
         .find(|&i| strong_at(i) || is_year(&toks[i]).is_some())
         .unwrap_or(toks.len());
     // A bracket holding only language words (`[ENG]`, `[Hindi+English]`, `(French)`).
-    let lang_only_bracket = |b: u32| {
-        b != 0
-            && toks.iter().filter(|t| t.bracket == b).all(|t| {
-                language(&t.low).is_some()
-                    || matches!(t.low.as_str(), "dub" | "dubbed" | "audio" | "sub" | "subs")
-            })
-    };
+    let lang_only_bracket = |b: u32| b != 0 && brackets[b as usize].lang_only;
     let in_tags = |i: usize| i >= region || lang_only_bracket(toks[i].bracket);
     // Ambiguous words also need a tag next to them (`S01E05 The French Connection` is a title).
     let tag_neighbour = |i: usize| {
@@ -1022,9 +1112,7 @@ fn parse_one(name: &str, ctx: &Ctx) -> ReleaseAttrs {
         // ("(Les Feux de l'Amour du 16 janvier 2026 - …)").
         if after_title
             && let Some(y) = is_year(t)
-            && (t.bracket == 0
-                || i < region
-                || toks.iter().filter(|x| x.bracket == t.bracket).count() < 4)
+            && (t.bracket == 0 || i < region || t.bracket_len < 4)
         {
             years.push((i, y));
         }
@@ -1178,11 +1266,8 @@ fn parse_one(name: &str, ctx: &Ctx) -> ReleaseAttrs {
             && (t.sep_before.contains(" - ")
                 || t.sep_before.ends_with("- ")
                 || (t.bracket != 0
-                    && toks.iter().filter(|x| x.bracket == t.bracket).count() <= 2
-                    && toks
-                        .iter()
-                        .filter(|x| x.bracket == t.bracket)
-                        .all(|x| x.digits().is_some())))
+                    && t.bracket_len <= 2
+                    && brackets[t.bracket as usize].all_digits))
         {
             // Anime: "Title - 07 (1080p)", "One Piece - 1152", "[05][WebRip]", "(01-12)".
             a.episode = Some(n as i32);
@@ -1487,10 +1572,9 @@ fn parse_one(name: &str, ctx: &Ctx) -> ReleaseAttrs {
     // Year: the first one followed by a tag or alone in brackets ("Blade Runner 2049 2017
     // 1080p" is 2017, "L'Armée des Ombres 1969 REMASTERISÉ 2024" is 1969), the start of a range
     // ("2008-2013"); else the last one before the first tag, else the first one.
-    let bracket_len = |b: u32| toks.iter().filter(|t| t.bracket == b).count();
     let tagged = years.iter().find(|(j, _)| {
         let t = &toks[*j];
-        (t.bracket != 0 && bracket_len(t.bracket) == 1)
+        (t.bracket != 0 && t.bracket_len == 1)
             || *j + 1 == toks.len()
             || is_tagish(&toks[*j + 1], toks.get(*j + 2))
     });
@@ -1687,13 +1771,7 @@ fn language_token(
         "gb" if t.upper() && t.bracket != 0 => push(&mut a.subtitles, "zh"),
         "esub" | "esubs" => push(&mut a.subtitles, "en"),
         // Erai-raws marks Chinese animation "(CA)".
-        "ca" if ctx.anime
-            && t.upper()
-            && t.bracket != 0
-            && toks.iter().filter(|x| x.bracket == t.bracket).count() == 1 =>
-        {
-            audio(a, "zh")
-        }
+        "ca" if ctx.anime && t.upper() && t.bracket != 0 && t.bracket_len == 1 => audio(a, "zh"),
         _ if w.starts_with("multi")
             && w[5..].bytes().all(|b| b.is_ascii_digit())
             && w.len() > 5 =>
@@ -1804,8 +1882,27 @@ fn file_track_languages(path: &str) -> Vec<&'static str> {
     out
 }
 
+/// Longest name the parsers read, in bytes (D110): the stored title cap
+/// (`nip35::MAX_TITLE_BYTES`). New titles are capped before they are stored; rows from before
+/// D110 are not, and are parsed again on every parser or classifier version bump.
+pub const NAME_MAX: usize = crate::nip35::MAX_TITLE_BYTES;
+
+/// `s` cut to at most [`NAME_MAX`] bytes on a character boundary.
+pub fn capped(s: &str) -> &str {
+    if s.len() <= NAME_MAX {
+        return s;
+    }
+    let mut end = NAME_MAX;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Attributes of a torrent from its title and files. `category` turns on anime and book rules.
+/// The title and the file name parsed are cut to [`NAME_MAX`] first (D110).
 pub fn parse_release(title: &str, files: &[TorrentFile], category: Category) -> ReleaseAttrs {
+    let title = capped(title);
     let ctx = Ctx {
         anime: category == Category::Anime,
         book: category == Category::Book,
@@ -1829,7 +1926,7 @@ pub fn parse_release(title: &str, files: &[TorrentFile], category: Category) -> 
         .iter()
         .filter(|f| ext_of(&f.path).is_some_and(|e| VIDEO_EXT.contains(&e.as_str()) && e != "iso"));
     if poor && let Some(v) = videos.clone().max_by_key(|f| f.size.unwrap_or(0)) {
-        let f = parse_one(stem_of(&v.path), &ctx);
+        let f = parse_one(capped(stem_of(&v.path)), &ctx);
         merge_missing(&mut a, f);
     }
     let has_video = videos.clone().next().is_some();
@@ -2226,6 +2323,188 @@ pub fn resolution_rank(r: Option<&str>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `fold` before D110 (quadratic), kept as the reference for the linear one.
+    fn fold_quadratic(name: &str) -> String {
+        let mut out = name.to_string();
+        for (from, to) in FOLDS {
+            let mut search_from = 0;
+            loop {
+                let lower = out.to_lowercase();
+                if lower.len() != out.len() {
+                    break;
+                }
+                let Some(rel) = lower[search_from..].find(from) else {
+                    break;
+                };
+                let at = search_from + rel;
+                out.replace_range(at..at + from.len(), to);
+                search_from = at + to.len();
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn fold_matches_the_old_fold() {
+        let names = [
+            "Movie.2020.1080p.Blu-Ray.DD+5.1.x-264-GRP",
+            "Show S01E01 WEB-DL DTS-HD MA HE-AAC-LC 10-bit",
+            "he-aac-lc chained: HE-AAC then AAC-LC",
+            "Film (2019) Director's Cut Open.Matte Dolby Vision HDR10+ E-AC-3",
+            "Dual Áudio PT-BR Multi-Subs multi-sub MULTI.SUB vost-fr Sous-Titres",
+            "ÉTÉ 16-bit 24-bit 8-bit 12-bit 10 bit DUAL AUDIO dual.audio",
+            "dts:x dts-x DTS-MA vc-1 MPEG-2 web-rip x-265 e-ac3",
+            "nothing to fold here",
+            "",
+            "İstanbul 10-bit", // lowercase grows: nothing folded, as before
+            "Ⅻ dd+ ǅ blu-ray Σίσυφος",
+            "dd+dd+dd+ blu-rayblu-ray 10-bit10-bit",
+        ];
+        for n in names {
+            assert_eq!(fold(n), fold_quadratic(n), "{n}");
+        }
+    }
+
+    /// This thread's CPU time (wall time elsewhere): time spent preempted by other work on the
+    /// machine does not count.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn cpu_time() -> std::time::Duration {
+        use nix::time::{ClockId, clock_gettime};
+        clock_gettime(ClockId::CLOCK_THREAD_CPUTIME_ID)
+            .map(std::time::Duration::from)
+            .unwrap_or_default()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn cpu_time() -> std::time::Duration {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed()
+    }
+
+    /// Fastest of `runs` timings (thread CPU time) of `small` and of `big`, run in turns so
+    /// other work on the machine (caches, frequency) slows both alike.
+    fn timings(
+        runs: usize,
+        mut small: impl FnMut(),
+        mut big: impl FnMut(),
+    ) -> (std::time::Duration, std::time::Duration) {
+        let time = |f: &mut dyn FnMut()| {
+            let t = cpu_time();
+            f();
+            cpu_time().saturating_sub(t)
+        };
+        let mut best = (std::time::Duration::MAX, std::time::Duration::MAX);
+        for _ in 0..runs {
+            best.0 = best.0.min(time(&mut small));
+            best.1 = best.1.min(time(&mut big));
+        }
+        best
+    }
+
+    /// `big` (4 × the input of `small`) took at most 10 × `small`, + 50 ms of timer and scheduler
+    /// noise: linear code takes ~4 ×, quadratic 16 ×. CPU time, and comparing two timings of the
+    /// same run, keep the test valid on a loaded machine (fixed wall-clock limits failed while 4
+    /// builds ran).
+    fn assert_scales(what: &str, (small, big): (std::time::Duration, std::time::Duration)) {
+        assert!(
+            big <= small * 10 + std::time::Duration::from_millis(50),
+            "{what}: {small:?}, then {big:?}"
+        );
+    }
+
+    #[test]
+    fn fold_is_linear_on_a_hostile_name() {
+        // D110: the old fold took ~27 s on a 1 MB name in a debug build (hours at 16 MiB),
+        // 1.7 s on 256 KB.
+        let unit = "16-bit ";
+        let small = unit.repeat((256 << 10) / unit.len());
+        let big = unit.repeat((1 << 20) / unit.len());
+        let t = timings(5, || drop(fold(&small)), || drop(fold(&big)));
+        assert_scales("fold", t);
+        assert_eq!(fold(&big), "16bit ".repeat((1 << 20) / unit.len()));
+    }
+
+    #[test]
+    fn parse_one_is_linear_on_many_brackets() {
+        // D110 review: per-token bracket scans made these quadratic (release build: "[x] " ×
+        // 64 KB took 1.1 s, × 256 KB 23 s; "(2020) " 0.2 s and 3 s; now 0.08 s at 256 KB).
+        // Uncapped on purpose: parse_one is what the caps protect. 16 KB, then 64 KB (~0.3 s
+        // per parse in a debug build).
+        let video = Ctx {
+            video: true,
+            ..Ctx::default()
+        };
+        let anime = Ctx {
+            anime: true,
+            video: true,
+            ..Ctx::default()
+        };
+        for unit in ["[x] ", "(2020) ", "[01] ", "[ENG] ", "(1080) "] {
+            let small = unit.repeat((16 << 10) / unit.len());
+            let big = unit.repeat((64 << 10) / unit.len());
+            let both = |name: &str| {
+                let _ = parse_one(name, &video);
+                let _ = parse_one(name, &anime);
+            };
+            assert_scales(unit, timings(3, || both(&small), || both(&big)));
+        }
+    }
+
+    #[test]
+    fn parse_release_and_classify_cap_the_name() {
+        // D110 review: rows stored before D110 kept uncapped titles and paths, and are parsed
+        // again on every parser or classifier version bump.
+        let name = "[x] ".repeat((4 << 20) / 4);
+        let files = [TorrentFile {
+            path: format!("{}.mkv", "(2020) ".repeat((64 << 10) / 7)),
+            size: Some(1),
+        }];
+        // The 4 MiB name costs what its first KiB does (uncapped, it took minutes).
+        let run = |name: &str| {
+            let _ = parse_release(name, &files, Category::Video);
+            let _ = crate::classify::classify(name, &files);
+        };
+        assert_scales(
+            "4 MiB name",
+            timings(5, || run(capped(&name)), || run(&name)),
+        );
+        let a = parse_release(&name, &files, Category::Video);
+        let c = crate::classify::classify(&name, &files);
+        assert_eq!(
+            format!("{a:?}"),
+            format!(
+                "{:?}",
+                parse_release(capped(&name), &files, Category::Video)
+            )
+        );
+        assert_eq!(
+            format!("{c:?}"),
+            format!("{:?}", crate::classify::classify(capped(&name), &files))
+        );
+        let mut s = String::from("a");
+        s.push_str(&"é".repeat(NAME_MAX));
+        assert_eq!(capped(&s).len(), NAME_MAX - 1);
+        assert_eq!(capped("short"), "short");
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn fold_matches_the_old_fold_on_fragments(
+            parts in proptest::collection::vec(
+                proptest::sample::select(vec![
+                    "dd+", "DD+", "hdr10+", "E-AC-3", "e-ac3", "Blu-Ray", "web-dl", "dts-hd",
+                    "dts:x", "Dolby.Vision", "director's cut", "multi-sub", "multi-subs",
+                    "dual áudio", "Dual Áudio", "HE-AAC", "aac-lc", "x-264", "10-bit", "10 bit",
+                    "-", ".", " ", "a", "é", "É", "x", "1", "0", "bit", "multi", "sub", "s",
+                ]),
+                0..40,
+            )
+        ) {
+            let name: String = parts.concat();
+            proptest::prop_assert_eq!(fold(&name), fold_quadratic(&name));
+        }
+    }
 
     fn p(name: &str) -> ReleaseAttrs {
         parse_release(name, &[], Category::Video)

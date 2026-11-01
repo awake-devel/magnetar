@@ -89,31 +89,156 @@ fn info(id: usize, h: &ManagedTorrent) -> DownloadInfo {
     }
 }
 
+/// File (under `state_dir`) holding librqbit's peer blocklist.
+const PEER_BLOCKLIST_FILE: &str = "peer-blocklist.txt";
+
+/// The shared address policy's ranges (D112) in the P2P blocklist format librqbit reads
+/// (`name:first-last`, one range per line), plus the IPv4-mapped form of every IPv4 range.
+/// librqbit checks it before every outgoing peer connect and on every incoming one, so a tracker
+/// or DHT peer cannot make a download dial 192.168.1.1, 127.0.0.1 or the tailnet. NAT64 and 6to4
+/// addresses that embed a private IPv4 address are not listed (librqbit matches ranges only).
+/// `own` (our own addresses, [`crate::netaddr::OwnAddrs::snapshot`]) is listed too, as it is
+/// when the session starts: an address learned later is not added.
+pub fn peer_blocklist(own: &[(std::net::IpAddr, u8)]) -> String {
+    use crate::netaddr::{BLOCKED_V4, BLOCKED_V6};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let mut out = String::from("# magnetar: non-public ranges (D112)\n");
+    for &(net, len) in own {
+        match net {
+            IpAddr::V4(v4) => {
+                let first = u32::from(v4);
+                let last = first | (u32::MAX.checked_shr(u32::from(len)).unwrap_or(0));
+                let (a, b) = (Ipv4Addr::from(first), Ipv4Addr::from(last));
+                out.push_str(&format!("own:{a}-{b}\n"));
+                out.push_str(&format!(
+                    "own:{}-{}\n",
+                    a.to_ipv6_mapped(),
+                    b.to_ipv6_mapped()
+                ));
+            }
+            IpAddr::V6(v6) => {
+                let first = u128::from(v6);
+                let last = first | (u128::MAX.checked_shr(u32::from(len)).unwrap_or(0));
+                out.push_str(&format!(
+                    "own6:{}-{}\n",
+                    Ipv6Addr::from(first),
+                    Ipv6Addr::from(last)
+                ));
+            }
+        }
+    }
+    for &(net, len) in BLOCKED_V4 {
+        let first = u32::from(net);
+        let last = first | (u32::MAX.checked_shr(u32::from(len)).unwrap_or(0));
+        let (a, b) = (Ipv4Addr::from(first), Ipv4Addr::from(last));
+        out.push_str(&format!("local:{a}-{b}\n"));
+        let mapped = |v: Ipv4Addr| v.to_ipv6_mapped();
+        out.push_str(&format!("mapped:{}-{}\n", mapped(a), mapped(b)));
+    }
+    // ::ffff:0:0/96 (IPv4-mapped) is cut out of the IPv6 ranges that contain it (::/8): mapped
+    // addresses are judged by their IPv4 part, listed above.
+    let mapped_first = u128::from(Ipv4Addr::UNSPECIFIED.to_ipv6_mapped());
+    let mapped_last = u128::from(Ipv4Addr::BROADCAST.to_ipv6_mapped());
+    let mut push6 = |first: u128, last: u128| {
+        let (a, b) = (Ipv6Addr::from(first), Ipv6Addr::from(last));
+        out.push_str(&format!("local6:{a}-{b}\n"));
+    };
+    for &(net, len) in BLOCKED_V6 {
+        let first = u128::from(net);
+        let last = first | (u128::MAX.checked_shr(u32::from(len)).unwrap_or(0));
+        if first <= mapped_first && mapped_last <= last {
+            push6(first, mapped_first - 1);
+            push6(mapped_last + 1, last);
+        } else {
+            push6(first, last);
+        }
+    }
+    out
+}
+
+/// A `file://` URL for `path`, made absolute first: a relative state directory (`HOME` unset
+/// gives `./.local/...`) must not break downloads.
+fn file_url(path: &std::path::Path) -> Result<url::Url> {
+    let abs = std::path::absolute(path)
+        .map_err(|e| Error::Other(format!("path {}: {e}", path.display())))?;
+    url::Url::from_file_path(&abs).map_err(|()| Error::Other(format!("path {}", abs.display())))
+}
+
+/// Session options: persistence and DHT state under `state_dir`, peer blocklist written there.
+async fn session_options(state_dir: &std::path::Path) -> Result<SessionOptions> {
+    let path = state_dir.join(PEER_BLOCKLIST_FILE);
+    tokio::fs::write(&path, peer_blocklist(&crate::netaddr::OWN.snapshot()))
+        .await
+        .map_err(|e| Error::Other(format!("write {}: {e}", path.display())))?;
+    let blocklist_url = file_url(&path)?;
+    Ok(SessionOptions {
+        dht: Some(DhtSessionConfig {
+            bootstrap_addrs: None,
+            port: None,
+            persistence: Some(DhtPersistenceConfig {
+                dump_interval: None,
+                config_filename: Some(state_dir.join("dht.json")),
+            }),
+        }),
+        persistence: Some(SessionPersistenceConfig::Json {
+            folder: Some(state_dir.join("session")),
+        }),
+        fastresume: true,
+        client_name_and_version: Some(crate::identity::USER_AGENT.into()),
+        blocklist_url: Some(blocklist_url.into()),
+        ..Default::default()
+    })
+}
+
+/// `magnet` without the `tr=` trackers that can only be local or are our own address (D112): a
+/// non-public or own IP literal in any spelling, a `localhost` name, or a URL that does not
+/// parse. librqbit announces to every tracker left with its own HTTP client (redirects
+/// followed, names resolved unchecked), so this is the only check those requests get; a name
+/// that resolves to a private address still gets through (UNVERIFIED: no hook in librqbit).
+pub fn drop_local_trackers(magnet: &str) -> String {
+    let Some((head, query)) = magnet.split_once('?') else {
+        return magnet.to_string();
+    };
+    // Keys and values are decoded the way librqbit reads them (`query_pairs`), so `t%72=` is
+    // a tracker too.
+    let decode = |s: &str| {
+        percent_encoding::percent_decode_str(&s.replace('+', " "))
+            .decode_utf8_lossy()
+            .into_owned()
+    };
+    let refused = |v: &str| {
+        let v = decode(v).trim().to_string();
+        match url::Url::parse(&v) {
+            Ok(u) => {
+                crate::netaddr::is_local_host(&u)
+                    || crate::netaddr::url_ip(&u)
+                        .is_some_and(|ip| !crate::netaddr::AddrPolicy::PUBLIC.allows(ip))
+            }
+            Err(_) => true,
+        }
+    };
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|kv| {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            let k = decode(k);
+            !((k == "tr" || k.starts_with("tr.")) && refused(v))
+        })
+        .collect();
+    format!("{head}?{}", kept.join("&"))
+}
+
 impl Downloader {
     /// Explicit session + DHT persistence under `state_dir` (never ProjectDirs).
     pub async fn new(output_dir: PathBuf, state_dir: PathBuf) -> Result<Self> {
+        let state_dir = std::path::absolute(&state_dir).unwrap_or(state_dir);
         let session_dir = state_dir.join("session");
         for d in [&output_dir, &state_dir, &session_dir] {
             tokio::fs::create_dir_all(d)
                 .await
                 .map_err(|e| Error::Other(format!("create {}: {e}", d.display())))?;
         }
-        let opts = SessionOptions {
-            dht: Some(DhtSessionConfig {
-                bootstrap_addrs: None,
-                port: None,
-                persistence: Some(DhtPersistenceConfig {
-                    dump_interval: None,
-                    config_filename: Some(state_dir.join("dht.json")),
-                }),
-            }),
-            persistence: Some(SessionPersistenceConfig::Json {
-                folder: Some(session_dir),
-            }),
-            fastresume: true,
-            client_name_and_version: Some(concat!("magnetar/", env!("CARGO_PKG_VERSION")).into()),
-            ..Default::default()
-        };
+        let opts = session_options(&state_dir).await?;
         let session = Session::new_with_opts(output_dir.clone(), opts)
             .await
             .map_err(other)?;
@@ -139,7 +264,7 @@ impl Downloader {
         }
 
         let session = self.session.clone();
-        let url = magnet.to_string();
+        let url = drop_local_trackers(magnet);
         let mut task = tokio::spawn(async move {
             let opts = AddTorrentOptions {
                 overwrite: true,
@@ -288,7 +413,146 @@ impl Downloader {
 mod tests {
     use super::*;
 
+    /// D112: the session librqbit builds from our options refuses LAN, loopback, tailnet, ULA
+    /// and link-local peers. The session is started without DHT, listener or LSD, so nothing
+    /// leaves the machine.
     #[tokio::test]
+    async fn session_blocks_local_peers() {
+        let dir = std::env::temp_dir().join(format!("magnetar-dl-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        let opts = SessionOptions {
+            dht: None,
+            listen: None,
+            persistence: None,
+            fastresume: false,
+            disable_local_service_discovery: true,
+            disable_trackers: true,
+            ..session_options(&dir).await.unwrap()
+        };
+        let session = Session::new_with_opts(dir.join("out"), opts).await.unwrap();
+        for ip in [
+            "192.168.1.1",
+            "127.0.0.1",
+            "10.1.2.3",
+            "100.100.1.1",
+            "172.18.0.2",
+            "169.254.1.1",
+            "0.0.0.0",
+            // 255.255.255.255 is the one gap: librqbit stores ranges end-exclusive with a
+            // saturating +1, so the very last address cannot be listed (a TCP connect to the
+            // broadcast address fails anyway). 255.255.255.254 is in.
+            "255.255.255.254",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:192.168.1.1",
+        ] {
+            let ip: std::net::IpAddr = ip.parse().unwrap();
+            assert!(session.blocklist.has(ip), "{ip} must be blocked");
+        }
+        for ip in [
+            "1.1.1.1",
+            "87.98.162.88",
+            "2606:4700::1111",
+            "::ffff:1.1.1.1",
+        ] {
+            let ip: std::net::IpAddr = ip.parse().unwrap();
+            assert!(!session.blocklist.has(ip), "{ip} must stay allowed");
+        }
+        session.stop().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// D112: `tr=` trackers on a non-public or own literal (any spelling) or a `localhost` name
+    /// never reach librqbit; public ones and every other parameter are kept byte for byte.
+    #[test]
+    fn magnet_local_trackers_are_dropped() {
+        let xt = "xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10&dn=Sintel";
+        let public = "tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce";
+        let magnet = format!(
+            "magnet:?{xt}&tr=http%3A%2F%2F192.168.1.1%2Fannounce&{public}\
+             &tr=udp://127.1:6969&tr.1=http%3A%2F%2Flocalhost%3A8080%2Fa\
+             &tr=http%3A%2F%2F%5Bfd00%3A%3A1%5D%2Fa&tr=udp%3A%2F%2F100.100.1.1%3A80\
+             &tr=not%20a%20url&t%72=http%3A%2F%2F192.168.1.1%2Fannounce\
+             &%74r=udp://127.0.0.1:6969&x.pe=1.2.3.4:6881"
+        );
+        assert_eq!(
+            drop_local_trackers(&magnet),
+            format!("magnet:?{xt}&{public}&x.pe=1.2.3.4:6881")
+        );
+        // Read back the way librqbit does: no local tracker survives under any key spelling.
+        let kept = url::Url::parse(&drop_local_trackers(&magnet)).unwrap();
+        let trackers: Vec<String> = kept
+            .query_pairs()
+            .filter(|(k, _)| k == "tr" || k.starts_with("tr."))
+            .map(|(_, v)| v.into_owned())
+            .collect();
+        assert_eq!(trackers, ["udp://tracker.opentrackr.org:1337/announce"]);
+        assert_eq!(drop_local_trackers("magnet:"), "magnet:");
+    }
+
+    /// librqbit really blocks the `own:` lines of [`peer_blocklist`] (D112), not just lists them.
+    #[tokio::test]
+    async fn session_blocks_own_addresses() {
+        let dir = std::env::temp_dir().join(format!("magnetar-dl-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        let own = crate::netaddr::parse_nets(&["11.22.33.44", "2a01:e0a:1:2::/64"]).unwrap();
+        let list = dir.join("own-blocklist.txt");
+        std::fs::write(&list, peer_blocklist(&own)).unwrap();
+        let opts = SessionOptions {
+            dht: None,
+            listen: None,
+            persistence: None,
+            fastresume: false,
+            disable_local_service_discovery: true,
+            disable_trackers: true,
+            blocklist_url: Some(file_url(&list).unwrap().into()),
+            ..session_options(&dir).await.unwrap()
+        };
+        let session = Session::new_with_opts(dir.join("out"), opts).await.unwrap();
+        for ip in [
+            "11.22.33.44",
+            "::ffff:11.22.33.44",
+            "2a01:e0a:1:2::99",
+            "192.168.1.1",
+        ] {
+            let ip: std::net::IpAddr = ip.parse().unwrap();
+            assert!(session.blocklist.has(ip), "{ip} must be blocked");
+        }
+        for ip in ["11.22.33.45", "2a01:e0a:1:3::1"] {
+            let ip: std::net::IpAddr = ip.parse().unwrap();
+            assert!(!session.blocklist.has(ip), "{ip} must stay allowed");
+        }
+        session.stop().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A relative state directory (`HOME` unset) still gives a usable blocklist URL.
+    #[test]
+    fn relative_state_dir_gives_a_file_url() {
+        let u = file_url(std::path::Path::new("state/peer-blocklist.txt")).unwrap();
+        assert_eq!(u.scheme(), "file");
+        assert!(u.path().ends_with("/state/peer-blocklist.txt"), "{u}");
+    }
+
+    /// Our own addresses go into the blocklist (IPv4 also IPv4-mapped).
+    #[test]
+    fn blocklist_lists_own_addresses() {
+        let own = crate::netaddr::parse_nets(&["11.22.33.44", "2a01:e0a:1:2::/64"]).unwrap();
+        let text = peer_blocklist(&own);
+        for line in [
+            "own:11.22.33.44-11.22.33.44",
+            "own:::ffff:11.22.33.44-::ffff:11.22.33.44",
+            "own6:2a01:e0a:1:2::-2a01:e0a:1:2:ffff:ffff:ffff:ffff",
+        ] {
+            assert!(text.lines().any(|l| l == line), "{line} missing:\n{text}");
+        }
+    }
+
+    /// Starts librqbit's DHT, which contacts the public bootstrap routers: not part of the
+    /// local suite (tests stay local).
+    #[tokio::test]
+    #[ignore = "network: librqbit DHT bootstrap"]
     async fn session_lifecycle_offline() {
         let dir = std::env::temp_dir().join(format!("magnetar-dl-{}", rand::random::<u64>()));
         let d = Downloader::new(dir.join("out"), dir.join("state"))

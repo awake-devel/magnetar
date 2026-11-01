@@ -4,7 +4,9 @@
 //! `file tree`).
 //!
 //! The input was verified against the infohash, but its content is still chosen by whoever made
-//! the torrent: nothing here panics, logs or allocates beyond a small multiple of the input.
+//! the torrent: nothing here panics or logs, and the strings it builds are priced in real
+//! (decoded) bytes before they are allocated, against an absolute cap ([`output_max`]) and a
+//! bound relative to the dict's size ([`output_bound`], D110).
 //! **Nothing here may log a name or path** (docs/DHT.md §7.1: the blocklist runs after this).
 
 use crate::liveness::bencode::{self, Value};
@@ -13,6 +15,64 @@ use crate::liveness::bencode::{self, Value};
 const PAD_DIR: &str = ".pad";
 /// BitComet's padding files, from before BEP 47 (`_____padding_file_N_…`).
 const BITCOMET_PAD: &str = "_____padding_file_";
+
+/// Longest name and display path kept, in bytes (D110): the Nostr title cap
+/// (`nip35::MAX_TITLE_BYTES`). Real names are well under 300 bytes; a longer one is cut on a
+/// character boundary so the title, its tsvector and the release parser stay small. The
+/// blocklist input ([`InfoSummary::all_names`]) keeps the full strings.
+pub const DISPLAY_MAX: usize = 1024;
+/// Longest BEP 52 file-tree path joined, in raw bytes with separators (D110): Linux `PATH_MAX`,
+/// so no client could write a longer one. Longer → [`InfoError::TooComplex`].
+pub const TREE_PATH_MAX: usize = 4096;
+/// Real bytes of strings a parse may build per byte of `metadata_max` (D110): every name,
+/// `all_names` entry and display path, measured after lossy UTF-8 decoding (an invalid byte
+/// becomes the 3-byte U+FFFD) and before it is allocated. Absolute: padding a dict does not
+/// raise it. A real dict needs its whole paths once for the blocklist plus up to
+/// [`DISPLAY_MAX`] per displayed file: ~4.7× its size for a v2 manga pack with long directory
+/// names (6800 files, 547 KB, `a_manga_pack_parses`), ~7.8× with the per-string and per-file
+/// prices, so at the default 16 MiB a v2 dict of that shape fits up to ~6 MB. One huge
+/// directory key over many leaves asked for terabytes. [`output_bound`] also bounds it by the
+/// dict's size.
+pub const OUTPUT_FACTOR: usize = 3;
+/// Floor of [`output_max`], so small `metadata_max` settings still parse ordinary dicts.
+const OUTPUT_MIN: usize = 4 * 1024 * 1024;
+/// Bytes charged per string built on top of its contents, so strings that decode to nothing
+/// (all NUL) are not free: its 24 B `String` header in a `Vec` that may have doubled (48 B),
+/// plus the allocator's rounding of a short heap buffer (D110; `tests/parse_memory.rs` checks
+/// the price against a counting allocator).
+pub const STRING_COST: usize = 64;
+/// Bytes charged per [`InfoFile`] on top of its path string: 32 B, plus half again for the
+/// growth of its `Vec` (D110; the counting allocator in `tests/parse_memory.rs` finds what a
+/// summary keeps 10–25 % under the price).
+pub const FILE_COST: usize = 48;
+/// Real bytes of strings a parse may build per byte of the dict (D110), on top of
+/// [`OUTPUT_SLACK`]: results are held long after the decode (a worker upload holds up to 1 000,
+/// the DHT pipeline a channel plus a 500-row batch), so what a small dict may build must scale
+/// with its size, not with `metadata_max`. The manga pack (`a_manga_pack_parses`, 547 KB) is
+/// priced ~7.8× its size with the per-string and per-file prices (2.6 MB of strings).
+pub const SIZE_FACTOR: usize = 8;
+/// Bytes any dict may build whatever its size (D110): a short dict with a few long names.
+pub const OUTPUT_SLACK: usize = 1024 * 1024;
+/// The default `MAGNETAR_DHT_METADATA_MAX` (16 MiB), the cap [`parse_info`] uses.
+const DEFAULT_METADATA_MAX: usize = 16 * 1024 * 1024;
+
+/// Most real bytes of strings one parse may build when dicts are at most `metadata_max` bytes
+/// (D110): [`OUTPUT_FACTOR`] × `metadata_max`, at least 4 MiB. A parse is also bounded by the
+/// dict's size ([`output_bound`]), and the fetcher reserves that bound in each decode's price.
+pub const fn output_max(metadata_max: usize) -> usize {
+    let n = metadata_max.saturating_mul(OUTPUT_FACTOR);
+    if n < OUTPUT_MIN { OUTPUT_MIN } else { n }
+}
+
+/// Most real bytes of strings the parse of a `raw_len`-byte dict may build (D110):
+/// `min(output_max, SIZE_FACTOR × raw_len + OUTPUT_SLACK)`. [`parse_info_bounded`] applies it, so
+/// every caller does.
+pub const fn output_bound(raw_len: usize, output_max: usize) -> usize {
+    let n = raw_len
+        .saturating_mul(SIZE_FACTOR)
+        .saturating_add(OUTPUT_SLACK);
+    if n < output_max { n } else { output_max }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InfoFile {
@@ -89,18 +149,78 @@ impl InfoError {
     }
 }
 
-/// Lossy UTF-8 without NUL (Postgres `text` and `jsonb` cannot hold U+0000).
-fn text(b: &[u8]) -> String {
-    let s = String::from_utf8_lossy(b);
-    if s.contains('\0') {
-        s.replace('\0', "")
-    } else {
-        s.into_owned()
-    }
+/// Length of [`text`]`(b)` without allocating: lossy UTF-8 (one U+FFFD, 3 bytes, per invalid
+/// sequence, as `String::from_utf8_lossy`), NUL removed.
+fn text_len(b: &[u8]) -> usize {
+    b.utf8_chunks()
+        .map(|c| {
+            let nul = c.valid().bytes().filter(|&x| x == 0).count();
+            c.valid().len() - nul + if c.invalid().is_empty() { 0 } else { 3 }
+        })
+        .sum()
 }
 
-fn strict_text(b: &[u8]) -> Option<String> {
-    std::str::from_utf8(b).ok().map(|s| s.replace('\0', ""))
+/// Push `s` while `out` stays within `max` bytes, cut on a character boundary. False once
+/// something was cut (nothing more may follow, or the result would not be a prefix).
+fn push_capped(out: &mut String, s: &str, max: usize) -> bool {
+    let room = max.saturating_sub(out.len());
+    if s.len() <= room {
+        out.push_str(s);
+        return true;
+    }
+    let mut end = room;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.push_str(&s[..end]);
+    false
+}
+
+/// Append [`text`]`(b)` to `out`, stopping at `max` bytes. False once cut.
+fn push_text(out: &mut String, b: &[u8], max: usize) -> bool {
+    for c in b.utf8_chunks() {
+        for piece in c.valid().split('\0') {
+            if !push_capped(out, piece, max) {
+                return false;
+            }
+        }
+        if !c.invalid().is_empty() && !push_capped(out, "\u{FFFD}", max) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Lossy UTF-8 without NUL (Postgres `text` and `jsonb` cannot hold U+0000).
+fn text(b: &[u8]) -> String {
+    let mut s = String::with_capacity(text_len(b));
+    push_text(&mut s, b, usize::MAX);
+    s
+}
+
+/// True when `b` is valid UTF-8 (then [`text`] keeps it as is, NUL removed).
+fn is_utf8(b: &[u8]) -> bool {
+    std::str::from_utf8(b).is_ok()
+}
+
+/// The real bytes a parse may still build, spent before each string is allocated (D110).
+struct Budget(usize);
+
+impl Budget {
+    /// Take one string of `n` bytes, or fail before anything is allocated.
+    fn spend(&mut self, n: usize) -> Result<(), InfoError> {
+        self.take(n.saturating_add(STRING_COST))
+    }
+
+    /// Take one [`InfoFile`] entry (its path is spent on its own).
+    fn file(&mut self) -> Result<(), InfoError> {
+        self.take(FILE_COST)
+    }
+
+    fn take(&mut self, n: usize) -> Result<(), InfoError> {
+        self.0 = self.0.checked_sub(n).ok_or(InfoError::TooComplex)?;
+        Ok(())
+    }
 }
 
 /// True when some dict in the tree has a key twice.
@@ -129,19 +249,44 @@ fn path_parts(v: &Value) -> Option<Vec<&[u8]>> {
     v.as_list()?.iter().map(Value::as_bytes).collect()
 }
 
-fn join(parts: &[&[u8]], strict: bool) -> Option<String> {
-    let mut out = String::new();
+/// Length of [`join`]`(parts, usize::MAX)`, without allocating.
+fn join_len(parts: &[&[u8]]) -> usize {
+    parts.iter().map(|p| text_len(p)).sum::<usize>() + parts.len().saturating_sub(1)
+}
+
+/// The parts as lossy text joined by `/`, at most `max` bytes (cut on a character boundary).
+fn join(parts: &[&[u8]], max: usize) -> String {
+    let mut out = String::with_capacity(join_len(parts).min(max));
     for (i, p) in parts.iter().enumerate() {
-        if i > 0 {
-            out.push('/');
-        }
-        if strict {
-            out.push_str(&strict_text(p)?);
-        } else {
-            out.push_str(&text(p));
+        if (i > 0 && !push_capped(&mut out, "/", max)) || !push_text(&mut out, p, max) {
+            break;
         }
     }
-    Some(out)
+    out
+}
+
+/// Price and build one full `all_names` path.
+fn name_path(parts: &[&[u8]], budget: &mut Budget) -> Result<String, InfoError> {
+    budget.spend(join_len(parts))?;
+    Ok(join(parts, usize::MAX))
+}
+
+/// Price and build one display path, capped at [`DISPLAY_MAX`].
+fn display_path(parts: &[&[u8]], budget: &mut Budget) -> Result<String, InfoError> {
+    budget.spend(join_len(parts).min(DISPLAY_MAX))?;
+    Ok(join(parts, DISPLAY_MAX))
+}
+
+/// Cut `s` to at most `max` bytes on a character boundary (no-op when it fits).
+pub fn truncate_utf8(s: &mut String, max: usize) {
+    if s.len() <= max {
+        return;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
 }
 
 fn is_padding(attr: Option<&[u8]>, first: Option<&[u8]>, last: Option<&[u8]>) -> bool {
@@ -150,8 +295,17 @@ fn is_padding(attr: Option<&[u8]>, first: Option<&[u8]>, last: Option<&[u8]>) ->
         || last.is_some_and(|l| l.starts_with(BITCOMET_PAD.as_bytes()))
 }
 
-/// Parse a verified info dict.
+/// Parse a verified info dict, building at most [`output_max`] of the default 16 MiB
+/// `metadata_max` in strings.
 pub fn parse_info(raw: &[u8]) -> Result<InfoSummary, InfoError> {
+    parse_info_bounded(raw, output_max(DEFAULT_METADATA_MAX))
+}
+
+/// Parse a verified info dict, building at most [`output_bound`]`(raw.len(), output_max)` real
+/// bytes of strings (names, `all_names`, display paths, priced per string and per file); above
+/// it [`InfoError::TooComplex`], before the string that would cross it is allocated (D110).
+pub fn parse_info_bounded(raw: &[u8], output_max: usize) -> Result<InfoSummary, InfoError> {
+    let mut budget = Budget(output_bound(raw.len(), output_max));
     let v = bencode::decode(raw).map_err(|_| InfoError::Decode)?;
     if v.as_dict().is_none() {
         return Err(InfoError::Decode);
@@ -166,15 +320,21 @@ pub fn parse_info(raw: &[u8]) -> Result<InfoSummary, InfoError> {
     let mut all_names = Vec::new();
     let name_raw = v.get(b"name").and_then(Value::as_bytes);
     let name_utf8 = v.get(b"name.utf-8").and_then(Value::as_bytes);
-    if let Some(n) = name_raw {
+    for n in [name_raw, name_utf8].into_iter().flatten() {
+        budget.spend(text_len(n))?;
         all_names.push(text(n));
     }
-    if let Some(n) = name_utf8 {
-        all_names.push(text(n));
-    }
+    // `name.utf-8` when it is valid UTF-8, else `name` lossy; capped as it is built (D110).
     let name = name_utf8
-        .and_then(strict_text)
-        .or_else(|| name_raw.map(text))
+        .filter(|n| is_utf8(n))
+        .or(name_raw)
+        .map(|n| {
+            budget.spend(text_len(n).min(DISPLAY_MAX))?;
+            let mut s = String::new();
+            push_text(&mut s, n, DISPLAY_MAX);
+            Ok(s)
+        })
+        .transpose()?
         .map(|n| n.trim().to_string())
         .filter(|n| !n.is_empty())
         .ok_or(InfoError::NoName)?;
@@ -196,11 +356,8 @@ pub fn parse_info(raw: &[u8]) -> Result<InfoSummary, InfoError> {
             let parts_utf8 = f.get(b"path.utf-8").and_then(path_parts);
             let first = parts.as_ref().and_then(|p| p.first().copied());
             let last = parts.as_ref().and_then(|p| p.last().copied());
-            if let Some(p) = &parts {
-                all_names.push(join(p, false).unwrap_or_default());
-            }
-            if let Some(p) = &parts_utf8 {
-                all_names.push(join(p, false).unwrap_or_default());
+            for p in [&parts, &parts_utf8].into_iter().flatten() {
+                all_names.push(name_path(p, &mut budget)?);
             }
             if is_padding(attr, first, last) {
                 // BEP 47: a padding file's path may be absent; its length is still required by
@@ -211,12 +368,13 @@ pub fn parse_info(raw: &[u8]) -> Result<InfoSummary, InfoError> {
                 .and_then(|l| u64::try_from(l).ok())
                 .ok_or(InfoError::BadFiles)?;
             let parts = parts.filter(|p| !p.is_empty()).ok_or(InfoError::BadFiles)?;
-            let path = parts_utf8
+            // `path.utf-8` when every element is valid UTF-8, else `path` lossy.
+            let shown = parts_utf8
                 .as_deref()
-                .filter(|p| !p.is_empty())
-                .and_then(|p| join(p, true))
-                .or_else(|| join(&parts, false))
-                .ok_or(InfoError::BadFiles)?;
+                .filter(|p| !p.is_empty() && p.iter().all(|e| is_utf8(e)))
+                .unwrap_or(&parts);
+            let path = display_path(shown, &mut budget)?;
+            budget.file()?;
             files.push(InfoFile { path, size });
         }
     } else if let Some(len) = v.get(b"length") {
@@ -224,13 +382,23 @@ pub fn parse_info(raw: &[u8]) -> Result<InfoSummary, InfoError> {
             .as_int()
             .and_then(|l| u64::try_from(l).ok())
             .ok_or(InfoError::BadFiles)?;
+        budget.spend(name.len())?;
+        budget.file()?;
         files.push(InfoFile {
             path: name.clone(),
             size,
         });
     } else if let Some(t) = tree {
         // v2-only dicts: the file tree is the only file list.
-        walk_tree(t, &mut Vec::new(), &mut files, &mut all_names, 0)?;
+        walk_tree(
+            t,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut files,
+            &mut all_names,
+            &mut budget,
+            0,
+        )?;
     } else {
         return Err(InfoError::BadFiles);
     }
@@ -238,7 +406,15 @@ pub fn parse_info(raw: &[u8]) -> Result<InfoSummary, InfoError> {
         // Hybrid: the v1 list is displayed, the v2 keys still go to the blocklist. A tree that
         // does not walk is an invalid hybrid (the screen must see every name, not a prefix).
         let mut ignored = Vec::new();
-        walk_tree(t, &mut Vec::new(), &mut ignored, &mut all_names, 0)?;
+        walk_tree(
+            t,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut ignored,
+            &mut all_names,
+            &mut budget,
+            0,
+        )?;
     }
     let total_size = files
         .iter()
@@ -251,6 +427,7 @@ pub fn parse_info(raw: &[u8]) -> Result<InfoSummary, InfoError> {
     if total_size == 0 {
         return Err(InfoError::Empty);
     }
+    // Display strings were built capped (D110); the screen has the full ones in all_names.
     Ok(InfoSummary {
         name,
         files,
@@ -265,11 +442,17 @@ pub fn parse_info(raw: &[u8]) -> Result<InfoSummary, InfoError> {
 }
 
 /// BEP 52 `file tree`: dict keys are path elements; a key `""` holding `length` marks a file.
+/// Every leaf joins its whole prefix, so each string is priced in real bytes first (D110): at
+/// most [`TREE_PATH_MAX`] raw bytes per path and the parse's [`Budget`] in all, else
+/// [`InfoError::TooComplex`]. `lens` holds each prefix element's decoded length, so a leaf is
+/// priced in O(depth).
 fn walk_tree<'a>(
     node: &'a Value,
     prefix: &mut Vec<&'a [u8]>,
+    lens: &mut Vec<usize>,
     files: &mut Vec<InfoFile>,
     names: &mut Vec<String>,
+    budget: &mut Budget,
     depth: usize,
 ) -> Result<(), InfoError> {
     // The decoder caps nesting at 64; this keeps our own recursion bounded the same way.
@@ -289,20 +472,34 @@ fn walk_tree<'a>(
                 .and_then(|l| u64::try_from(l).ok())
                 .ok_or(InfoError::BadFiles)?;
             let attr = child.get(b"attr").and_then(Value::as_bytes);
+            // Raw and decoded lengths of the joined path (depth ≤ 64, so these sums are cheap).
+            let seps = prefix.len() - 1;
+            if prefix.iter().map(|p| p.len()).sum::<usize>() + seps > TREE_PATH_MAX {
+                return Err(InfoError::TooComplex);
+            }
+            let real_len = lens.iter().sum::<usize>() + seps;
+            let padding = is_padding(attr, prefix.first().copied(), prefix.last().copied());
             // The whole path too, as stored for v1 files (a screen rule may span elements).
-            names.push(join(prefix, false).unwrap_or_default());
-            if !is_padding(attr, prefix.first().copied(), prefix.last().copied()) {
+            budget.spend(real_len)?;
+            names.push(join(prefix, usize::MAX));
+            if !padding {
+                budget.spend(real_len.min(DISPLAY_MAX))?;
+                budget.file()?;
                 files.push(InfoFile {
-                    path: join(prefix, false).unwrap_or_default(),
+                    path: join(prefix, DISPLAY_MAX),
                     size: len,
                 });
             }
             continue;
         }
+        let n = text_len(k);
+        budget.spend(n)?;
         names.push(text(k));
         prefix.push(k);
-        let r = walk_tree(child, prefix, files, names, depth + 1);
+        lens.push(n);
+        let r = walk_tree(child, prefix, lens, files, names, budget, depth + 1);
         prefix.pop();
+        lens.pop();
         r?;
     }
     Ok(())
@@ -429,7 +626,267 @@ mod tests {
         );
     }
 
+    /// A v2-only info dict whose file tree is `tree` (a dict value).
+    fn v2_with_tree(tree: Value) -> Vec<u8> {
+        bencode::encode(&Value::Dict(vec![
+            (b"file tree".to_vec(), tree),
+            (b"meta version".to_vec(), Value::Int(2)),
+            (b"name".to_vec(), Value::Bytes(b"t".to_vec())),
+            (b"piece length".to_vec(), Value::Int(16384)),
+        ]))
+    }
+
+    /// A tree leaf: `{"": {length, pieces root}}`.
+    fn leaf(len: i64) -> Value {
+        Value::Dict(vec![(
+            Vec::new(),
+            Value::Dict(vec![
+                (b"length".to_vec(), Value::Int(len)),
+                (b"pieces root".to_vec(), Value::Bytes(vec![b'r'; 32])),
+            ]),
+        )])
+    }
+
+    /// `n` leaves named 0000, 0001, … under `dir`.
+    fn wide_dir(dir: Vec<u8>, n: usize) -> Value {
+        let leaves = (0..n)
+            .map(|i| (format!("{i:04}").into_bytes(), leaf(1)))
+            .collect();
+        Value::Dict(vec![(dir, Value::Dict(leaves))])
+    }
+
+    /// Real bytes of every string a summary holds.
+    fn built(s: &InfoSummary) -> usize {
+        s.name.len()
+            + s.files.iter().map(|f| f.path.len()).sum::<usize>()
+            + s.all_names.iter().map(String::len).sum::<usize>()
+    }
+
+    /// A hybrid dict: `tree` as its file tree, one v1 file, and `pieces` of `pad` bytes.
+    fn hybrid_with_tree(tree: Value, pad: usize) -> Vec<u8> {
+        bencode::encode(&Value::Dict(vec![
+            (b"file tree".to_vec(), tree),
+            (b"length".to_vec(), Value::Int(5)),
+            (b"name".to_vec(), Value::Bytes(b"a".to_vec())),
+            (b"pieces".to_vec(), Value::Bytes(vec![b'p'; pad])),
+        ]))
+    }
+
+    #[test]
+    fn file_tree_output_is_bounded_before_joining() {
+        // D110, the audit's shape: one big directory key over many tiny leaves. Each leaf
+        // used to copy the key twice (16 MB here from a ~150 KB dict; terabytes at 16 MiB).
+        let cap = output_max(0);
+        let raw = v2_with_tree(wide_dir(vec![b'k'; 4000], 2000));
+        assert!(raw.len() < 256 * 1024);
+        assert_eq!(parse_info_bounded(&raw, cap), Err(InfoError::TooComplex));
+        // One path longer than PATH_MAX is refused on its own.
+        let raw = v2_with_tree(wide_dir(vec![b'k'; TREE_PATH_MAX], 1));
+        assert_eq!(parse_info(&raw), Err(InfoError::TooComplex));
+        // A hybrid's tree is priced too (it feeds the blocklist input).
+        let raw = hybrid_with_tree(wide_dir(vec![b'k'; 4000], 2000), 0);
+        assert_eq!(parse_info_bounded(&raw, cap), Err(InfoError::TooComplex));
+    }
+
+    #[test]
+    fn output_is_capped_in_real_bytes() {
+        // D110 review: the cap counts decoded bytes (0xFF → U+FFFD, 3 bytes) and does not grow
+        // with the dict, so neither invalid UTF-8 nor `pieces` padding buys more output.
+        let cap = output_max(0);
+        let check = |raw: &[u8]| match parse_info_bounded(raw, cap) {
+            Ok(s) => panic!("accepted, {} bytes built for a {cap} cap", built(&s)),
+            Err(e) => assert_eq!(e, InfoError::TooComplex),
+        };
+        // 44 bytes of 0xFF over 20 000 leaves: ~1.5 MB of dict, ~6 MB of strings.
+        let raw = v2_with_tree(wide_dir(vec![0xFF; 44], 20_000));
+        assert!(raw.len() < cap / 2);
+        check(&raw);
+        // A hybrid padded with 3 MB of `pieces`, a 1000-byte 0xFF directory over 1500 leaves.
+        let raw = hybrid_with_tree(wide_dir(vec![0xFF; 1000], 1500), 3 << 20);
+        check(&raw);
+        // Whatever is accepted stays under the cap.
+        let raw = v2_with_tree(wide_dir(vec![0xFF; 44], 5000));
+        let s = parse_info_bounded(&raw, cap).unwrap();
+        assert_eq!(s.files.len(), 5000);
+        assert!(built(&s) <= cap);
+        assert!(s.files[0].path.starts_with('\u{FFFD}'));
+        // The default cap is reserved by the fetcher's decode price.
+        assert_eq!(output_max(16 << 20), OUTPUT_FACTOR * (16 << 20));
+    }
+
+    #[test]
+    fn small_hostile_dicts_build_in_proportion_to_their_size() {
+        // D110 review: the absolute cap alone let a 44 KB dict (a 4 000-byte 0xFF directory over
+        // 1 900 leaves without `pieces root`; ~140 KB with them) build 24.7 MB, and results are held by the hundred (a worker upload holds
+        // up to 1 000 before persisting). Whatever is built stays within 8 × the dict + 1 MiB.
+        let cap = output_max(16 << 20);
+        let (mut raw_total, mut built_total, mut dicts, mut refused) = (0, 0, 0, 0);
+        for dir in [16, 256, 1000, 4000] {
+            for leaves in [10, 100, 500, 1900] {
+                let raw = v2_with_tree(wide_dir(vec![0xFF; dir], leaves));
+                assert!(raw.len() < 256 * 1024);
+                raw_total += raw.len();
+                dicts += 1;
+                match parse_info_bounded(&raw, cap) {
+                    Ok(s) => {
+                        assert!(
+                            built(&s) <= output_bound(raw.len(), cap),
+                            "{dir} × {leaves}"
+                        );
+                        built_total += built(&s);
+                    }
+                    Err(e) => {
+                        assert_eq!(e, InfoError::TooComplex, "{dir} × {leaves}");
+                        refused += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            built_total <= SIZE_FACTOR * raw_total + dicts * OUTPUT_SLACK,
+            "{built_total} B built from {raw_total} B of {dicts} dicts"
+        );
+        // The reviewer's shape is refused; the small ones still parse.
+        let raw = v2_with_tree(wide_dir(vec![0xFF; 4000], 1900));
+        assert_eq!(parse_info_bounded(&raw, cap), Err(InfoError::TooComplex));
+        assert!(
+            refused > 0 && refused < dicts,
+            "{refused} of {dicts} refused"
+        );
+        // The bound: 8 × the dict + 1 MiB, never above the absolute cap.
+        assert_eq!(output_bound(1000, cap), 8000 + (1 << 20));
+        assert_eq!(output_bound(16 << 20, cap), cap);
+    }
+
+    #[test]
+    fn a_manga_pack_parses() {
+        // D110 review: a v2-only manga pack, long directory names over short page names (each
+        // leaf repeats ~190 bytes of directories), was refused by the raw-size budget.
+        let root = "Shingeki no Kyojin - Attack on Titan (2010-2021) (Complete Series) (Digital) (danke-Empire)";
+        let vols = (1..=34)
+            .map(|v| {
+                let name = format!(
+                    "Shingeki no Kyojin - Attack on Titan v{v:02} (2012) (Digital) (danke-Empire) [Kodansha Comics]"
+                );
+                let pages = (1..=200)
+                    .map(|p| (format!("{p:03}.jpg").into_bytes(), leaf(400_000)))
+                    .collect();
+                (name.into_bytes(), Value::Dict(pages))
+            })
+            .collect();
+        let tree = Value::Dict(vec![(root.as_bytes().to_vec(), Value::Dict(vols))]);
+        let raw = v2_with_tree(tree);
+        assert!(raw.len() < 600 * 1024);
+        let s = parse_info(&raw).unwrap();
+        assert_eq!(s.files.len(), 34 * 200);
+        assert!(s.files[0].path.ends_with("[Kodansha Comics]/001.jpg"));
+        // ~7.8 × with the per-string and per-file prices: inside the size-relative bound.
+        assert!(built(&s) <= output_bound(raw.len(), output_max(16 << 20)));
+    }
+
+    #[test]
+    fn real_file_trees_fit_the_budget() {
+        // A season pack: 3000 files under two shared directories, and one deep long path.
+        let season = Value::Dict(vec![(
+            b"Season 01".to_vec(),
+            Value::Dict(
+                (0..3000)
+                    .map(|i| {
+                        let name = format!("Some.Show.2020.S01E{i:04}.1080p.WEB-DL.x264-GRP.mkv");
+                        (name.into_bytes(), leaf(1_000_000))
+                    })
+                    .collect(),
+            ),
+        )]);
+        let tree = Value::Dict(vec![(
+            b"Some Show (2020) Complete [1080p WEB-DL]".to_vec(),
+            season,
+        )]);
+        let s = parse_info(&v2_with_tree(tree)).unwrap();
+        assert_eq!(s.files.len(), 3000);
+        assert!(
+            s.files[0]
+                .path
+                .starts_with("Some Show (2020) Complete [1080p WEB-DL]/Season 01/")
+        );
+        // 60 nested 64-byte directories (the decoder's depth limit): a 3.9 KB path, under
+        // TREE_PATH_MAX.
+        let mut node = leaf(7);
+        for i in 0..60 {
+            node = Value::Dict(vec![(
+                format!("{i:02}{}", "d".repeat(62)).into_bytes(),
+                node,
+            )]);
+        }
+        let s = parse_info(&v2_with_tree(node)).unwrap();
+        assert_eq!(s.files.len(), 1);
+        // The display path is capped, the blocklist input keeps the whole path.
+        assert_eq!(s.files[0].path.len(), DISPLAY_MAX);
+        assert!(s.all_names.iter().any(|n| n.len() == 60 * 64 + 59));
+    }
+
+    #[test]
+    fn name_and_paths_are_capped_on_a_char_boundary() {
+        // D110: the DHT title and each display path stop at DISPLAY_MAX bytes.
+        let long = "é".repeat(DISPLAY_MAX); // 2 bytes each
+        let raw = bencode::encode(&Value::Dict(vec![
+            (
+                b"files".to_vec(),
+                Value::List(vec![Value::Dict(vec![
+                    (b"length".to_vec(), Value::Int(5)),
+                    (
+                        b"path".to_vec(),
+                        Value::List(vec![Value::Bytes(format!("x{long}").into_bytes())]),
+                    ),
+                ])]),
+            ),
+            (b"name".to_vec(), Value::Bytes(long.clone().into_bytes())),
+        ]));
+        let s = parse_info(&raw).unwrap();
+        assert_eq!(s.name.len(), DISPLAY_MAX);
+        assert!(s.name.chars().all(|c| c == 'é'));
+        // "x" + é…: the cut falls inside an é and backs off one byte.
+        assert_eq!(s.files[0].path.len(), DISPLAY_MAX - 1);
+        // The screen still sees every byte.
+        assert!(s.all_names.contains(&long));
+        assert!(s.all_names.contains(&format!("x{long}")));
+        // A single-file torrent's path is its name: capped the same way.
+        let raw = format!(
+            "d6:lengthi1e4:name{}:{}e",
+            3 * DISPLAY_MAX,
+            "a".repeat(3 * DISPLAY_MAX)
+        );
+        let s = parse_info(raw.as_bytes()).unwrap();
+        assert_eq!(
+            (s.name.len(), s.files[0].path.len()),
+            (DISPLAY_MAX, DISPLAY_MAX)
+        );
+        let mut t = String::from("aé");
+        truncate_utf8(&mut t, 2);
+        assert_eq!(t, "a");
+    }
+
     proptest! {
+        #[test]
+        fn priced_lengths_match_what_is_built(
+            parts in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..40), 0..5),
+            max in 0usize..120,
+        ) {
+            // The price is the real decoded length (lossy UTF-8, NUL removed), and a capped
+            // join is a char-boundary prefix of the full one.
+            let parts: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+            for p in &parts {
+                let want = String::from_utf8_lossy(p).replace('\0', "");
+                prop_assert_eq!(text(p), want.clone());
+                prop_assert_eq!(text_len(p), want.len());
+            }
+            let full = join(&parts, usize::MAX);
+            prop_assert_eq!(full.len(), join_len(&parts));
+            let mut want = full.clone();
+            truncate_utf8(&mut want, max);
+            prop_assert_eq!(join(&parts, max), want);
+        }
+
         #[test]
         fn arbitrary_bytes_never_panic(b in proptest::collection::vec(any::<u8>(), 0..400)) {
             let _ = parse_info(&b);

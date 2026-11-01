@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod blocklist;
+pub mod body;
 pub mod classify;
 pub mod crawler;
 #[cfg(feature = "dht-crawl")]
@@ -13,12 +14,14 @@ pub mod enrich;
 pub mod enrich_anime;
 pub mod error;
 pub mod http;
+pub mod identity;
 pub mod ingest;
 pub mod liveness;
 pub mod magnet;
 #[cfg(feature = "dht-crawl")]
 pub mod metainfo;
 pub mod model;
+pub mod netaddr;
 pub mod nip35;
 pub mod nip66;
 pub mod notify;

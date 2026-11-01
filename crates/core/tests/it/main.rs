@@ -7,6 +7,7 @@ mod support;
 mod trust_support;
 
 mod api_client;
+mod body_caps;
 mod crawler;
 mod dht_bench;
 mod dht_fake_network;

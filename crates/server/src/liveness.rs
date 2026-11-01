@@ -63,6 +63,40 @@ pub const SERVER_CLAIM_SECS: i64 = 1800;
 /// Lease rows this far past their end are removed by the hourly maintenance.
 const LEASE_KEEP_SECS: i64 = 86400;
 
+/// Forced checks (`POST /api/v1/torrents/{ih}/liveness`, D113): one infohash is scraped again
+/// at most this often; a tap meanwhile gets the stored answer. A minute is well under the
+/// shortest scheduled re-check (1 h for errors) and longer than any one check takes.
+pub const FORCED_COOLDOWN: Duration = Duration::from_secs(60);
+/// Forced checks per minute, server-wide: a person tapping through torrents makes a few; more
+/// is a script, and each check is up to 30 tracker flows plus a DHT walk on the home router.
+pub const FORCED_PER_MINUTE: usize = 20;
+/// Forced checks running at once.
+pub const FORCED_CONCURRENCY: usize = 2;
+/// Longest a forced check runs (it shares the checker's trackers and may wait for a slot the
+/// batch holds); then the stored answer is returned. Under the API's 60 s request timeout.
+pub const FORCED_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Why a forced check does not run now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForcedRefusal {
+    /// This infohash was checked less than [`FORCED_COOLDOWN`] ago: use the stored answer.
+    Cooldown,
+    /// Over [`FORCED_PER_MINUTE`] or [`FORCED_CONCURRENCY`]: try again after this long.
+    Busy(Duration),
+}
+
+/// Held while a forced check runs.
+#[derive(Debug)]
+pub struct ForcedPermit(#[allow(dead_code)] tokio::sync::OwnedSemaphorePermit);
+
+#[derive(Default)]
+struct Forced {
+    /// When each infohash was last force-checked (entries older than the cooldown are pruned).
+    last: HashMap<String, Instant>,
+    /// Start times of the forced checks of the last minute.
+    window: std::collections::VecDeque<Instant>,
+}
+
 /// The checker's shared state: scraper (tracker sockets, rate limits, backoff, DHT nodes),
 /// pending boosts from the API, the last batch report.
 pub struct LivenessService {
@@ -72,6 +106,8 @@ pub struct LivenessService {
     stats: tokio::sync::Mutex<Option<(Instant, LivenessStats)>>,
     /// Infohashes the server's own batches checked since the start (D102).
     checked: std::sync::atomic::AtomicU64,
+    forced: Mutex<Forced>,
+    forced_running: Arc<tokio::sync::Semaphore>,
 }
 
 impl Default for LivenessService {
@@ -88,7 +124,62 @@ impl LivenessService {
             last: Mutex::default(),
             stats: tokio::sync::Mutex::default(),
             checked: std::sync::atomic::AtomicU64::new(0),
+            forced: Mutex::default(),
+            forced_running: Arc::new(tokio::sync::Semaphore::new(FORCED_CONCURRENCY)),
         }
+    }
+
+    /// May `infohash` be force-checked now (D113)? Taking the permit counts the check against
+    /// the per-infohash cooldown and the server-wide rate.
+    pub fn forced_permit(
+        &self,
+        infohash: &str,
+        now: Instant,
+    ) -> std::result::Result<ForcedPermit, ForcedRefusal> {
+        let minute = Duration::from_secs(60);
+        let mut f = self.forced.lock().unwrap();
+        f.last
+            .retain(|_, at| now.saturating_duration_since(*at) < FORCED_COOLDOWN);
+        while f
+            .window
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= minute)
+        {
+            f.window.pop_front();
+        }
+        if f.last.contains_key(infohash) {
+            return Err(ForcedRefusal::Cooldown);
+        }
+        if f.window.len() >= FORCED_PER_MINUTE {
+            let oldest = f.window.front().copied().unwrap_or(now);
+            let wait = minute.saturating_sub(now.saturating_duration_since(oldest));
+            return Err(ForcedRefusal::Busy(wait.max(Duration::from_secs(1))));
+        }
+        let permit = self
+            .forced_running
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ForcedRefusal::Busy(Duration::from_secs(5)))?;
+        f.last.insert(infohash.to_string(), now);
+        f.window.push_back(now);
+        Ok(ForcedPermit(permit))
+    }
+
+    /// One forced check through the checker's own scraper (D113): its per-tracker rate limits,
+    /// backoff, UDP connections, DHT node cache and pace apply, unlike a one-shot
+    /// `check_batch`. None when it ran past [`FORCED_TIMEOUT`].
+    pub async fn check_forced(
+        &self,
+        _permit: &ForcedPermit,
+        infohash: &str,
+        trackers: Vec<String>,
+        now: i64,
+    ) -> Option<Liveness> {
+        let items = [(infohash.to_string(), trackers)];
+        let (results, _) = tokio::time::timeout(FORCED_TIMEOUT, self.scraper.check(&items, now))
+            .await
+            .ok()?;
+        results.into_iter().find(|l| l.infohash == infohash)
     }
 
     /// Seed checks written by the server's own batches since the start.
@@ -214,13 +305,16 @@ impl LivenessService {
 
 /// Server checker config from `MAGNETAR_LIVENESS_*` (docs/CONFIG.md). Torrents without a
 /// tracker are scraped on the trackers their magnet links get (`magnet::DEFAULT_TRACKERS`).
-/// DHT walks wait for permits of `pacer`, the process's shared DHT pacer (D109).
+/// DHT walks wait for permits of `pacer`, the process's shared DHT pacer (D109), and so does
+/// each new tracker contact (D113): scrapes follow the router health brake too.
 pub fn liveness_config(
     cfg: &Config,
     pacer: Option<Arc<magnetar_core::dht::limiter::Pacer>>,
 ) -> LivenessConfig {
+    let pacer = pacer.map(|p| p as Arc<dyn magnetar_core::liveness::dht::WalkPacer>);
     LivenessConfig {
-        dht_pacer: pacer.map(|p| p as Arc<dyn magnetar_core::liveness::dht::WalkPacer>),
+        tracker_pacer: pacer.clone(),
+        dht_pacer: pacer,
         tracker_concurrency: cfg.liveness_tracker_concurrency.max(1),
         tracker_rps: cfg.liveness_tracker_rps,
         use_dht: cfg.liveness_dht,

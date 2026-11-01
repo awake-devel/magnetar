@@ -741,7 +741,9 @@ pub fn index_query(
         // Relevance is always best-first (as the Postgres search).
         descending: sort == SortBy::Relevance || q.descending,
         limit: q.effective_limit() as usize,
-        offset: q.offset as usize,
+        // The store refuses deeper offsets (D110); clamped again so no caller of this index
+        // can make the collector keep every match.
+        offset: q.offset.min(magnetar_core::query::MAX_OFFSET) as usize,
     }
 }
 
@@ -1014,5 +1016,27 @@ pub async fn discard_loop(pool: PgPool, mut shutdown: watch::Receiver<bool>) {
             _ = tokio::time::sleep(Duration::from_secs(3600)) => {}
             _ = stop_requested(&mut shutdown) => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magnetar_core::query::MAX_OFFSET;
+
+    #[test]
+    fn index_offset_is_clamped() {
+        // D110: the collector keeps offset + limit documents per segment.
+        let q = SearchQuery {
+            offset: u32::MAX,
+            ..Default::default()
+        };
+        let iq = index_query(&q, "", 0, None, 0);
+        assert_eq!(iq.offset, MAX_OFFSET as usize);
+        let q = SearchQuery {
+            offset: 120,
+            ..Default::default()
+        };
+        assert_eq!(index_query(&q, "", 0, None, 0).offset, 120);
     }
 }

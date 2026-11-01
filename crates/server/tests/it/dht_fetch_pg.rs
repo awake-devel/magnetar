@@ -864,3 +864,139 @@ async fn pipeline_blocklist_run(cap: Capture) {
         );
     }
 }
+
+/// D110: a `Fetched` whose name was not capped (built by hand, as a future caller could): the
+/// title is capped before the INSERT, so the generated `search_tsv` stays under Postgres's
+/// 1 MB tsvector limit and the row is stored.
+#[tokio::test]
+async fn an_uncapped_name_is_stored_capped() {
+    use magnetar_core::metainfo::info::DISPLAY_MAX;
+    let Some(db) = test_db().await else { return };
+    let pool = db.store.pool();
+    let raw = info("Long.Name", "0");
+    let h = sha1(&raw);
+    queue(pool, &[h]).await;
+    // ~2.4 MB of distinct words: a tsvector of several MB.
+    let huge: String = (0..300_000).map(|i| format!("w{i:06} ")).collect();
+    let mut r = ok(&raw);
+    if let Ok(Outcome::Ok(f)) = &mut r.result {
+        f.info.name = huge;
+        f.info.files[0].path = "p".repeat(3 * DISPLAY_MAX);
+    }
+    let o = persist_batch(pool, &[r], Some(&MarkerScreen), false, NOW)
+        .await
+        .unwrap();
+    assert_eq!((o.stored, o.row_errors), (1, 0));
+    let (title, path): (String, String) =
+        sqlx::query_as("SELECT title, files->0->>'path' FROM dht_torrents WHERE infohash = $1")
+            .bind(hex::encode(h))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(title.len() <= DISPLAY_MAX && title.starts_with("w000000 w000001 "));
+    assert_eq!(path.len(), DISPLAY_MAX);
+}
+
+/// D110: a row the database refuses is skipped alone (its savepoint rolled back, its hash
+/// closed as `store_error`), and the rest of the batch is written.
+#[tokio::test]
+async fn a_refused_row_does_not_fail_the_batch() {
+    use magnetar_server::dht::persist::{STATUS_INVALID, STORE_ERROR};
+    let Some(db) = test_db().await else { return };
+    let pool = db.store.pool();
+    // Stand-in for any per-row refusal (a tsvector over 1 MB, a constraint), in this test's
+    // schema only.
+    sqlx::raw_sql(
+        "CREATE FUNCTION refuse_poison() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           IF NEW.title LIKE '%Poison%' THEN RAISE EXCEPTION 'refused'; END IF;
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER refuse_poison BEFORE INSERT ON dht_torrents
+           FOR EACH ROW EXECUTE FUNCTION refuse_poison();",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let bad = info("Poison.Name", "0");
+    let good = info("Fine.Name.After", "0");
+    let (hb, hg) = (sha1(&bad), sha1(&good));
+    queue(pool, &[hb, hg]).await;
+    let o = persist_batch(
+        pool,
+        &[ok(&bad), ok(&good)],
+        Some(&MarkerScreen),
+        false,
+        NOW,
+    )
+    .await
+    .unwrap();
+    assert_eq!((o.stored, o.row_errors, o.invalid), (1, 1, 1));
+    let titles: Vec<String> = sqlx::query_scalar("SELECT title FROM dht_torrents")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    assert_eq!(titles, vec!["Fine.Name.After".to_string()]);
+    // Closed for good, not leased again; nothing left from the rolled-back row.
+    let (status, attempts, next, err) = seen(pool, &hb).await.unwrap();
+    assert_eq!((status, attempts, next), (STATUS_INVALID, 1, None));
+    assert_eq!(err.as_deref(), Some(STORE_ERROR));
+    assert_eq!(
+        count(
+            pool,
+            "SELECT count(*) FROM torrent_attrs WHERE infohash = $1",
+            &hex::encode(hb)
+        )
+        .await,
+        0
+    );
+    assert!(seen(pool, &hg).await.is_none());
+}
+
+/// D110 review: a database error a retry can clear (here a deadlock, 40P01) is not the row's
+/// fault: the batch fails as before D110, nothing is closed, and the leases stay for a retry.
+#[tokio::test]
+async fn a_transient_database_error_fails_the_batch() {
+    let Some(db) = test_db().await else { return };
+    let pool = db.store.pool();
+    sqlx::raw_sql(
+        "CREATE FUNCTION deadlock_poison() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           IF NEW.title LIKE '%Poison%' THEN
+             RAISE EXCEPTION 'deadlock stand-in' USING ERRCODE = '40P01';
+           END IF;
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER deadlock_poison BEFORE INSERT ON dht_torrents
+           FOR EACH ROW EXECUTE FUNCTION deadlock_poison();",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let bad = info("Poison.Name", "0");
+    let good = info("Fine.Name.After", "0");
+    let (hb, hg) = (sha1(&bad), sha1(&good));
+    queue(pool, &[hb, hg]).await;
+    let before = (seen(pool, &hb).await, seen(pool, &hg).await);
+    let e = persist_batch(
+        pool,
+        &[ok(&bad), ok(&good)],
+        Some(&MarkerScreen),
+        false,
+        NOW,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        magnetar_server::dht::persist::error_class(&e),
+        "database error 40P01"
+    );
+    // The whole batch rolled back: both hashes as queued, nothing stored.
+    assert_eq!((seen(pool, &hb).await, seen(pool, &hg).await), before);
+    assert!(before.0.is_some());
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM dht_torrents")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 0);
+}

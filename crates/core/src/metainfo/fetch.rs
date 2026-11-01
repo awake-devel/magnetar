@@ -6,8 +6,9 @@
 //! (whole peer 10 s). Per hash: ≤ 12 peers, ≤ 4 at once, 30 s. Global: ≤ 150 connection attempts/s and ≤ 350 open
 //! connections (router benchmark, D66),
 //! 256 MiB of metadata in flight, 4 decodes at once, each priced before it runs (3 × its size
-//! plus 64 B per bencode value, counted without allocating) and reserved from a decode budget
-//! of its own (3 × `metadata_max` × 4); above `metadata_max / 8` values it is `too_complex`.
+//! plus 112 B per bencode value, counted without allocating, plus the parse's string bound
+//! `min(3 × metadata_max, 8 × size + 1 MiB)`, D110) and reserved from a decode budget of its own
+//! (6 × `metadata_max` × 4); above `metadata_max / 8` values it is `too_complex`.
 //!
 //! Verification (BEP 52 "the encoded form as found", never a decode-encode round trip):
 //! `sha1(raw) == hash` → v1 (hybrid when it also carries `meta version` 2); else
@@ -32,7 +33,9 @@ use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
-use super::info::{InfoError, InfoSummary, parse_info};
+use super::info::{
+    InfoError, InfoSummary, output_bound, output_max, parse_info, parse_info_bounded,
+};
 use super::wire::{self, ExtHandshake, MetadataMsg, WireError};
 use crate::dht::addr::AddrFilter;
 use crate::dht::limiter::{Pace, brake_divisor};
@@ -47,9 +50,11 @@ const DISCARD_BUDGET: u64 = 4 * 1024 * 1024;
 const MAX_REJECTS_SENT: usize = 64;
 /// Budget accounting unit (the semaphore counts KiB so 256 MiB fits its u32 permits).
 const UNIT: usize = 1024;
-/// Bytes one decoded bencode value may cost (`Value` is 32 B, a dict entry 56 B, `Vec` growth
-/// up to 2×), used to price a decode before it runs.
-const VALUE_COST: usize = 64;
+/// Bytes one decoded bencode value may cost, used to price a decode before it runs: `Value` is
+/// 32 B and a dict entry (key and value, two counted values) 56 B, in a `Vec` that may have
+/// doubled, plus the allocator's chunk for each short key and string buffer (D110: a tree of tiny leaves peaks at ~102 B per value, string
+/// copies included, counted in glibc chunks by `tests/parse_memory.rs`).
+pub const VALUE_COST: usize = 112;
 /// Decode cost of the raw bytes themselves: the input, the copied strings, the names.
 const RAW_COST: usize = 3;
 
@@ -59,11 +64,22 @@ pub fn max_values(metadata_max: usize) -> usize {
     (metadata_max / 8).max(64 * 1024)
 }
 
-/// Bytes a decode of `raw_len` bytes holding `values` values may take.
-fn decode_cost(raw_len: usize, values: usize) -> usize {
+/// Bytes a decode of `raw_len` bytes holding `values` values may take, when dicts are at most
+/// `metadata_max` bytes: the decode itself plus the strings the parse may build
+/// ([`output_bound`]: at most [`output_max`], and at most 8 × the dict plus 1 MiB, D110).
+fn decode_cost(raw_len: usize, values: usize, metadata_max: usize) -> usize {
     raw_len
         .saturating_mul(RAW_COST)
         .saturating_add(values.saturating_mul(VALUE_COST))
+        .saturating_add(output_bound(raw_len, output_max(metadata_max)))
+}
+
+/// Decode budget per decode slot, bytes: the priced cost of a `metadata_max` dict without its
+/// per-value part.
+fn decode_slot(metadata_max: usize) -> usize {
+    metadata_max
+        .saturating_mul(RAW_COST)
+        .saturating_add(output_max(metadata_max))
 }
 
 #[derive(Clone, Debug)]
@@ -116,7 +132,7 @@ impl Default for FetchConfig {
             connects_per_sec: 150,
             max_connections: 350,
             decode_parallel: 4,
-            client: format!("Magnetar {}", env!("CARGO_PKG_VERSION")),
+            client: crate::identity::CLIENT_NAME.to_string(),
             allow_loopback: false,
             fake_strikes: 3,
             fake_ban: Duration::from_secs(3600),
@@ -335,7 +351,7 @@ struct Inner {
     /// Metadata bytes in flight (downloading or decoding), in KiB.
     budget: Semaphore,
     decode: Semaphore,
-    /// Decode working memory (3 × the metadata size per decode), in KiB. Separate from
+    /// Decode working memory ([`decode_slot`] per decode), in KiB. Separate from
     /// `budget` so downloads holding the whole budget cannot starve the decodes that would
     /// release it.
     decode_budget: Semaphore,
@@ -475,10 +491,11 @@ pub struct Fetcher {
     inner: Arc<Inner>,
 }
 
-/// Azureus-style BEP 20 peer id: `-MG0300-` + 12 random bytes (docs/DHT.md §3.3).
+/// Azureus-style BEP 20 peer id: [`crate::identity::PEER_ID_PREFIX`] (`-MG0310-` for 0.3.1)
+/// + 12 random bytes (docs/DHT.md §3.3, D115).
 pub fn new_peer_id() -> [u8; 20] {
     let mut id = [0u8; 20];
-    id[..8].copy_from_slice(b"-MG0300-");
+    id[..8].copy_from_slice(&crate::identity::PEER_ID_PREFIX);
     for b in &mut id[8..] {
         *b = rand::random();
     }
@@ -576,7 +593,9 @@ pub enum RawError {
 /// as a fetched dict is: size bound, hash of the raw bytes, value count before any decode
 /// (`too_complex` above [`max_values`]), parse, identity. Synchronous and CPU-bound (run it off
 /// the async threads); its memory is bounded like a fetcher decode: about 3 × the size plus
-/// 64 B per value, at most `metadata_max / 8` values.
+/// 112 B per value, at most `metadata_max / 8` values, plus at most
+/// `min(3 × metadata_max, 8 × size + 1 MiB)` of parsed strings, which is also what the result
+/// keeps (D110).
 pub fn outcome_from_raw(
     sighted: [u8; 20],
     raw: &[u8],
@@ -601,7 +620,7 @@ pub fn outcome_from_raw(
             0,
         ));
     }
-    let (id, parsed) = identify(m, raw, parse_info(raw));
+    let (id, parsed) = identify(m, raw, parse_info_bounded(raw, output_max(metadata_max)));
     Ok(outcome_of(sighted, raw.len(), None, id, parsed, 0))
 }
 
@@ -612,7 +631,8 @@ impl Fetcher {
         cfg.inflight_max = (cfg.inflight_max.max(UNIT) / UNIT) * UNIT;
         cfg.metadata_max = cfg.metadata_max.clamp(1, cfg.inflight_max);
         let units = u32::try_from(cfg.inflight_max / UNIT).unwrap_or(u32::MAX >> 3);
-        let decode_units = (cfg.metadata_max.div_ceil(UNIT) * RAW_COST)
+        let decode_units = decode_slot(cfg.metadata_max)
+            .div_ceil(UNIT)
             .saturating_mul(cfg.decode_parallel.max(1))
             .clamp(1, Semaphore::MAX_PERMITS);
         let now = Instant::now();
@@ -1004,7 +1024,8 @@ impl Fetcher {
 
         // Verify, price, then parse off the async threads, `decode_parallel` at once. The hash
         // and the value count allocate nothing; the decode reserves its priced cost (raw bytes
-        // × 3 + 64 B per value) from the decode budget, capped at the whole budget so the
+        // × 3 + 112 B per value + the parse's string bound, D110) from the decode budget, capped
+        // at the whole budget so the
         // largest allowed dict still runs (alone).
         let _decode = self
             .inner
@@ -1028,7 +1049,7 @@ impl Fetcher {
             };
             return Ok((raw, id, Err(InfoError::TooComplex)));
         }
-        let cost_units = decode_cost(size, values)
+        let cost_units = decode_cost(size, values, cfg.metadata_max)
             .div_ceil(UNIT)
             .min(self.inner.decode_units);
         let _extra = self
@@ -1037,8 +1058,9 @@ impl Fetcher {
             .acquire_many(u32::try_from(cost_units).unwrap_or(u32::MAX))
             .await
             .map_err(|_| PeerError::Closed)?;
+        let out_max = output_max(cfg.metadata_max);
         let (raw, id, parsed) = tokio::task::spawn_blocking(move || {
-            let parsed = parse_info(&raw);
+            let parsed = parse_info_bounded(&raw, out_max);
             let (id, parsed) = identify(m, &raw, parsed);
             (raw, id, parsed)
         })
@@ -1187,12 +1209,29 @@ mod tests {
         assert_eq!(count_values(b"llelelee", 100), 4);
         // stops past the limit
         assert_eq!(count_values(&b"le".repeat(1000), 10), 11);
-        // malformed input ends the count, never panics
-        assert_eq!(count_values(b"99999999999999999999999:x", 10), 1);
-        assert_eq!(count_values(b"i12", 10), 1);
+        // malformed input is priced past the limit (D110), never panics
+        assert_eq!(count_values(b"99999999999999999999999:x", 10), 11);
+        assert_eq!(count_values(b"i12", 10), 11);
         assert_eq!(max_values(16 << 20), 2 << 20);
         assert_eq!(max_values(1 << 10), 64 * 1024);
-        assert_eq!(decode_cost(10, 2), 30 + 128);
+        // D110: the parse's string bound is reserved: 8 × the dict + 1 MiB, at most the cap
+        // (`output_max`, which padding the dict does not raise).
+        assert_eq!(decode_cost(10, 2, 1 << 20), 30 + 224 + 80 + (1 << 20));
+        assert_eq!(
+            decode_cost(1 << 20, 2, 1 << 20),
+            (3 << 20) + 224 + (4 << 20)
+        );
+        assert_eq!(
+            decode_cost(16 << 20, 2, 16 << 20),
+            (48 << 20) + 224 + (48 << 20)
+        );
+        assert_eq!(decode_slot(16 << 20), 96 << 20);
+        let f = Fetcher::new(FetchConfig {
+            metadata_max: 16 << 20,
+            decode_parallel: 4,
+            ..FetchConfig::default()
+        });
+        assert_eq!(f.inner.decode_units, 4 * (96 << 20) / UNIT);
     }
 
     #[test]
@@ -1246,7 +1285,12 @@ mod tests {
     #[test]
     fn peer_id_shape() {
         let id = new_peer_id();
-        assert_eq!(&id[..8], b"-MG0300-");
+        assert_eq!(&id[..8], &crate::identity::PEER_ID_PREFIX);
+        assert_ne!(
+            &id[..8],
+            b"-MG0300-",
+            "the prefix follows the crate version (D115)"
+        );
     }
 
     #[test]

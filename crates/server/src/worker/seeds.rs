@@ -61,7 +61,8 @@ fn add(a: &AtomicU64, n: u64) {
     a.fetch_add(n, Ordering::Relaxed);
 }
 
-/// Send with retries on transient errors (≤ `tries`); fatal errors return at once.
+/// Send with retries on transient errors (≤ `tries`); fatal errors and refused bodies
+/// (D113) return at once.
 pub async fn with_retry<T, F, Fut>(
     tries: u32,
     stop: &mut watch::Receiver<bool>,
@@ -76,7 +77,7 @@ where
     loop {
         match f().await {
             Ok(v) => return Ok(v),
-            Err(e) if e.is_fatal() => return Err(e),
+            Err(e) if !e.is_retryable() => return Err(e),
             Err(e) => {
                 n += 1;
                 if n >= tries || *stop.borrow() {

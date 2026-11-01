@@ -11,6 +11,10 @@
 //! A server checker passes the process's shared DHT pacer as a [`WalkPacer`] (D109): every
 //! `get_peers` of every walk then waits for a permit, so walks count against `MAGNETAR_DHT_QPS`
 //! (or the seed checker's own rate) and slow down with the router health brake.
+//!
+//! Every address a walk would send to (seeds, cached nodes, `nodes` from answers) must pass the
+//! shared address policy (D112, [`crate::netaddr`]): a hostile node cannot point the walk at the
+//! router, 127.0.0.1 services, the tailnet or the LAN.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -22,6 +26,7 @@ use tokio::time::Instant;
 
 use super::bencode::{self, Value};
 use crate::error::{Error, Result};
+use crate::netaddr::AddrPolicy;
 
 /// Send permits for walk queries (D109). The server implements it with the DHT crawler's
 /// global pacer (`dht::limiter::Pacer`, a feature the phone library does not build).
@@ -132,7 +137,9 @@ pub async fn scrape(infohash: &[u8; 20], budget: std::time::Duration) -> crate::
     let deadline = Instant::now() + budget;
     let bootstrap = resolve_bootstrap().await?;
     let seeds = bootstrap.into_iter().map(|a| (a, None)).collect();
-    Ok(walk(seeds, infohash, deadline, None).await?.0)
+    Ok(walk(seeds, infohash, deadline, None, AddrPolicy::PUBLIC)
+        .await?
+        .0)
 }
 
 async fn resolve_bootstrap() -> Result<Vec<SocketAddr>> {
@@ -155,13 +162,16 @@ async fn resolve_bootstrap() -> Result<Vec<SocketAddr>> {
 }
 
 /// Same walk from explicit bootstrap addresses (IPv4), e.g. a cached node list or a test node.
+/// Only addresses `policy` allows are asked (tests on 127.0.0.1 pass
+/// [`AddrPolicy::loopback_for_tests`]).
 pub async fn scrape_from(
     bootstrap: &[SocketAddr],
     infohash: &[u8; 20],
     budget: Duration,
+    policy: AddrPolicy,
 ) -> Result<DhtScrape> {
     let seeds = bootstrap.iter().map(|a| (*a, None)).collect();
-    Ok(walk(seeds, infohash, Instant::now() + budget, None)
+    Ok(walk(seeds, infohash, Instant::now() + budget, None, policy)
         .await?
         .0)
 }
@@ -243,16 +253,18 @@ pub async fn scrape_cached(
     infohash: &[u8; 20],
     budget: Duration,
 ) -> Result<DhtScrape> {
-    scrape_paced(cache, infohash, budget, None).await
+    scrape_paced(cache, infohash, budget, None, AddrPolicy::PUBLIC).await
 }
 
 /// [`scrape_cached`] with every query waiting for a permit of `pacer` (D109). The wait counts
-/// against `budget`: a walk starved by a busy or braked pacer ends early, unanswered.
+/// against `budget`: a walk starved by a busy or braked pacer ends early, unanswered. Only
+/// addresses `policy` allows are asked (D112).
 pub async fn scrape_paced(
     cache: &NodeCache,
     infohash: &[u8; 20],
     budget: Duration,
     pacer: Option<&dyn WalkPacer>,
+    policy: AddrPolicy,
 ) -> Result<DhtScrape> {
     let deadline = Instant::now() + budget;
     let mut seeds: Vec<(SocketAddr, Option<[u8; 20]>)> = cache
@@ -272,7 +284,7 @@ pub async fn scrape_paced(
             Err(_) => {}
         }
     }
-    let (scrape, answered, failed) = walk(seeds, infohash, deadline, pacer).await?;
+    let (scrape, answered, failed) = walk(seeds, infohash, deadline, pacer, policy).await?;
     cache.update(&answered, &failed);
     Ok(scrape)
 }
@@ -308,6 +320,8 @@ const SYBIL_PORTS_PER_IP: usize = 3;
 
 struct Walk {
     target: [u8; 20],
+    /// Addresses the walk may send to (D112).
+    policy: AddrPolicy,
     nodes: HashMap<SocketAddr, Node>,
     swarm: Vec<SwarmAnswer>,
     answered: u32,
@@ -336,7 +350,7 @@ impl Walk {
     }
 
     fn add_node(&mut self, addr: SocketAddr, id: [u8; 20]) {
-        if addr.port() == 0 || addr.ip().is_unspecified() || self.nodes.len() >= MAX_NODES {
+        if addr.port() == 0 || !self.policy.allows(addr.ip()) || self.nodes.len() >= MAX_NODES {
             return;
         }
         self.nodes.entry(addr).or_insert(Node {
@@ -495,6 +509,7 @@ async fn walk(
     infohash: &[u8; 20],
     deadline: Instant,
     pacer: Option<&dyn WalkPacer>,
+    policy: AddrPolicy,
 ) -> Result<(DhtScrape, Vec<(SocketAddr, [u8; 20])>, Vec<SocketAddr>)> {
     let sock = UdpSocket::bind(SocketAddr::from(([0u8; 4], 0)))
         .await
@@ -503,9 +518,10 @@ async fn walk(
     let mut next_tid: u16 = rand::random();
     let mut w = Walk {
         target: *infohash,
+        policy,
         nodes: seeds
             .into_iter()
-            .filter(|(a, _)| a.is_ipv4())
+            .filter(|(a, _)| a.is_ipv4() && a.port() != 0 && policy.allows(a.ip()))
             .map(|(a, id)| {
                 (
                     a,
@@ -659,6 +675,83 @@ fn get_peers(my_id: &[u8; 20], infohash: &[u8; 20], tid: &[u8; 2]) -> Vec<u8> {
         (b"q".to_vec(), b(b"get_peers")),
         (b"ro".to_vec(), Value::Int(1)),
         (b"t".to_vec(), b(tid)),
+        // The same honest client tag as the crawler (D115).
+        (b"v".to_vec(), b(&crate::identity::KRPC_VERSION)),
         (b"y".to_vec(), b(b"q")),
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D115: the seed checker's walks carry the same client tag as the crawler.
+    #[test]
+    fn get_peers_names_the_client() {
+        let q = bencode::decode(&get_peers(&[1; 20], &[2; 20], b"aa")).unwrap();
+        assert_eq!(
+            q.get(b"v").and_then(Value::as_bytes),
+            Some(&crate::identity::KRPC_VERSION[..])
+        );
+    }
+
+    /// D112: `nodes` from an answer that point at the LAN, loopback, the tailnet or link-local
+    /// space are never added to the walk, so no query is ever sent there.
+    #[test]
+    fn answer_nodes_outside_the_policy_are_dropped() {
+        let target = [0x42u8; 20];
+        let src: SocketAddr = "1.2.3.4:6881".parse().unwrap();
+        let tid = [7u8, 9];
+        let mut w = Walk {
+            target,
+            policy: AddrPolicy::PUBLIC,
+            nodes: HashMap::from([(
+                src,
+                Node {
+                    id: None,
+                    state: State::InFlight {
+                        tid,
+                        until: Instant::now() + RPC_TIMEOUT,
+                    },
+                },
+            )]),
+            swarm: Vec::new(),
+            answered: 0,
+        };
+        let mut compact = Vec::new();
+        for (i, (ip, port)) in [
+            ([192, 168, 1, 1], 80u16),
+            ([127, 0, 0, 1], 5432),
+            ([100, 64, 3, 4], 8443),
+            ([10, 0, 0, 1], 6881),
+            ([169, 254, 1, 1], 6881),
+            ([87, 98, 162, 88], 6881),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut id = target;
+            id[19] ^= i as u8 + 1;
+            compact.extend_from_slice(&id);
+            compact.extend_from_slice(&ip);
+            compact.extend_from_slice(&port.to_be_bytes());
+        }
+        let b = |s: &[u8]| Value::Bytes(s.to_vec());
+        let reply = Value::Dict(vec![
+            (
+                b"r".to_vec(),
+                Value::Dict(vec![
+                    (b"id".to_vec(), b(&[0x11; 20])),
+                    (b"nodes".to_vec(), b(&compact)),
+                ]),
+            ),
+            (b"t".to_vec(), b(&tid)),
+            (b"y".to_vec(), b(b"r")),
+        ]);
+        w.handle(src, &bencode::encode(&reply));
+        let mut addrs: Vec<SocketAddr> = w.nodes.keys().copied().collect();
+        addrs.sort();
+        let want: Vec<SocketAddr> = vec![src, "87.98.162.88:6881".parse().unwrap()];
+        assert_eq!(addrs, want);
+    }
 }

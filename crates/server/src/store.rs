@@ -10,7 +10,7 @@ use std::time::Duration;
 use magnetar_core::api::{FacetSet, FacetsResponse, MediaReleases, SearchIndexStatus};
 use magnetar_core::error::{Error, Result};
 use magnetar_core::model::*;
-use magnetar_core::query::{SearchPage, SearchQuery, Sort};
+use magnetar_core::query::{MAX_OFFSET, SearchPage, SearchQuery, Sort};
 use magnetar_core::store::{DEFAULT_TRUST_THRESHOLD, Store, keys};
 use magnetar_core::{magnet, release, trust, wot};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
@@ -1201,7 +1201,10 @@ impl Store for PgStore {
         let mut tx = self.pool.begin().await.map_err(db)?;
         sqlx::query(
             "INSERT INTO blocked_infohashes (infohash, blocked_at, rule_version, origin)
-             VALUES ($1, $2, $3, 'nostr') ON CONFLICT (infohash) DO NOTHING",
+             VALUES ($1, $2, $3, 'nostr') ON CONFLICT (infohash) DO UPDATE
+             SET origin = EXCLUDED.origin, blocked_at = EXCLUDED.blocked_at,
+                 rule_version = EXCLUDED.rule_version
+             WHERE blocked_infohashes.origin = 'worker'",
         )
         .bind(infohash)
         .bind(now)
@@ -1237,8 +1240,12 @@ impl Store for PgStore {
     }
 
     async fn is_blocked(&self, infohash: &str, event_id: &str) -> Result<bool> {
+        // A block on a crawl worker's word only (origin `worker`, D113) does not stop a Nostr
+        // event: a worker token holder could otherwise block any hash it triages first. The
+        // event is screened by the server itself next, and a block then replaces the origin.
         sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM blocked_infohashes WHERE infohash = $1)
+            "SELECT EXISTS (SELECT 1 FROM blocked_infohashes
+                            WHERE infohash = $1 AND origin <> 'worker')
                  OR EXISTS (SELECT 1 FROM blocked_events WHERE id = $2)",
         )
         .bind(infohash)
@@ -1447,6 +1454,13 @@ impl Store for PgStore {
     }
 
     async fn search(&self, q: &SearchQuery, now: i64) -> Result<SearchPage> {
+        // Checked before either engine runs: both keep `offset + limit` results (D110).
+        if q.offset > MAX_OFFSET {
+            return Err(Error::Invalid(format!(
+                "offset {} is above the maximum {MAX_OFFSET}",
+                q.offset
+            )));
+        }
         let min_trust = match q.min_trust {
             Some(t) => t,
             None => self.threshold().await?,

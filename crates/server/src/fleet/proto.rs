@@ -171,6 +171,14 @@ pub struct TriageResponse {
     pub fetch: Vec<String>,
     pub blocked: u32,
     pub known: u32,
+    /// New hashes not queued because this worker reached its hourly cap (D113,
+    /// `MAGNETAR_WORKER_TRIAGE_NEW_PER_HOUR`). Absent from older servers (0).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub capped: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// What became of one hash the worker was told to fetch.

@@ -1,7 +1,8 @@
 //! Fetch results → Postgres (docs/DHT.md §2.4, D50, D53): verified torrents into `dht_torrents`
 //! and `torrent_attrs`, final statuses and backoff into `dht_seen`, blocked hashes into
 //! `blocked_infohashes`. One transaction per batch (at most [`BATCH_MAX`] results or
-//! [`BATCH_WAIT`]).
+//! [`BATCH_WAIT`]), one savepoint per result: a row the database refuses is skipped and its
+//! hash closed as invalid (`store_error`), the rest of the batch is written (D110).
 //!
 //! Order per verified torrent (D53): the content screen runs **before** any statement that
 //! carries its name; a block writes only hashes; no screen at all → nothing named is written
@@ -12,6 +13,7 @@ use std::time::Duration;
 
 use magnetar_core::classify::{CLASSIFIER_VERSION, Classification};
 use magnetar_core::dht::Via;
+use magnetar_core::metainfo::info::{DISPLAY_MAX, truncate_utf8};
 use magnetar_core::metainfo::{FetchFailure, Fetched, Outcome, PeerError};
 use magnetar_core::model::{Category, TorrentFile};
 use magnetar_core::release;
@@ -38,6 +40,8 @@ pub const STATUS_PRIVATE: i16 = 4;
 pub const STATUS_V2_ONLY: i16 = 5;
 pub const STATUS_OVERSIZE: i16 = 6;
 pub const STATUS_ALIAS: i16 = 8;
+/// `dht_seen.last_error` of a verified result the database refused (D110).
+pub const STORE_ERROR: &str = "store_error";
 
 /// One finished fetch, keyed by the hash it was triaged under.
 #[derive(Debug)]
@@ -69,6 +73,9 @@ pub struct PersistOutcome {
     pub invalid: u64,
     pub oversize: u64,
     pub failed: u64,
+    /// Verified results the database refused (a constraint, a value too large): skipped
+    /// alone, their hash closed as invalid with `store_error` (D110). Also in `invalid`.
+    pub row_errors: u64,
     /// Country / network of the node each new row was first heard from (`dht_seen.src_*`,
     /// D101), for the crawl map's `stored` counter; only rows triaged with geo on. Codes only.
     #[serde(skip)]
@@ -101,6 +108,14 @@ fn via_text(v: Via) -> &'static str {
 
 fn clean(s: &str) -> String {
     s.replace('\0', "")
+}
+
+/// The stored title: NUL removed, at most [`DISPLAY_MAX`] bytes (D110). `parse_info` already
+/// caps the name; this keeps the `search_tsv` input small whatever built the `Fetched`.
+fn title_of(f: &Fetched) -> String {
+    let mut t = clean(&f.info.name);
+    truncate_utf8(&mut t, DISPLAY_MAX);
+    t
 }
 
 /// Paths joined by `\n`, cut at [`FILES_TEXT_MAX`] bytes on a character boundary.
@@ -181,7 +196,9 @@ async fn block(
     sqlx::query(
         "INSERT INTO blocked_infohashes (infohash, blocked_at, rule_version, origin)
          SELECT h, $2, $3, 'dht' FROM unnest($1::text[]) AS u(h) ORDER BY h
-         ON CONFLICT (infohash) DO NOTHING",
+         ON CONFLICT (infohash) DO UPDATE SET origin = EXCLUDED.origin,
+             blocked_at = EXCLUDED.blocked_at, rule_version = EXCLUDED.rule_version
+           WHERE blocked_infohashes.origin = 'worker'",
     )
     .bind(&hashes)
     .bind(now)
@@ -212,9 +229,13 @@ fn display_files(f: &Fetched) -> Vec<TorrentFile> {
     f.info
         .files
         .iter()
-        .map(|x| TorrentFile {
-            path: clean(&x.path),
-            size: Some(x.size),
+        .map(|x| {
+            let mut path = clean(&x.path);
+            truncate_utf8(&mut path, DISPLAY_MAX);
+            TorrentFile {
+                path,
+                size: Some(x.size),
+            }
         })
         .collect()
 }
@@ -230,9 +251,10 @@ async fn store(
     peers_seen: usize,
     fetch_known: bool,
     now: i64,
+    supplied_by: Option<&str>,
 ) -> sqlx::Result<(bool, Option<crate::geo::GeoCode>)> {
     let v1 = hex::encode(f.v1);
-    let title = clean(&f.info.name);
+    let title = title_of(f);
     let files = display_files(f);
     let kept = &files[..files.len().min(FILES_MAX)];
     let text = files_text(kept);
@@ -243,10 +265,10 @@ async fn store(
         r#"
         INSERT INTO dht_torrents (infohash, infohash_v2, title, files, file_count, files_text,
             total_size, category, metadata_size, piece_length, first_seen, fetched_at,
-            discovered_via, peers_seen, classifier_version)
+            discovered_via, peers_seen, classifier_version, supplied_by)
         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                COALESCE((SELECT first_seen FROM dht_seen WHERE infohash = $11), $12), $12,
-               $13, $14, $15
+               $13, $14, $15, $17
         WHERE NOT EXISTS (SELECT 1 FROM blocked_infohashes b WHERE b.infohash = $1)
           AND ($16 OR NOT EXISTS (SELECT 1 FROM torrent_infohashes t WHERE t.infohash = $1))
         ON CONFLICT (infohash) DO NOTHING
@@ -268,6 +290,7 @@ async fn store(
     .bind(i32::try_from(peers_seen).unwrap_or(i32::MAX))
     .bind(CLASSIFIER_VERSION)
     .bind(skip_known_check)
+    .bind(supplied_by)
     .execute(&mut **tx)
     .await?
     .rows_affected()
@@ -314,6 +337,99 @@ async fn store(
     Ok((inserted, geo))
 }
 
+/// What [`write_screened`] did with one verified result.
+enum Written {
+    Blocked(magnetar_core::blocklist::Tier),
+    Stored {
+        inserted: bool,
+        geo: Option<crate::geo::GeoCode>,
+    },
+}
+
+impl PersistOutcome {
+    /// Count a result once its savepoint is released.
+    fn add(&mut self, w: Written, f: &Fetched, class: &Classification) {
+        match w {
+            Written::Blocked(tier) => {
+                self.blocked += 1;
+                *self
+                    .blocked_by_tier
+                    .entry(tier.as_str().into())
+                    .or_default() += 1;
+            }
+            Written::Stored { inserted, geo } => {
+                if inserted {
+                    self.stored += 1;
+                    self.stored_geo.extend(geo);
+                    *self
+                        .categories
+                        .entry(class.category.as_str().into())
+                        .or_default() += 1;
+                } else {
+                    self.not_new += 1;
+                }
+                if f.sighted != f.v1 {
+                    self.alias += 1;
+                }
+            }
+        }
+    }
+}
+
+/// A failure that belongs to one row, so the same bytes would fail the same way: the values
+/// could not be encoded, or the database refused them by SQLSTATE class (D110). The batch goes
+/// on without the row. Anything else aborts the batch and keeps its leases, to be retried:
+/// I/O, pool, protocol, and database errors that a retry can clear (deadlock or serialization
+/// 40, resources 53, lock timeout 55, cancel or statement timeout 57) or that we do not know.
+fn row_level(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Encode(_) => true,
+        sqlx::Error::Database(d) => d.code().is_some_and(|c| row_level_sqlstate(&c)),
+        _ => false,
+    }
+}
+
+/// SQLSTATE classes that describe the row's values: 22 data exception, 23 integrity
+/// constraint, 54 program limit (a tsvector over 1 MB is 54000), P0 PL/pgSQL raise.
+fn row_level_sqlstate(code: &str) -> bool {
+    matches!(code.get(..2), Some("22" | "23" | "54" | "P0"))
+}
+
+/// Block or store one screened result.
+#[allow(clippy::too_many_arguments)]
+async fn write_screened(
+    tx: &mut Transaction<'_, Postgres>,
+    it: &FetchResult,
+    f: &Fetched,
+    screen: &dyn Screen,
+    class: &Classification,
+    verdict: Verdict,
+    fetch_known: bool,
+    now: i64,
+    supplied_by: Option<&str>,
+) -> sqlx::Result<Written> {
+    Ok(match verdict {
+        Verdict::Block(tier) => {
+            block(tx, f, screen.rule_version(), now).await?;
+            Written::Blocked(tier)
+        }
+        Verdict::Allow => {
+            let (inserted, geo) = store(
+                tx,
+                f,
+                class,
+                it.via,
+                it.peers_seen,
+                fetch_known,
+                now,
+                supplied_by,
+            )
+            .await?;
+            Written::Stored { inserted, geo }
+        }
+    })
+}
+
 /// Write one batch of results in one transaction.
 pub async fn persist_batch(
     pool: &PgPool,
@@ -321,6 +437,20 @@ pub async fn persist_batch(
     screen: Option<&dyn Screen>,
     fetch_known: bool,
     now: i64,
+) -> sqlx::Result<PersistOutcome> {
+    persist_batch_from(pool, items, screen, fetch_known, now, None).await
+}
+
+/// [`persist_batch`] for dicts a crawl worker supplied (D113): each new `dht_torrents` row
+/// records it in `supplied_by` (None = the server's own crawler), so what one worker token
+/// added can be found and removed.
+pub async fn persist_batch_from(
+    pool: &PgPool,
+    items: &[FetchResult],
+    screen: Option<&dyn Screen>,
+    fetch_known: bool,
+    now: i64,
+    supplied_by: Option<&str>,
 ) -> sqlx::Result<PersistOutcome> {
     let mut o = PersistOutcome::default();
     // Classify and screen first, outside the transaction and off the async workers: on a
@@ -333,7 +463,7 @@ pub async fn persist_batch(
                     Ok(Outcome::Ok(f)) => {
                         // Classify (pure, silent) before the screen: the context tier needs
                         // the adult result (docs/DHT.md §7.1 order).
-                        let class = classify(&f.info.name, &display_files(f));
+                        let class = classify(&title_of(f), &display_files(f));
                         Some((class, screen.verdict(&f.info.all_names, class.adult())))
                     }
                     _ => None,
@@ -359,29 +489,47 @@ pub async fn persist_batch(
                     o.unscreened += 1;
                     continue;
                 };
-                match verdict {
-                    Verdict::Block(tier) => {
-                        block(&mut tx, f, screen.rule_version(), now).await?;
-                        o.blocked += 1;
-                        *o.blocked_by_tier.entry(tier.as_str().into()).or_default() += 1;
+                // One savepoint per verified result (D110): a row the database refuses (a
+                // generated tsvector over 1 MB, a constraint) must not roll back the batch, or
+                // its hash, still leased, comes back and poisons every batch it joins.
+                sqlx::query("SAVEPOINT persist_row")
+                    .execute(&mut *tx)
+                    .await?;
+                match write_screened(
+                    &mut tx,
+                    it,
+                    f,
+                    screen,
+                    &class,
+                    verdict,
+                    fetch_known,
+                    now,
+                    supplied_by,
+                )
+                .await
+                {
+                    Ok(w) => {
+                        sqlx::query("RELEASE SAVEPOINT persist_row")
+                            .execute(&mut *tx)
+                            .await?;
+                        o.add(w, f, &class);
                     }
-                    Verdict::Allow => {
-                        let (inserted, geo) =
-                            store(&mut tx, f, &class, it.via, it.peers_seen, fetch_known, now)
-                                .await?;
-                        if inserted {
-                            o.stored += 1;
-                            o.stored_geo.extend(geo);
-                            *o.categories
-                                .entry(class.category.as_str().into())
-                                .or_default() += 1;
-                        } else {
-                            o.not_new += 1;
-                        }
-                        if f.sighted != f.v1 {
-                            o.alias += 1;
-                        }
+                    Err(e) if row_level(&e) => {
+                        sqlx::query("ROLLBACK TO SAVEPOINT persist_row")
+                            .execute(&mut *tx)
+                            .await?;
+                        sqlx::query("RELEASE SAVEPOINT persist_row")
+                            .execute(&mut *tx)
+                            .await?;
+                        // Closed for good: by its SQLSTATE class (`row_level`), the same bytes
+                        // would fail the same way.
+                        set_final(&mut tx, &it.sighted, STATUS_INVALID, STORE_ERROR).await?;
+                        o.invalid += 1;
+                        o.row_errors += 1;
+                        // The class only: the message could quote the name (D53).
+                        tracing::warn!("DHT persist: row skipped: {}", error_class(&e));
                     }
+                    Err(e) => return Err(e),
                 }
             }
             Ok(Outcome::Private) => {
@@ -484,7 +632,10 @@ pub async fn reclassify_batch(
         if let Verdict::Block(_) = verdict {
             sqlx::query(
                 "INSERT INTO blocked_infohashes (infohash, blocked_at, rule_version, origin)
-                 VALUES ($1, $2, $3, 'sweep') ON CONFLICT (infohash) DO NOTHING",
+                 VALUES ($1, $2, $3, 'sweep') ON CONFLICT (infohash) DO UPDATE
+                 SET origin = EXCLUDED.origin, blocked_at = EXCLUDED.blocked_at,
+                     rule_version = EXCLUDED.rule_version
+                 WHERE blocked_infohashes.origin = 'worker'",
             )
             .bind(&infohash)
             .bind(now)
@@ -548,5 +699,21 @@ mod tests {
         let t = files_text(&[f("x"), f(&long)]);
         assert!(t.len() <= FILES_TEXT_MAX && t.len() > FILES_TEXT_MAX - 2);
         assert!(t.starts_with("x\né"));
+    }
+
+    #[test]
+    fn only_value_errors_close_a_row() {
+        // D110 review: the row's own values (data, constraint, size limit, a trigger's raise).
+        for c in ["22001", "22P02", "23505", "54000", "P0001"] {
+            assert!(row_level_sqlstate(c), "{c}");
+        }
+        // A retry can clear these (deadlock, serialization, out of memory, disk full, lock
+        // timeout, statement timeout or cancel), or we do not know them: the batch fails.
+        for c in [
+            "40P01", "40001", "53200", "53100", "55P03", "57014", "08006", "XX000", "42601", "",
+        ] {
+            assert!(!row_level_sqlstate(c), "{c}");
+        }
+        assert!(!row_level(&sqlx::Error::PoolTimedOut));
     }
 }

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [features]
 default = []
@@ -37,6 +38,13 @@ data-encoding.workspace = true
 librqbit = { workspace = true, optional = true }
 parse-torrent-title = { workspace = true, optional = true }
 unicode-normalization = { workspace = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+nix.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dev-dependencies]
+# Thread CPU time for the scaling tests (release.rs), so a loaded machine does not fail them.
+nix = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

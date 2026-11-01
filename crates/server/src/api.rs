@@ -150,6 +150,7 @@ impl From<Error> for ApiError {
             Error::Network(_) | Error::Relay { .. } | Error::Server { .. } => {
                 (StatusCode::BAD_GATEWAY, "upstream")
             }
+            Error::Refused(_) => (StatusCode::BAD_GATEWAY, "refused"),
             Error::Timeout(_) => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
             Error::Store(_) => (StatusCode::INTERNAL_SERVER_ERROR, "store"),
             Error::Other(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
@@ -157,7 +158,18 @@ impl From<Error> for ApiError {
         if status.is_server_error() {
             tracing::warn!("api error: {e}");
         }
-        Self::new(status, code, e.to_string())
+        Self::new(status, code, client_message(&e))
+    }
+}
+
+/// What a client is told about `e` (D113): database and internal errors only by class, since
+/// their text can quote SQL, a bound value or a constraint name; the full error goes to the log
+/// at the call site. Every other error is the client's own (bad input) or names an upstream.
+pub fn client_message(e: &Error) -> String {
+    match e {
+        Error::Store(_) => "database error (see the server log)".into(),
+        Error::Other(_) => "internal error (see the server log)".into(),
+        e => e.to_string(),
     }
 }
 
@@ -292,8 +304,45 @@ pub fn router(state: AppState) -> Router {
             StatusCode::REQUEST_TIMEOUT,
             REQUEST_TIMEOUT,
         ))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(request_span))
         .with_state(state)
+}
+
+/// What a `token=` query value is logged as.
+const REDACTED: &str = "<redacted>";
+
+/// `uri` with every `token=` query value replaced by [`REDACTED`] (D113): `/relay?token=` carries
+/// the API token, and the request span records the URI (tower-http's default span logs it at
+/// DEBUG). Keys are compared decoded, as [`query_token`] reads them.
+pub fn redacted_uri(uri: &axum::http::Uri) -> String {
+    let Some(q) = uri.query() else {
+        return uri.to_string();
+    };
+    let q: Vec<String> = q
+        .split('&')
+        .map(|pair| {
+            let key = pair.split('=').next().unwrap_or_default();
+            let decoded = url::form_urlencoded::parse(key.as_bytes())
+                .next()
+                .map(|(k, _)| k.into_owned());
+            if decoded.as_deref() == Some("token") {
+                format!("{key}={REDACTED}")
+            } else {
+                pair.to_string()
+            }
+        })
+        .collect();
+    format!("{}?{}", uri.path(), q.join("&"))
+}
+
+/// The request span: tower-http's default fields, the URI redacted.
+fn request_span<B>(req: &axum::http::Request<B>) -> tracing::Span {
+    tracing::debug_span!(
+        "request",
+        method = %req.method(),
+        uri = %redacted_uri(req.uri()),
+        version = ?req.version(),
+    )
 }
 
 async fn health(State(st): State<AppState>) -> Json<Health> {
@@ -608,9 +657,14 @@ async fn media_poster(
         )
             .into_response());
     }
-    let bytes = tokio::fs::read(&file)
-        .await
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?;
+    let bytes = tokio::fs::read(&file).await.map_err(|e| {
+        tracing::warn!("poster {}: {e}", file.display());
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "poster read failed",
+        )
+    })?;
     Ok((
         [
             (header::CONTENT_TYPE, img.content_type),
@@ -622,27 +676,62 @@ async fn media_poster(
         .into_response())
 }
 
+/// `POST /api/v1/torrents/{infohash}/liveness`: check one torrent now (D45). Bounded (D113): a
+/// cooldown per infohash (a repeat gets the stored answer), a server-wide rate and concurrency
+/// (429 with Retry-After), at most [`liveness::MAX_TRACKERS_PER_TORRENT`] trackers, and the
+/// checker's own scraper, so tracker backoff and the router health brake apply.
 async fn refresh_liveness(
     State(st): State<AppState>,
     Path(infohash): Path<String>,
-) -> ApiResult<Json<Liveness>> {
+) -> ApiResult<Response> {
     let ih = infohash_param(&infohash)?;
-    let trackers = st
+    let mut trackers = st
         .store
         .trackers_for(&ih)
         .await?
         .ok_or_else(|| ApiError::not_found("unknown infohash"))?;
+    trackers.truncate(liveness::MAX_TRACKERS_PER_TORRENT);
+    let permit = match st.liveness.forced_permit(&ih, std::time::Instant::now()) {
+        Ok(p) => p,
+        Err(crate::liveness::ForcedRefusal::Cooldown) => {
+            if let Some(l) = st.store.get_liveness(&ih).await? {
+                return Ok(Json(l).into_response());
+            }
+            return Ok(too_many(crate::liveness::FORCED_COOLDOWN));
+        }
+        Err(crate::liveness::ForcedRefusal::Busy(wait)) => return Ok(too_many(wait)),
+    };
     let now = magnetar_core::now();
-    // One-shot: a user waiting should not queue behind the checker's rate limits.
-    let l = liveness::check_batch(&[(ih.clone(), trackers)], st.liveness.config(), now)
-        .await
-        .into_iter()
-        .find(|l| l.infohash == ih)
-        .ok_or_else(|| ApiError::new(StatusCode::BAD_GATEWAY, "upstream", "no liveness result"))?;
-    crate::liveness::put_one(st.store.pool(), &l, crate::liveness::Expiry::Scheduled).await?;
+    let checked = st.liveness.check_forced(&permit, &ih, trackers, now).await;
+    drop(permit);
+    if let Some(l) = &checked {
+        crate::liveness::put_one(st.store.pool(), l, crate::liveness::Expiry::Scheduled).await?;
+    }
     // What is stored now: the next due time as `expires_at`, or the previous answer when this
     // check got none (D45).
-    Ok(Json(st.store.get_liveness(&ih).await?.unwrap_or(l)))
+    match (st.store.get_liveness(&ih).await?, checked) {
+        (Some(l), _) | (None, Some(l)) => Ok(Json(l).into_response()),
+        (None, None) => Err(ApiError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "timeout",
+            "the seed check took too long",
+        )),
+    }
+}
+
+/// 429 with `Retry-After` (whole seconds, at least 1).
+fn too_many(wait: Duration) -> Response {
+    let mut r = ApiError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limited",
+        "too many seed checks right now; try again later",
+    )
+    .into_response();
+    r.headers_mut().insert(
+        header::RETRY_AFTER,
+        axum::http::HeaderValue::from(wait.as_secs().max(1)),
+    );
+    r
 }
 
 /// `GET /api/v1/torrents/{infohash}/liveness-history?days=N` (D45, default and max 90).
@@ -698,7 +787,7 @@ pub async fn ingest_one(store: &PgStore, raw: RawEvent, now: i64) -> BatchResult
                 id,
                 accepted: false,
                 duplicate: false,
-                message: format!("error: {e}"),
+                message: format!("error: {}", client_message(&e)),
             }
         }
     }
@@ -1207,6 +1296,37 @@ async fn remove_download(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D113: a database error reaches the client only as its class; the text (SQL, constraint
+    /// names, bound values) stays in the log.
+    #[test]
+    fn store_errors_are_not_echoed_to_clients() {
+        let raw = "duplicate key value violates unique constraint \"torrents_pkey\": Key (event_id)=(abc)";
+        let e = ApiError::from(Error::Store(raw.into()));
+        assert_eq!(
+            (e.status, e.code),
+            (StatusCode::INTERNAL_SERVER_ERROR, "store")
+        );
+        assert!(!e.message.contains("torrents_pkey"), "{}", e.message);
+        assert!(!e.message.contains("abc"), "{}", e.message);
+        let e = ApiError::from(Error::Other("open /var/lib/secret: denied".into()));
+        assert!(!e.message.contains("/var/lib"), "{}", e.message);
+        // The client's own errors keep their text.
+        let e = ApiError::from(Error::Invalid("bad infohash".into()));
+        assert!(e.message.contains("bad infohash"), "{}", e.message);
+    }
+
+    #[test]
+    fn token_query_values_are_redacted() {
+        let u: axum::http::Uri = "/relay?a=1&token=s3cr3t&%74oken=two&b=token"
+            .parse()
+            .unwrap();
+        let r = redacted_uri(&u);
+        assert!(!r.contains("s3cr3t") && !r.contains("two"), "{r}");
+        assert_eq!(r, "/relay?a=1&token=<redacted>&%74oken=<redacted>&b=token");
+        let u: axum::http::Uri = "/api/v1/search?q=x".parse().unwrap();
+        assert_eq!(redacted_uri(&u), "/api/v1/search?q=x");
+    }
 
     #[test]
     fn constant_time_eq() {

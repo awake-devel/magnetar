@@ -7,3 +7,6 @@ target/
 /dist/
 *.apk
 /.env
+# Worker settings with its token (docs/WORKERS.md §4): never committed.
+/docker/worker.env
+/docker/*.env

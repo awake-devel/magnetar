@@ -168,6 +168,14 @@ docker compose start magnetar
 
 Copying the `db-data` volume is also a valid backup, but only with `db` stopped.
 
+`scripts/backup.sh` does the dump on a schedule: to a local directory or to another host over
+ssh (`MAGNETAR_BACKUP_DEST=host:/dir`), written as a `.part` file and renamed only when
+`pg_dump` succeeded, keeping the newest `MAGNETAR_BACKUP_KEEP` (7) dumps. Run it nightly with
+`packaging/magnetar-backup.{service,timer}` (systemd user units; install steps in the service
+file). Measured on 2026-11-01: a 9.5 GB database (446 k torrents) dumps to 1.7 GB in 4.5 min
+over ssh; `pg_restore -l` on the copy lists all 48 tables. Keep the dumps on another machine
+than the one running the stack.
+
 ## Using an existing Postgres container or volume
 
 **Different server.** Set `DATABASE_URL` in `.env` to that server and start only magnetar:

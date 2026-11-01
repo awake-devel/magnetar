@@ -62,6 +62,8 @@ fn service() -> LivenessService {
         use_dht: false,
         tracker_rps: 100.0,
         tracker_timeout: std::time::Duration::from_millis(300),
+        // The fake trackers live on 127.0.0.1 (D112 test seam).
+        addr_policy: magnetar_core::liveness::AddrPolicy::loopback_for_tests(),
         ..Default::default()
     })
 }
@@ -410,4 +412,81 @@ async fn a_torrent_deleted_during_a_batch_does_not_fail_it() {
     assert_eq!(history_len(s, 1).await, 0);
     assert_eq!(history_len(s, 2).await, 1);
     assert_eq!(schedule(s, 2).await.3, Some(NOW));
+}
+
+/// D113: a forced check goes through the checker's own scraper (its tracker state), a repeat
+/// within the cooldown is answered from the store without a scrape, and past the server-wide
+/// rate the API answers 429 with Retry-After.
+#[tokio::test]
+async fn forced_checks_share_the_checker_and_are_rate_limited() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    let (tracker, scrapes) = fake_tracker(by_last_byte).await;
+    let first = 30u64;
+    let n_last = first + live::FORCED_PER_MINUTE as u64;
+    for n in first..=n_last {
+        put_with(s, n, NOW, n, &tracker).await;
+    }
+    let svc = Arc::new(service());
+    let state =
+        magnetar_server::AppState::new(Arc::new(s.clone()), TOKEN).with_liveness(svc.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, magnetar_server::router(state))
+            .await
+            .unwrap();
+    });
+    let http = reqwest::Client::new();
+    let force = |n: u64| {
+        http.post(format!("{base}/api/v1/torrents/{}/liveness", ih(n)))
+            .bearer_auth(TOKEN)
+            .send()
+    };
+
+    let r = force(first).await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let l: Liveness = r.json().await.unwrap();
+    assert_eq!(l.seeders, Some(first as u32));
+    assert_eq!(scrapes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        svc.tracker_state(&tracker),
+        Some((0, false)),
+        "scraped by the checker's own scraper"
+    );
+
+    // Again at once: the stored answer, no new scrape.
+    let r = force(first).await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(
+        r.json::<Liveness>().await.unwrap().seeders,
+        Some(first as u32)
+    );
+    assert_eq!(
+        scrapes.load(Ordering::SeqCst),
+        1,
+        "cooldown: not scraped again"
+    );
+
+    // The rest of the minute's budget, then 429.
+    for n in first + 1..n_last {
+        assert_eq!(
+            force(n).await.unwrap().status().as_u16(),
+            200,
+            "infohash {n}"
+        );
+    }
+    let r = force(n_last).await.unwrap();
+    assert_eq!(r.status().as_u16(), 429);
+    let ra: u64 = r.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=60).contains(&ra), "{ra}");
+    assert_eq!(
+        scrapes.load(Ordering::SeqCst),
+        live::FORCED_PER_MINUTE,
+        "one scrape per check that ran"
+    );
 }

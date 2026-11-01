@@ -41,8 +41,8 @@ pub const QUERY_TIMEOUT: Duration = Duration::from_secs(4);
 /// next candidate, but still takes a late answer until [`QUERY_TIMEOUT`]. Default 4 s = no widening:
 /// at production load 1.5 s halved the torrents stored per minute (docs/DHT.md §18.5).
 pub const LOOKUP_TIMEOUT: Duration = Duration::from_millis(4000);
-/// `v` = "MG" (unregistered in BEP 20, checked 2026-10-26) + 2 version bytes.
-pub const VERSION: [u8; 4] = [b'M', b'G', 0, 2];
+/// KRPC `v`: "MG" + 2 version bytes ([`crate::identity::KRPC_VERSION`], D115).
+pub const VERSION: [u8; 4] = crate::identity::KRPC_VERSION;
 /// Ids sharing this many leading bits with a target were made for it (D45's node-farm rule).
 pub const FARM_PREFIX_BITS: u32 = 64;
 const SECRET_ROTATION: Duration = Duration::from_secs(300);
@@ -653,6 +653,8 @@ impl Dht {
             && !ip.is_loopback()
         {
             filter.set_own(Some(ip));
+            // Every other outbound path refuses it too (D112).
+            crate::netaddr::OWN.learn(ip.into());
         }
         let qps = cfg.qps.max(1);
         let shards = sockets
@@ -1403,6 +1405,7 @@ impl Dht {
             }
             if !ip.is_loopback() {
                 ext.filter.set_own(Some(ip));
+                crate::netaddr::OWN.learn(ip.into());
             }
             ext.external_ip = Some(ip);
         }

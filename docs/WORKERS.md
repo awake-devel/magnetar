@@ -61,8 +61,15 @@ any change an older peer could misread.
 | `/api/v1/worker/liveness/lease` | `{max}` → `Lease {expires_at, items:[{infohash, trackers}]}` | |
 | `/api/v1/worker/liveness/results` | `{results:[Liveness]}` → `{accepted, ignored}` | |
 | `/api/v1/worker/liveness/release` | `{infohashes}` → `{accepted, ignored}` | unchecked leases given back at stop |
-| `/api/v1/worker/dht/triage` | `{items:[{h, via}]}` (≤ 2000) → `{fetch:[h], blocked, known}` | |
+| `/api/v1/worker/dht/triage` | `{items:[{h, via}]}` (≤ 2000, ≤ 1 MiB) → `{fetch:[h], blocked, known, capped}` | `capped`: new hashes over the worker's hourly cap (D113) |
 | `/api/v1/worker/dht/results` | `{items:[DhtResult]}` (≤ 1000, ≤ 32 MiB) → `{stored, not_new, blocked, rejected, applied, ignored}` | |
+
+Hello, heartbeat and lease bodies are limited to 64 KiB, triage and release bodies to 1 MiB
+(413 above; the 32 MiB limit is for the two result uploads, D113). A worker sends at most 2000
+node-count rows and 1000 AS names with one triage (the rest goes with the next one), so a full
+triage stays under ~800 KB. The server drops control characters from `version`, `arch` and the DHT
+`mode` and keeps at most 64 characters of each and 64 DHT ports before it logs, stores or
+shows them in `/api/v1/stats` (D111).
 
 `DhtResult = {sighted, via, peers_seen, kind, …}` with `kind` one of `metadata {raw}` (the raw
 bencoded info dict, base64), `blocked {v1?, tier, rule_version}` (hash only), `private`,
@@ -103,10 +110,10 @@ apply to it), from its own line: trackers see another IP, so the per-tracker rat
 3. The worker collects peers and fetches the info dict, keeps the **raw bytes**, classifies
    it and runs the hard blocklist (D53) on every name/path variant **before anything leaves
    the machine**: a blocked torrent is reported as `blocked` with its hash (and a hybrid's
-   SHA-1) only — no name, no file, no dict. The server records it in `blocked_infohashes`
-   (origin `dht`), only for a hash it handed out and still holds queued, and a hybrid's
-   claimed SHA-1 only when nothing is stored under it: a worker cannot block what the index
-   already has.
+   SHA-1) only — no name, no file, no dict. The server records the sighted hash in
+   `blocked_infohashes` (origin `worker`), only when this worker holds it (see 6). The claimed
+   hybrid SHA-1 is not used (D113): the server never saw the dict, and the claim let a worker
+   block any hash; a hybrid sighted under its v1 is fetched and screened on its own.
 4. Otherwise the raw dict is uploaded. The server **verifies it again**
    (`metainfo::outcome_from_raw`: size ≤ its `MAGNETAR_DHT_METADATA_MAX`, SHA-1 or truncated
    SHA-256 of the exact bytes = the infohash, value count before decoding, parse), then hands
@@ -115,9 +122,38 @@ apply to it), from its own line: trackers see another IP, so the per-tracker rat
    and logged by hash; the row keeps its lease. The wire format has no field for a category or
    a verdict on a dict: nothing a worker says about content is trusted.
 5. Statuses (`no_peers`, other failures with the 1 h / 6 h / 24 h backoff, private, v2-only,
-   invalid) are applied only to hashes the server holds queued. `oversize` is final only from
+   invalid) are applied only to hashes the worker holds (see 6). `oversize` is final only from
    a worker whose limit is at least the server's; a smaller worker (the Pi's 4 MiB) leaves the
    torrent to someone with room (normal backoff).
+6. **Holders (D113).** Triage records the worker it queued a hash for in `dht_seen.holder`
+   (NULL = the server's own crawler; its retry loop takes a row back by clearing it). Every
+   item of an upload, dict or status, is for a hash this worker holds, or it is `ignored`
+   before anything is decoded: a worker cannot upload a dict or a status for a hash another
+   worker or the server holds. A due row another worker holds (an expired lease, or a
+   failure's backoff over) is handed to a second worker only once it is 1 h past due
+   (`TAKEOVER_GRACE_SECS`), also when the server's retry loop never runs (DHT off on the
+   server); the holder itself and the server's own crawler may take it at once. Within one
+   upload each hash counts once: its first item that decodes and verifies (a malformed or
+   forged copy does not shadow a good one after it).
+
+   This does **not** stop a worker token holder from storing dicts it made up: a worker
+   chooses what it triages, so it can triage `sha1(D)` for a dict D of its own, be handed the
+   new hash, and upload D (it verifies). Two limits: each worker may queue at most
+   `MAGNETAR_WORKER_TRIAGE_NEW_PER_HOUR` new hashes an hour (default 100 000; re-queued
+   hashes do not count, the triage answer's `capped` says how many were left out), and every
+   row stored from a worker's dict records it in `dht_torrents.supplied_by` (NULL = the
+   server's own crawler and every row stored before migration `20261104120000`), so what one
+   token added can be removed (§7). The server's own classifier and blocklist still run on
+   every such dict.
+7. **Upload slots (D113).** `dht/results` and `liveness/results` take a slot before their body
+   is read: 4 server-wide (one 32 MiB upload holds ~90 MB while parsed), 2 per worker. With
+   none free the server answers 503 with `Retry-After: 5`, and the worker retries with backoff.
+   Every other worker route takes a small slot the same way (6 per worker, 16 server-wide,
+   bodies ≤ 1 MiB; 503 with `Retry-After: 1`); an honest worker has at most ~4 in flight.
+   The worker retries only 408, 429 and 5xx (and network errors); any other 4xx (400, 413,
+   422) refuses that body for good, so the worker splits it in halves and drops a single
+   refused item with a warning (`upload_dropped` in its report), instead of resending it
+   forever.
 
 ### What a worker keeps (D100)
 
@@ -217,10 +253,25 @@ runs for N seconds; either way it prints a JSON report (seed checks, DHT counter
 server answered, RSS, CPU) when it stops. Exit status 2 = refused by the server (token,
 version), 1 = other error (e.g. UDP port taken), 0 = stopped.
 
-### Profiles (router benchmarks of 2026-10-26)
+### Profiles (router benchmarks of 2026-10-26, collectors of 2026-10-31)
 
 Both lines were measured with the stage-1 router benchmark (KRPC, new TCP attempts, held
 connections; ~30 % margin under the knees).
+
+**What limits a worker is `MAGNETAR_DHT_PEER_LOOKUPS`, not `MAGNETAR_DHT_QPS`** (D114). Each
+peer collection waits ~8.6 s for its walk, so the old fixed default of 64 kept the profiles
+below at ~160–180 real q/s, whatever their `QPS`. Since D114 the default is 0.4 per q/s; the
+settings measured with the real worker on 2026-10-31 (docs/benchmarks/2026-10-31-worker-
+collectors, stop at the first router fault, production at about two thirds of the last clean
+step):
+
+| | last clean step | fault at | production setting | stored / min |
+|---|---|---|---|---:|
+| EEE | 384 lookups, TCP 300/s, 256 fetches, 500 open: 837 q/s, 2 734 / 5 min | 512 (WAN loss) | `PEER_LOOKUPS=256 QPS=700 TCP_RATE=200 FETCH_CONCURRENCY=192 TCP_MAX=450` | ~420 |
+| RPI | 256 lookups, TCP 200/s, 128 fetches, 450 open: 591 q/s, 1 931 / 5 min, CPU 67 % | 384 (gateway stops answering) | `PEER_LOOKUPS=128 QPS=450 TCP_RATE=150 FETCH_CONCURRENCY=64 TCP_MAX=350` | ~240 |
+
+EEE's worker also needs more memory than the unit's 300 MB cap at 256 collectors (peak 422 MB over 8 h): a drop-in
+with `MemoryHigh=900M`, `MemoryMax=1200M` (`systemctl edit magnetar-worker`).
 
 **EEE** (x86_64, 4 cores, 7.7 GB, Docker; router: no knee up to 1600 KRPC q/s, TCP attempts
 clean to 400/s, 480 held):
@@ -278,8 +329,12 @@ docker compose -f docker/compose.worker.yml --env-file docker/worker.env up -d
 docker compose -f docker/compose.worker.yml logs -f worker
 ```
 
-The EEE profile is the file's default; override any value in `docker/worker.env`. The
-container reaches a Tailscale name through the host when the host resolves it for Docker; if
+The EEE profile is the file's default; override any value in `docker/worker.env`. Every
+setting in that file reaches the container (`env_file:`), also ones the compose file does not
+list (`MAGNETAR_DHT_METADATA_MAX`, `MAGNETAR_BLOCKLIST_FILE`, …); keep passing `--env-file` as
+above, since the listed ones are read from it (D113). `MAGNETAR_DHT_PORT` and
+`MAGNETAR_DHT_NODES` are fixed by the `ports:` mapping. `docker/worker.env` holds the worker
+token: it is gitignored, keep it mode 600. The container reaches a Tailscale name through the host when the host resolves it for Docker; if
 `docker compose … exec worker getent hosts <server>.<tailnet>.ts.net` finds nothing (Docker
 copies the host's upstream DNS, not MagicDNS), set `MAGNETAR_WORKER_SERVER_HOST` and
 `MAGNETAR_WORKER_SERVER_IP` (the server's `tailscale ip -4`) in `docker/worker.env`: the
@@ -369,7 +424,33 @@ health probe are the safeguards.
 
 - Nostr relay crawling on workers (D99), header probes (not built), UPnP by default.
 - Hashes leased to a worker that dies come back through the server's DHT retry loop only when
-  the server's own DHT crawler runs; otherwise they wait until sighted again after the lease.
+  the server's own DHT crawler runs; otherwise they wait until sighted again, by another worker
+  at least 1 h after the lease's end (D113), or by the same worker at once.
 - A worker trusts the server it is pointed at (TLS checks the name); the server trusts a
   worker's seed-check numbers and failure statuses (they only move schedules), never its
-  content claims.
+  content claims, and only for hashes it holds (D113).
+- A worker token holder can still store dicts it made up, within its hourly cap
+  (`MAGNETAR_WORKER_TRIAGE_NEW_PER_HOUR`, default 100 000 new hashes an hour): it chooses what
+  it triages (§1 DHT item 6). After a token leak, remove the token from
+  `MAGNETAR_WORKER_TOKENS`, then drop the seed-check schedule of its dicts and the dicts
+  (counts and the search index follow):
+
+  ```sql
+  DELETE FROM liveness_schedule s USING dht_torrents d
+   WHERE d.infohash = s.infohash AND d.supplied_by = '<name>'
+     AND NOT EXISTS (SELECT 1 FROM torrent_infohashes t
+                      WHERE t.infohash = s.infohash AND t.events > 0);
+  DELETE FROM dht_torrents WHERE supplied_by = '<name>';
+  ```
+ Rows stored before migration `20261104120000` have no
+  supplier and cannot be told apart.
+- A worker can still block (or mark failed, private, …) a hash it triaged itself. Blocks from a
+  worker's word are origin `worker` in `blocked_infohashes`: they keep the DHT (server and
+  workers) from fetching the hash, but **do not stop a Nostr event** for it (D113); the server
+  screens that event itself, and a block of its own (Nostr, its DHT screen, the sweep) then
+  replaces the origin. After a token leak `DELETE FROM blocked_infohashes WHERE origin =
+  'worker'` undoes them. Worker blocks recorded before migration `20261104113000` have origin
+  `dht` and cannot be told apart from the server's own.
+- The triage cap's default and the small-request slots are sized from the 2026-10-27 laptop
+  run, not measured against eee or the Pi: **UNVERIFIED** that they never hold back an honest
+  worker.

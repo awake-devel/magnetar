@@ -9,12 +9,16 @@ use std::time::Duration;
 use magnetar_core::liveness::bencode::{self, Value};
 use magnetar_core::liveness::dht::{self, Bloom256};
 use magnetar_core::liveness::udp::{self, ScrapeStats};
-use magnetar_core::liveness::{self, LivenessConfig, TTL_ALIVE, TTL_DEAD, TTL_ERROR, http};
+use magnetar_core::liveness::{
+    self, AddrPolicy, LivenessConfig, TTL_ALIVE, TTL_DEAD, TTL_ERROR, http,
+};
 use magnetar_core::model::LivenessSource;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
 const T: Duration = Duration::from_millis(400);
+/// The fakes live on 127.0.0.1: the address policy's test seam (D112).
+const LOCAL: AddrPolicy = AddrPolicy::loopback_for_tests();
 
 fn h(seed: u8) -> [u8; 20] {
     std::array::from_fn(|i| seed.wrapping_add(i as u8 * 7))
@@ -185,7 +189,7 @@ async fn udp_scrape_batches_of_74_with_noise() {
     })
     .await;
     let hashes: Vec<[u8; 20]> = (0..150u8).map(h).collect();
-    let res = udp::scrape(&url, &hashes, T).await.unwrap();
+    let res = udp::scrape(&url, &hashes, T, LOCAL).await.unwrap();
     assert_eq!(res.len(), 150);
     for (r, hash) in res.iter().zip(&hashes) {
         assert_eq!(*r, Some(fake_stats(hash, 0)));
@@ -207,7 +211,7 @@ async fn udp_scrape_truncation_is_unanswered() {
     })
     .await;
     let hashes: Vec<[u8; 20]> = (0..80u8).map(h).collect();
-    let res = udp::scrape(&url, &hashes, T).await.unwrap();
+    let res = udp::scrape(&url, &hashes, T, LOCAL).await.unwrap();
     assert_eq!(res.len(), 80);
     // Two packets (74 + 6); the first is cut at 10, the second fits.
     for (i, r) in res.iter().enumerate() {
@@ -225,7 +229,7 @@ async fn udp_scrape_error_action() {
         ..Default::default()
     })
     .await;
-    let err = udp::scrape(&url, &[h(1)], T).await.unwrap_err();
+    let err = udp::scrape(&url, &[h(1)], T, LOCAL).await.unwrap_err();
     assert!(err.to_string().contains("unregistered torrent"), "{err}");
 }
 
@@ -237,7 +241,7 @@ async fn udp_scrape_retries_once() {
         ..Default::default()
     })
     .await;
-    let res = udp::scrape(&url, &[h(9)], T).await.unwrap();
+    let res = udp::scrape(&url, &[h(9)], T, LOCAL).await.unwrap();
     assert_eq!(res, vec![Some(fake_stats(&h(9), 0))]);
     assert_eq!(log.connects.load(Ordering::SeqCst), 2);
 }
@@ -249,7 +253,7 @@ async fn udp_scrape_timeout() {
     let url = format!("udp://{}", silent.local_addr().unwrap());
     let start = std::time::Instant::now();
     assert!(
-        udp::scrape(&url, &[h(1)], Duration::from_millis(200))
+        udp::scrape(&url, &[h(1)], Duration::from_millis(200), LOCAL)
             .await
             .is_err()
     );
@@ -263,17 +267,19 @@ async fn udp_scrape_timeout() {
 #[tokio::test]
 async fn udp_scrape_bad_urls() {
     assert!(
-        udp::scrape("udp://example.org/announce", &[h(1)], T)
+        udp::scrape("udp://example.org/announce", &[h(1)], T, LOCAL)
             .await
             .is_err()
     );
     assert!(
-        udp::scrape("http://example.org:80/announce", &[h(1)], T)
+        udp::scrape("http://example.org:80/announce", &[h(1)], T, LOCAL)
             .await
             .is_err()
     );
     assert_eq!(
-        udp::scrape("udp://x.invalid:1", &[], T).await.unwrap(),
+        udp::scrape("udp://x.invalid:1", &[], T, LOCAL)
+            .await
+            .unwrap(),
         vec![]
     );
 }
@@ -392,7 +398,7 @@ fn scrape_url_derivation() {
 #[tokio::test]
 async fn http_scrape_batches_and_unsorted_keys() {
     let (base, log) = fake_http_tracker(0).await;
-    let client = magnetar_core::http::client(Duration::from_secs(5)).unwrap();
+    let client = http::TrackerClient::new(Duration::from_secs(5), LOCAL).unwrap();
     // Raw bytes that need escaping (space, %, &, non-ASCII) must survive the round trip.
     let mut hashes: Vec<[u8; 20]> = (0..120u8).map(h).collect();
     hashes[3] = *b" %&=+?#/\x00\xffabcdefghij";
@@ -430,7 +436,7 @@ async fn http_scrape_batches_and_unsorted_keys() {
 #[tokio::test]
 async fn http_scrape_failure_reason_and_status() {
     let (base, _) = fake_http_tracker(0).await;
-    let client = magnetar_core::http::client(Duration::from_secs(5)).unwrap();
+    let client = http::TrackerClient::new(Duration::from_secs(5), LOCAL).unwrap();
     let err = http::scrape(&client, &format!("{base}/announce?passkey=bad"), &[h(1)])
         .await
         .unwrap_err();
@@ -562,7 +568,7 @@ async fn dht_walk_against_fake_nodes() {
     serve(near, near_reply, None);
 
     let start = std::time::Instant::now();
-    let r = dht::scrape_from(&[far_addr], &target, Duration::from_secs(5))
+    let r = dht::scrape_from(&[far_addr], &target, Duration::from_secs(5), LOCAL)
         .await
         .unwrap();
     assert!(
@@ -600,7 +606,7 @@ async fn dht_walk_against_fake_nodes() {
 async fn dht_no_answer_is_an_error() {
     let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = silent.local_addr().unwrap();
-    let r = dht::scrape_from(&[addr], &h(1), Duration::from_millis(500)).await;
+    let r = dht::scrape_from(&[addr], &h(1), Duration::from_millis(500), LOCAL).await;
     assert!(r.is_err());
 }
 
@@ -610,6 +616,7 @@ fn cfg() -> LivenessConfig {
     LivenessConfig {
         tracker_timeout: T,
         use_dht: false,
+        addr_policy: LOCAL,
         ..Default::default()
     }
 }
@@ -1207,6 +1214,68 @@ async fn slow_pacer_keeps_answers_and_cached_nodes() {
     );
 }
 
+/// D113: one torrent's trackers are capped, and every tracker contact waits for the tracker
+/// pacer (the server passes its shared pace, so scrapes follow the router health brake); a
+/// pacer that grants nothing sends nothing.
+#[tokio::test]
+async fn tracker_contacts_are_capped_and_wait_for_the_pacer() {
+    let max = liveness::MAX_TRACKERS_PER_TORRENT;
+    let mut urls = Vec::new();
+    let mut logs = Vec::new();
+    for _ in 0..max + 10 {
+        let (u, l) = fake_udp_tracker(UdpBehavior {
+            cap: 75,
+            ..Default::default()
+        })
+        .await;
+        urls.push(u);
+        logs.push(l);
+    }
+    let pacer = Arc::new(TestPacer::default());
+    let scraper = liveness::Scraper::new(LivenessConfig {
+        tracker_pacer: Some(pacer.clone()),
+        tracker_concurrency: 64,
+        ..cfg()
+    });
+    let (out, report) = scraper.check(&items_of(&[h(1)], &urls), 1).await;
+    let asked = logs
+        .iter()
+        .filter(|l| l.connects.load(Ordering::SeqCst) > 0)
+        .count();
+    assert_eq!(report.trackers, max as u64);
+    assert_eq!(asked, max, "trackers past the cap are never contacted");
+    assert_eq!(
+        pacer.granted.load(Ordering::SeqCst),
+        max,
+        "one permit per tracker contact"
+    );
+    assert_eq!(out[0].source, LivenessSource::Udp);
+
+    let (u, log) = fake_udp_tracker(UdpBehavior {
+        cap: 75,
+        ..Default::default()
+    })
+    .await;
+    let scraper = liveness::Scraper::new(LivenessConfig {
+        tracker_pacer: Some(Arc::new(TestPacer {
+            closed: true,
+            ..Default::default()
+        })),
+        ..cfg()
+    });
+    let r = tokio::time::timeout(
+        Duration::from_millis(500),
+        scraper.check(&items_of(&[h(2)], &[u]), 1),
+    )
+    .await;
+    assert!(r.is_err(), "waits for a permit");
+    assert_eq!(
+        log.connects.load(Ordering::SeqCst),
+        0,
+        "no permit, no packet"
+    );
+}
+
 #[test]
 fn walks_follow_the_pace() {
     let ten = Duration::from_secs(10);
@@ -1358,10 +1427,197 @@ async fn dht_ignores_node_farms_and_made_up_ids() {
             (b"nodes".to_vec(), bytes(&compact)),
         ]),
     );
-    let r = dht::scrape_from(&[boot_addr], &target, Duration::from_secs(3))
+    let r = dht::scrape_from(&[boot_addr], &target, Duration::from_secs(3), LOCAL)
         .await
         .unwrap();
     // Neither is walked through: only the bootstrap node and the honest one are asked.
     assert_eq!(r.nodes_queried, 2);
     assert_eq!(r.values_ips, 1, "{r:?}");
+}
+
+// ---------------------------------------------------------------- address policy (D112)
+
+/// A TCP listener on 127.0.0.1 that counts connections (and answers nothing).
+async fn counting_listener() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = listener.accept().await {
+            h.fetch_add(1, Ordering::SeqCst);
+            held.push(s);
+        }
+    });
+    (addr, hits)
+}
+
+/// A tracker on loopback (a literal, a name resolving there, the IPv4-mapped form) is never
+/// contacted: the HTTP scrape fails with `Refused` before any connect.
+#[tokio::test]
+async fn http_scrape_refuses_local_tracker() {
+    let (addr, hits) = counting_listener().await;
+    let client = http::TrackerClient::new(T, AddrPolicy::PUBLIC).unwrap();
+    for tracker in [
+        format!("http://{addr}/announce"),
+        format!("http://localhost:{}/announce", addr.port()),
+        format!("http://[::ffff:127.0.0.1]:{}/announce", addr.port()),
+    ] {
+        let err = http::scrape(&client, &tracker, &[h(1)]).await.unwrap_err();
+        assert!(
+            matches!(err, magnetar_core::Error::Refused(_)),
+            "{tracker}: {err:?}"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "a connect reached loopback");
+}
+
+/// A server on `bind` that answers every request with a 302 to `location(its own address)`.
+async fn redirector(
+    bind: &str,
+    location: impl Fn(SocketAddr) -> String + Send + 'static,
+) -> SocketAddr {
+    let listener = TcpListener::bind(bind).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut conn, _)) = listener.accept().await {
+            let resp = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n",
+                location(addr)
+            );
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = conn.read(&mut buf).await;
+                let _ = conn.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    addr
+}
+
+/// A moved tracker still answers: the scrape follows a redirect to an allowed address.
+#[tokio::test]
+async fn http_scrape_follows_allowed_redirect() {
+    let (base, log) = fake_http_tracker(0).await;
+    let to = format!("{base}/scrape");
+    let outer = redirector("127.0.0.1:0", move |_| to.clone()).await;
+    let client = http::TrackerClient::new(T, LOCAL).unwrap();
+    let out = http::scrape(&client, &format!("http://{outer}/announce"), &[h(1)])
+        .await
+        .unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(log.requests.load(Ordering::SeqCst), 1);
+}
+
+/// D112: every redirect hop is checked. 127.0.0.1, 127.0.0.2 and ::1 stand in for the router:
+/// the test policy refuses them as "our own", and the redirectors sit on 127.0.0.3, so only
+/// loopback is involved even if the check regressed. A literal hop and a name hop
+/// (`localhost`) are refused before any connect, and a redirect loop stops at the hop limit.
+#[tokio::test]
+async fn http_scrape_checks_every_redirect_hop() {
+    use magnetar_core::netaddr::OwnAddrs;
+    let own = OwnAddrs::fixed(vec![
+        ("127.0.0.1".parse().unwrap(), 32),
+        ("127.0.0.2".parse().unwrap(), 32),
+        ("::1".parse().unwrap(), 128),
+    ]);
+    let client = http::TrackerClient::new(T, LOCAL.with_own(own)).unwrap();
+    let inner = TcpListener::bind("127.0.0.2:0").await.unwrap();
+    let inner_addr = inner.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hh = hits.clone();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = inner.accept().await {
+            hh.fetch_add(1, Ordering::SeqCst);
+            held.push(s);
+        }
+    });
+    for location in [
+        format!("http://{inner_addr}/cgi-bin/admin?x=1"),
+        format!("http://localhost:{}/admin", inner_addr.port()),
+    ] {
+        let outer = redirector("127.0.0.3:0", move |_| location.clone()).await;
+        let err = http::scrape(&client, &format!("http://{outer}/announce"), &[h(1)])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, magnetar_core::Error::Refused(_)),
+            "{outer}: {err:?}"
+        );
+    }
+    let looping = redirector("127.0.0.3:0", |me| format!("http://{me}/announce")).await;
+    let err = http::scrape(&client, &format!("http://{looping}/announce"), &[h(1)])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("redirects"), "loop: {err:?}");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "a refused hop was connected"
+    );
+}
+
+/// A UDP tracker on loopback gets no datagram.
+#[tokio::test]
+async fn udp_scrape_refuses_local_tracker() {
+    let (url, log) = fake_udp_tracker(UdpBehavior::default()).await;
+    let port = url::Url::parse(&url).unwrap().port().unwrap();
+    for tracker in [url.clone(), format!("udp://localhost:{port}/announce")] {
+        let err = udp::scrape(&tracker, &[h(1)], T, AddrPolicy::PUBLIC)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, magnetar_core::Error::Refused(_)),
+            "{tracker}: {err:?}"
+        );
+    }
+    assert_eq!(log.connects.load(Ordering::SeqCst), 0);
+    assert_eq!(log.scrapes.load(Ordering::SeqCst), 0);
+}
+
+/// End to end with the production config: a torrent whose trackers sit on loopback is checked
+/// without a single datagram or connect reaching them.
+#[tokio::test]
+async fn check_batch_never_contacts_local_trackers() {
+    let (udp_url, udp_log) = fake_udp_tracker(UdpBehavior::default()).await;
+    let (http_base, http_log) = fake_http_tracker(0).await;
+    let cfg = LivenessConfig {
+        tracker_timeout: T,
+        use_dht: false,
+        ..Default::default()
+    };
+    assert_eq!(cfg.addr_policy, AddrPolicy::PUBLIC);
+    let items = vec![(
+        hex::encode(h(1)),
+        vec![udp_url, format!("{http_base}/announce")],
+    )];
+    let out = liveness::check_batch(&items, &cfg, 1000).await;
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].source, LivenessSource::None, "{:?}", out[0]);
+    assert_eq!(udp_log.connects.load(Ordering::SeqCst), 0);
+    assert_eq!(http_log.requests.load(Ordering::SeqCst), 0);
+}
+
+/// The DHT walk sends nothing to a loopback seed under the production policy.
+#[tokio::test]
+async fn dht_walk_refuses_local_seed() {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    let _ = dht::scrape_from(
+        &[addr],
+        &h(1),
+        Duration::from_millis(300),
+        AddrPolicy::PUBLIC,
+    )
+    .await;
+    let mut buf = [0u8; 64];
+    assert!(
+        sock.try_recv_from(&mut buf).is_err(),
+        "a query reached the loopback node"
+    );
 }
