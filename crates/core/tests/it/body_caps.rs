@@ -49,7 +49,11 @@ async fn http_scrape_body_is_capped() {
     )
     .await;
     // The client timeout is long: only the cap can end this read quickly.
-    let client = magnetar_core::http::client(Duration::from_secs(30)).unwrap();
+    let client = http::TrackerClient::new(
+        Duration::from_secs(30),
+        magnetar_core::liveness::AddrPolicy::loopback_for_tests(),
+    )
+    .unwrap();
     let res = tokio::time::timeout(
         Duration::from_secs(5),
         http::scrape(&client, &format!("{base}/announce"), &[h(1)]),
@@ -94,7 +98,11 @@ async fn http_scrape_prices_the_decode() {
         body,
     )
     .await;
-    let client = magnetar_core::http::client(Duration::from_secs(5)).unwrap();
+    let client = http::TrackerClient::new(
+        Duration::from_secs(5),
+        magnetar_core::liveness::AddrPolicy::loopback_for_tests(),
+    )
+    .unwrap();
     let err = http::scrape(&client, &format!("{base}/announce"), &[h(1)])
         .await
         .unwrap_err()
