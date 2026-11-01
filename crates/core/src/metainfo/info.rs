@@ -5,7 +5,8 @@
 //!
 //! The input was verified against the infohash, but its content is still chosen by whoever made
 //! the torrent: nothing here panics or logs, and the strings it builds are priced in real
-//! (decoded) bytes before they are allocated, against an absolute cap ([`output_max`], D110).
+//! (decoded) bytes before they are allocated, against an absolute cap ([`output_max`]) and a
+//! bound relative to the dict's size ([`output_bound`], D110).
 //! **Nothing here may log a name or path** (docs/DHT.md §7.1: the blocklist runs after this).
 
 use crate::liveness::bencode::{self, Value};
@@ -28,23 +29,49 @@ pub const TREE_PATH_MAX: usize = 4096;
 /// becomes the 3-byte U+FFFD) and before it is allocated. Absolute: padding a dict does not
 /// raise it. A real dict needs its whole paths once for the blocklist plus up to
 /// [`DISPLAY_MAX`] per displayed file: ~4.7× its size for a v2 manga pack with long directory
-/// names (6800 files, 547 KB, `a_manga_pack_parses`), so at the default 16 MiB a v2 dict of
-/// that shape fits up to ~10 MB. One huge directory key over many leaves asked for terabytes.
+/// names (6800 files, 547 KB, `a_manga_pack_parses`), ~7.8× with the per-string and per-file
+/// prices, so at the default 16 MiB a v2 dict of that shape fits up to ~6 MB. One huge
+/// directory key over many leaves asked for terabytes. [`output_bound`] also bounds it by the
+/// dict's size.
 pub const OUTPUT_FACTOR: usize = 3;
 /// Floor of [`output_max`], so small `metadata_max` settings still parse ordinary dicts.
 const OUTPUT_MIN: usize = 4 * 1024 * 1024;
-/// Bytes charged per string built on top of its contents (the `String` header and its `Vec`
-/// slot), so strings that decode to nothing (all NUL) are not free.
-const STRING_COST: usize = 32;
+/// Bytes charged per string built on top of its contents, so strings that decode to nothing
+/// (all NUL) are not free: its 24 B `String` header in a `Vec` that may have doubled (48 B),
+/// plus the allocator's rounding of a short heap buffer (D110; `tests/parse_memory.rs` checks
+/// the price against a counting allocator).
+pub const STRING_COST: usize = 64;
+/// Bytes charged per [`InfoFile`] on top of its path string: 32 B, plus half again for the
+/// growth of its `Vec` (D110; the counting allocator in `tests/parse_memory.rs` finds what a
+/// summary keeps 10–25 % under the price).
+pub const FILE_COST: usize = 48;
+/// Real bytes of strings a parse may build per byte of the dict (D110), on top of
+/// [`OUTPUT_SLACK`]: results are held long after the decode (a worker upload holds up to 1 000,
+/// the DHT pipeline a channel plus a 500-row batch), so what a small dict may build must scale
+/// with its size, not with `metadata_max`. The manga pack (`a_manga_pack_parses`, 547 KB) is
+/// priced ~7.8× its size with the per-string and per-file prices (2.6 MB of strings).
+pub const SIZE_FACTOR: usize = 8;
+/// Bytes any dict may build whatever its size (D110): a short dict with a few long names.
+pub const OUTPUT_SLACK: usize = 1024 * 1024;
 /// The default `MAGNETAR_DHT_METADATA_MAX` (16 MiB), the cap [`parse_info`] uses.
 const DEFAULT_METADATA_MAX: usize = 16 * 1024 * 1024;
 
 /// Most real bytes of strings one parse may build when dicts are at most `metadata_max` bytes
-/// (D110): [`OUTPUT_FACTOR`] × `metadata_max`, at least 4 MiB. The fetcher reserves it in each
-/// decode's price.
+/// (D110): [`OUTPUT_FACTOR`] × `metadata_max`, at least 4 MiB. A parse is also bounded by the
+/// dict's size ([`output_bound`]), and the fetcher reserves that bound in each decode's price.
 pub const fn output_max(metadata_max: usize) -> usize {
     let n = metadata_max.saturating_mul(OUTPUT_FACTOR);
     if n < OUTPUT_MIN { OUTPUT_MIN } else { n }
+}
+
+/// Most real bytes of strings the parse of a `raw_len`-byte dict may build (D110):
+/// `min(output_max, SIZE_FACTOR × raw_len + OUTPUT_SLACK)`. [`parse_info_bounded`] applies it, so
+/// every caller does.
+pub const fn output_bound(raw_len: usize, output_max: usize) -> usize {
+    let n = raw_len
+        .saturating_mul(SIZE_FACTOR)
+        .saturating_add(OUTPUT_SLACK);
+    if n < output_max { n } else { output_max }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -182,10 +209,16 @@ struct Budget(usize);
 impl Budget {
     /// Take one string of `n` bytes, or fail before anything is allocated.
     fn spend(&mut self, n: usize) -> Result<(), InfoError> {
-        self.0 = self
-            .0
-            .checked_sub(n.saturating_add(STRING_COST))
-            .ok_or(InfoError::TooComplex)?;
+        self.take(n.saturating_add(STRING_COST))
+    }
+
+    /// Take one [`InfoFile`] entry (its path is spent on its own).
+    fn file(&mut self) -> Result<(), InfoError> {
+        self.take(FILE_COST)
+    }
+
+    fn take(&mut self, n: usize) -> Result<(), InfoError> {
+        self.0 = self.0.checked_sub(n).ok_or(InfoError::TooComplex)?;
         Ok(())
     }
 }
@@ -268,11 +301,11 @@ pub fn parse_info(raw: &[u8]) -> Result<InfoSummary, InfoError> {
     parse_info_bounded(raw, output_max(DEFAULT_METADATA_MAX))
 }
 
-/// Parse a verified info dict, building at most `output_max` real bytes of strings (names,
-/// `all_names`, display paths); above it [`InfoError::TooComplex`], before the string that
-/// would cross it is allocated (D110).
+/// Parse a verified info dict, building at most [`output_bound`]`(raw.len(), output_max)` real
+/// bytes of strings (names, `all_names`, display paths, priced per string and per file); above
+/// it [`InfoError::TooComplex`], before the string that would cross it is allocated (D110).
 pub fn parse_info_bounded(raw: &[u8], output_max: usize) -> Result<InfoSummary, InfoError> {
-    let mut budget = Budget(output_max);
+    let mut budget = Budget(output_bound(raw.len(), output_max));
     let v = bencode::decode(raw).map_err(|_| InfoError::Decode)?;
     if v.as_dict().is_none() {
         return Err(InfoError::Decode);
@@ -341,6 +374,7 @@ pub fn parse_info_bounded(raw: &[u8], output_max: usize) -> Result<InfoSummary, 
                 .filter(|p| !p.is_empty() && p.iter().all(|e| is_utf8(e)))
                 .unwrap_or(&parts);
             let path = display_path(shown, &mut budget)?;
+            budget.file()?;
             files.push(InfoFile { path, size });
         }
     } else if let Some(len) = v.get(b"length") {
@@ -349,6 +383,7 @@ pub fn parse_info_bounded(raw: &[u8], output_max: usize) -> Result<InfoSummary, 
             .and_then(|l| u64::try_from(l).ok())
             .ok_or(InfoError::BadFiles)?;
         budget.spend(name.len())?;
+        budget.file()?;
         files.push(InfoFile {
             path: name.clone(),
             size,
@@ -449,6 +484,7 @@ fn walk_tree<'a>(
             names.push(join(prefix, usize::MAX));
             if !padding {
                 budget.spend(real_len.min(DISPLAY_MAX))?;
+                budget.file()?;
                 files.push(InfoFile {
                     path: join(prefix, DISPLAY_MAX),
                     size: len,
@@ -679,6 +715,50 @@ mod tests {
     }
 
     #[test]
+    fn small_hostile_dicts_build_in_proportion_to_their_size() {
+        // D110 review: the absolute cap alone let a 44 KB dict (a 4 000-byte 0xFF directory over
+        // 1 900 leaves without `pieces root`; ~140 KB with them) build 24.7 MB, and results are held by the hundred (a worker upload holds
+        // up to 1 000 before persisting). Whatever is built stays within 8 × the dict + 1 MiB.
+        let cap = output_max(16 << 20);
+        let (mut raw_total, mut built_total, mut dicts, mut refused) = (0, 0, 0, 0);
+        for dir in [16, 256, 1000, 4000] {
+            for leaves in [10, 100, 500, 1900] {
+                let raw = v2_with_tree(wide_dir(vec![0xFF; dir], leaves));
+                assert!(raw.len() < 256 * 1024);
+                raw_total += raw.len();
+                dicts += 1;
+                match parse_info_bounded(&raw, cap) {
+                    Ok(s) => {
+                        assert!(
+                            built(&s) <= output_bound(raw.len(), cap),
+                            "{dir} × {leaves}"
+                        );
+                        built_total += built(&s);
+                    }
+                    Err(e) => {
+                        assert_eq!(e, InfoError::TooComplex, "{dir} × {leaves}");
+                        refused += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            built_total <= SIZE_FACTOR * raw_total + dicts * OUTPUT_SLACK,
+            "{built_total} B built from {raw_total} B of {dicts} dicts"
+        );
+        // The reviewer's shape is refused; the small ones still parse.
+        let raw = v2_with_tree(wide_dir(vec![0xFF; 4000], 1900));
+        assert_eq!(parse_info_bounded(&raw, cap), Err(InfoError::TooComplex));
+        assert!(
+            refused > 0 && refused < dicts,
+            "{refused} of {dicts} refused"
+        );
+        // The bound: 8 × the dict + 1 MiB, never above the absolute cap.
+        assert_eq!(output_bound(1000, cap), 8000 + (1 << 20));
+        assert_eq!(output_bound(16 << 20, cap), cap);
+    }
+
+    #[test]
     fn a_manga_pack_parses() {
         // D110 review: a v2-only manga pack, long directory names over short page names (each
         // leaf repeats ~190 bytes of directories), was refused by the raw-size budget.
@@ -700,7 +780,8 @@ mod tests {
         let s = parse_info(&raw).unwrap();
         assert_eq!(s.files.len(), 34 * 200);
         assert!(s.files[0].path.ends_with("[Kodansha Comics]/001.jpg"));
-        assert!(built(&s) <= output_max(16 << 20));
+        // ~7.8 × with the per-string and per-file prices: inside the size-relative bound.
+        assert!(built(&s) <= output_bound(raw.len(), output_max(16 << 20)));
     }
 
     #[test]

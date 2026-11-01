@@ -560,8 +560,9 @@ test):
   `Value` tree tens of times its size (2-byte values, ≥ 32 B each decoded). Decoding runs under
   a semaphore (4 at once); before it runs, the verified bytes are scanned without allocating
   to count values: more than `metadata_max / 8` = `invalid` (`too_complex`), else the decode
-  reserves `3 × size + 64 B × values` plus the parse's string cap (`3 × metadata_max`, below)
-  from a decode budget of its own (D67, D110). Info dicts with
+  reserves `3 × size + 112 B × values` plus the parse's string bound
+  (`min(3 × metadata_max, 8 × size + 1 MiB)`, below) from a decode budget of its own
+  (`6 × metadata_max` per decode slot, D67, D110). Info dicts with
   duplicate keys at any level are `invalid` (§4 step 6). The count and the decoder read string
   lengths with the same digits-only parser (no sign: `-0:` was an empty key to the decoder and a
   stop for the counter), and anything the counter cannot read is priced as `too_complex`
@@ -570,14 +571,20 @@ test):
   (blocklist input and display path), so one huge directory key over many tiny leaves asked for
   prefix × leaves bytes (terabytes at 16 MiB), and lossy decoding makes each invalid byte a
   3-byte U+FFFD. Every string the parse builds (names, blocklist input, v1 and v2 paths) is
-  priced in real decoded bytes before it is allocated, against an absolute cap
-  `info::output_max` = 3 × `MAGNETAR_DHT_METADATA_MAX` (48 MiB at the default, at least 4 MiB):
-  padding the dict does not raise it, and the decode price above reserves it. A BEP 52 path
-  over 4 096 raw bytes (`PATH_MAX`) or a parse over the cap is `too_complex`. The name and
+  priced in real decoded bytes plus 64 B per string and 48 B per file entry (measured against a
+  counting allocator, `tests/parse_memory.rs`) before it is allocated, against
+  `info::output_bound` = `min(output_max, 8 × size + 1 MiB)`, where the absolute cap
+  `output_max` = 3 × `MAGNETAR_DHT_METADATA_MAX` (48 MiB at the default, at least 4 MiB) does
+  not grow when the dict is padded, and the size-relative term keeps what a small dict builds
+  small: results are held long after the decode (a worker upload holds up to 1 000 before
+  persisting, the pipeline a channel and a 500-row batch), and a 44 KB dict built 24.7 MB under
+  the cap alone. The decode price above reserves the bound. A BEP 52 path over 4 096 raw bytes
+  (`PATH_MAX`) or a parse over the bound is `too_complex`. The name and
   every display path are built cut to 1 KiB on a character boundary (the Nostr title cap,
   `info::DISPLAY_MAX`); the blocklist input keeps the full strings. A v2 manga pack with long
-  directory names builds ~4.7 × its size, so that shape fits up to a ~10 MB dict at the default
-  (larger: UNVERIFIED). The release parser is linear in the name (`fold` and the per-bracket
+  directory names builds ~4.7 × its size in strings, ~7.8 × with the per-string and per-file
+  prices, so that shape fits the size-relative bound and, at the default cap, up to a ~6 MB
+  dict (larger: UNVERIFIED). The release parser is linear in the name (`fold` and the per-bracket
   facts were quadratic), and `parse_release` / `classify` read at most 1 KiB of a title
   (`release::NAME_MAX`), also for rows stored before D110.
 
