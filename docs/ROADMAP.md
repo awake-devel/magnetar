@@ -40,3 +40,11 @@ At 8 nodes, 10,000 q/s and 8,192 lookups, both the D106 engine and the code befo
 fall to about 20 % of their query cap, with the transaction map full (`busy`). Production runs far
 below this (16 nodes, 5,000 q/s, 4,096 lookups). Find out why before raising limits further
 (docs/DHT.md §20.5).
+
+## Low priority
+
+### App: stop infinite scroll at the search offset cap
+Since D110 the server answers 400 above `offset` 10 000 (`query::MAX_OFFSET`). The app's
+infinite scroll asks for `offset = hits shown`, so a list scrolled past 10 000 hits (200 pages
+of 50) shows an error message instead of more hits. The app should stop loading at the cap and
+say "refine the search" instead.

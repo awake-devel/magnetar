@@ -65,7 +65,7 @@ class SettingsChecksTest {
     @Test
     fun `server URL field`() {
         assertEquals(checkServerUrl(""), Check())
-        assertEquals(checkServerUrl("https://ryoku.tail26814a.ts.net"), Check())
+        assertEquals(checkServerUrl("https://myserver.tail0000.ts.net"), Check())
         assertEquals(checkServerUrl("http://magnetar.tail1234.ts.net:8787/"), Check())
         assertEquals(checkServerUrl("http://localhost:8787"), Check())
         assertEquals(checkServerUrl("http://127.0.0.1:8787"), Check())
