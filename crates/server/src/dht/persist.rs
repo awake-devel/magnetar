@@ -372,10 +372,23 @@ impl PersistOutcome {
     }
 }
 
-/// A failure that belongs to one row (the database refused its values, or they could not be
-/// encoded): the batch goes on without it. Anything else (I/O, pool, protocol) aborts it.
+/// A failure that belongs to one row, so the same bytes would fail the same way: the values
+/// could not be encoded, or the database refused them by SQLSTATE class (D110). The batch goes
+/// on without the row. Anything else aborts the batch and keeps its leases, to be retried:
+/// I/O, pool, protocol, and database errors that a retry can clear (deadlock or serialization
+/// 40, resources 53, lock timeout 55, cancel or statement timeout 57) or that we do not know.
 fn row_level(e: &sqlx::Error) -> bool {
-    matches!(e, sqlx::Error::Database(_) | sqlx::Error::Encode(_))
+    match e {
+        sqlx::Error::Encode(_) => true,
+        sqlx::Error::Database(d) => d.code().is_some_and(|c| row_level_sqlstate(&c)),
+        _ => false,
+    }
+}
+
+/// SQLSTATE classes that describe the row's values: 22 data exception, 23 integrity
+/// constraint, 54 program limit (a tsvector over 1 MB is 54000), P0 PL/pgSQL raise.
+fn row_level_sqlstate(code: &str) -> bool {
+    matches!(code.get(..2), Some("22" | "23" | "54" | "P0"))
 }
 
 /// Block or store one screened result.
@@ -470,7 +483,8 @@ pub async fn persist_batch(
                         sqlx::query("RELEASE SAVEPOINT persist_row")
                             .execute(&mut *tx)
                             .await?;
-                        // Closed for good: the same bytes would fail the same way.
+                        // Closed for good: by its SQLSTATE class (`row_level`), the same bytes
+                        // would fail the same way.
                         set_final(&mut tx, &it.sighted, STATUS_INVALID, STORE_ERROR).await?;
                         o.invalid += 1;
                         o.row_errors += 1;
@@ -644,5 +658,21 @@ mod tests {
         let t = files_text(&[f("x"), f(&long)]);
         assert!(t.len() <= FILES_TEXT_MAX && t.len() > FILES_TEXT_MAX - 2);
         assert!(t.starts_with("x\né"));
+    }
+
+    #[test]
+    fn only_value_errors_close_a_row() {
+        // D110 review: the row's own values (data, constraint, size limit, a trigger's raise).
+        for c in ["22001", "22P02", "23505", "54000", "P0001"] {
+            assert!(row_level_sqlstate(c), "{c}");
+        }
+        // A retry can clear these (deadlock, serialization, out of memory, disk full, lock
+        // timeout, statement timeout or cancel), or we do not know them: the batch fails.
+        for c in [
+            "40P01", "40001", "53200", "53100", "55P03", "57014", "08006", "XX000", "42601", "",
+        ] {
+            assert!(!row_level_sqlstate(c), "{c}");
+        }
+        assert!(!row_level(&sqlx::Error::PoolTimedOut));
     }
 }
