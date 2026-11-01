@@ -882,6 +882,7 @@ async fn persist_flush(p: &Pipeline, pool: &PgPool, batch: &mut Vec<FetchResult>
             t.invalid += o.invalid;
             t.oversize += o.oversize;
             t.failed += o.failed;
+            t.row_errors += o.row_errors;
         }
         Err(e) => {
             // The hashes keep their dht_seen lease: the retry loop brings them back.
