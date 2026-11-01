@@ -61,11 +61,13 @@ any change an older peer could misread.
 | `/api/v1/worker/liveness/lease` | `{max}` → `Lease {expires_at, items:[{infohash, trackers}]}` | |
 | `/api/v1/worker/liveness/results` | `{results:[Liveness]}` → `{accepted, ignored}` | |
 | `/api/v1/worker/liveness/release` | `{infohashes}` → `{accepted, ignored}` | unchecked leases given back at stop |
-| `/api/v1/worker/dht/triage` | `{items:[{h, via}]}` (≤ 2000) → `{fetch:[h], blocked, known}` | |
+| `/api/v1/worker/dht/triage` | `{items:[{h, via}]}` (≤ 2000, ≤ 1 MiB) → `{fetch:[h], blocked, known, capped}` | `capped`: new hashes over the worker's hourly cap (D113) |
 | `/api/v1/worker/dht/results` | `{items:[DhtResult]}` (≤ 1000, ≤ 32 MiB) → `{stored, not_new, blocked, rejected, applied, ignored}` | |
 
-Hello, heartbeat and lease bodies are limited to 64 KiB (413 above; the 32 MiB limit is for
-result uploads). The server drops control characters from `version`, `arch` and the DHT
+Hello, heartbeat and lease bodies are limited to 64 KiB, triage and release bodies to 1 MiB
+(413 above; the 32 MiB limit is for the two result uploads, D113). A worker sends at most 2000
+node-count rows and 1000 AS names with one triage (the rest goes with the next one), so a full
+triage stays under ~800 KB. The server drops control characters from `version`, `arch` and the DHT
 `mode` and keeps at most 64 characters of each and 64 DHT ports before it logs, stores or
 shows them in `/api/v1/stats` (D111).
 
@@ -126,12 +128,28 @@ apply to it), from its own line: trackers see another IP, so the per-tracker rat
 6. **Holders (D113).** Triage records the worker it queued a hash for in `dht_seen.holder`
    (NULL = the server's own crawler; its retry loop takes a row back by clearing it). Every
    item of an upload, dict or status, is for a hash this worker holds, or it is `ignored`
-   before anything is decoded: a worker cannot inject a dict under a hash it was never handed,
-   nor finalise or block another worker's or the server's hashes. Each hash counts once per
-   upload.
+   before anything is decoded: a worker cannot upload a dict or a status for a hash another
+   worker or the server holds. A due row another worker holds (an expired lease, or a
+   failure's backoff over) is handed to a second worker only once it is 1 h past due
+   (`TAKEOVER_GRACE_SECS`), also when the server's retry loop never runs (DHT off on the
+   server); the holder itself and the server's own crawler may take it at once. Within one
+   upload each hash counts once: its first item that decodes and verifies (a malformed or
+   forged copy does not shadow a good one after it).
+
+   This does **not** stop a worker token holder from storing dicts it made up: a worker
+   chooses what it triages, so it can triage `sha1(D)` for a dict D of its own, be handed the
+   new hash, and upload D (it verifies). Two limits: each worker may queue at most
+   `MAGNETAR_WORKER_TRIAGE_NEW_PER_HOUR` new hashes an hour (default 100 000; re-queued
+   hashes do not count, the triage answer's `capped` says how many were left out), and every
+   row stored from a worker's dict records it in `dht_torrents.supplied_by` (NULL = the
+   server's own crawler and every row stored before migration `20261104120000`), so what one
+   token added can be removed (§7). The server's own classifier and blocklist still run on
+   every such dict.
 7. **Upload slots (D113).** `dht/results` and `liveness/results` take a slot before their body
    is read: 4 server-wide (one 32 MiB upload holds ~90 MB while parsed), 2 per worker. With
    none free the server answers 503 with `Retry-After: 5`, and the worker retries with backoff.
+   Every other worker route takes a small slot the same way (6 per worker, 16 server-wide,
+   bodies ≤ 1 MiB; 503 with `Retry-After: 1`); an honest worker has at most ~4 in flight.
    The worker retries only 408, 429 and 5xx (and network errors); any other 4xx (400, 413,
    422) refuses that body for good, so the worker splits it in halves and drops a single
    refused item with a warning (`upload_dropped` in its report), instead of resending it
@@ -391,11 +409,24 @@ health probe are the safeguards.
 
 - Nostr relay crawling on workers (D99), header probes (not built), UPnP by default.
 - Hashes leased to a worker that dies come back through the server's DHT retry loop only when
-  the server's own DHT crawler runs; otherwise they wait until sighted again after the lease.
+  the server's own DHT crawler runs; otherwise they wait until sighted again, by another worker
+  at least 1 h after the lease's end (D113), or by the same worker at once.
 - A worker trusts the server it is pointed at (TLS checks the name); the server trusts a
   worker's seed-check numbers and failure statuses (they only move schedules), never its
   content claims, and only for hashes it holds (D113).
-- A worker can still block (or mark failed, private, …) a hash it triaged itself: it chooses
-  what it triages. Blocks from a worker's word are origin `worker` in `blocked_infohashes`, so
-  after a token leak `DELETE FROM blocked_infohashes WHERE origin = 'worker'` undoes them
-  (they also stop a Nostr event for the same hash, like any block, D53).
+- A worker token holder can still store dicts it made up, within its hourly cap
+  (`MAGNETAR_WORKER_TRIAGE_NEW_PER_HOUR`, default 100 000 new hashes an hour): it chooses what
+  it triages (§1 DHT item 6). After a token leak, remove the token from
+  `MAGNETAR_WORKER_TOKENS`, then `DELETE FROM dht_torrents WHERE supplied_by = '<name>'`
+  (counts and the search index follow). Rows stored before migration `20261104120000` have no
+  supplier and cannot be told apart.
+- A worker can still block (or mark failed, private, …) a hash it triaged itself. Blocks from a
+  worker's word are origin `worker` in `blocked_infohashes`: they keep the DHT (server and
+  workers) from fetching the hash, but **do not stop a Nostr event** for it (D113); the server
+  screens that event itself, and a block of its own (Nostr, its DHT screen, the sweep) then
+  replaces the origin. After a token leak `DELETE FROM blocked_infohashes WHERE origin =
+  'worker'` undoes them. Worker blocks recorded before migration `20261104113000` have origin
+  `dht` and cannot be told apart from the server's own.
+- The triage cap's default and the small-request slots are sized from the 2026-10-27 laptop
+  run, not measured against eee or the Pi: **UNVERIFIED** that they never hold back an honest
+  worker.
