@@ -42,6 +42,10 @@ unicode-normalization = { workspace = true }
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 nix.workspace = true
 
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dev-dependencies]
+# Thread CPU time for the scaling tests (release.rs), so a loaded machine does not fail them.
+nix = { workspace = true, features = ["time"] }
+
 [dev-dependencies]
 tokio = { workspace = true }
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }

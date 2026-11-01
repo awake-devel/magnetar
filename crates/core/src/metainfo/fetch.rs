@@ -6,8 +6,8 @@
 //! (whole peer 10 s). Per hash: ≤ 12 peers, ≤ 4 at once, 30 s. Global: ≤ 150 connection attempts/s and ≤ 350 open
 //! connections (router benchmark, D66),
 //! 256 MiB of metadata in flight, 4 decodes at once, each priced before it runs (3 × its size
-//! plus 64 B per bencode value, counted without allocating, plus the parse's string cap
-//! `3 × metadata_max`, D110) and reserved from a decode budget of its own
+//! plus 112 B per bencode value, counted without allocating, plus the parse's string bound
+//! `min(3 × metadata_max, 8 × size + 1 MiB)`, D110) and reserved from a decode budget of its own
 //! (6 × `metadata_max` × 4); above `metadata_max / 8` values it is `too_complex`.
 //!
 //! Verification (BEP 52 "the encoded form as found", never a decode-encode round trip):
@@ -33,7 +33,9 @@ use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
-use super::info::{InfoError, InfoSummary, output_max, parse_info, parse_info_bounded};
+use super::info::{
+    InfoError, InfoSummary, output_bound, output_max, parse_info, parse_info_bounded,
+};
 use super::wire::{self, ExtHandshake, MetadataMsg, WireError};
 use crate::dht::addr::AddrFilter;
 use crate::dht::limiter::{Pace, brake_divisor};
@@ -48,9 +50,11 @@ const DISCARD_BUDGET: u64 = 4 * 1024 * 1024;
 const MAX_REJECTS_SENT: usize = 64;
 /// Budget accounting unit (the semaphore counts KiB so 256 MiB fits its u32 permits).
 const UNIT: usize = 1024;
-/// Bytes one decoded bencode value may cost (`Value` is 32 B, a dict entry 56 B, `Vec` growth
-/// up to 2×), used to price a decode before it runs.
-const VALUE_COST: usize = 64;
+/// Bytes one decoded bencode value may cost, used to price a decode before it runs: `Value` is
+/// 32 B and a dict entry (key and value, two counted values) 56 B, in a `Vec` that may have
+/// doubled, plus the allocator's chunk for each short key and string buffer (D110: a tree of tiny leaves peaks at ~102 B per value, string
+/// copies included, counted in glibc chunks by `tests/parse_memory.rs`).
+pub const VALUE_COST: usize = 112;
 /// Decode cost of the raw bytes themselves: the input, the copied strings, the names.
 const RAW_COST: usize = 3;
 
@@ -61,13 +65,13 @@ pub fn max_values(metadata_max: usize) -> usize {
 }
 
 /// Bytes a decode of `raw_len` bytes holding `values` values may take, when dicts are at most
-/// `metadata_max` bytes: the decode itself plus the strings the parse may build, whose cap
-/// ([`output_max`]) does not depend on the dict's size (D110).
+/// `metadata_max` bytes: the decode itself plus the strings the parse may build
+/// ([`output_bound`]: at most [`output_max`], and at most 8 × the dict plus 1 MiB, D110).
 fn decode_cost(raw_len: usize, values: usize, metadata_max: usize) -> usize {
     raw_len
         .saturating_mul(RAW_COST)
         .saturating_add(values.saturating_mul(VALUE_COST))
-        .saturating_add(output_max(metadata_max))
+        .saturating_add(output_bound(raw_len, output_max(metadata_max)))
 }
 
 /// Decode budget per decode slot, bytes: the priced cost of a `metadata_max` dict without its
@@ -589,8 +593,9 @@ pub enum RawError {
 /// as a fetched dict is: size bound, hash of the raw bytes, value count before any decode
 /// (`too_complex` above [`max_values`]), parse, identity. Synchronous and CPU-bound (run it off
 /// the async threads); its memory is bounded like a fetcher decode: about 3 × the size plus
-/// 64 B per value, at most `metadata_max / 8` values, plus at most `3 × metadata_max` of
-/// parsed strings (D110).
+/// 112 B per value, at most `metadata_max / 8` values, plus at most
+/// `min(3 × metadata_max, 8 × size + 1 MiB)` of parsed strings, which is also what the result
+/// keeps (D110).
 pub fn outcome_from_raw(
     sighted: [u8; 20],
     raw: &[u8],
@@ -1019,7 +1024,7 @@ impl Fetcher {
 
         // Verify, price, then parse off the async threads, `decode_parallel` at once. The hash
         // and the value count allocate nothing; the decode reserves its priced cost (raw bytes
-        // × 3 + 64 B per value + the parse's string cap, D110) from the decode budget, capped
+        // × 3 + 112 B per value + the parse's string bound, D110) from the decode budget, capped
         // at the whole budget so the
         // largest allowed dict still runs (alone).
         let _decode = self
@@ -1209,9 +1214,17 @@ mod tests {
         assert_eq!(count_values(b"i12", 10), 11);
         assert_eq!(max_values(16 << 20), 2 << 20);
         assert_eq!(max_values(1 << 10), 64 * 1024);
-        // D110: the parse's string cap is reserved whatever the dict's size.
-        assert_eq!(decode_cost(10, 2, 1 << 20), 30 + 128 + (4 << 20));
-        assert_eq!(decode_cost(10, 2, 16 << 20), 30 + 128 + (48 << 20));
+        // D110: the parse's string bound is reserved: 8 × the dict + 1 MiB, at most the cap
+        // (`output_max`, which padding the dict does not raise).
+        assert_eq!(decode_cost(10, 2, 1 << 20), 30 + 224 + 80 + (1 << 20));
+        assert_eq!(
+            decode_cost(1 << 20, 2, 1 << 20),
+            (3 << 20) + 224 + (4 << 20)
+        );
+        assert_eq!(
+            decode_cost(16 << 20, 2, 16 << 20),
+            (48 << 20) + 224 + (48 << 20)
+        );
         assert_eq!(decode_slot(16 << 20), 96 << 20);
         let f = Fetcher::new(FetchConfig {
             metadata_max: 16 << 20,

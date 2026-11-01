@@ -2366,26 +2366,71 @@ mod tests {
         }
     }
 
+    /// This thread's CPU time (wall time elsewhere): time spent preempted by other work on the
+    /// machine does not count.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn cpu_time() -> std::time::Duration {
+        use nix::time::{ClockId, clock_gettime};
+        clock_gettime(ClockId::CLOCK_THREAD_CPUTIME_ID)
+            .map(std::time::Duration::from)
+            .unwrap_or_default()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn cpu_time() -> std::time::Duration {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed()
+    }
+
+    /// Fastest of `runs` timings (thread CPU time) of `small` and of `big`, run in turns so
+    /// other work on the machine (caches, frequency) slows both alike.
+    fn timings(
+        runs: usize,
+        mut small: impl FnMut(),
+        mut big: impl FnMut(),
+    ) -> (std::time::Duration, std::time::Duration) {
+        let time = |f: &mut dyn FnMut()| {
+            let t = cpu_time();
+            f();
+            cpu_time().saturating_sub(t)
+        };
+        let mut best = (std::time::Duration::MAX, std::time::Duration::MAX);
+        for _ in 0..runs {
+            best.0 = best.0.min(time(&mut small));
+            best.1 = best.1.min(time(&mut big));
+        }
+        best
+    }
+
+    /// `big` (4 × the input of `small`) took at most 10 × `small`, + 50 ms of timer and scheduler
+    /// noise: linear code takes ~4 ×, quadratic 16 ×. CPU time, and comparing two timings of the
+    /// same run, keep the test valid on a loaded machine (fixed wall-clock limits failed while 4
+    /// builds ran).
+    fn assert_scales(what: &str, (small, big): (std::time::Duration, std::time::Duration)) {
+        assert!(
+            big <= small * 10 + std::time::Duration::from_millis(50),
+            "{what}: {small:?}, then {big:?}"
+        );
+    }
+
     #[test]
     fn fold_is_linear_on_a_hostile_name() {
-        // D110: the old fold took ~27 s on this 1 MB name in a debug build (hours at 16 MiB).
-        let name = "16-bit ".repeat((1 << 20) / 7);
-        let t = std::time::Instant::now();
-        let out = fold(&name);
-        assert!(
-            t.elapsed() < std::time::Duration::from_secs(1),
-            "{:?}",
-            t.elapsed()
-        );
-        assert_eq!(out, "16bit ".repeat((1 << 20) / 7));
+        // D110: the old fold took ~27 s on a 1 MB name in a debug build (hours at 16 MiB),
+        // 1.7 s on 256 KB.
+        let unit = "16-bit ";
+        let small = unit.repeat((256 << 10) / unit.len());
+        let big = unit.repeat((1 << 20) / unit.len());
+        let t = timings(5, || drop(fold(&small)), || drop(fold(&big)));
+        assert_scales("fold", t);
+        assert_eq!(fold(&big), "16bit ".repeat((1 << 20) / unit.len()));
     }
 
     #[test]
     fn parse_one_is_linear_on_many_brackets() {
         // D110 review: per-token bracket scans made these quadratic (release build: "[x] " ×
         // 64 KB took 1.1 s, × 256 KB 23 s; "(2020) " 0.2 s and 3 s; now 0.08 s at 256 KB).
-        // Uncapped on purpose: parse_one is what the caps protect. 64 KB keeps a debug build
-        // well under the limit (~0.3 s per parse).
+        // Uncapped on purpose: parse_one is what the caps protect. 16 KB, then 64 KB (~0.3 s
+        // per parse in a debug build).
         let video = Ctx {
             video: true,
             ..Ctx::default()
@@ -2396,15 +2441,13 @@ mod tests {
             ..Ctx::default()
         };
         for unit in ["[x] ", "(2020) ", "[01] ", "[ENG] ", "(1080) "] {
-            let name = unit.repeat((64 << 10) / unit.len());
-            let t = std::time::Instant::now();
-            let _ = parse_one(&name, &video);
-            let _ = parse_one(&name, &anime);
-            assert!(
-                t.elapsed() < std::time::Duration::from_secs(3),
-                "{unit:?}: {:?}",
-                t.elapsed()
-            );
+            let small = unit.repeat((16 << 10) / unit.len());
+            let big = unit.repeat((64 << 10) / unit.len());
+            let both = |name: &str| {
+                let _ = parse_one(name, &video);
+                let _ = parse_one(name, &anime);
+            };
+            assert_scales(unit, timings(3, || both(&small), || both(&big)));
         }
     }
 
@@ -2417,14 +2460,17 @@ mod tests {
             path: format!("{}.mkv", "(2020) ".repeat((64 << 10) / 7)),
             size: Some(1),
         }];
-        let t = std::time::Instant::now();
+        // The 4 MiB name costs what its first KiB does (uncapped, it took minutes).
+        let run = |name: &str| {
+            let _ = parse_release(name, &files, Category::Video);
+            let _ = crate::classify::classify(name, &files);
+        };
+        assert_scales(
+            "4 MiB name",
+            timings(5, || run(capped(&name)), || run(&name)),
+        );
         let a = parse_release(&name, &files, Category::Video);
         let c = crate::classify::classify(&name, &files);
-        assert!(
-            t.elapsed() < std::time::Duration::from_secs(2),
-            "{:?}",
-            t.elapsed()
-        );
         assert_eq!(
             format!("{a:?}"),
             format!(
