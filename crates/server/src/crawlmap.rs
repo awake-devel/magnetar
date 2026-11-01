@@ -53,6 +53,11 @@ pub const TOP_RELAYS: i64 = 20;
 const NAMED_MAX: usize = 200_000;
 /// Worker uploads: most tally rows / names accepted per triage request.
 pub const MAX_UPLOAD_ROWS: usize = 20_000;
+/// Most node-count rows / AS names a worker sends with one triage request (D113): with 2000
+/// triage items that stays under ~800 KB, inside the triage route's 1 MiB body limit
+/// ([`crate::fleet::TRIAGE_BODY_LIMIT`]). The rest waits for the next request.
+pub const UPLOAD_ROWS_PER_TRIAGE: usize = 2_000;
+pub const UPLOAD_NAMES_PER_TRIAGE: usize = 1_000;
 
 /// Bloom filter sizes (bits, log2): the server sees ~1–2 M DHT nodes a day (2 MiB, ~3 %
 /// false "already seen" at 2 M), a worker fewer (512 KiB).
@@ -335,7 +340,7 @@ impl CrawlMap {
         let mut t = self.tally.lock().unwrap();
         let mut rows = Vec::new();
         t.counts.retain(|(l, m, c), n| {
-            if *l == Layer::Dht && *m == Metric::Nodes && rows.len() < MAX_UPLOAD_ROWS {
+            if *l == Layer::Dht && *m == Metric::Nodes && rows.len() < UPLOAD_ROWS_PER_TRIAGE {
                 rows.push(crate::fleet::proto::GeoTally {
                     cc: c.country().map(str::to_string),
                     asn: c.asn(),
@@ -346,11 +351,18 @@ impl CrawlMap {
                 true
             }
         });
-        let names: Vec<crate::fleet::proto::AsName> = t
+        let take: Vec<u32> = t
             .names
-            .drain()
-            .take(MAX_UPLOAD_ROWS)
-            .map(|(asn, org)| crate::fleet::proto::AsName { asn, org })
+            .keys()
+            .take(UPLOAD_NAMES_PER_TRIAGE)
+            .copied()
+            .collect();
+        let names: Vec<crate::fleet::proto::AsName> = take
+            .into_iter()
+            .filter_map(|asn| {
+                let org = t.names.remove(&asn)?;
+                Some(crate::fleet::proto::AsName { asn, org })
+            })
             .collect();
         (rows, names)
     }
@@ -1215,5 +1227,50 @@ mod tests {
         let t = server.tally.lock().unwrap();
         assert_eq!(t.counts.values().sum::<u64>(), 1);
         assert_eq!(t.names.get(&64500).map(String::as_str), Some("Example AS"));
+    }
+
+    /// D113: one triage request carries at most a slice of the pending node counts and AS
+    /// names (the triage body limit is 1 MiB); the rest stays for the next request.
+    #[test]
+    fn worker_upload_is_sliced_per_triage() {
+        let m = CrawlMap::new(GeoMode::On, 16);
+        {
+            let mut t = m.tally.lock().unwrap();
+            for asn in 0..(UPLOAD_ROWS_PER_TRIAGE as u32 + 10) {
+                t.add(
+                    Layer::Dht,
+                    Metric::Nodes,
+                    GeoCode::from_parts(Some("FR"), Some(asn + 1)),
+                    1,
+                );
+            }
+            for asn in 0..(UPLOAD_NAMES_PER_TRIAGE as u32 + 7) {
+                t.names.insert(asn + 1, "x".repeat(120));
+            }
+        }
+        let (rows, names) = m.take_upload();
+        assert_eq!(rows.len(), UPLOAD_ROWS_PER_TRIAGE);
+        assert_eq!(names.len(), UPLOAD_NAMES_PER_TRIAGE);
+        let items: Vec<crate::fleet::proto::TriageItem> = (0..crate::fleet::MAX_TRIAGE)
+            .map(|_| crate::fleet::proto::TriageItem {
+                h: "f".repeat(40),
+                via: "get_peers".into(),
+                cc: Some("FR".into()),
+                asn: Some(4_200_000_000),
+            })
+            .collect();
+        let body = serde_json::to_vec(&crate::fleet::proto::TriageRequest {
+            items,
+            geo_nodes: rows,
+            as_names: names,
+        })
+        .unwrap();
+        assert!(
+            body.len() < crate::fleet::TRIAGE_BODY_LIMIT,
+            "{} bytes",
+            body.len()
+        );
+        let (rows, names) = m.take_upload();
+        assert_eq!((rows.len(), names.len()), (10, 7), "the rest comes next");
     }
 }

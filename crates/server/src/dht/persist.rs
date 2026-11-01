@@ -196,7 +196,9 @@ async fn block(
     sqlx::query(
         "INSERT INTO blocked_infohashes (infohash, blocked_at, rule_version, origin)
          SELECT h, $2, $3, 'dht' FROM unnest($1::text[]) AS u(h) ORDER BY h
-         ON CONFLICT (infohash) DO NOTHING",
+         ON CONFLICT (infohash) DO UPDATE SET origin = EXCLUDED.origin,
+             blocked_at = EXCLUDED.blocked_at, rule_version = EXCLUDED.rule_version
+           WHERE blocked_infohashes.origin = 'worker'",
     )
     .bind(&hashes)
     .bind(now)
@@ -249,6 +251,7 @@ async fn store(
     peers_seen: usize,
     fetch_known: bool,
     now: i64,
+    supplied_by: Option<&str>,
 ) -> sqlx::Result<(bool, Option<crate::geo::GeoCode>)> {
     let v1 = hex::encode(f.v1);
     let title = title_of(f);
@@ -262,10 +265,10 @@ async fn store(
         r#"
         INSERT INTO dht_torrents (infohash, infohash_v2, title, files, file_count, files_text,
             total_size, category, metadata_size, piece_length, first_seen, fetched_at,
-            discovered_via, peers_seen, classifier_version)
+            discovered_via, peers_seen, classifier_version, supplied_by)
         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                COALESCE((SELECT first_seen FROM dht_seen WHERE infohash = $11), $12), $12,
-               $13, $14, $15
+               $13, $14, $15, $17
         WHERE NOT EXISTS (SELECT 1 FROM blocked_infohashes b WHERE b.infohash = $1)
           AND ($16 OR NOT EXISTS (SELECT 1 FROM torrent_infohashes t WHERE t.infohash = $1))
         ON CONFLICT (infohash) DO NOTHING
@@ -287,6 +290,7 @@ async fn store(
     .bind(i32::try_from(peers_seen).unwrap_or(i32::MAX))
     .bind(CLASSIFIER_VERSION)
     .bind(skip_known_check)
+    .bind(supplied_by)
     .execute(&mut **tx)
     .await?
     .rows_affected()
@@ -389,6 +393,7 @@ async fn write_screened(
     verdict: Verdict,
     fetch_known: bool,
     now: i64,
+    supplied_by: Option<&str>,
 ) -> sqlx::Result<Written> {
     Ok(match verdict {
         Verdict::Block(tier) => {
@@ -396,8 +401,17 @@ async fn write_screened(
             Written::Blocked(tier)
         }
         Verdict::Allow => {
-            let (inserted, geo) =
-                store(tx, f, class, it.via, it.peers_seen, fetch_known, now).await?;
+            let (inserted, geo) = store(
+                tx,
+                f,
+                class,
+                it.via,
+                it.peers_seen,
+                fetch_known,
+                now,
+                supplied_by,
+            )
+            .await?;
             Written::Stored { inserted, geo }
         }
     })
@@ -410,6 +424,20 @@ pub async fn persist_batch(
     screen: Option<&dyn Screen>,
     fetch_known: bool,
     now: i64,
+) -> sqlx::Result<PersistOutcome> {
+    persist_batch_from(pool, items, screen, fetch_known, now, None).await
+}
+
+/// [`persist_batch`] for dicts a crawl worker supplied (D113): each new `dht_torrents` row
+/// records it in `supplied_by` (None = the server's own crawler), so what one worker token
+/// added can be found and removed.
+pub async fn persist_batch_from(
+    pool: &PgPool,
+    items: &[FetchResult],
+    screen: Option<&dyn Screen>,
+    fetch_known: bool,
+    now: i64,
+    supplied_by: Option<&str>,
 ) -> sqlx::Result<PersistOutcome> {
     let mut o = PersistOutcome::default();
     // Classify and screen first, outside the transaction and off the async workers: on a
@@ -454,8 +482,18 @@ pub async fn persist_batch(
                 sqlx::query("SAVEPOINT persist_row")
                     .execute(&mut *tx)
                     .await?;
-                match write_screened(&mut tx, it, f, screen, &class, verdict, fetch_known, now)
-                    .await
+                match write_screened(
+                    &mut tx,
+                    it,
+                    f,
+                    screen,
+                    &class,
+                    verdict,
+                    fetch_known,
+                    now,
+                    supplied_by,
+                )
+                .await
                 {
                     Ok(w) => {
                         sqlx::query("RELEASE SAVEPOINT persist_row")
@@ -580,7 +618,10 @@ pub async fn reclassify_batch(
         if let Verdict::Block(_) = verdict {
             sqlx::query(
                 "INSERT INTO blocked_infohashes (infohash, blocked_at, rule_version, origin)
-                 VALUES ($1, $2, $3, 'sweep') ON CONFLICT (infohash) DO NOTHING",
+                 VALUES ($1, $2, $3, 'sweep') ON CONFLICT (infohash) DO UPDATE
+                 SET origin = EXCLUDED.origin, blocked_at = EXCLUDED.blocked_at,
+                     rule_version = EXCLUDED.rule_version
+                 WHERE blocked_infohashes.origin = 'worker'",
             )
             .bind(&infohash)
             .bind(now)

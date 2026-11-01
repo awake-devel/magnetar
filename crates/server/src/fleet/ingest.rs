@@ -77,22 +77,38 @@ pub async fn triage(
     }
     st.crawlmap.add_upload(&r.geo_nodes, &r.as_names);
     let now = magnetar_core::now();
-    let o = store::triage_for(
+    // D113: at most `triage_new_per_hour` new hashes per worker (a token holder chooses what
+    // it triages, and every new hash it is handed can be filled with a dict of its own).
+    let reserved = st.fleet.reserve_new(&name, batch.len(), now);
+    let res = store::triage_for(
         st.store.pool(),
         &batch,
         &geo,
         now,
         st.fleet.config().fetch_known,
         Some(&name),
+        reserved.map(|n| n as i64),
     )
-    .await
-    .map_err(|e| {
+    .await;
+    if let Some(n) = reserved {
+        let used = res.as_ref().map_or(0, |o| o.fresh);
+        st.fleet.refund_new(&name, n.saturating_sub(used));
+    }
+    let o = res.map_err(|e| {
         ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "store",
             persist::error_class(&e),
         )
     })?;
+    if o.capped > 0 && st.fleet.note_capped(&name, o.capped as u64, now) {
+        tracing::warn!(
+            worker = %name,
+            capped = o.capped,
+            per_hour = st.fleet.config().triage_new_per_hour,
+            "worker triage: new hashes over MAGNETAR_WORKER_TRIAGE_NEW_PER_HOUR, not queued"
+        );
+    }
     st.fleet.with(&name, |e| {
         e.triaged += batch.len() as u64;
         e.queued += o.queued.len() as u64;
@@ -104,11 +120,27 @@ pub async fn triage(
         fetch: o.queued.iter().map(hex::encode).collect(),
         blocked: o.blocked as u32,
         known: o.known as u32,
+        capped: o.capped as u32,
     }))
 }
 
 /// A worker's block report: sighted hash, rule version.
 type BlockReport = ([u8; 20], i16);
+
+/// One upload item for a hash the worker holds, decoded.
+struct Parsed {
+    h: [u8; 20],
+    via: Via,
+    peers: usize,
+    kind: Kind,
+}
+
+enum Kind {
+    /// Raw info dict, verified next (emptied once verified).
+    Dict(Vec<u8>),
+    Block(i16),
+    Report(Result<Outcome, FetchFailure>),
+}
 
 /// The `dht_seen` rows among `hashes` that `worker` holds (queued, `holder` = it, D113): the
 /// only hashes it may upload a dict or report a status for.
@@ -205,90 +237,45 @@ pub async fn dht_results(
             .map_or(cfg.metadata_max as u64, |h| h.metadata_max)
     });
 
-    // Only hashes this worker holds (D113), each once; the rest is ignored before any decoding.
+    // Only hashes this worker holds (D113); the rest is ignored before any decoding. Each hash
+    // counts once: the first item for it that decodes and verifies, so a malformed copy does
+    // not shadow a good one later in the same upload.
     let sighted: Vec<[u8; 20]> = r
         .items
         .iter()
         .filter_map(|it| parse_hash(&it.sighted))
         .collect();
     let mine = held(pool, &name, &sighted).await.map_err(store_err)?;
-    let mut seen: HashSet<[u8; 20]> = HashSet::new();
 
-    // Decode first; dicts are verified together off the async threads.
-    let mut dicts: Vec<([u8; 20], Via, usize, Vec<u8>)> = Vec::new();
-    let mut reports: Vec<([u8; 20], Via, usize, DhtOutcome)> = Vec::new();
+    // Decode first (base64, status codes); dicts are verified together off the async threads.
+    let mut items: Vec<Parsed> = Vec::new();
+    // Hashes already settled by a valid status report: a later dict for them is not verified.
+    let mut reported: HashSet<[u8; 20]> = HashSet::new();
     for it in r.items {
         let Some(h) = parse_hash(&it.sighted) else {
             ack.rejected += 1;
             continue;
         };
-        if !mine.contains(&h) || !seen.insert(h) {
+        if !mine.contains(&h) || reported.contains(&h) {
             ack.ignored += 1;
             continue;
         }
         let via = via_of(&it.via);
         let peers = it.peers_seen as usize;
-        match it.outcome {
+        let kind = match it.outcome {
             DhtOutcome::Metadata { raw } => match data_encoding::BASE64.decode(raw.as_bytes()) {
-                Ok(b) => dicts.push((h, via, peers, b)),
-                Err(_) => ack.rejected += 1,
-            },
-            o => reports.push((h, via, peers, o)),
-        }
-    }
-
-    let mut results: Vec<FetchResult> = Vec::new();
-    if !dicts.is_empty() {
-        let _permit = fleet.verify.acquire().await.map_err(|_| {
-            ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "internal", "shutting down")
-        })?;
-        let max = cfg.metadata_max;
-        let checked = tokio::task::spawn_blocking(move || {
-            dicts
-                .into_iter()
-                .map(|(h, via, peers, raw)| (h, via, peers, outcome_from_raw(h, &raw, max)))
-                .collect::<Vec<_>>()
-        })
-        .await
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "verify"))?;
-        for (h, via, peers, o) in checked {
-            match o {
-                Ok(outcome) => results.push(FetchResult {
-                    sighted: h,
-                    via,
-                    peers_seen: peers,
-                    result: Ok(outcome),
-                }),
-                Err(e) => {
+                Ok(b) => Kind::Dict(b),
+                Err(_) => {
                     ack.rejected += 1;
-                    tracing::warn!(
-                        worker = %name,
-                        infohash = %hex::encode(h),
-                        "worker upload refused: {e:?}"
-                    );
+                    continue;
                 }
-            }
-        }
-    }
-    let verified = results
-        .iter()
-        .filter(|r| matches!(r.result, Ok(Outcome::Ok(_))))
-        .count() as u64;
-
-    // Status reports: already limited to hashes this worker holds (above).
-    let mut blocked: Vec<BlockReport> = Vec::new();
-    for (h, via, peers, o) in reports {
-        let result = match o {
-            DhtOutcome::Metadata { .. } => unreachable!("split above"),
+            },
             // The claimed hybrid v1 is not used (see `record_blocked`).
-            DhtOutcome::Blocked { rule_version, .. } => {
-                blocked.push((h, rule_version));
-                continue;
-            }
-            DhtOutcome::Private => Ok(Outcome::Private),
-            DhtOutcome::V2Only => Ok(Outcome::V2Only),
+            DhtOutcome::Blocked { rule_version, .. } => Kind::Block(rule_version),
+            DhtOutcome::Private => Kind::Report(Ok(Outcome::Private)),
+            DhtOutcome::V2Only => Kind::Report(Ok(Outcome::V2Only)),
             DhtOutcome::Invalid { code } => match InfoError::from_code(&code) {
-                Some(e) => Ok(Outcome::Invalid(e)),
+                Some(e) => Kind::Report(Ok(Outcome::Invalid(e))),
                 None => {
                     ack.rejected += 1;
                     continue;
@@ -296,28 +283,102 @@ pub async fn dht_results(
             },
             // Final only when the worker's limit is at least the server's: a smaller worker
             // leaves the torrent to someone with room (normal backoff, retried later).
-            DhtOutcome::Oversize => Err(FetchFailure {
+            DhtOutcome::Oversize => Kind::Report(Err(FetchFailure {
                 error: PeerError::Oversize,
                 oversize: worker_max >= cfg.metadata_max as u64,
                 peers_tried: 1,
                 skipped: 0,
-            }),
+            })),
             DhtOutcome::Failed { code } => match failure(&code) {
-                Some(f) => Err(f),
+                Some(f) => Kind::Report(Err(f)),
                 None => {
                     ack.rejected += 1;
                     continue;
                 }
             },
         };
-        ack.applied += 1;
-        results.push(FetchResult {
-            sighted: h,
+        if !matches!(kind, Kind::Dict(_)) {
+            reported.insert(h);
+        }
+        items.push(Parsed {
+            h,
             via,
-            peers_seen: peers,
+            peers,
+            kind,
+        });
+    }
+
+    // Verify every decoded dict (an earlier bad copy must not hide a later good one).
+    let mut verdicts = Vec::new();
+    if items.iter().any(|p| matches!(p.kind, Kind::Dict(_))) {
+        let _permit = fleet.verify.acquire().await.map_err(|_| {
+            ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "internal", "shutting down")
+        })?;
+        let max = cfg.metadata_max;
+        let (back, v) = tokio::task::spawn_blocking(move || {
+            let v: Vec<_> = items
+                .iter_mut()
+                .map(|p| match &mut p.kind {
+                    Kind::Dict(raw) => {
+                        let o = outcome_from_raw(p.h, raw, max);
+                        *raw = Vec::new();
+                        Some(o)
+                    }
+                    _ => None,
+                })
+                .collect();
+            (items, v)
+        })
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "verify"))?;
+        items = back;
+        verdicts = v;
+    }
+    verdicts.resize_with(items.len(), || None);
+
+    // The first valid item per hash wins; later ones are ignored.
+    let mut results: Vec<FetchResult> = Vec::new();
+    let mut blocked: Vec<BlockReport> = Vec::new();
+    let mut done: HashSet<[u8; 20]> = HashSet::new();
+    for (p, verdict) in items.into_iter().zip(verdicts) {
+        if done.contains(&p.h) {
+            ack.ignored += 1;
+            continue;
+        }
+        let result = match (p.kind, verdict) {
+            (Kind::Dict(_), Some(Ok(outcome))) => Ok(outcome),
+            (Kind::Dict(_), Some(Err(e))) => {
+                ack.rejected += 1;
+                tracing::warn!(
+                    worker = %name,
+                    infohash = %hex::encode(p.h),
+                    "worker upload refused: {e:?}"
+                );
+                continue;
+            }
+            (Kind::Dict(_), None) => unreachable!("every dict is verified"),
+            (Kind::Block(v), _) => {
+                done.insert(p.h);
+                blocked.push((p.h, v));
+                continue;
+            }
+            (Kind::Report(r), _) => {
+                ack.applied += 1;
+                r
+            }
+        };
+        done.insert(p.h);
+        results.push(FetchResult {
+            sighted: p.h,
+            via: p.via,
+            peers_seen: p.peers,
             result,
         });
     }
+    let verified = results
+        .iter()
+        .filter(|r| matches!(r.result, Ok(Outcome::Ok(_))))
+        .count() as u64;
 
     record_blocked(pool, &blocked, now)
         .await
@@ -326,9 +387,17 @@ pub async fn dht_results(
     ack.blocked += worker_blocked as u32;
     let mut stored = 0u64;
     for chunk in results.chunks(persist::BATCH_MAX) {
-        let o = persist::persist_batch(pool, chunk, fleet.screen.as_deref(), cfg.fetch_known, now)
-            .await
-            .map_err(store_err)?;
+        // D113: each stored torrent records the worker that supplied it (`supplied_by`).
+        let o = persist::persist_batch_from(
+            pool,
+            chunk,
+            fleet.screen.as_deref(),
+            cfg.fetch_known,
+            now,
+            Some(&name),
+        )
+        .await
+        .map_err(store_err)?;
         crawlmap.add_stored(&o.stored_geo);
         stored += o.stored;
         ack.stored += o.stored as u32;
