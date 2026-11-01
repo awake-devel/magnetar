@@ -22,6 +22,19 @@ its file list says. Never on torrents tagged adult or matched by the blocklist. 
 is active, since probing connects to peers from the server's IP. Per-machine limits for the
 crawl workers come from the router benchmarks (docs/benchmarks/).
 
+**Legal note, required with the feature (README "Legal" and the feature's doc).** Today
+Magnetar only handles metadata: info dicts (names, sizes, hashes), never file data. Header
+probes download pieces of the files themselves, so the legal position becomes blurry and the
+README must say so when they ship. The user's point for France: what is enforced is
+*sharing* (Arcom's graduated response, formerly HADOPI, acts on uploads seen in P2P swarms).
+Downloading a fragment to learn what a torrent contains is not the targeted act, but it is not
+explicitly lawful either: copying from an unlawful source is not covered by the private-copy
+exception (CJEU C-435/12 *ACI Adam*, 2014), so do not write that probing is legal. What the
+design must guarantee so a probe never shares: no upload at all (never unchoke, no `HAVE` or
+bitfield of real pieces, not announced as a seeder), only the bytes needed for the check, and
+nothing kept after it. **UNVERIFIED legal reading, not legal advice**; other countries differ
+(Germany, for example, fines downloads too).
+
 ### DHT engine: collapse at extreme settings
 At 8 nodes, 10,000 q/s and 8,192 lookups, both the D106 engine and the code before it sometimes
 fall to about 20 % of their query cap, with the transaction map full (`busy`). Production runs far
