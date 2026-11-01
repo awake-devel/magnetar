@@ -338,12 +338,12 @@ class StatsSettingsViewModelTest {
         vm.setServerUrl("ftp://x")
         assertFalse(vm.state.value.canSave)
         assertFalse(vm.saveNow())
-        vm.setServerUrl("https://ryoku.tail26814a.ts.net/")
+        vm.setServerUrl("https://myserver.tail0000.ts.net/")
         vm.setRootKey("hello")
         assertFalse(vm.saveNow())
         vm.setRootKey("")
         assertTrue(vm.saveNow())
-        assertEquals(store.flow.value.serverUrl, "https://ryoku.tail26814a.ts.net")
+        assertEquals(store.flow.value.serverUrl, "https://myserver.tail0000.ts.net")
     }
 
     @Test

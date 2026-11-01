@@ -10,3 +10,7 @@ target/
 # Worker settings with its token (docs/WORKERS.md §4): never committed.
 /docker/worker.env
 /docker/*.env
+# Local agent notes (home network details) and agent worktrees: never committed.
+/CLAUDE.md
+/CLAUDE.local.md
+/.claude/
