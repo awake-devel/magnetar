@@ -698,8 +698,10 @@ fn installer_set(files: &[TorrentFile]) -> bool {
     setup && parts > 0
 }
 
-/// Classify a torrent by its display name and files (padding files already dropped).
+/// Classify a torrent by its display name and files (padding files already dropped). The name
+/// is cut to [`release::NAME_MAX`] first, like a stored title (D110).
 pub fn classify(name: &str, files: &[TorrentFile]) -> Classification {
+    let name = release::capped(name);
     let mut bytes = [0u128; CLASSES.len()];
     let sized = files.iter().any(|f| f.size.is_some_and(|s| s > 0));
     for f in files {
