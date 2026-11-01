@@ -337,7 +337,8 @@ fn hits_query_with(
         .push(order)
         .push(", h.infohash ASC LIMIT ");
     qb.push_bind(i64::from(q.effective_limit()));
-    qb.push(" OFFSET ").push_bind(i64::from(q.offset));
+    qb.push(" OFFSET ")
+        .push_bind(i64::from(q.offset.min(magnetar_core::query::MAX_OFFSET)));
     qb
 }
 

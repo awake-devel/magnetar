@@ -10,7 +10,7 @@ use std::time::Duration;
 use magnetar_core::api::{FacetSet, FacetsResponse, MediaReleases, SearchIndexStatus};
 use magnetar_core::error::{Error, Result};
 use magnetar_core::model::*;
-use magnetar_core::query::{SearchPage, SearchQuery, Sort};
+use magnetar_core::query::{MAX_OFFSET, SearchPage, SearchQuery, Sort};
 use magnetar_core::store::{DEFAULT_TRUST_THRESHOLD, Store, keys};
 use magnetar_core::{magnet, release, trust, wot};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
@@ -1447,6 +1447,13 @@ impl Store for PgStore {
     }
 
     async fn search(&self, q: &SearchQuery, now: i64) -> Result<SearchPage> {
+        // Checked before either engine runs: both keep `offset + limit` results (D110).
+        if q.offset > MAX_OFFSET {
+            return Err(Error::Invalid(format!(
+                "offset {} is above the maximum {MAX_OFFSET}",
+                q.offset
+            )));
+        }
         let min_trust = match q.min_trust {
             Some(t) => t,
             None => self.threshold().await?,

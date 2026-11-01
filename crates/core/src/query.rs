@@ -6,6 +6,11 @@ use crate::model::{Category, MediaKind, TorrentSummary};
 
 pub const DEFAULT_LIMIT: u32 = 50;
 pub const MAX_LIMIT: u32 = 200;
+/// Deepest result offset a search accepts (D110): 50 pages of [`MAX_LIMIT`]. Every result up to
+/// `offset + limit` is kept while ranking (the index's top-k heaps, the SQL fallback's OFFSET
+/// scan), so an unbounded offset held every matching document in memory. Above it the server
+/// answers 400; nobody scrolls that far, narrower filters find the rest.
+pub const MAX_OFFSET: u32 = 10_000;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]

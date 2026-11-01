@@ -103,6 +103,42 @@ async fn auth_required_everywhere_but_health() {
 }
 
 #[tokio::test]
+async fn search_offset_has_a_maximum() {
+    // D110: every result up to offset + limit is kept while ranking, so the offset is capped.
+    use magnetar_core::query::MAX_OFFSET;
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    put(s, torrent(1, 1, NOW - 10, 1, "Some.Title.2020")).await;
+    let base = spawn_server(s).await;
+
+    let ok = get(
+        &base,
+        &format!("/api/v1/search?min_trust=0&offset={MAX_OFFSET}"),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::OK);
+    let page: SearchPage = ok.json().await.unwrap();
+    assert!(page.hits.is_empty());
+    let deep = MAX_OFFSET + 1;
+    assert_eq!(
+        error_code(get(&base, &format!("/api/v1/search?offset={deep}")).await).await,
+        (StatusCode::BAD_REQUEST, "invalid".to_string())
+    );
+    assert_eq!(
+        error_code(get(&base, "/api/v1/search?offset=4000000000").await).await,
+        (StatusCode::BAD_REQUEST, "invalid".to_string())
+    );
+    let r = http()
+        .post(format!("{base}/api/v1/search"))
+        .bearer_auth(TOKEN)
+        .json(&json!({"text": "title", "offset": deep}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(error_code(r).await.0, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn search_and_errors() {
     let Some(db) = test_db().await else { return };
     let s = &db.store;
