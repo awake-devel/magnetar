@@ -787,7 +787,7 @@ others are still planned (their stage in brackets).
 | `MAGNETAR_DHT_NODES` | `4` (aggressive), `1` (polite) | 1–32 (BEP 42 allows 8 id prefixes per IP; beyond 8 they repeat, §3.3, §20) |
 | `MAGNETAR_DHT_QPS` | `200` / `50` | global outbound KRPC queries per second over every virtual node (1–20000, §20) |
 | `MAGNETAR_DHT_POOL` | `1000000` / `200000` | crawl pool size (nodes) |
-| `MAGNETAR_DHT_PEER_LOOKUPS` | `64` / `8` | peer collections (sampling node, then lookup) at once (D62) |
+| `MAGNETAR_DHT_PEER_LOOKUPS` | 0.4 × QPS (8–4096) / `8` | peer collections (sampling node, then lookup) at once (D62, D114) |
 | `MAGNETAR_DHT_SAMPLE_PRIORITY` | `0` | share of the KRPC budget reserved for sampling ahead of the queue (0–1, §20, D106) |
 | `MAGNETAR_DHT_FETCH_CONCURRENCY` | `128` / `16` | metadata fetches in flight |
 | `MAGNETAR_DHT_LOOKUP_TIMEOUT_MS` | `4000` | soft per-query timeout of lookups (100–4000, §18, D93) |

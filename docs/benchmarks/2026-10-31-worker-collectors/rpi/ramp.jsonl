@@ -1,0 +1,102 @@
+{"phase": "baseline", "gw_answers": true, "cf_med": 6.5, "lat_limit": 46.5, "ct": 137, "ctmax": 65536, "t": "16:01:56"}
+{"phase": "step", "rate": 25, "s": 30, "cf_med": 6.5, "lost": 0, "gw": 1.3, "ct": 1392, "fault": null, "t": "16:02:26"}
+{"phase": "step", "rate": 25, "s": 61, "cf_med": 6.3, "lost": 0, "gw": 1.6, "ct": 2501, "fault": null, "t": "16:02:57"}
+{"phase": "step", "rate": 25, "s": 91, "cf_med": 6.4, "lost": 0, "gw": 1.3, "ct": 2686, "fault": null, "t": "16:03:27"}
+{"phase": "step", "rate": 25, "s": 121, "cf_med": 6.6, "lost": 0, "gw": 1.5, "ct": 2616, "fault": null, "t": "16:03:57"}
+{"phase": "step", "rate": 25, "s": 150, "cf_med": 6.7, "lost": 0, "gw": 1.2, "ct": 2369, "fault": null, "t": "16:04:26"}
+{"phase": "step", "rate": 25, "s": 180, "cf_med": 6.3, "lost": 0, "gw": 1.4, "ct": 3406, "fault": null, "t": "16:04:56"}
+{"phase": "step", "rate": 25, "s": 210, "cf_med": 6.3, "lost": 0, "gw": 1.4, "ct": 3328, "fault": null, "t": "16:05:27"}
+{"phase": "step", "rate": 25, "s": 241, "cf_med": 6.4, "lost": 0, "gw": 1.5, "ct": 3039, "fault": null, "t": "16:05:57"}
+{"phase": "step", "rate": 25, "s": 271, "cf_med": 6.3, "lost": 0, "gw": 1.1, "ct": 2422, "fault": null, "t": "16:06:27"}
+{"phase": "pass", "rate": 25, "t": "16:06:56"}
+{"phase": "step", "rate": 50, "s": 30, "cf_med": 6.4, "lost": 0, "gw": 1.5, "ct": 4304, "fault": null, "t": "16:07:27"}
+{"phase": "step", "rate": 50, "s": 61, "cf_med": 6.2, "lost": 0, "gw": 1.5, "ct": 4663, "fault": null, "t": "16:07:57"}
+{"phase": "step", "rate": 50, "s": 91, "cf_med": 6.8, "lost": 0, "gw": 1.6, "ct": 6297, "fault": null, "t": "16:08:28"}
+{"phase": "step", "rate": 50, "s": 121, "cf_med": 6.2, "lost": 0, "gw": 1.4, "ct": 5980, "fault": null, "t": "16:08:58"}
+{"phase": "step", "rate": 50, "s": 150, "cf_med": 6.3, "lost": 0, "gw": 1.7, "ct": 5536, "fault": null, "t": "16:09:26"}
+{"phase": "step", "rate": 50, "s": 180, "cf_med": 6.3, "lost": 0, "gw": 1.1, "ct": 7107, "fault": null, "t": "16:09:57"}
+{"phase": "step", "rate": 50, "s": 211, "cf_med": 6.2, "lost": 0, "gw": 1.2, "ct": 6545, "fault": null, "t": "16:10:27"}
+{"phase": "step", "rate": 50, "s": 241, "cf_med": 6.3, "lost": 0, "gw": 1.2, "ct": 5661, "fault": null, "t": "16:10:58"}
+{"phase": "step", "rate": 50, "s": 271, "cf_med": 6.4, "lost": 0, "gw": 1.3, "ct": 7163, "fault": null, "t": "16:11:28"}
+{"phase": "pass", "rate": 50, "t": "16:11:56"}
+{"phase": "step", "rate": 100, "s": 30, "cf_med": 6.4, "lost": 0, "gw": 1.2, "ct": 6845, "fault": null, "t": "16:12:27"}
+{"phase": "step", "rate": 100, "s": 60, "cf_med": 5.9, "lost": 0, "gw": 1.0, "ct": 9170, "fault": null, "t": "16:12:57"}
+{"phase": "step", "rate": 100, "s": 91, "cf_med": 6.8, "lost": 0, "gw": 1.5, "ct": 9213, "fault": null, "t": "16:13:27"}
+{"phase": "step", "rate": 100, "s": 121, "cf_med": 6.0, "lost": 0, "gw": 1.0, "ct": 8324, "fault": null, "t": "16:13:58"}
+{"phase": "step", "rate": 100, "s": 151, "cf_med": 6.3, "lost": 0, "gw": 1.4, "ct": 11068, "fault": null, "t": "16:14:28"}
+{"phase": "step", "rate": 100, "s": 180, "cf_med": 6.7, "lost": 0, "gw": 1.1, "ct": 9316, "fault": null, "t": "16:14:57"}
+{"phase": "step", "rate": 100, "s": 210, "cf_med": 6.5, "lost": 0, "gw": 4.2, "ct": 11484, "fault": null, "t": "16:15:27"}
+{"phase": "step", "rate": 100, "s": 240, "cf_med": 6.2, "lost": 0, "gw": 1.2, "ct": 10840, "fault": null, "t": "16:15:57"}
+{"phase": "step", "rate": 100, "s": 271, "cf_med": 6.3, "lost": 0, "gw": 1.5, "ct": 8460, "fault": null, "t": "16:16:28"}
+{"phase": "pass", "rate": 100, "t": "16:16:57"}
+{"phase": "step", "rate": 200, "s": 30, "cf_med": 6.3, "lost": 0, "gw": 1.2, "ct": 11120, "fault": null, "t": "16:17:27"}
+{"phase": "step", "rate": 200, "s": 60, "cf_med": 6.2, "lost": 0, "gw": 1.1, "ct": 13563, "fault": null, "t": "16:17:57"}
+{"phase": "step", "rate": 200, "s": 91, "cf_med": 6.7, "lost": 0, "gw": 1.4, "ct": 12986, "fault": null, "t": "16:18:28"}
+{"phase": "step", "rate": 200, "s": 121, "cf_med": 6.2, "lost": 0, "gw": 1.8, "ct": 11345, "fault": null, "t": "16:18:58"}
+{"phase": "step", "rate": 200, "s": 151, "cf_med": 6.6, "lost": 0, "gw": 1.3, "ct": 12810, "fault": null, "t": "16:19:28"}
+{"phase": "step", "rate": 200, "s": 180, "cf_med": 6.5, "lost": 0, "gw": 2.8, "ct": 11645, "fault": null, "t": "16:19:57"}
+{"phase": "step", "rate": 200, "s": 210, "cf_med": 6.5, "lost": 0, "gw": 1.2, "ct": 12541, "fault": null, "t": "16:20:27"}
+{"phase": "step", "rate": 200, "s": 240, "cf_med": 6.8, "lost": 0, "gw": 1.2, "ct": 13335, "fault": null, "t": "16:20:58"}
+{"phase": "step", "rate": 200, "s": 271, "cf_med": 6.8, "lost": 0, "gw": 1.6, "ct": 11978, "fault": null, "t": "16:21:28"}
+{"phase": "pass", "rate": 200, "t": "16:21:57"}
+{"phase": "step", "rate": 300, "s": 30, "cf_med": 6.7, "lost": 0, "gw": 1.2, "ct": 16200, "fault": null, "t": "16:22:27"}
+{"phase": "step", "rate": 300, "s": 60, "cf_med": 6.2, "lost": 0, "gw": 1.7, "ct": 15889, "fault": null, "t": "16:22:57"}
+{"phase": "step", "rate": 300, "s": 91, "cf_med": 6.4, "lost": 0, "gw": 1.4, "ct": 18358, "fault": null, "t": "16:23:28"}
+{"phase": "step", "rate": 300, "s": 121, "cf_med": 6.5, "lost": 0, "gw": 1.4, "ct": 16850, "fault": null, "t": "16:23:58"}
+{"phase": "step", "rate": 300, "s": 151, "cf_med": 6.5, "lost": 0, "gw": 1.0, "ct": 13948, "fault": null, "t": "16:24:29"}
+{"phase": "step", "rate": 300, "s": 180, "cf_med": 6.8, "lost": 0, "gw": 1.4, "ct": 15849, "fault": null, "t": "16:24:57"}
+{"phase": "step", "rate": 300, "s": 210, "cf_med": 6.2, "lost": 0, "gw": 1.1, "ct": 14192, "fault": null, "t": "16:25:27"}
+{"phase": "step", "rate": 300, "s": 240, "cf_med": 6.4, "lost": 0, "gw": 1.7, "ct": 14109, "fault": null, "t": "16:25:58"}
+{"phase": "step", "rate": 300, "s": 271, "cf_med": 6.3, "lost": 0, "gw": 1.2, "ct": 15680, "fault": null, "t": "16:26:28"}
+{"phase": "pass", "rate": 300, "t": "16:26:57"}
+{"phase": "step", "rate": 400, "s": 30, "cf_med": 6.4, "lost": 0, "gw": 1.2, "ct": 13705, "fault": null, "t": "16:27:27"}
+{"phase": "step", "rate": 400, "s": 60, "cf_med": 6.2, "lost": 0, "gw": 1.1, "ct": 15365, "fault": null, "t": "16:27:58"}
+{"phase": "step", "rate": 400, "s": 91, "cf_med": 6.3, "lost": 0, "gw": 1.1, "ct": 12347, "fault": null, "t": "16:28:28"}
+{"phase": "step", "rate": 400, "s": 121, "cf_med": 6.7, "lost": 0, "gw": 1.4, "ct": 10097, "fault": null, "t": "16:28:58"}
+{"phase": "step", "rate": 400, "s": 151, "cf_med": 6.6, "lost": 0, "gw": 1.3, "ct": 16545, "fault": null, "t": "16:29:29"}
+{"phase": "step", "rate": 400, "s": 180, "cf_med": 6.4, "lost": 0, "gw": 1.8, "ct": 15912, "fault": null, "t": "16:29:57"}
+{"phase": "step", "rate": 400, "s": 210, "cf_med": 6.4, "lost": 0, "gw": 1.3, "ct": 16302, "fault": null, "t": "16:30:28"}
+{"phase": "step", "rate": 400, "s": 240, "cf_med": 6.2, "lost": 0, "gw": 1.2, "ct": 13497, "fault": null, "t": "16:30:58"}
+{"phase": "step", "rate": 400, "s": 271, "cf_med": 6.4, "lost": 0, "gw": 1.3, "ct": 10445, "fault": null, "t": "16:31:28"}
+{"phase": "pass", "rate": 400, "t": "16:31:57"}
+{"phase": "step", "rate": 600, "s": 30, "cf_med": 6.4, "lost": 0, "gw": 1.2, "ct": 14202, "fault": null, "t": "16:32:27"}
+{"phase": "step", "rate": 600, "s": 60, "cf_med": 6.5, "lost": 0, "gw": 1.2, "ct": 9877, "fault": null, "t": "16:32:58"}
+{"phase": "step", "rate": 600, "s": 91, "cf_med": 6.5, "lost": 0, "gw": 1.3, "ct": 12453, "fault": null, "t": "16:33:28"}
+{"phase": "step", "rate": 600, "s": 121, "cf_med": 6.2, "lost": 0, "gw": 1.9, "ct": 11106, "fault": null, "t": "16:33:59"}
+{"phase": "step", "rate": 600, "s": 151, "cf_med": 6.3, "lost": 0, "gw": 1.2, "ct": 13149, "fault": null, "t": "16:34:29"}
+{"phase": "step", "rate": 600, "s": 180, "cf_med": 6.3, "lost": 0, "gw": 1.8, "ct": 14873, "fault": null, "t": "16:34:57"}
+{"phase": "step", "rate": 600, "s": 210, "cf_med": 6.1, "lost": 0, "gw": 1.3, "ct": 14225, "fault": null, "t": "16:35:28"}
+{"phase": "step", "rate": 600, "s": 240, "cf_med": 6.4, "lost": 0, "gw": 1.3, "ct": 16510, "fault": null, "t": "16:35:58"}
+{"phase": "step", "rate": 600, "s": 271, "cf_med": 6.5, "lost": 0, "gw": 2.1, "ct": 10924, "fault": null, "t": "16:36:28"}
+{"phase": "pass", "rate": 600, "t": "16:36:57"}
+{"phase": "step", "rate": 800, "s": 30, "cf_med": 6.3, "lost": 0, "gw": 1.3, "ct": 16271, "fault": null, "t": "16:37:28"}
+{"phase": "step", "rate": 800, "s": 60, "cf_med": 6.3, "lost": 0, "gw": 1.5, "ct": 13799, "fault": null, "t": "16:37:58"}
+{"phase": "step", "rate": 800, "s": 91, "cf_med": 6.5, "lost": 0, "gw": 1.4, "ct": 15875, "fault": null, "t": "16:38:28"}
+{"phase": "step", "rate": 800, "s": 121, "cf_med": 6.3, "lost": 0, "gw": 1.2, "ct": 14541, "fault": null, "t": "16:38:59"}
+{"phase": "step", "rate": 800, "s": 151, "cf_med": 6.1, "lost": 0, "gw": 1.3, "ct": 12888, "fault": null, "t": "16:39:29"}
+{"phase": "step", "rate": 800, "s": 180, "cf_med": 6.3, "lost": 0, "gw": 1.2, "ct": 13107, "fault": null, "t": "16:39:57"}
+{"phase": "step", "rate": 800, "s": 210, "cf_med": 7.0, "lost": 0, "gw": 1.4, "ct": 11604, "fault": null, "t": "16:40:28"}
+{"phase": "step", "rate": 800, "s": 241, "cf_med": 6.5, "lost": 0, "gw": 1.2, "ct": 14198, "fault": null, "t": "16:40:59"}
+{"phase": "step", "rate": 800, "s": 271, "cf_med": 6.7, "lost": 0, "gw": 1.5, "ct": 16865, "fault": null, "t": "16:41:29"}
+{"phase": "pass", "rate": 800, "t": "16:41:57"}
+{"phase": "step", "rate": 1000, "s": 30, "cf_med": 6.5, "lost": 0, "gw": 1.5, "ct": 14654, "fault": null, "t": "16:42:28"}
+{"phase": "step", "rate": 1000, "s": 60, "cf_med": 6.0, "lost": 0, "gw": 1.3, "ct": 11889, "fault": null, "t": "16:42:58"}
+{"phase": "step", "rate": 1000, "s": 91, "cf_med": 6.5, "lost": 0, "gw": 10.0, "ct": 13335, "fault": null, "t": "16:43:29"}
+{"phase": "step", "rate": 1000, "s": 121, "cf_med": 6.6, "lost": 0, "gw": 1.2, "ct": 18925, "fault": null, "t": "16:43:59"}
+{"phase": "step", "rate": 1000, "s": 151, "cf_med": 6.6, "lost": 0, "gw": 1.3, "ct": 16404, "fault": null, "t": "16:44:29"}
+{"phase": "step", "rate": 1000, "s": 180, "cf_med": 6.4, "lost": 0, "gw": 1.0, "ct": 11810, "fault": null, "t": "16:44:58"}
+{"phase": "step", "rate": 1000, "s": 210, "cf_med": 6.4, "lost": 0, "gw": 1.3, "ct": 12850, "fault": null, "t": "16:45:28"}
+{"phase": "step", "rate": 1000, "s": 240, "cf_med": 6.4, "lost": 0, "gw": 1.3, "ct": 11586, "fault": null, "t": "16:45:58"}
+{"phase": "step", "rate": 1000, "s": 271, "cf_med": 6.6, "lost": 0, "gw": 1.3, "ct": 12716, "fault": null, "t": "16:46:29"}
+{"phase": "pass", "rate": 1000, "t": "16:46:57"}
+{"phase": "step", "rate": 1300, "s": 30, "cf_med": 6.4, "lost": 0, "gw": 1.3, "ct": 15573, "fault": null, "t": "16:47:28"}
+{"phase": "step", "rate": 1300, "s": 60, "cf_med": 6.2, "lost": 0, "gw": 1.2, "ct": 14223, "fault": null, "t": "16:47:58"}
+{"phase": "step", "rate": 1300, "s": 91, "cf_med": 6.8, "lost": 0, "gw": 1.2, "ct": 12132, "fault": null, "t": "16:48:29"}
+{"phase": "step", "rate": 1300, "s": 121, "cf_med": 6.4, "lost": 0, "gw": 1.3, "ct": 16908, "fault": null, "t": "16:48:59"}
+{"phase": "step", "rate": 1300, "s": 151, "cf_med": 6.2, "lost": 0, "gw": 1.0, "ct": 20748, "fault": null, "t": "16:49:29"}
+{"phase": "step", "rate": 1300, "s": 180, "cf_med": 6.4, "lost": 0, "gw": 1.5, "ct": 19375, "fault": null, "t": "16:49:58"}
+{"phase": "step", "rate": 1300, "s": 211, "cf_med": 6.6, "lost": 0, "gw": 1.3, "ct": 17466, "fault": null, "t": "16:50:29"}
+{"phase": "step", "rate": 1300, "s": 241, "cf_med": 6.6, "lost": 0, "gw": 1.5, "ct": 20489, "fault": null, "t": "16:50:59"}
+{"phase": "step", "rate": 1300, "s": 270, "cf_med": 6.2, "lost": 0, "gw": 1.3, "ct": 19860, "fault": null, "t": "16:51:28"}
+{"phase": "pass", "rate": 1300, "t": "16:51:58"}
+{"phase": "done", "max_ok": 1300, "limit": 433, "note": "no fault up to the last step", "t": "16:51:58"}
