@@ -176,6 +176,42 @@ struct Tok {
     sep_before: String,
     /// Bracket instance this token is in (0 = none).
     bracket: u32,
+    /// Tokens in that bracket instance (set by [`bracket_stats`]; 0 until then). Counted once,
+    /// not per token: a per-token count made a name of many brackets quadratic (D110).
+    bracket_len: usize,
+}
+
+/// What [`parse_one`] asks of a whole bracket instance, computed in one pass (D110).
+#[derive(Clone, Copy)]
+struct Bracket {
+    /// Every token is a number.
+    all_digits: bool,
+    /// Every token is a language word (`[ENG]`, `[Hindi+English]`, `(French)`).
+    lang_only: bool,
+}
+
+/// Fill each token's `bracket_len` and return per-instance facts, indexed by bracket id.
+fn bracket_stats(toks: &mut [Tok]) -> Vec<Bracket> {
+    let ids = toks.iter().map(|t| t.bracket as usize).max().unwrap_or(0) + 1;
+    let mut lens = vec![0usize; ids];
+    let mut out = vec![
+        Bracket {
+            all_digits: true,
+            lang_only: true,
+        };
+        ids
+    ];
+    for t in toks.iter() {
+        let b = t.bracket as usize;
+        lens[b] += 1;
+        out[b].all_digits &= t.digits().is_some();
+        out[b].lang_only &= language(&t.low).is_some()
+            || matches!(t.low.as_str(), "dub" | "dubbed" | "audio" | "sub" | "subs");
+    }
+    for t in toks.iter_mut() {
+        t.bracket_len = lens[t.bracket as usize];
+    }
+    out
 }
 
 impl Tok {
@@ -336,6 +372,7 @@ fn tokenize(name: &str) -> Vec<Tok> {
                     raw: std::mem::take(&mut cur),
                     sep_before: std::mem::take(&mut sep),
                     bracket: current_bracket,
+                    bracket_len: 0,
                 });
             }
             if opens(c) {
@@ -361,6 +398,7 @@ fn tokenize(name: &str) -> Vec<Tok> {
             raw: cur,
             sep_before: sep,
             bracket: current_bracket,
+            bracket_len: 0,
         });
     }
     toks
@@ -610,7 +648,7 @@ fn bare_height_bracket(toks: &[Tok], i: usize) -> bool {
             toks[i].low.as_str(),
             "1080" | "720" | "576" | "480" | "2160"
         )
-        && toks.iter().filter(|t| t.bracket == b).count() == 1
+        && toks[i].bracket_len == 1
 }
 
 /// `2nd`, `4th`, `3rd`, `1st` → 2, 4, 3, 1 (seasons up to 99).
@@ -1009,6 +1047,7 @@ fn parse_one(name: &str, ctx: &Ctx) -> ReleaseAttrs {
     if toks.is_empty() {
         return a;
     }
+    let brackets = bracket_stats(&mut toks);
     // The title starts after a leading "[Group]" bracket.
     let title_start = if toks[0].bracket != 0 {
         let b = toks[0].bracket;
@@ -1025,13 +1064,7 @@ fn parse_one(name: &str, ctx: &Ctx) -> ReleaseAttrs {
         .find(|&i| strong_at(i) || is_year(&toks[i]).is_some())
         .unwrap_or(toks.len());
     // A bracket holding only language words (`[ENG]`, `[Hindi+English]`, `(French)`).
-    let lang_only_bracket = |b: u32| {
-        b != 0
-            && toks.iter().filter(|t| t.bracket == b).all(|t| {
-                language(&t.low).is_some()
-                    || matches!(t.low.as_str(), "dub" | "dubbed" | "audio" | "sub" | "subs")
-            })
-    };
+    let lang_only_bracket = |b: u32| b != 0 && brackets[b as usize].lang_only;
     let in_tags = |i: usize| i >= region || lang_only_bracket(toks[i].bracket);
     // Ambiguous words also need a tag next to them (`S01E05 The French Connection` is a title).
     let tag_neighbour = |i: usize| {
@@ -1079,9 +1112,7 @@ fn parse_one(name: &str, ctx: &Ctx) -> ReleaseAttrs {
         // ("(Les Feux de l'Amour du 16 janvier 2026 - …)").
         if after_title
             && let Some(y) = is_year(t)
-            && (t.bracket == 0
-                || i < region
-                || toks.iter().filter(|x| x.bracket == t.bracket).count() < 4)
+            && (t.bracket == 0 || i < region || t.bracket_len < 4)
         {
             years.push((i, y));
         }
@@ -1235,11 +1266,8 @@ fn parse_one(name: &str, ctx: &Ctx) -> ReleaseAttrs {
             && (t.sep_before.contains(" - ")
                 || t.sep_before.ends_with("- ")
                 || (t.bracket != 0
-                    && toks.iter().filter(|x| x.bracket == t.bracket).count() <= 2
-                    && toks
-                        .iter()
-                        .filter(|x| x.bracket == t.bracket)
-                        .all(|x| x.digits().is_some())))
+                    && t.bracket_len <= 2
+                    && brackets[t.bracket as usize].all_digits))
         {
             // Anime: "Title - 07 (1080p)", "One Piece - 1152", "[05][WebRip]", "(01-12)".
             a.episode = Some(n as i32);
@@ -1544,10 +1572,9 @@ fn parse_one(name: &str, ctx: &Ctx) -> ReleaseAttrs {
     // Year: the first one followed by a tag or alone in brackets ("Blade Runner 2049 2017
     // 1080p" is 2017, "L'Armée des Ombres 1969 REMASTERISÉ 2024" is 1969), the start of a range
     // ("2008-2013"); else the last one before the first tag, else the first one.
-    let bracket_len = |b: u32| toks.iter().filter(|t| t.bracket == b).count();
     let tagged = years.iter().find(|(j, _)| {
         let t = &toks[*j];
-        (t.bracket != 0 && bracket_len(t.bracket) == 1)
+        (t.bracket != 0 && t.bracket_len == 1)
             || *j + 1 == toks.len()
             || is_tagish(&toks[*j + 1], toks.get(*j + 2))
     });
@@ -1744,13 +1771,7 @@ fn language_token(
         "gb" if t.upper() && t.bracket != 0 => push(&mut a.subtitles, "zh"),
         "esub" | "esubs" => push(&mut a.subtitles, "en"),
         // Erai-raws marks Chinese animation "(CA)".
-        "ca" if ctx.anime
-            && t.upper()
-            && t.bracket != 0
-            && toks.iter().filter(|x| x.bracket == t.bracket).count() == 1 =>
-        {
-            audio(a, "zh")
-        }
+        "ca" if ctx.anime && t.upper() && t.bracket != 0 && t.bracket_len == 1 => audio(a, "zh"),
         _ if w.starts_with("multi")
             && w[5..].bytes().all(|b| b.is_ascii_digit())
             && w.len() > 5 =>
@@ -1861,8 +1882,27 @@ fn file_track_languages(path: &str) -> Vec<&'static str> {
     out
 }
 
+/// Longest name the parsers read, in bytes (D110): the stored title cap
+/// (`nip35::MAX_TITLE_BYTES`). New titles are capped before they are stored; rows from before
+/// D110 are not, and are parsed again on every parser or classifier version bump.
+pub const NAME_MAX: usize = crate::nip35::MAX_TITLE_BYTES;
+
+/// `s` cut to at most [`NAME_MAX`] bytes on a character boundary.
+pub fn capped(s: &str) -> &str {
+    if s.len() <= NAME_MAX {
+        return s;
+    }
+    let mut end = NAME_MAX;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Attributes of a torrent from its title and files. `category` turns on anime and book rules.
+/// The title and the file name parsed are cut to [`NAME_MAX`] first (D110).
 pub fn parse_release(title: &str, files: &[TorrentFile], category: Category) -> ReleaseAttrs {
+    let title = capped(title);
     let ctx = Ctx {
         anime: category == Category::Anime,
         book: category == Category::Book,
@@ -1886,7 +1926,7 @@ pub fn parse_release(title: &str, files: &[TorrentFile], category: Category) -> 
         .iter()
         .filter(|f| ext_of(&f.path).is_some_and(|e| VIDEO_EXT.contains(&e.as_str()) && e != "iso"));
     if poor && let Some(v) = videos.clone().max_by_key(|f| f.size.unwrap_or(0)) {
-        let f = parse_one(stem_of(&v.path), &ctx);
+        let f = parse_one(capped(stem_of(&v.path)), &ctx);
         merge_missing(&mut a, f);
     }
     let has_video = videos.clone().next().is_some();
@@ -2338,6 +2378,68 @@ mod tests {
             t.elapsed()
         );
         assert_eq!(out, "16bit ".repeat((1 << 20) / 7));
+    }
+
+    #[test]
+    fn parse_one_is_linear_on_many_brackets() {
+        // D110 review: per-token bracket scans made these quadratic (release build: "[x] " ×
+        // 64 KB took 1.1 s, × 256 KB 23 s; "(2020) " 0.2 s and 3 s; now 0.08 s at 256 KB).
+        // Uncapped on purpose: parse_one is what the caps protect. 64 KB keeps a debug build
+        // well under the limit (~0.3 s per parse).
+        let video = Ctx {
+            video: true,
+            ..Ctx::default()
+        };
+        let anime = Ctx {
+            anime: true,
+            video: true,
+            ..Ctx::default()
+        };
+        for unit in ["[x] ", "(2020) ", "[01] ", "[ENG] ", "(1080) "] {
+            let name = unit.repeat((64 << 10) / unit.len());
+            let t = std::time::Instant::now();
+            let _ = parse_one(&name, &video);
+            let _ = parse_one(&name, &anime);
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(3),
+                "{unit:?}: {:?}",
+                t.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn parse_release_and_classify_cap_the_name() {
+        // D110 review: rows stored before D110 kept uncapped titles and paths, and are parsed
+        // again on every parser or classifier version bump.
+        let name = "[x] ".repeat((4 << 20) / 4);
+        let files = [TorrentFile {
+            path: format!("{}.mkv", "(2020) ".repeat((64 << 10) / 7)),
+            size: Some(1),
+        }];
+        let t = std::time::Instant::now();
+        let a = parse_release(&name, &files, Category::Video);
+        let c = crate::classify::classify(&name, &files);
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            t.elapsed()
+        );
+        assert_eq!(
+            format!("{a:?}"),
+            format!(
+                "{:?}",
+                parse_release(capped(&name), &files, Category::Video)
+            )
+        );
+        assert_eq!(
+            format!("{c:?}"),
+            format!("{:?}", crate::classify::classify(capped(&name), &files))
+        );
+        let mut s = String::from("a");
+        s.push_str(&"é".repeat(NAME_MAX));
+        assert_eq!(capped(&s).len(), NAME_MAX - 1);
+        assert_eq!(capped("short"), "short");
     }
 
     proptest::proptest! {

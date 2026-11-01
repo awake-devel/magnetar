@@ -952,3 +952,51 @@ async fn a_refused_row_does_not_fail_the_batch() {
     );
     assert!(seen(pool, &hg).await.is_none());
 }
+
+/// D110 review: a database error a retry can clear (here a deadlock, 40P01) is not the row's
+/// fault: the batch fails as before D110, nothing is closed, and the leases stay for a retry.
+#[tokio::test]
+async fn a_transient_database_error_fails_the_batch() {
+    let Some(db) = test_db().await else { return };
+    let pool = db.store.pool();
+    sqlx::raw_sql(
+        "CREATE FUNCTION deadlock_poison() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           IF NEW.title LIKE '%Poison%' THEN
+             RAISE EXCEPTION 'deadlock stand-in' USING ERRCODE = '40P01';
+           END IF;
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER deadlock_poison BEFORE INSERT ON dht_torrents
+           FOR EACH ROW EXECUTE FUNCTION deadlock_poison();",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let bad = info("Poison.Name", "0");
+    let good = info("Fine.Name.After", "0");
+    let (hb, hg) = (sha1(&bad), sha1(&good));
+    queue(pool, &[hb, hg]).await;
+    let before = (seen(pool, &hb).await, seen(pool, &hg).await);
+    let e = persist_batch(
+        pool,
+        &[ok(&bad), ok(&good)],
+        Some(&MarkerScreen),
+        false,
+        NOW,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        magnetar_server::dht::persist::error_class(&e),
+        "database error 40P01"
+    );
+    // The whole batch rolled back: both hashes as queued, nothing stored.
+    assert_eq!((seen(pool, &hb).await, seen(pool, &hg).await), before);
+    assert!(before.0.is_some());
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM dht_torrents")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 0);
+}
