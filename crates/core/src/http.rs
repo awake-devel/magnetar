@@ -25,7 +25,7 @@ pub fn tls_config() -> rustls::ClientConfig {
 /// Builder with our user agent, TLS config and timeouts.
 pub fn builder(timeout: Duration) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
-        .user_agent(concat!("magnetar/", env!("CARGO_PKG_VERSION")))
+        .user_agent(crate::identity::USER_AGENT)
         .timeout(timeout)
         .connect_timeout(Duration::from_secs(10))
         .tls_backend_preconfigured(tls_config())

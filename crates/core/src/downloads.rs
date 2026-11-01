@@ -151,7 +151,7 @@ async fn session_options(state_dir: &std::path::Path) -> Result<SessionOptions> 
             folder: Some(state_dir.join("session")),
         }),
         fastresume: true,
-        client_name_and_version: Some(concat!("magnetar/", env!("CARGO_PKG_VERSION")).into()),
+        client_name_and_version: Some(crate::identity::USER_AGENT.into()),
         blocklist_url: Some(blocklist_url.into()),
         ..Default::default()
     })

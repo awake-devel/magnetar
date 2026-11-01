@@ -225,9 +225,16 @@ impl RelayConn {
             relay: url.to_string(),
             msg,
         };
-        let request = url
+        let mut request = url
             .into_client_request()
             .map_err(|e| err(format!("bad url: {e}")))?;
+        // Relays see the same honest name as every other peer (D115).
+        request.headers_mut().insert(
+            "user-agent",
+            tokio_tungstenite::tungstenite::http::HeaderValue::from_static(
+                crate::identity::USER_AGENT,
+            ),
+        );
         let config = WebSocketConfig::default()
             .max_message_size(Some(MAX_MESSAGE_BYTES))
             .max_frame_size(Some(MAX_MESSAGE_BYTES));

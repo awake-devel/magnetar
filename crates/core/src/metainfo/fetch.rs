@@ -116,7 +116,7 @@ impl Default for FetchConfig {
             connects_per_sec: 150,
             max_connections: 350,
             decode_parallel: 4,
-            client: format!("Magnetar {}", env!("CARGO_PKG_VERSION")),
+            client: crate::identity::CLIENT_NAME.to_string(),
             allow_loopback: false,
             fake_strikes: 3,
             fake_ban: Duration::from_secs(3600),
@@ -475,10 +475,11 @@ pub struct Fetcher {
     inner: Arc<Inner>,
 }
 
-/// Azureus-style BEP 20 peer id: `-MG0300-` + 12 random bytes (docs/DHT.md §3.3).
+/// Azureus-style BEP 20 peer id: [`crate::identity::PEER_ID_PREFIX`] (`-MG0310-` for 0.3.1)
+/// + 12 random bytes (docs/DHT.md §3.3, D115).
 pub fn new_peer_id() -> [u8; 20] {
     let mut id = [0u8; 20];
-    id[..8].copy_from_slice(b"-MG0300-");
+    id[..8].copy_from_slice(&crate::identity::PEER_ID_PREFIX);
     for b in &mut id[8..] {
         *b = rand::random();
     }
@@ -1246,7 +1247,12 @@ mod tests {
     #[test]
     fn peer_id_shape() {
         let id = new_peer_id();
-        assert_eq!(&id[..8], b"-MG0300-");
+        assert_eq!(&id[..8], &crate::identity::PEER_ID_PREFIX);
+        assert_ne!(
+            &id[..8],
+            b"-MG0300-",
+            "the prefix follows the crate version (D115)"
+        );
     }
 
     #[test]

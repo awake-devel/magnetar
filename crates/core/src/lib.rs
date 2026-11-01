@@ -14,6 +14,7 @@ pub mod enrich;
 pub mod enrich_anime;
 pub mod error;
 pub mod http;
+pub mod identity;
 pub mod ingest;
 pub mod liveness;
 pub mod magnet;

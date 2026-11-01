@@ -675,6 +675,8 @@ fn get_peers(my_id: &[u8; 20], infohash: &[u8; 20], tid: &[u8; 2]) -> Vec<u8> {
         (b"q".to_vec(), b(b"get_peers")),
         (b"ro".to_vec(), Value::Int(1)),
         (b"t".to_vec(), b(tid)),
+        // The same honest client tag as the crawler (D115).
+        (b"v".to_vec(), b(&crate::identity::KRPC_VERSION)),
         (b"y".to_vec(), b(b"q")),
     ]))
 }
@@ -682,6 +684,16 @@ fn get_peers(my_id: &[u8; 20], infohash: &[u8; 20], tid: &[u8; 2]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D115: the seed checker's walks carry the same client tag as the crawler.
+    #[test]
+    fn get_peers_names_the_client() {
+        let q = bencode::decode(&get_peers(&[1; 20], &[2; 20], b"aa")).unwrap();
+        assert_eq!(
+            q.get(b"v").and_then(Value::as_bytes),
+            Some(&crate::identity::KRPC_VERSION[..])
+        );
+    }
 
     /// D112: `nodes` from an answer that point at the LAN, loopback, the tailnet or link-local
     /// space are never added to the walk, so no query is ever sent there.

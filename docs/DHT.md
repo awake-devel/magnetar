@@ -375,8 +375,21 @@ Both modes honour every rule of §3.4 (interval, per-IP rate, honest ids, no fak
 - Each virtual node is a separate UDP socket on its own port: queries carry no recipient id, so
   a remote node identifies "us" by (IP, port). Remote libtorrent nodes keep one routing slot per
   IP (`restrict_routing_ips`, dht-crawling.md §1.2), so more than a few virtual nodes add little.
-- `v` = `MG` + 2 version bytes (`MG` is unregistered in BEP 20's list, checked 2026-10-26). BEP 9
-  peer id: Azureus style `-MG0300-` + 12 random bytes.
+- **Identity (D115): one honest name on every protocol, never another client's**, so any node,
+  peer, tracker or relay can recognise the crawler and block it. Everything comes from the crate
+  version (`crates/core/src/identity.rs`):
+  - KRPC `v` = `MG` + major + `minor << 4 | patch` (0.3.1 → `MG 00 31`), on the crawler's
+    queries and on the seed checker's DHT walks (`MG` is unregistered in BEP 20's list,
+    checked 2026-10-26);
+  - BEP 20 peer id: Azureus style `-MG` + major, minor, patch + `0-` (`-MG0310-`) + 12 random
+    bytes;
+  - BEP 10 extended handshake `v` = `Magnetar 0.3.1`;
+  - HTTP (trackers, TMDB, GeoIP) and the relay WebSocket handshake: User-Agent
+    `magnetar/0.3.1 (+https://github.com/awake-devel/magnetar)`; librqbit downloads use it as
+    their client name.
+
+  The crawler only fetches info dicts (BEP 9) and never uploads file data: it has no pieces.
+  To block it: KRPC `v` starting with `MG`, peer ids starting with `-MG`, or the User-Agent.
 
 ### 3.4 Politeness and protocol rules (D54, D55)
 
