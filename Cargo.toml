@@ -49,6 +49,8 @@ tantivy = { version = "=0.27.0", default-features = false, features = ["mmap", "
 maxminddb = { version = "=0.32.0", default-features = false }
 # UPnP IGD client for the DHT crawler's port mappings (D57, D72; MIT).
 igd-next = { version = "=0.18.0", default-features = false, features = ["aio_tokio"] }
+# getifaddrs(3) for the own-address deny set of the outbound address policy (D112; MIT).
+nix = { version = "=0.30.1", default-features = false, features = ["net"] }
 
 [profile.release]
 opt-level = 3

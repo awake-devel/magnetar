@@ -397,6 +397,12 @@ mod tests {
             "http://169.254.169.254/announce",
             "http://localhost:8080/announce",
             "udp://tracker.localhost:6969",
+            // Other IPv4 spellings of loopback and the router in opaque udp:// hosts (D112).
+            "udp://127.1:6969",
+            "udp://2130706433:6969",
+            "udp://0x7f.0.0.1:6969/announce",
+            "udp://127.0.0.1.:6969",
+            "udp://3232235777:53",
         ] {
             assert_eq!(valid_tracker(bad), None, "{bad}");
         }

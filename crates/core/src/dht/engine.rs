@@ -653,6 +653,8 @@ impl Dht {
             && !ip.is_loopback()
         {
             filter.set_own(Some(ip));
+            // Every other outbound path refuses it too (D112).
+            crate::netaddr::OWN.learn(ip.into());
         }
         let qps = cfg.qps.max(1);
         let shards = sockets
@@ -1403,6 +1405,7 @@ impl Dht {
             }
             if !ip.is_loopback() {
                 ext.filter.set_own(Some(ip));
+                crate::netaddr::OWN.learn(ip.into());
             }
             ext.external_ip = Some(ip);
         }

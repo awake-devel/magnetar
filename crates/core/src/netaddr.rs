@@ -9,9 +9,15 @@
 //! scrapes, the liveness DHT walk, untrusted relay connects and the librqbit peer blocklist all
 //! use it. [`AddrPolicy`] adds the only escape hatch, loopback for in-process test servers, which
 //! no configuration can turn on.
+//!
+//! Public addresses that are our own are refused too ([`OwnAddrs`]): the line's WAN address (a
+//! connect to it hairpins into the router and its port forwards) and the global IPv6 prefixes of
+//! this host's interfaces (where the other LAN hosts live). A hostile tracker or relay sees our
+//! source address on the first request and could publish it back.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::Duration;
+use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 
@@ -104,17 +110,257 @@ pub fn is_public(ip: IpAddr) -> bool {
     }
 }
 
-/// [`is_public`] plus the test seam. The default (and [`AddrPolicy::PUBLIC`]) refuses every
-/// non-public address; there is no setting that changes it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AddrPolicy {
-    allow_loopback: bool,
+/// `net/len` contains `ip` (families must match).
+fn net_contains(net: IpAddr, len: u8, ip: IpAddr) -> bool {
+    match (net, ip) {
+        (IpAddr::V4(n), IpAddr::V4(i)) => in_v4(i, n, len.min(32)),
+        (IpAddr::V6(n), IpAddr::V6(i)) => in_v6(i, n, len.min(128)),
+        _ => false,
+    }
 }
 
+fn mask_net(ip: IpAddr, len: u8) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => {
+            let mask = u32::MAX
+                .checked_shl(32 - u32::from(len.min(32)))
+                .unwrap_or(0);
+            IpAddr::V4(Ipv4Addr::from(u32::from(v4) & mask))
+        }
+        IpAddr::V6(v6) => {
+            let mask = u128::MAX
+                .checked_shl(128 - u32::from(len.min(128)))
+                .unwrap_or(0);
+            IpAddr::V6(Ipv6Addr::from(u128::from(v6) & mask))
+        }
+    }
+}
+
+/// Prefix denied around a public IPv6 address of ours: its /64, the on-link LAN of a home line
+/// (an interface prefix wider than /64 is kept as is).
+pub const OWN_V6_PREFIX: u8 = 64;
+
+/// How long interface addresses are reused before `getifaddrs` is read again.
+pub const IFACE_TTL: Duration = Duration::from_secs(60);
+
+/// Learned addresses kept (newest win): the DHT vote and UPnP can each report a new WAN address.
+const MAX_LEARNED: usize = 4;
+
+/// The networks our own addresses stand for: an IPv4 address alone, an IPv6 address's
+/// [`OWN_V6_PREFIX`] (or its interface prefix when wider). Non-public addresses are dropped:
+/// the policy refuses them anyway, and loopback must stay reachable through the test seam.
+/// `addrs` is (address, interface prefix length if known).
+pub fn own_nets(addrs: impl IntoIterator<Item = (IpAddr, Option<u8>)>) -> Vec<(IpAddr, u8)> {
+    let mut out: Vec<(IpAddr, u8)> = Vec::new();
+    for (ip, len) in addrs {
+        let ip = ip.to_canonical();
+        if !is_public(ip) {
+            continue;
+        }
+        let len = match ip {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => len.unwrap_or(OWN_V6_PREFIX).min(OWN_V6_PREFIX),
+        };
+        let net = (mask_net(ip, len), len);
+        if !out.contains(&net) {
+            out.push(net);
+        }
+    }
+    out
+}
+
+/// Parse `MAGNETAR_OWN_ADDRS` items: addresses and networks (`203.0.113.7`,
+/// `2a01:db8:1::/56`). A bare IPv6 address stands for its [`OWN_V6_PREFIX`].
+pub fn parse_nets<S: AsRef<str>>(items: &[S]) -> Result<Vec<(IpAddr, u8)>> {
+    let mut out = Vec::new();
+    for item in items {
+        let item = item.as_ref().trim();
+        if item.is_empty() {
+            continue;
+        }
+        let bad = || Error::Invalid(format!("own address {item:?}: expected an IP or IP/len"));
+        let (ip, len) = match item.split_once('/') {
+            Some((ip, len)) => (ip, Some(len.trim().parse::<u8>().map_err(|_| bad())?)),
+            None => (item, None),
+        };
+        let ip: IpAddr = ip.trim().parse().map_err(|_| bad())?;
+        let len = match (len, ip) {
+            (Some(l), IpAddr::V4(_)) if l > 32 => return Err(bad()),
+            (Some(l), _) if l > 128 => return Err(bad()),
+            (Some(l), _) => l,
+            (None, IpAddr::V4(_)) => 32,
+            (None, IpAddr::V6(_)) => OWN_V6_PREFIX,
+        };
+        out.push((mask_net(ip, len), len));
+    }
+    Ok(out)
+}
+
+/// Whether `ip`, or the IPv4 address it embeds (mapped, NAT64, 6to4), is in one of `nets`.
+pub fn in_nets(nets: &[(IpAddr, u8)], ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    let inner = match ip {
+        IpAddr::V6(v6) => embedded_v4(v6).map(IpAddr::V4),
+        IpAddr::V4(_) => None,
+    };
+    nets.iter().any(|&(net, len)| {
+        net_contains(net, len, ip) || inner.is_some_and(|v4| net_contains(net, len, v4))
+    })
+}
+
+#[derive(Debug, Default)]
+struct OwnState {
+    /// Reported at run time (DHT external-address vote, UPnP), newest last.
+    learned: Vec<(IpAddr, u8)>,
+    /// `MAGNETAR_OWN_ADDRS`, or what a test put there.
+    configured: Vec<(IpAddr, u8)>,
+    /// Public interface addresses and IPv6 prefixes, from `getifaddrs`.
+    ifaces: Vec<(IpAddr, u8)>,
+    read_at: Option<Instant>,
+}
+
+/// Our own public addresses, refused by every [`AddrPolicy`] that uses this set. The process
+/// has one ([`OWN`]); tests build their own with [`OwnAddrs::fixed`].
+#[derive(Debug)]
+pub struct OwnAddrs {
+    state: RwLock<OwnState>,
+    read_interfaces: bool,
+}
+
+/// The process-wide own-address set: interface addresses (re-read every [`IFACE_TTL`]), the
+/// addresses the DHT crawler and UPnP learn, and `MAGNETAR_OWN_ADDRS`.
+pub static OWN: OwnAddrs = OwnAddrs {
+    state: RwLock::new(OwnState {
+        learned: Vec::new(),
+        configured: Vec::new(),
+        ifaces: Vec::new(),
+        read_at: None,
+    }),
+    read_interfaces: true,
+};
+
+impl OwnAddrs {
+    /// A set holding only `nets`, with no interface reads (tests; leaked, so keep it small).
+    /// Unlike learned and interface addresses, these apply to any address, loopback included,
+    /// so a test can refuse 127.0.0.2 while 127.0.0.1 stays reachable.
+    pub fn fixed(nets: Vec<(IpAddr, u8)>) -> &'static Self {
+        Box::leak(Box::new(Self {
+            state: RwLock::new(OwnState {
+                configured: nets,
+                ..OwnState::default()
+            }),
+            read_interfaces: false,
+        }))
+    }
+
+    /// Replace the configured networks ([`parse_nets`]).
+    pub fn configure(&self, nets: Vec<(IpAddr, u8)>) {
+        self.state
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .configured = nets;
+    }
+
+    /// Record an address reported as ours (DHT vote, UPnP). Non-public ones are ignored.
+    pub fn learn(&self, ip: IpAddr) {
+        let Some(net) = own_nets([(ip, None)]).into_iter().next() else {
+            return;
+        };
+        let mut st = self.state.write().unwrap_or_else(|e| e.into_inner());
+        st.learned.retain(|n| *n != net);
+        st.learned.push(net);
+        let over = st.learned.len().saturating_sub(MAX_LEARNED);
+        st.learned.drain(..over);
+    }
+
+    /// Whether `ip` is one of ours.
+    pub fn denies(&self, ip: IpAddr) -> bool {
+        self.refresh(Instant::now());
+        let st = self.state.read().unwrap_or_else(|e| e.into_inner());
+        in_nets(&st.configured, ip) || in_nets(&st.learned, ip) || in_nets(&st.ifaces, ip)
+    }
+
+    /// Every network in the set now (for the librqbit blocklist, written once per session).
+    pub fn snapshot(&self) -> Vec<(IpAddr, u8)> {
+        self.refresh(Instant::now());
+        let st = self.state.read().unwrap_or_else(|e| e.into_inner());
+        let mut out = st.configured.clone();
+        for n in st.learned.iter().chain(&st.ifaces) {
+            if !out.contains(n) {
+                out.push(*n);
+            }
+        }
+        out
+    }
+
+    fn refresh(&self, now: Instant) {
+        if !self.read_interfaces {
+            return;
+        }
+        let fresh = |st: &OwnState| {
+            st.read_at
+                .is_some_and(|t| now.saturating_duration_since(t) < IFACE_TTL)
+        };
+        if fresh(&self.state.read().unwrap_or_else(|e| e.into_inner())) {
+            return;
+        }
+        let ifaces = own_nets(interface_addrs());
+        let mut st = self.state.write().unwrap_or_else(|e| e.into_inner());
+        st.ifaces = ifaces;
+        st.read_at = Some(now);
+    }
+}
+
+/// This host's interface addresses with their prefix lengths (local `getifaddrs`, no traffic).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn interface_addrs() -> Vec<(IpAddr, Option<u8>)> {
+    let Ok(list) = nix::ifaddrs::getifaddrs() else {
+        return Vec::new();
+    };
+    list.filter_map(|ifa| {
+        let addr = ifa.address?;
+        if let Some(a) = addr.as_sockaddr_in6() {
+            let len = ifa
+                .netmask
+                .as_ref()
+                .and_then(|m| m.as_sockaddr_in6())
+                .map(|m| u128::from(m.ip()).count_ones() as u8);
+            Some((IpAddr::V6(a.ip()), len))
+        } else {
+            addr.as_sockaddr_in().map(|a| (IpAddr::V4(a.ip()), None))
+        }
+    })
+    .collect()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn interface_addrs() -> Vec<(IpAddr, Option<u8>)> {
+    Vec::new()
+}
+
+/// [`is_public`] minus our own addresses ([`OwnAddrs`]), plus the test seam. The default (and
+/// [`AddrPolicy::PUBLIC`]) refuses every non-public address and every address of ours; no
+/// setting lets a private range through.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AddrPolicy {
+    allow_loopback: bool,
+    /// None is the process-wide [`OWN`].
+    own: Option<&'static OwnAddrs>,
+}
+
+impl PartialEq for AddrPolicy {
+    fn eq(&self, other: &Self) -> bool {
+        self.allow_loopback == other.allow_loopback && std::ptr::eq(self.own(), other.own())
+    }
+}
+
+impl Eq for AddrPolicy {}
+
 impl AddrPolicy {
-    /// Public addresses only (production).
+    /// Public addresses only, minus our own (production).
     pub const PUBLIC: Self = Self {
         allow_loopback: false,
+        own: None,
     };
 
     /// Test seam: also lets loopback through, so in-process fake trackers, relays and DHT nodes
@@ -123,26 +369,51 @@ impl AddrPolicy {
     pub const fn loopback_for_tests() -> Self {
         Self {
             allow_loopback: true,
+            own: None,
+        }
+    }
+
+    /// The same policy with `own` as its own-address set instead of [`OWN`] (tests).
+    pub const fn with_own(self, own: &'static OwnAddrs) -> Self {
+        Self {
+            allow_loopback: self.allow_loopback,
+            own: Some(own),
+        }
+    }
+
+    fn own(&self) -> &'static OwnAddrs {
+        self.own.unwrap_or(&OWN)
+    }
+
+    /// Why `ip` is refused, None if it is allowed.
+    fn reason(&self, ip: IpAddr) -> Option<&'static str> {
+        let open = is_public(ip) || (self.allow_loopback && ip.to_canonical().is_loopback());
+        if !open {
+            Some("is not a public address")
+        } else if self.own().denies(ip) {
+            Some("is our own address")
+        } else {
+            None
         }
     }
 
     pub fn allows(&self, ip: IpAddr) -> bool {
-        is_public(ip) || (self.allow_loopback && ip.to_canonical().is_loopback())
+        self.reason(ip).is_none()
     }
 
     /// [`Error::Refused`] naming `what` unless `ip` is allowed.
     pub fn check(&self, what: &str, ip: IpAddr) -> Result<()> {
-        if self.allows(ip) {
-            Ok(())
-        } else {
-            Err(refused(what, ip))
+        match self.reason(ip) {
+            None => Ok(()),
+            Some(why) => Err(refused(what, ip, why)),
         }
     }
 
-    /// Resolve `host` (a name or an IP literal, IPv6 with or without brackets) and keep only the
-    /// allowed addresses, so the caller connects to an address that was checked: a name whose
-    /// records point at 192.168.1.1 gives an error, not a connect. A name with both public and
-    /// private records keeps the public ones.
+    /// Resolve `host` (a name or an IP literal: IPv6 with or without brackets, IPv4 in any
+    /// spelling [`literal_ip`] accepts) and keep only the allowed addresses, so the caller
+    /// connects to an address that was checked: a name whose records point at 192.168.1.1
+    /// gives an error, not a connect. A name with both public and private records keeps the
+    /// public ones. A literal never reaches the resolver.
     pub async fn resolve(
         &self,
         what: &str,
@@ -150,8 +421,7 @@ impl AddrPolicy {
         port: u16,
         timeout: Duration,
     ) -> Result<Vec<SocketAddr>> {
-        let host = host.trim_start_matches('[').trim_end_matches(']');
-        if let Ok(ip) = host.parse::<IpAddr>() {
+        if let Some(ip) = literal_ip(host) {
             self.check(what, ip)?;
             return Ok(vec![SocketAddr::new(ip, port)]);
         }
@@ -165,15 +435,18 @@ impl AddrPolicy {
             return Err(Error::Network(format!("{what}: no address")));
         };
         let ok: Vec<SocketAddr> = found.into_iter().filter(|a| self.allows(a.ip())).collect();
-        if ok.is_empty() {
-            return Err(refused(what, first.ip()));
+        match ok.is_empty() {
+            true => Err(self
+                .check(what, first.ip())
+                .err()
+                .unwrap_or_else(|| refused(what, first.ip(), "was refused"))),
+            false => Ok(ok),
         }
-        Ok(ok)
     }
 }
 
-fn refused(what: &str, ip: IpAddr) -> Error {
-    Error::Refused(format!("{what}: {ip} is not a public address"))
+fn refused(what: &str, ip: IpAddr, why: &str) -> Error {
+    Error::Refused(format!("{what}: {ip} {why}"))
 }
 
 /// reqwest DNS resolver that drops non-allowed addresses ([`AddrPolicy::resolve`]). reqwest
@@ -201,13 +474,36 @@ impl reqwest::dns::Resolve for PolicyResolver {
     }
 }
 
-/// The IP literal a URL's host is, if it is one. Non-special schemes (`udp://`) keep an IPv4
-/// literal as an opaque host string, so that form is parsed too.
+/// The IP address a host string spells, if it spells one: plain IPv4 and IPv6 (brackets
+/// optional) and every IPv4 form the WHATWG URL parser accepts (as `inet_aton` does): `127.1`,
+/// `2130706433`, `0x7f.0.0.1`, `0177.0.0.1`, and a trailing dot (`127.0.0.1.`). A resolver
+/// turns such a host into that address without asking DNS, so it is judged as the address.
+pub fn literal_ip(host: &str) -> Option<IpAddr> {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    if bare.is_empty() || bare.contains(['/', '?', '#', '@', ':', '[', ']', '\\', '%']) {
+        return None;
+    }
+    // The special-scheme host parser applies the WHATWG IPv4 rules.
+    match url::Url::parse(&format!("http://{bare}/")).ok()?.host()? {
+        url::Host::Ipv4(ip) => Some(IpAddr::V4(ip)),
+        url::Host::Ipv6(ip) => Some(IpAddr::V6(ip)),
+        url::Host::Domain(_) => None,
+    }
+}
+
+/// The IP literal a URL's host is, if it is one. Non-special schemes (`udp://`) keep any host,
+/// an IPv4 literal included, as an opaque string, so it goes through [`literal_ip`].
 pub fn url_ip(url: &url::Url) -> Option<IpAddr> {
     match url.host()? {
         url::Host::Ipv4(ip) => Some(IpAddr::V4(ip)),
         url::Host::Ipv6(ip) => Some(IpAddr::V6(ip)),
-        url::Host::Domain(d) => d.parse().ok(),
+        url::Host::Domain(d) => literal_ip(d),
     }
 }
 
@@ -342,14 +638,154 @@ mod tests {
         assert!(!t.allows(ip("fd00::1")));
     }
 
+    fn net(s: &str) -> (IpAddr, u8) {
+        let (a, l) = s.split_once('/').unwrap();
+        (ip(a), l.parse().unwrap())
+    }
+
+    /// D112: our WAN address and our IPv6 prefix are public, and refused anyway, in every
+    /// spelling that reaches the same host (IPv4-mapped, 6to4). Neighbours outside stay allowed.
+    #[test]
+    fn own_addresses_are_refused() {
+        let own = OwnAddrs::fixed(vec![net("11.22.33.44/32"), net("2a01:e0a:1:2::/64")]);
+        let p = AddrPolicy::PUBLIC.with_own(own);
+        for s in [
+            "11.22.33.44",
+            "::ffff:11.22.33.44",
+            "2002:b16:212c::1",
+            "64:ff9b::b16:212c",
+            "2a01:e0a:1:2::1",
+            "2a01:e0a:1:2:ffff:ffff:ffff:ffff",
+        ] {
+            assert!(!p.allows(ip(s)), "{s} is ours");
+            let e = p.check("t", ip(s)).unwrap_err();
+            assert!(e.to_string().contains("our own"), "{e}");
+        }
+        for s in ["11.22.33.45", "2a01:e0a:1:3::1", "1.1.1.1"] {
+            assert!(p.allows(ip(s)), "{s} is not ours");
+        }
+        // Private ranges stay refused for their own reason.
+        let e = p.check("t", ip("192.168.1.1")).unwrap_err();
+        assert!(e.to_string().contains("not a public"), "{e}");
+    }
+
+    #[test]
+    fn learned_addresses_are_refused_and_bounded() {
+        let own = OwnAddrs::fixed(Vec::new());
+        let p = AddrPolicy::PUBLIC.with_own(own);
+        own.learn(ip("192.168.1.1"));
+        own.learn(ip("127.0.0.1"));
+        assert!(own.snapshot().is_empty(), "non-public reports are ignored");
+        own.learn(ip("11.22.33.44"));
+        assert!(!p.allows(ip("11.22.33.44")));
+        own.learn(ip("2a01:e0a:1:2::7"));
+        assert!(
+            !p.allows(ip("2a01:e0a:1:2::8")),
+            "the /64 of a learned IPv6"
+        );
+        for i in 1..=MAX_LEARNED as u8 {
+            own.learn(IpAddr::V4(Ipv4Addr::new(11, 0, 0, i)));
+        }
+        assert!(
+            p.allows(ip("11.22.33.44")),
+            "oldest learned address dropped"
+        );
+        assert_eq!(own.snapshot().len(), MAX_LEARNED);
+        // The test seam is not affected by the process set: loopback is never learned.
+        assert!(AddrPolicy::loopback_for_tests().allows(ip("127.0.0.1")));
+    }
+
+    #[test]
+    fn interface_addresses_become_own_networks() {
+        let got = own_nets([
+            (ip("192.168.1.10"), Some(24)),
+            (ip("127.0.0.1"), Some(8)),
+            (ip("::1"), Some(128)),
+            (ip("fe80::1"), Some(64)),
+            (ip("fd00::5"), Some(64)),
+            (ip("88.1.2.3"), Some(24)),
+            (ip("2a01:e0a:1:2:aaaa::5"), Some(64)),
+            (ip("2a01:e0a:9::1"), Some(128)),
+            (ip("2a01:e0a:7::1"), Some(56)),
+            (ip("2a01:e0a:1:2::6"), None),
+        ]);
+        assert_eq!(
+            got,
+            vec![
+                net("88.1.2.3/32"),
+                net("2a01:e0a:1:2::/64"),
+                net("2a01:e0a:9::/64"),
+                net("2a01:e0a:7::/56"),
+            ]
+        );
+    }
+
+    /// `getifaddrs` works here (lo is always up); no traffic is involved.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn interface_addresses_are_read() {
+        assert!(
+            interface_addrs().iter().any(|(a, _)| a.is_loopback()),
+            "{:?}",
+            interface_addrs()
+        );
+    }
+
+    #[test]
+    fn parses_own_address_settings() {
+        assert_eq!(
+            parse_nets(&["203.0.113.7", " 2a01:db8:1:2::9 ", "2a01:db8:1::77/56", ""]).unwrap(),
+            vec![
+                net("203.0.113.7/32"),
+                net("2a01:db8:1:2::/64"),
+                net("2a01:db8:1::/56"),
+            ]
+        );
+        for bad in ["host.example", "1.2.3.4/33", "::1/129", "1.2.3.4/x"] {
+            assert!(parse_nets(&[bad]).is_err(), "{bad}");
+        }
+    }
+
+    /// D112: every IPv4 spelling a resolver accepts is judged as the address, also in opaque
+    /// `udp://` hosts, so `udp://127.1:6969` is not stored and never reaches a resolver.
+    #[test]
+    fn odd_ipv4_spellings_are_literals() {
+        for s in [
+            "127.1",
+            "2130706433",
+            "0x7f000001",
+            "0x7f.0.0.1",
+            "0x7f.1",
+            "0177.0.0.1",
+            "127.0.0.1.",
+            "127.0.0.1",
+        ] {
+            assert_eq!(literal_ip(s), Some(ip("127.0.0.1")), "{s}");
+            let u = url::Url::parse(&format!("udp://{s}:6969/announce")).unwrap();
+            assert_eq!(url_ip(&u), Some(ip("127.0.0.1")), "{u}");
+            assert!(is_local_host(&u), "{u}");
+        }
+        assert_eq!(literal_ip("[::1]"), Some(ip("::1")));
+        assert_eq!(literal_ip("3232235777"), Some(ip("192.168.1.1")));
+        for s in ["tracker.example", "localhost", "1.2.3.example", "", "a b"] {
+            assert_eq!(literal_ip(s), None, "{s}");
+        }
+        let u = url::Url::parse("udp://tracker.example:6969/announce").unwrap();
+        assert!(!is_local_host(&u));
+    }
+
     #[tokio::test]
     async fn resolve_checks_literals_and_names() {
         let p = AddrPolicy::PUBLIC;
         let t = Duration::from_secs(2);
         let e = p.resolve("t", "192.168.1.1", 80, t).await.unwrap_err();
         assert!(matches!(e, Error::Refused(_)), "{e}");
-        let e = p.resolve("t", "[fd00::1]", 80, t).await.unwrap_err();
-        assert!(matches!(e, Error::Refused(_)), "{e}");
+        // LAN, tailnet and ULA literals are refused here, without a connect: connect tests use
+        // loopback targets only.
+        for host in ["[fd00::1]", "fd00::1", "100.100.1.1", "100.64.0.1"] {
+            let e = p.resolve("t", host, 80, t).await.unwrap_err();
+            assert!(matches!(e, Error::Refused(_)), "{host}: {e}");
+        }
         // `localhost` resolves locally (no DNS traffic) to loopback only.
         let e = p.resolve("t", "localhost", 80, t).await.unwrap_err();
         assert!(matches!(e, Error::Refused(_)), "{e}");

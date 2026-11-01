@@ -3,7 +3,8 @@
 //! Tracker URLs come from Nostr events, so every request goes through a [`TrackerClient`]
 //! (D112): an IP-literal host is checked against the address policy before the request, a name
 //! is checked when it is resolved (the client's DNS resolver drops non-public addresses, so the
-//! connect goes to a checked address), redirects are never followed and no proxy is used.
+//! connect goes to a checked address), each redirect hop is checked the same way (at most
+//! [`MAX_SCRAPE_REDIRECTS`]) and no proxy is used.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,9 +36,29 @@ const INFO_HASH_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'~');
 
-/// HTTP client for tracker scrapes (D112). BEP 48 scrapes need no redirect: a 3xx answer is a
-/// failed scrape, so a public tracker cannot bounce the request to `http://192.168.1.1/...`.
-/// No proxy either: a proxy would resolve the name itself, past the check.
+/// Redirects a scrape follows (an http→https move, a tracker that changed host). More is a
+/// failed scrape.
+pub const MAX_SCRAPE_REDIRECTS: usize = 3;
+
+/// Whether a scrape follows a redirect to `next` after `hops` earlier ones (D112): within
+/// [`MAX_SCRAPE_REDIRECTS`], http(s) only, and an IP-literal host must pass `policy` (a name
+/// is checked by the client's resolver when the hop connects). A public tracker therefore
+/// cannot bounce the request to `http://192.168.1.1/...`.
+pub fn redirect_allowed(policy: AddrPolicy, hops: usize, next: &url::Url) -> Result<()> {
+    if hops >= MAX_SCRAPE_REDIRECTS {
+        return Err(Error::Network(format!(
+            "more than {MAX_SCRAPE_REDIRECTS} redirects"
+        )));
+    }
+    if !matches!(next.scheme(), "http" | "https") {
+        return Err(Error::Invalid(format!("redirect to {}", next.scheme())));
+    }
+    netaddr::check_url_host(policy, "redirect", next)
+}
+
+/// HTTP client for tracker scrapes (D112). Every redirect hop goes through
+/// [`redirect_allowed`] and the policy resolver. No proxy: a proxy resolves the name itself,
+/// past the resolver's check, so `HTTP(S)_PROXY` is ignored for scrapes.
 #[derive(Clone, Debug)]
 pub struct TrackerClient {
     http: reqwest::Client,
@@ -49,7 +70,14 @@ impl TrackerClient {
     /// [`AddrPolicy::PUBLIC`]; tests on 127.0.0.1 pass [`AddrPolicy::loopback_for_tests`].
     pub fn new(timeout: Duration, policy: AddrPolicy) -> Result<Self> {
         let http = crate::http::builder(timeout)
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                // `previous` holds the first URL and every earlier hop.
+                let hops = attempt.previous().len().saturating_sub(1);
+                match redirect_allowed(policy, hops, attempt.url()) {
+                    Ok(()) => attempt.follow(),
+                    Err(e) => attempt.error(e),
+                }
+            }))
             .no_proxy()
             .dns_resolver(Arc::new(PolicyResolver { policy, timeout }))
             .build()?;
@@ -134,12 +162,16 @@ pub async fn scrape_chunk(
     parse_response(tracker, &body, chunk)
 }
 
-/// A name the resolver refused comes back wrapped in reqwest's connect error: keep it typed.
+/// A name the resolver refused or a redirect hop [`redirect_allowed`] stopped comes back
+/// wrapped in reqwest's error: keep it typed.
 fn send_error(tracker: &str, e: reqwest::Error) -> Error {
     let mut src = std::error::Error::source(&e);
     while let Some(s) = src {
-        if let Some(Error::Refused(msg)) = s.downcast_ref::<Error>() {
-            return Error::Refused(format!("{tracker}: {msg}"));
+        match s.downcast_ref::<Error>() {
+            Some(Error::Refused(msg)) => return Error::Refused(format!("{tracker}: {msg}")),
+            Some(Error::Network(msg)) => return Error::Network(format!("{tracker}: {msg}")),
+            Some(Error::Invalid(msg)) => return Error::Invalid(format!("{tracker}: {msg}")),
+            _ => {}
         }
         src = s.source();
     }
@@ -195,4 +227,30 @@ fn parse_response(
             })
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D112: the redirect decision on literals, without any connect.
+    #[test]
+    fn redirect_hops_are_checked() {
+        let p = AddrPolicy::PUBLIC;
+        let u = |s: &str| url::Url::parse(s).unwrap();
+        assert!(redirect_allowed(p, 0, &u("https://1.1.1.1/scrape")).is_ok());
+        assert!(redirect_allowed(p, 2, &u("https://tracker.example/scrape")).is_ok());
+        for bad in [
+            "http://192.168.1.1/cgi-bin/admin",
+            "http://100.100.1.1:8443/",
+            "http://[fd00::1]/",
+            "http://127.1/",
+            "http://[::ffff:10.0.0.1]/",
+        ] {
+            let e = redirect_allowed(p, 0, &u(bad)).unwrap_err();
+            assert!(matches!(e, Error::Refused(_)), "{bad}: {e}");
+        }
+        assert!(redirect_allowed(p, 0, &u("ftp://1.1.1.1/x")).is_err());
+        assert!(redirect_allowed(p, MAX_SCRAPE_REDIRECTS, &u("https://1.1.1.1/")).is_err());
+    }
 }

@@ -1474,36 +1474,92 @@ async fn http_scrape_refuses_local_tracker() {
     assert_eq!(hits.load(Ordering::SeqCst), 0, "a connect reached loopback");
 }
 
-/// A tracker that answers its scrape with a redirect (to a second local server standing in for
-/// the router's admin page) gives a failed scrape: the redirect is not followed.
-#[tokio::test]
-async fn http_scrape_does_not_follow_redirects() {
-    let (inner, inner_hits) = counting_listener().await;
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let outer = listener.local_addr().unwrap();
+/// A server on `bind` that answers every request with a 302 to `location(its own address)`.
+async fn redirector(
+    bind: &str,
+    location: impl Fn(SocketAddr) -> String + Send + 'static,
+) -> SocketAddr {
+    let listener = TcpListener::bind(bind).await.unwrap();
+    let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         while let Ok((mut conn, _)) = listener.accept().await {
+            let resp = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n",
+                location(addr)
+            );
             tokio::spawn(async move {
                 let mut buf = [0u8; 4096];
                 let _ = conn.read(&mut buf).await;
-                let resp = format!(
-                    "HTTP/1.1 302 Found\r\nLocation: http://{inner}/cgi-bin/admin?x=1\r\n\
-                     Content-Length: 0\r\nConnection: close\r\n\r\n"
-                );
                 let _ = conn.write_all(resp.as_bytes()).await;
             });
         }
     });
+    addr
+}
+
+/// A moved tracker still answers: the scrape follows a redirect to an allowed address.
+#[tokio::test]
+async fn http_scrape_follows_allowed_redirect() {
+    let (base, log) = fake_http_tracker(0).await;
+    let to = format!("{base}/scrape");
+    let outer = redirector("127.0.0.1:0", move |_| to.clone()).await;
     let client = http::TrackerClient::new(T, LOCAL).unwrap();
-    let err = http::scrape(&client, &format!("http://{outer}/announce"), &[h(1)])
+    let out = http::scrape(&client, &format!("http://{outer}/announce"), &[h(1)])
+        .await
+        .unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(log.requests.load(Ordering::SeqCst), 1);
+}
+
+/// D112: every redirect hop is checked. 127.0.0.1, 127.0.0.2 and ::1 stand in for the router:
+/// the test policy refuses them as "our own", and the redirectors sit on 127.0.0.3, so only
+/// loopback is involved even if the check regressed. A literal hop and a name hop
+/// (`localhost`) are refused before any connect, and a redirect loop stops at the hop limit.
+#[tokio::test]
+async fn http_scrape_checks_every_redirect_hop() {
+    use magnetar_core::netaddr::OwnAddrs;
+    let own = OwnAddrs::fixed(vec![
+        ("127.0.0.1".parse().unwrap(), 32),
+        ("127.0.0.2".parse().unwrap(), 32),
+        ("::1".parse().unwrap(), 128),
+    ]);
+    let client = http::TrackerClient::new(T, LOCAL.with_own(own)).unwrap();
+    let inner = TcpListener::bind("127.0.0.2:0").await.unwrap();
+    let inner_addr = inner.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hh = hits.clone();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = inner.accept().await {
+            hh.fetch_add(1, Ordering::SeqCst);
+            held.push(s);
+        }
+    });
+    for location in [
+        format!("http://{inner_addr}/cgi-bin/admin?x=1"),
+        format!("http://localhost:{}/admin", inner_addr.port()),
+    ] {
+        let outer = redirector("127.0.0.3:0", move |_| location.clone()).await;
+        let err = http::scrape(&client, &format!("http://{outer}/announce"), &[h(1)])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, magnetar_core::Error::Refused(_)),
+            "{outer}: {err:?}"
+        );
+    }
+    let looping = redirector("127.0.0.3:0", |me| format!("http://{me}/announce")).await;
+    let err = http::scrape(&client, &format!("http://{looping}/announce"), &[h(1)])
         .await
         .unwrap_err();
-    assert!(
-        matches!(err, magnetar_core::Error::Server { status: 302, .. }),
-        "{err:?}"
-    );
+    assert!(err.to_string().contains("redirects"), "loop: {err:?}");
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(inner_hits.load(Ordering::SeqCst), 0, "redirect followed");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "a refused hop was connected"
+    );
 }
 
 /// A UDP tracker on loopback gets no datagram.

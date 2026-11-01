@@ -146,6 +146,12 @@ pub struct Config {
     /// Comma-separated hex pubkeys of trusted NIP-66 monitors (default: built-in list, D36).
     #[arg(long, env = "MAGNETAR_NIP66_TRUSTED", value_delimiter = ',')]
     pub nip66_trusted: Vec<String>,
+    /// Comma-separated addresses and networks of our own that no tracker, relay, DHT walk or
+    /// download peer may be sent to (D112), e.g. the line's WAN IPv4 and its IPv6 prefix:
+    /// `203.0.113.7,2a01:db8:1:2::/56`. Interface addresses and the address the DHT crawler or
+    /// UPnP learns are refused without it.
+    #[arg(long, env = "MAGNETAR_OWN_ADDRS", value_delimiter = ',')]
+    pub own_addrs: Vec<String>,
     /// Offline IMDb identification from the non-commercial datasets (D40).
     #[arg(long, env = "MAGNETAR_IMDB", default_value_t = true, action = clap::ArgAction::Set)]
     pub imdb: bool,

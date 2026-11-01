@@ -289,6 +289,10 @@ pub async fn map_once(
         }
     }
     let ext = igd::external_ip(&gw).await;
+    if let Some(ip) = ext {
+        // Our WAN address: no outbound path may connect to it (D112).
+        magnetar_core::netaddr::OWN.learn(ip);
+    }
     set(status, |s| {
         s.gateway = Some(gw_addr.to_string());
         s.state = if round.errors.is_empty() {
