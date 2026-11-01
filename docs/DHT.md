@@ -518,7 +518,10 @@ test):
   sampler or the metadata fetcher would then spray them. Before any UDP send or TCP connect,
   addresses in 0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.0.0/24, 192.168/16,
   198.18/15, 224/4, 240/4 and our own external address are dropped (the bootstrap routers are
-  resolved names and pass the same check). Counted in stats, never logged per address.
+  resolved names and pass the same check). Counted in stats, never logged per address. The
+  ranges are the crate-wide policy `netaddr::is_public` (D112), which also drops the
+  documentation nets and 192.88.99/24, and which the seed checker's DHT walk, tracker scrapes,
+  untrusted relays and librqbit's peer blocklist use too.
 - **Reflection**: our responses are at most a few hundred bytes larger than the query; the
   response caps of §3.4 rule 4 (300/s, 5/s per IP) bound what a spoofed-source flood can
   reflect.

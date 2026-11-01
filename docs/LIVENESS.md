@@ -41,6 +41,28 @@ Batches run back to back while a full batch is due; otherwise the loop sleeps
 `MAGNETAR_LIVENESS_INTERVAL_SECS` (default 60). The `liveness.enabled` setting still turns
 the checker off.
 
+### Which addresses are contacted (D112)
+
+Tracker URLs come from Nostr events and DHT `nodes` from other peers, so a hostile publisher
+or node could aim checks at the home router, Postgres on 127.0.0.1, a tailnet service or any
+LAN host. Every target is checked against one policy (`netaddr::is_public`: no loopback,
+RFC 1918, 100.64/10 CGNAT/Tailscale, link-local, ULA fd00::/8 and the rest of fc00::/7,
+multicast, documentation, benchmarking or reserved ranges, and no IPv4-mapped, NAT64 or 6to4
+address carrying one of those) on the address actually connected to, after DNS:
+
+- HTTP trackers: an IP-literal host is checked before the request; a name goes through a DNS
+  resolver that keeps only public addresses, so the connect goes to a checked one. Redirects
+  are never followed (a 3xx is a failed scrape) and no proxy is used.
+- UDP trackers: the name is resolved through the policy and the socket is connected to the
+  checked address.
+- DHT walks: seeds and every `nodes` entry are checked before a query is sent; the node cache
+  only holds nodes that passed.
+- At ingest, trackers with a non-public IP literal or a `localhost` name are not stored, so
+  workers never lease them either.
+
+A refused tracker fails like an unreachable one (`Error::Refused`) and backs off. There is no
+setting to allow private targets; only in-process tests use a loopback seam.
+
 ### Node farms on the DHT
 
 The live DHT answers many lookups from nodes that do not hold the swarm: one IP answering
