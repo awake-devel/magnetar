@@ -576,6 +576,7 @@ async fn worker_triage_codes() {
             max_lease: 100,
             metadata_max: 1 << 20,
             fetch_known: false,
+            ..Default::default()
         },
         screen::global_screen(),
     );

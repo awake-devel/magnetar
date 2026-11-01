@@ -324,6 +324,10 @@ pub struct Config {
     /// Server: seed-check lease length handed to workers, seconds.
     #[arg(long, env = "MAGNETAR_WORKER_LEASE_SECS", default_value_t = crate::fleet::DEFAULT_LEASE_SECS, value_parser = clap::value_parser!(u64).range(60..=86_400))]
     pub worker_lease_secs: u64,
+    /// Server: new DHT hashes one worker's triage may queue per hour (D113); beyond it the
+    /// worker is told to fetch nothing new until the budget refills. 0 = no cap.
+    #[arg(long, env = "MAGNETAR_WORKER_TRIAGE_NEW_PER_HOUR", default_value_t = crate::fleet::DEFAULT_TRIAGE_NEW_PER_HOUR)]
+    pub worker_triage_new_per_hour: u64,
     /// Worker: the main server's base URL, e.g. https://<host>.<tailnet>.ts.net.
     #[arg(long, env = "MAGNETAR_WORKER_SERVER")]
     pub worker_server: Option<String>,

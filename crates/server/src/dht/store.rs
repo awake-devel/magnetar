@@ -27,6 +27,10 @@ pub struct TriageOutcome {
     pub known: i64,
     /// Hashes to fetch now (new, or due again).
     pub queued: Vec<[u8; 20]>,
+    /// Of `queued`, rows created by this triage (new to `dht_seen`).
+    pub fresh: usize,
+    /// New hashes left out by the `new_limit` of [`triage_for`].
+    pub capped: usize,
 }
 
 /// One round trip for a batch: blocked → drop, known (Nostr or stored) → drop unless
@@ -52,12 +56,22 @@ pub async fn triage_geo(
     now: i64,
     fetch_known: bool,
 ) -> sqlx::Result<TriageOutcome> {
-    triage_for(pool, batch, geo, now, fetch_known, None).await
+    triage_for(pool, batch, geo, now, fetch_known, None, None).await
 }
+
+/// How long past its end a row a worker holds (its lease, or the backoff after a failure it
+/// reported) must be before another worker's triage may take it over (D113).
+pub const TAKEOVER_GRACE_SECS: i64 = LEASE_SECS;
 
 /// [`triage_geo`] on behalf of `holder` (D113): the rows it queues (new, or due again) record
 /// that crawl worker as their holder, so only it may upload a dict or a status for them. None =
 /// the server's own crawler.
+///
+/// A due row held by another worker is re-queued for `holder` only once it is
+/// [`TAKEOVER_GRACE_SECS`] past due (its holder is gone); NULL-holder rows, the holder's own
+/// rows and the server's own triage (`holder` None) are not held back. `new_limit` caps the
+/// rows this call may create (the hourly per-worker cap, D113; None = no cap); re-queued rows
+/// do not count.
 pub async fn triage_for(
     pool: &PgPool,
     batch: &[([u8; 20], Via)],
@@ -65,6 +79,7 @@ pub async fn triage_for(
     now: i64,
     fetch_known: bool,
     holder: Option<&str>,
+    new_limit: Option<i64>,
 ) -> sqlx::Result<TriageOutcome> {
     let hashes: Vec<Vec<u8>> = batch.iter().map(|(h, _)| h.to_vec()).collect();
     let vias: Vec<i16> = batch.iter().map(|(_, v)| v.code()).collect();
@@ -75,8 +90,9 @@ pub async fn triage_for(
     let asns: Vec<Option<i32>> = (0..batch.len())
         .map(|i| g(i).map(|c| i32::try_from(c.asn).unwrap_or(0)))
         .collect();
-    let (blocked, known, queued): (i64, i64, Vec<Vec<u8>>) = sqlx::query_as(
-        r#"
+    let (blocked, known, queued, fresh, candidates): (i64, i64, Vec<Vec<u8>>, i64, i64) =
+        sqlx::query_as(
+            r#"
         WITH input AS (
             SELECT DISTINCT ON (h) h, via, cc, asn
             FROM unnest($1::bytea[], $2::int2[], $7::text[], $8::int4[]) AS u(h, via, cc, asn)
@@ -89,39 +105,58 @@ pub async fn triage_for(
                    (NOT $4 AND EXISTS (SELECT 1 FROM torrent_infohashes t
                            WHERE t.infohash = encode(i.h, 'hex') COLLATE "C")) AS known
             FROM input i
+        ), cand AS (
+            SELECT c.h, c.via, c.cc, c.asn,
+                   EXISTS (SELECT 1 FROM dht_seen d WHERE d.infohash = c.h) AS present
+            FROM cls c
+            WHERE NOT c.blocked AND NOT c.known
+        ), pick AS (
+            SELECT h, via, cc, asn FROM cand WHERE present
+            UNION ALL
+            (SELECT h, via, cc, asn FROM cand WHERE NOT present ORDER BY h LIMIT $10)
         ), up AS (
             INSERT INTO dht_seen AS s (infohash, first_seen, last_seen, via, status, attempts,
                                        next_attempt_at, src_cc, src_asn, holder)
-            SELECT h, $3, $3, via, 0, 0, $3 + $5, cc, asn, $9 FROM cls
-            WHERE NOT blocked AND NOT known
+            SELECT h, $3, $3, via, 0, 0, $3 + $5, cc, asn, $9 FROM pick
             ORDER BY h
             ON CONFLICT (infohash) DO UPDATE
                 SET last_seen = EXCLUDED.last_seen, status = 0, via = EXCLUDED.via,
                     next_attempt_at = EXCLUDED.next_attempt_at, holder = EXCLUDED.holder,
                     src_cc = COALESCE(s.src_cc, EXCLUDED.src_cc),
                     src_asn = CASE WHEN s.src_cc IS NULL THEN EXCLUDED.src_asn ELSE s.src_asn END
-                WHERE (s.status IN (0, 2) AND s.next_attempt_at IS NOT NULL
-                       AND s.next_attempt_at <= EXCLUDED.last_seen)
-                   OR (s.status = 2 AND EXCLUDED.via = 1
-                       AND s.last_seen <= EXCLUDED.last_seen - $6)
-            RETURNING s.infohash
+                WHERE ((s.status IN (0, 2) AND s.next_attempt_at IS NOT NULL
+                        AND s.next_attempt_at <= EXCLUDED.last_seen)
+                    OR (s.status = 2 AND EXCLUDED.via = 1
+                        AND s.last_seen <= EXCLUDED.last_seen - $6))
+                  -- D113: no takeover of another worker's row until it is long past due.
+                  AND (EXCLUDED.holder IS NULL OR s.holder IS NULL
+                       OR s.holder = EXCLUDED.holder
+                       OR (s.next_attempt_at IS NOT NULL
+                           AND s.next_attempt_at <= EXCLUDED.last_seen - $11))
+            RETURNING s.infohash, (s.xmax = 0) AS fresh
         )
         SELECT (SELECT count(*) FROM cls WHERE blocked),
                (SELECT count(*) FROM cls WHERE known AND NOT blocked),
-               ARRAY(SELECT infohash FROM up)
+               ARRAY(SELECT infohash FROM up),
+               (SELECT count(*) FROM up WHERE fresh),
+               (SELECT count(*) FROM cand WHERE NOT present)
         "#,
-    )
-    .bind(&hashes)
-    .bind(&vias)
-    .bind(now)
-    .bind(fetch_known)
-    .bind(LEASE_SECS)
-    .bind(ANNOUNCE_RETRY_SECS)
-    .bind(&ccs)
-    .bind(&asns)
-    .bind(holder)
-    .fetch_one(pool)
-    .await?;
+        )
+        .bind(&hashes)
+        .bind(&vias)
+        .bind(now)
+        .bind(fetch_known)
+        .bind(LEASE_SECS)
+        .bind(ANNOUNCE_RETRY_SECS)
+        .bind(&ccs)
+        .bind(&asns)
+        .bind(holder)
+        .bind(new_limit.map(|n| n.max(0)))
+        .bind(TAKEOVER_GRACE_SECS)
+        .fetch_one(pool)
+        .await?;
+    let fresh = usize::try_from(fresh).unwrap_or(0);
+    let capped = new_limit.map_or(0, |l| usize::try_from(candidates - l.max(0)).unwrap_or(0));
     Ok(TriageOutcome {
         input: batch.len(),
         blocked,
@@ -130,6 +165,8 @@ pub async fn triage_for(
             .into_iter()
             .filter_map(|h| <[u8; 20]>::try_from(h.as_slice()).ok())
             .collect(),
+        fresh,
+        capped,
     })
 }
 

@@ -159,6 +159,7 @@ On the **server**:
 |---|---|---|
 | `MAGNETAR_WORKER_TOKENS` | unset (no worker can connect) | `name:token,name:token`: one token per worker (name 1–32 of `a-z0-9_-`, token ≥ 24 characters, e.g. `openssl rand -hex 32`), separate from `MAGNETAR_API_TOKEN` (a worker token only reaches `/api/v1/worker/*`, the API token never does). The server refuses to start on a malformed list or a token equal to the API token |
 | `MAGNETAR_WORKER_LEASE_SECS` | `900` | seed-check lease length (60–86400); an unanswered lease is due again for anyone at its end |
+| `MAGNETAR_WORKER_TRIAGE_NEW_PER_HOUR` | `100000` | new DHT hashes one worker's triage may queue per hour (D113; token bucket, burst one hour's worth; re-queued hashes do not count); beyond it the worker is told to fetch nothing new (`capped` in the triage answer, a warning in the server log at most once a minute). `0` = no cap. The default is ~1.5× the 66 k/h a laptop worker queued in aggressive mode (docs/WORKERS.md §6); a worker faster than that needs a higher value. It bounds, but does not stop, dicts a leaked worker token makes up (docs/WORKERS.md §7) |
 
 On a **worker** (`magnetar-server worker`): `MAGNETAR_WORKER_SERVER` (required, the server's
 URL), `MAGNETAR_WORKER_TOKEN` (required), `MAGNETAR_WORKER_STATE_DIR` (`<state dir>/worker`),
