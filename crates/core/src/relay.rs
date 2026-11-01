@@ -1,6 +1,7 @@
 //! Thin NIP-01/NIP-77 relay WebSocket client (D3). Owner: nostr agent.
-//! tokio-tungstenite with our rustls config (crate::http::tls_config), max message 16 MiB,
-//! 10 s connect timeout, ping keepalive. Tolerates NOTICE/AUTH/CLOSED at any time.
+//! tokio-tungstenite with our rustls config (crate::http::tls_config), max message just above
+//! `ingest::MAX_EVENT_BYTES` (D111), 10 s connect timeout, ping keepalive. Tolerates
+//! NOTICE/AUTH/CLOSED at any time.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -17,7 +18,23 @@ use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 use crate::error::{Error, Result};
 use crate::model::RawEvent;
 
-pub const MAX_MESSAGE_BYTES: usize = 16 << 20;
+/// Largest relay message (and frame) accepted (D111). Ingest refuses events above
+/// `MAX_EVENT_BYTES` (1 MiB) anyway, so a larger frame is only memory spent for nothing; the
+/// extra 16 KiB covers the `["EVENT","<sub>",…]` envelope. NIP-35 events are a few KB (5000
+/// `file` tags at most); the largest real events are kind 3 follow lists of a few hundred KB.
+/// Was 16 MiB.
+pub const MAX_MESSAGE_BYTES: usize = crate::ingest::MAX_EVENT_BYTES + (16 << 10);
+/// Text bytes of the events one REQ page may keep (D111): a normal page of 500 NIP-35 events
+/// is about 1 MB, so 16 MiB never cuts a real page, while a relay streaming 1 MiB events for
+/// the whole page timeout is stopped at 16 MiB instead of 10,000 messages.
+pub const MAX_PAGE_BYTES: usize = 16 << 20;
+/// Most tags per event kept (D111): above NIP-35's 5000 `file` tags and `wot::MAX_FOLLOWS`
+/// (10,000 `p` tags). Each tag costs ~70 bytes as `Vec<Vec<String>>` however short its JSON
+/// (`["a"],` is 6 bytes), so this bounds the decoded size of one event.
+pub const MAX_EVENT_TAGS: usize = 20_000;
+/// Longest event `content` kept (D111): NIP-35 descriptions are cut at 64 KiB and profiles are
+/// small, so nothing we use is longer.
+pub const MAX_EVENT_CONTENT_BYTES: usize = 256 << 10;
 /// Connect never waits longer than this, whatever the caller asks.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A ping is sent when the relay has been silent this long while we wait.
@@ -74,10 +91,16 @@ impl RelayMsg {
             Some(other) => other.to_string(),
         };
         Some(match kind.as_str() {
-            "EVENT" => RelayMsg::Event {
-                sub: s(1),
-                event: serde_json::from_value(arr.get(2)?.clone()).ok()?,
-            },
+            "EVENT" => {
+                let ev = arr.get(2)?;
+                if let Some(why) = oversized(ev) {
+                    return Some(RelayMsg::Other(format!("EVENT dropped: {why}")));
+                }
+                RelayMsg::Event {
+                    sub: s(1),
+                    event: serde_json::from_value(ev.clone()).ok()?,
+                }
+            }
             "EOSE" => RelayMsg::Eose { sub: s(1) },
             "CLOSED" => RelayMsg::Closed {
                 sub: s(1),
@@ -105,6 +128,24 @@ impl RelayMsg {
             _ => return None,
         })
     }
+}
+
+/// Why an EVENT is dropped before it becomes a `RawEvent` (D111); None when it fits.
+fn oversized(ev: &Value) -> Option<String> {
+    let tags = ev.get("tags").and_then(Value::as_array).map_or(0, Vec::len);
+    if tags > MAX_EVENT_TAGS {
+        return Some(format!("{tags} tags (max {MAX_EVENT_TAGS})"));
+    }
+    let content = ev
+        .get("content")
+        .and_then(Value::as_str)
+        .map_or(0, str::len);
+    if content > MAX_EVENT_CONTENT_BYTES {
+        return Some(format!(
+            "content of {content} bytes (max {MAX_EVENT_CONTENT_BYTES})"
+        ));
+    }
+    None
 }
 
 /// Outcome of one REQ page.
@@ -213,6 +254,11 @@ impl RelayConn {
 
     /// Next relay message, None on close. Errors on timeout.
     pub async fn recv(&mut self, timeout: Duration) -> Result<Option<RelayMsg>> {
+        Ok(self.recv_text(timeout).await?.map(|t| RelayMsg::parse(&t)))
+    }
+
+    /// Next relay message as received (its length is what the page budget counts).
+    async fn recv_text(&mut self, timeout: Duration) -> Result<Option<String>> {
         if self.dead {
             return Ok(None);
         }
@@ -258,7 +304,7 @@ impl RelayConn {
                 // Pings are answered by tungstenite on the next read/write.
                 Some(Ok(_)) => continue,
             };
-            return Ok(Some(RelayMsg::parse(&text)));
+            return Ok(Some(text));
         }
     }
 
@@ -284,10 +330,11 @@ impl RelayConn {
         let deadline = Instant::now() + timeout;
         let mut page = Page::default();
         let mut need_close = true;
+        let mut kept_bytes = 0usize;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            let msg = match self.recv(left).await {
-                Ok(Some(m)) => m,
+            let (msg, len) = match self.recv_text(left).await {
+                Ok(Some(t)) => (RelayMsg::parse(&t), t.len()),
                 Ok(None) => {
                     page.closed = Some("connection closed".into());
                     need_close = false;
@@ -302,7 +349,9 @@ impl RelayConn {
             match msg {
                 RelayMsg::Event { sub: s, event } if s == sub => {
                     page.events.push(event);
-                    if page.events.len() >= MAX_PAGE_EVENTS {
+                    kept_bytes += len;
+                    if page.events.len() >= MAX_PAGE_EVENTS || kept_bytes >= MAX_PAGE_BYTES {
+                        // Like a short page: the caller goes on from the oldest event kept.
                         break;
                     }
                 }
@@ -433,6 +482,34 @@ mod tests {
             r#"["EVENT","s",{"id":1}]"#,
         ] {
             assert_eq!(RelayMsg::parse(junk), RelayMsg::Other(junk.into()));
+        }
+    }
+
+    /// D111: events with more tags or longer content than anything we use are dropped before
+    /// they are decoded into a `RawEvent`.
+    #[test]
+    fn oversized_events_are_dropped() {
+        let ev = |tags: usize, content: usize| {
+            let tags: Vec<Vec<&str>> = (0..tags).map(|_| vec!["a"]).collect();
+            json!(["EVENT", "s1", {"id":"aa","pubkey":"bb","created_at":1,"kind":2003,
+                "tags": tags, "content": "x".repeat(content), "sig":"cc"}])
+            .to_string()
+        };
+        assert!(matches!(
+            RelayMsg::parse(&ev(MAX_EVENT_TAGS, MAX_EVENT_CONTENT_BYTES)),
+            RelayMsg::Event { .. }
+        ));
+        for text in [
+            ev(MAX_EVENT_TAGS + 1, 0),
+            ev(0, MAX_EVENT_CONTENT_BYTES + 1),
+        ] {
+            match RelayMsg::parse(&text) {
+                RelayMsg::Other(why) => assert!(why.starts_with("EVENT dropped"), "{why}"),
+                other => panic!(
+                    "kept an oversized event: {:?}",
+                    std::mem::discriminant(&other)
+                ),
+            }
         }
     }
 

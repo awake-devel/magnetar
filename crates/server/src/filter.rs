@@ -8,6 +8,19 @@ use serde_json::Value;
 
 /// Hard cap on stored events returned per filter (ARCHITECTURE.md §6).
 pub const MAX_LIMIT: usize = 500;
+/// Most values in one `ids`/`authors`/`kinds`/`#x` list (D111). Our crawler asks for at most
+/// 250 authors or 100 event ids per filter; unbounded lists cost memory and a linear
+/// `contains` per list on every live event matched against the subscription.
+pub const MAX_FILTER_VALUES: usize = 1000;
+
+fn check_len(key: &str, arr: &[Value]) -> Result<(), String> {
+    if arr.len() > MAX_FILTER_VALUES {
+        return Err(format!(
+            "blocked: {key} has more than {MAX_FILTER_VALUES} values"
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Filter {
@@ -36,6 +49,7 @@ impl Filter {
                     let arr = val
                         .as_array()
                         .ok_or_else(|| "invalid: kinds must be an array".to_string())?;
+                    check_len(key, arr)?;
                     let kinds = arr
                         .iter()
                         .map(|k| {
@@ -62,6 +76,7 @@ impl Filter {
                     let arr = val
                         .as_array()
                         .ok_or_else(|| format!("invalid: {k} must be an array"))?;
+                    check_len(k, arr)?;
                     let vals = arr
                         .iter()
                         .map(|s| {
@@ -123,6 +138,7 @@ fn hex_list(key: &str, val: &Value) -> Result<Vec<String>, String> {
     let arr = val
         .as_array()
         .ok_or_else(|| format!("invalid: {key} must be an array"))?;
+    check_len(key, arr)?;
     arr.iter()
         .map(|s| match s.as_str() {
             Some(h) if is_hex32(h) => Ok(h.to_string()),
@@ -208,6 +224,25 @@ mod tests {
                 .unwrap()
                 .neg_compatible()
         );
+    }
+
+    /// D111: every list is capped at MAX_FILTER_VALUES (a REQ cannot carry 16 MiB of ids).
+    #[test]
+    fn list_lengths_are_capped() {
+        let hex = vec!["b".repeat(64); MAX_FILTER_VALUES + 1];
+        let kinds = vec![1u16; MAX_FILTER_VALUES + 1];
+        let tags = vec!["v"; MAX_FILTER_VALUES + 1];
+        for f in [
+            json!({ "ids": hex }),
+            json!({ "authors": hex }),
+            json!({ "kinds": kinds }),
+            json!({ "#x": tags }),
+        ] {
+            let err = Filter::from_json(&f).unwrap_err();
+            assert!(err.starts_with("blocked:"), "{err}");
+        }
+        let ok = vec!["b".repeat(64); MAX_FILTER_VALUES];
+        assert!(Filter::from_json(&json!({ "authors": ok })).is_ok());
     }
 
     #[test]

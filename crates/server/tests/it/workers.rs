@@ -251,6 +251,75 @@ async fn tokens_are_separated_and_versions_checked() {
     assert_eq!((s, j["error"].as_str()), (403, Some("workers_disabled")));
 }
 
+/// D111: hello/heartbeat text is stored and served without control characters and cut to
+/// MAX_WORKER_LABEL, port lists to MAX_WORKER_PORTS, and the small calls refuse large bodies.
+#[tokio::test]
+async fn worker_hello_and_heartbeat_are_bounded() {
+    use magnetar_server::fleet::{MAX_WORKER_LABEL, MAX_WORKER_PORTS, SMALL_BODY_LIMIT};
+    let Some(db) = test_db().await else { return };
+    let (base, _) = spawn(&db.store, 900).await;
+    let v = Some("1");
+    let forged = format!(
+        "0.3.1\n2026-11-01T00:00:00Z INFO forged\x1b[31m{}",
+        "v".repeat(500)
+    );
+    let ports: Vec<u16> = (0..1000).collect();
+    let (s, _) = post(
+        &base,
+        HELLO,
+        W1,
+        v,
+        json!({"version": forged, "arch": "a\r\nb".repeat(100), "dht": "polite\n", "dht_ports": ports}),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, _) = post(
+        &base,
+        HEARTBEAT,
+        W1,
+        v,
+        json!({"uptime_secs": 1, "dht": {"mode": "x\n".repeat(100), "ports": ports}}),
+    )
+    .await;
+    assert_eq!(s, 204);
+    let st: J = http()
+        .get(format!("{base}/api/v1/stats"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let w = &st["workers"][0];
+    assert_eq!(w["name"], "w1");
+    for text in [&w["version"], &w["arch"], &w["dht"]["mode"]] {
+        let text = text.as_str().unwrap();
+        assert!(text.chars().count() <= MAX_WORKER_LABEL, "{text}");
+        assert!(!text.chars().any(char::is_control), "{text:?}");
+    }
+    assert!(
+        w["version"]
+            .as_str()
+            .unwrap()
+            .starts_with("0.3.12026-11-01")
+    );
+    assert_eq!(
+        w["dht"]["ports"].as_array().unwrap().len(),
+        MAX_WORKER_PORTS
+    );
+    // A hello body above the small limit is refused (the 32 MiB limit is for uploads).
+    let (s, _) = post(
+        &base,
+        HELLO,
+        W1,
+        v,
+        json!({"version": "x".repeat(SMALL_BODY_LIMIT)}),
+    )
+    .await;
+    assert_eq!(s, 413);
+}
+
 #[tokio::test]
 async fn worker_refuses_an_incompatible_or_old_server() {
     use axum::routing::post as p;
