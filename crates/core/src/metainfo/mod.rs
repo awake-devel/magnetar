@@ -12,4 +12,4 @@ pub use fetch::{
     FetchConfig, FetchFailure, FetchStats, Fetched, Fetcher, Identity, Outcome, PeerError,
     RawError, outcome_from_raw, verify_and_parse,
 };
-pub use info::{InfoError, InfoFile, InfoSummary, parse_info};
+pub use info::{InfoError, InfoFile, InfoSummary, output_max, parse_info, parse_info_bounded};
