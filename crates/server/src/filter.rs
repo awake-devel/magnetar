@@ -13,6 +13,10 @@ pub const MAX_LIMIT: usize = 500;
 /// `contains` per list on every live event matched against the subscription.
 pub const MAX_FILTER_VALUES: usize = 1000;
 
+/// Longest `#x` value (D111): `#x` info hashes are 40 hex chars, `#t` and `#d` values short
+/// words; a value of any length was one more linear comparison cost per live event.
+pub const MAX_TAG_VALUE_BYTES: usize = 256;
+
 fn check_len(key: &str, arr: &[Value]) -> Result<(), String> {
     if arr.len() > MAX_FILTER_VALUES {
         return Err(format!(
@@ -79,10 +83,12 @@ impl Filter {
                     check_len(k, arr)?;
                     let vals = arr
                         .iter()
-                        .map(|s| {
-                            s.as_str()
-                                .map(str::to_string)
-                                .ok_or_else(|| format!("invalid: {k} values must be strings"))
+                        .map(|s| match s.as_str() {
+                            Some(v) if v.len() > MAX_TAG_VALUE_BYTES => Err(format!(
+                                "blocked: {k} value longer than {MAX_TAG_VALUE_BYTES} bytes"
+                            )),
+                            Some(v) => Ok(v.to_string()),
+                            None => Err(format!("invalid: {k} values must be strings")),
                         })
                         .collect::<Result<_, _>>()?;
                     f.tags.insert(letter, vals);
@@ -91,6 +97,15 @@ impl Filter {
             }
         }
         Ok(f)
+    }
+
+    /// Values in all the lists of this filter (`ids`, `authors`, `kinds`, every `#x`), what a
+    /// REQ is capped on as a whole (D111).
+    pub fn value_count(&self) -> usize {
+        self.ids.as_ref().map_or(0, Vec::len)
+            + self.authors.as_ref().map_or(0, Vec::len)
+            + self.kinds.as_ref().map_or(0, Vec::len)
+            + self.tags.values().map(Vec::len).sum::<usize>()
     }
 
     /// Effective stored-event limit (absent = cap).
@@ -243,6 +258,23 @@ mod tests {
         }
         let ok = vec!["b".repeat(64); MAX_FILTER_VALUES];
         assert!(Filter::from_json(&json!({ "authors": ok })).is_ok());
+    }
+
+    /// D111 review: a `#x` value could be any length (one more long comparison per live
+    /// event). Values are capped at MAX_TAG_VALUE_BYTES and lists are counted together.
+    #[test]
+    fn tag_values_are_capped() {
+        let long = "v".repeat(MAX_TAG_VALUE_BYTES + 1);
+        let err = Filter::from_json(&json!({ "#t": [long] })).unwrap_err();
+        assert!(err.starts_with("blocked:"), "{err}");
+        let fits = "v".repeat(MAX_TAG_VALUE_BYTES);
+        assert!(Filter::from_json(&json!({ "#t": [fits] })).is_ok());
+        let f = Filter::from_json(&json!({
+            "ids": ["a".repeat(64)], "authors": ["b".repeat(64), "c".repeat(64)],
+            "kinds": [1, 2, 3], "#t": ["x"], "#e": ["y", "z"]
+        }))
+        .unwrap();
+        assert_eq!(f.value_count(), 9);
     }
 
     #[test]

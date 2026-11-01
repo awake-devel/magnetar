@@ -31,15 +31,32 @@ pub const MAX_SUB_ID_LEN: usize = 64;
 /// all buffered before EOSE, and every live event is matched against each; our crawler sends
 /// at most 2 per REQ. strfry's default is 200, nostr-rs-relay's 10.
 pub const MAX_FILTERS_PER_REQ: usize = 10;
+/// Most list values in all the filters of one REQ (D111): `MAX_FILTER_VALUES` is per list, so
+/// 10 filters × (ids + authors + kinds + 52 tag letters) still made ~550k values, each matched
+/// linearly against every live event. Our crawler sends at most 250 authors + 100 ids.
+pub const MAX_REQ_VALUES: usize = 5000;
 
-/// The filters of a REQ (everything after the subscription id), counted before any is parsed.
+/// The filters of a REQ (everything after the subscription id), counted before any is parsed,
+/// their values counted as they are.
 fn req_filters(raw: &[Value]) -> Result<Vec<Filter>, String> {
     if raw.len() > MAX_FILTERS_PER_REQ {
         return Err(format!(
             "blocked: more than {MAX_FILTERS_PER_REQ} filters in one REQ"
         ));
     }
-    raw.iter().map(Filter::from_json).collect()
+    let mut values = 0usize;
+    raw.iter()
+        .map(|v| {
+            let f = Filter::from_json(v)?;
+            values += f.value_count();
+            if values > MAX_REQ_VALUES {
+                return Err(format!(
+                    "blocked: more than {MAX_REQ_VALUES} filter values in one REQ"
+                ));
+            }
+            Ok(f)
+        })
+        .collect()
 }
 
 pub async fn ws_handler(ws: WebSocketUpgrade, State(st): State<AppState>) -> Response {
@@ -375,5 +392,35 @@ impl Session {
                 neg_err(&sub, &format!("invalid: {e}"))
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::filter::MAX_FILTER_VALUES;
+
+    /// D111 review: the value caps were per list, so one REQ of 10 filters could still carry
+    /// ~550k values. All the filters of a REQ are now counted together.
+    #[test]
+    fn req_values_are_capped_across_filters() {
+        let authors = |n: usize| -> Vec<String> { (0..n).map(|i| format!("{i:064x}")).collect() };
+        // 6 filters of 1000 authors: each list is under its cap, the REQ is over.
+        let filter = json!({ "authors": authors(MAX_FILTER_VALUES) });
+        let over = vec![filter.clone(); MAX_REQ_VALUES / MAX_FILTER_VALUES + 1];
+        let err = req_filters(&over).unwrap_err();
+        assert!(err.starts_with("blocked:"), "{err}");
+        let at = vec![filter; MAX_REQ_VALUES / MAX_FILTER_VALUES];
+        assert_eq!(req_filters(&at).unwrap().len(), at.len());
+        // The lists of one filter add up too.
+        let mixed = json!({
+            "authors": authors(MAX_FILTER_VALUES),
+            "ids": authors(MAX_FILTER_VALUES),
+            "#e": authors(MAX_FILTER_VALUES),
+            "#p": authors(MAX_FILTER_VALUES),
+            "#q": authors(MAX_FILTER_VALUES),
+            "kinds": [1],
+        });
+        assert!(req_filters(&[mixed]).is_err());
     }
 }
