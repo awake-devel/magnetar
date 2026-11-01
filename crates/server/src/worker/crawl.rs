@@ -72,6 +72,7 @@ struct Counters {
     uploaded: AtomicU64,
     upload_requests: AtomicU64,
     upload_errors: AtomicU64,
+    upload_dropped: AtomicU64,
     upload_backlog: AtomicU64,
     server_stored: AtomicU64,
     server_not_new: AtomicU64,
@@ -115,6 +116,8 @@ pub struct CrawlReport {
     pub uploaded: u64,
     pub upload_requests: u64,
     pub upload_errors: u64,
+    /// Results the server refused for good (D113: a 4xx on a single-item upload), dropped.
+    pub upload_dropped: u64,
     /// What the server answered.
     pub server_stored: u64,
     pub server_not_new: u64,
@@ -559,43 +562,78 @@ async fn upload(p: &Crawl, batch: &mut Vec<Pending>, abort: &Abort) {
         items.push(x.item);
         permits.push(x._permit);
     }
-    let body = DhtResults { items };
-    add(&p.c.upload_requests, 1);
-    // Retry until it goes through: the buffer fills meanwhile and fetching waits. Never
-    // given up while running (the hashes' server leases would expire for nothing).
-    let mut wait = Duration::from_secs(1);
-    loop {
-        match p.client.post::<_, DhtAck>(DHT_RESULTS, &body).await {
-            Ok(a) => {
-                add(&p.c.uploaded, n);
-                add(&p.c.server_stored, u64::from(a.stored));
-                add(&p.c.server_not_new, u64::from(a.not_new));
-                add(&p.c.server_blocked, u64::from(a.blocked));
-                add(&p.c.server_rejected, u64::from(a.rejected));
-                add(&p.c.server_ignored, u64::from(a.ignored));
-                break;
-            }
-            Err(e) if e.is_fatal() => {
-                abort.fatal(&e);
-                return;
-            }
-            Err(e) => {
-                add(&p.c.upload_errors, 1);
-                if get(&p.c.upload_errors).is_multiple_of(20) || wait.as_secs() <= 1 {
-                    tracing::warn!("worker: upload: {e}; retrying");
+    send_results(&p.client, items, abort, &p.c, n).await;
+    drop(permits);
+}
+
+/// Longest wait between two tries of the same upload.
+const UPLOAD_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Send `items` until the server has taken them. A transient failure (network, 408, 429,
+/// 5xx) is retried with backoff: never given up while running (the hashes' server leases
+/// would expire for nothing), and the buffer fills meanwhile so fetching waits. A refused
+/// body (D113: 413 too large, 400, any other 4xx) would be refused again: it is split in
+/// halves, and a single refused item is dropped with a warning (its server lease expires and
+/// the hash comes due again there), so one bad item can never stall the uploads.
+async fn send_results(client: &Client, items: Vec<DhtResult>, abort: &Abort, c: &Counters, n: u64) {
+    // Pieces still to send, the next one last.
+    let mut todo: Vec<Vec<DhtResult>> = vec![items];
+    while let Some(items) = todo.pop() {
+        let body = DhtResults { items };
+        add(&c.upload_requests, 1);
+        let mut wait = Duration::from_secs(1);
+        loop {
+            match client.post::<_, DhtAck>(DHT_RESULTS, &body).await {
+                Ok(a) => {
+                    add(&c.uploaded, body.items.len() as u64);
+                    add(&c.server_stored, u64::from(a.stored));
+                    add(&c.server_not_new, u64::from(a.not_new));
+                    add(&c.server_blocked, u64::from(a.blocked));
+                    add(&c.server_rejected, u64::from(a.rejected));
+                    add(&c.server_ignored, u64::from(a.ignored));
+                    break;
                 }
-                if abort.stopping() && wait >= Duration::from_secs(8) {
-                    tracing::warn!(
-                        "worker: stopping with {n} results not uploaded (their leases expire)"
-                    );
+                Err(e) if e.is_fatal() => {
+                    abort.fatal(&e);
                     return;
                 }
-                tokio::time::sleep(wait).await;
-                wait = (wait * 2).min(Duration::from_secs(60));
+                Err(e) if !e.is_retryable() => {
+                    add(&c.upload_errors, 1);
+                    let mut items = body.items;
+                    if items.len() > 1 {
+                        tracing::warn!(
+                            "worker: upload of {} results refused: {e}; sending it in halves",
+                            items.len()
+                        );
+                        let second = items.split_off(items.len() / 2);
+                        todo.push(second);
+                        todo.push(items);
+                    } else {
+                        add(&c.upload_dropped, items.len() as u64);
+                        tracing::warn!(
+                            "worker: result for {} refused by the server, dropped: {e}",
+                            items.first().map_or("?", |i| i.sighted.as_str())
+                        );
+                    }
+                    break;
+                }
+                Err(e) => {
+                    add(&c.upload_errors, 1);
+                    if get(&c.upload_errors).is_multiple_of(20) || wait.as_secs() <= 1 {
+                        tracing::warn!("worker: upload: {e}; retrying");
+                    }
+                    if abort.stopping() && wait >= Duration::from_secs(8) {
+                        tracing::warn!(
+                            "worker: stopping with {n} results not uploaded (their leases expire)"
+                        );
+                        return;
+                    }
+                    tokio::time::sleep(wait).await;
+                    wait = (wait * 2).min(UPLOAD_RETRY_MAX);
+                }
             }
         }
     }
-    drop(permits);
 }
 
 /// Batches results into uploads (≤ `max_results` items, ≤ 4 MiB of dicts, or 2 s). Runs until
@@ -896,6 +934,7 @@ fn report(p: &Crawl, dht: &Dht, started: Instant) -> CrawlReport {
         uploaded: get(&p.c.uploaded),
         upload_requests: get(&p.c.upload_requests),
         upload_errors: get(&p.c.upload_errors),
+        upload_dropped: get(&p.c.upload_dropped),
         server_stored: get(&p.c.server_stored),
         server_not_new: get(&p.c.server_not_new),
         server_blocked: get(&p.c.server_blocked),
@@ -911,5 +950,84 @@ fn report(p: &Crawl, dht: &Dht, started: Instant) -> CrawlReport {
         fetch: p.fetcher.stats(),
         health: p.health.lock().unwrap().clone(),
         engine: e,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use axum::Json;
+    use axum::http::StatusCode;
+    use axum::routing::post;
+
+    /// A loopback server that answers 503 to the first request, refuses more than two items
+    /// with 413 and an item for `bad` with 400, and records what it took.
+    async fn picky_server() -> (String, Arc<Mutex<Vec<String>>>) {
+        let took: Arc<Mutex<Vec<String>>> = Arc::default();
+        let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let t = took.clone();
+        let app = axum::Router::new().route(
+            DHT_RESULTS,
+            post(move |Json(r): Json<DhtResults>| {
+                let t = t.clone();
+                let first = first.clone();
+                async move {
+                    if first.swap(false, Ordering::Relaxed) {
+                        return Err(StatusCode::SERVICE_UNAVAILABLE);
+                    }
+                    if r.items.len() > 2 {
+                        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+                    }
+                    if r.items.iter().any(|i| i.sighted == "bad") {
+                        return Err(StatusCode::BAD_REQUEST);
+                    }
+                    t.lock()
+                        .unwrap()
+                        .extend(r.items.iter().map(|i| i.sighted.clone()));
+                    Ok(Json(DhtAck {
+                        stored: r.items.len() as u32,
+                        ..Default::default()
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), took)
+    }
+
+    fn item(sighted: &str) -> DhtResult {
+        DhtResult {
+            sighted: sighted.into(),
+            via: "sample".into(),
+            peers_seen: 0,
+            outcome: DhtOutcome::Private,
+        }
+    }
+
+    /// D113: a 413 splits the upload, a 400 on a single item drops it, a 503 is retried; the
+    /// upload finishes instead of resending a refused body forever.
+    #[tokio::test]
+    async fn refused_uploads_are_split_then_dropped_not_retried_forever() {
+        let (base, took) = picky_server().await;
+        let client = Client::new(&base, "w1-token-aaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let (abort, _rx) = Abort::new();
+        let c = Counters::default();
+        let items: Vec<DhtResult> = ["a", "b", "bad", "c", "d"].into_iter().map(item).collect();
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            send_results(&client, items, &abort, &c, 5),
+        )
+        .await
+        .expect("a refused body must not be resent forever");
+        let mut got = took.lock().unwrap().clone();
+        got.sort();
+        assert_eq!(got, ["a", "b", "c", "d"]);
+        assert_eq!(get(&c.uploaded), 4);
+        assert_eq!(get(&c.upload_dropped), 1);
+        assert_eq!(get(&c.server_stored), 4);
+        assert!(!abort.stopping(), "a refused body does not stop the worker");
     }
 }

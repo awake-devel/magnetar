@@ -1,6 +1,7 @@
 //! The worker's HTTP client for the server's `/api/v1/worker/*` endpoints (D96): bearer worker
 //! token, the [`API_HEADER`] on every request, and errors split into what stops the worker
-//! (wrong token, incompatible server) and what is retried (network, 5xx).
+//! (wrong token, incompatible server), what is retried (network, 408, 429, 5xx) and what the
+//! server refuses for good (any other 4xx, D113: sending the same body again cannot help).
 
 use std::time::Duration;
 
@@ -18,12 +19,27 @@ pub enum ClientError {
     /// Try again later: network error, timeout, server error, overload.
     #[error("{0}")]
     Retry(String),
+    /// The server refused this request's body (400, 413, 422, …): the same body would be
+    /// refused again. The caller drops or splits it; the worker goes on.
+    #[error("{message}")]
+    Rejected { status: u16, message: String },
 }
 
 impl ClientError {
     pub fn is_fatal(&self) -> bool {
         matches!(self, ClientError::Fatal(_))
     }
+
+    /// Worth sending the same request again later.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, ClientError::Retry(_))
+    }
+}
+
+/// Status codes worth retrying with backoff: request timeout, rate limited, and server-side
+/// errors. Every other 4xx means this body is refused.
+pub fn retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429) || status >= 500
 }
 
 #[derive(Clone)]
@@ -102,7 +118,11 @@ impl Client {
                 magnetar_core::VERSION
             )),
             409 => ClientError::Fatal(format!("incompatible server: {msg}")),
-            _ => ClientError::Retry(format!("{path}: {msg}")),
+            s if retryable_status(s) => ClientError::Retry(format!("{path}: {msg}")),
+            s => ClientError::Rejected {
+                status: s,
+                message: format!("{path}: refused: {msg}"),
+            },
         })
     }
 }
