@@ -199,11 +199,15 @@ pub fn drop_local_trackers(magnet: &str) -> String {
     let Some((head, query)) = magnet.split_once('?') else {
         return magnet.to_string();
     };
-    let refused = |v: &str| {
-        let v = percent_encoding::percent_decode_str(&v.replace('+', " "))
+    // Keys and values are decoded the way librqbit reads them (`query_pairs`), so `t%72=` is
+    // a tracker too.
+    let decode = |s: &str| {
+        percent_encoding::percent_decode_str(&s.replace('+', " "))
             .decode_utf8_lossy()
-            .trim()
-            .to_string();
+            .into_owned()
+    };
+    let refused = |v: &str| {
+        let v = decode(v).trim().to_string();
         match url::Url::parse(&v) {
             Ok(u) => {
                 crate::netaddr::is_local_host(&u)
@@ -217,6 +221,7 @@ pub fn drop_local_trackers(magnet: &str) -> String {
         .split('&')
         .filter(|kv| {
             let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            let k = decode(k);
             !((k == "tr" || k.starts_with("tr.")) && refused(v))
         })
         .collect();
@@ -468,13 +473,58 @@ mod tests {
             "magnet:?{xt}&tr=http%3A%2F%2F192.168.1.1%2Fannounce&{public}\
              &tr=udp://127.1:6969&tr.1=http%3A%2F%2Flocalhost%3A8080%2Fa\
              &tr=http%3A%2F%2F%5Bfd00%3A%3A1%5D%2Fa&tr=udp%3A%2F%2F100.100.1.1%3A80\
-             &tr=not%20a%20url&x.pe=1.2.3.4:6881"
+             &tr=not%20a%20url&t%72=http%3A%2F%2F192.168.1.1%2Fannounce\
+             &%74r=udp://127.0.0.1:6969&x.pe=1.2.3.4:6881"
         );
         assert_eq!(
             drop_local_trackers(&magnet),
             format!("magnet:?{xt}&{public}&x.pe=1.2.3.4:6881")
         );
+        // Read back the way librqbit does: no local tracker survives under any key spelling.
+        let kept = url::Url::parse(&drop_local_trackers(&magnet)).unwrap();
+        let trackers: Vec<String> = kept
+            .query_pairs()
+            .filter(|(k, _)| k == "tr" || k.starts_with("tr."))
+            .map(|(_, v)| v.into_owned())
+            .collect();
+        assert_eq!(trackers, ["udp://tracker.opentrackr.org:1337/announce"]);
         assert_eq!(drop_local_trackers("magnet:"), "magnet:");
+    }
+
+    /// librqbit really blocks the `own:` lines of [`peer_blocklist`] (D112), not just lists them.
+    #[tokio::test]
+    async fn session_blocks_own_addresses() {
+        let dir = std::env::temp_dir().join(format!("magnetar-dl-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        let own = crate::netaddr::parse_nets(&["11.22.33.44", "2a01:e0a:1:2::/64"]).unwrap();
+        let list = dir.join("own-blocklist.txt");
+        std::fs::write(&list, peer_blocklist(&own)).unwrap();
+        let opts = SessionOptions {
+            dht: None,
+            listen: None,
+            persistence: None,
+            fastresume: false,
+            disable_local_service_discovery: true,
+            disable_trackers: true,
+            blocklist_url: Some(file_url(&list).unwrap().into()),
+            ..session_options(&dir).await.unwrap()
+        };
+        let session = Session::new_with_opts(dir.join("out"), opts).await.unwrap();
+        for ip in [
+            "11.22.33.44",
+            "::ffff:11.22.33.44",
+            "2a01:e0a:1:2::99",
+            "192.168.1.1",
+        ] {
+            let ip: std::net::IpAddr = ip.parse().unwrap();
+            assert!(session.blocklist.has(ip), "{ip} must be blocked");
+        }
+        for ip in ["11.22.33.45", "2a01:e0a:1:3::1"] {
+            let ip: std::net::IpAddr = ip.parse().unwrap();
+            assert!(!session.blocklist.has(ip), "{ip} must stay allowed");
+        }
+        session.stop().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A relative state directory (`HOME` unset) still gives a usable blocklist URL.
