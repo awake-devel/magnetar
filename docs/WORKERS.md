@@ -417,8 +417,17 @@ health probe are the safeguards.
 - A worker token holder can still store dicts it made up, within its hourly cap
   (`MAGNETAR_WORKER_TRIAGE_NEW_PER_HOUR`, default 100 000 new hashes an hour): it chooses what
   it triages (§1 DHT item 6). After a token leak, remove the token from
-  `MAGNETAR_WORKER_TOKENS`, then `DELETE FROM dht_torrents WHERE supplied_by = '<name>'`
-  (counts and the search index follow). Rows stored before migration `20261104120000` have no
+  `MAGNETAR_WORKER_TOKENS`, then drop the seed-check schedule of its dicts and the dicts
+  (counts and the search index follow):
+
+  ```sql
+  DELETE FROM liveness_schedule s USING dht_torrents d
+   WHERE d.infohash = s.infohash AND d.supplied_by = '<name>'
+     AND NOT EXISTS (SELECT 1 FROM torrent_infohashes t
+                      WHERE t.infohash = s.infohash AND t.events > 0);
+  DELETE FROM dht_torrents WHERE supplied_by = '<name>';
+  ```
+ Rows stored before migration `20261104120000` have no
   supplier and cannot be told apart.
 - A worker can still block (or mark failed, private, …) a hash it triaged itself. Blocks from a
   worker's word are origin `worker` in `blocked_infohashes`: they keep the DHT (server and

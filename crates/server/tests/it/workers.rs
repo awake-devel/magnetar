@@ -956,13 +956,42 @@ async fn self_triaged_dicts_are_capped_and_traced_to_their_worker() {
         let want = if *h == hex::encode(hs[3]) { "w1" } else { "w2" };
         assert_eq!(w.as_deref(), Some(want), "{h}");
     }
-    // The documented clean-up after a leak of w2's token.
+    // The documented clean-up after a leak of w2's token (docs/WORKERS.md §7): seed-check
+    // schedule rows first, so the fakes are not handed out for checks afterwards.
+    let w2_hashes: Vec<String> =
+        sqlx::query_scalar("SELECT infohash FROM dht_torrents WHERE supplied_by = 'w2'")
+            .fetch_all(s.pool())
+            .await
+            .unwrap();
+    let scheduled: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM liveness_schedule WHERE infohash = ANY($1)")
+            .bind(&w2_hashes)
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+    assert!(scheduled > 0, "the fakes were scheduled for seed checks");
+    sqlx::query(
+        "DELETE FROM liveness_schedule s USING dht_torrents d \
+          WHERE d.infohash = s.infohash AND d.supplied_by = 'w2' \
+            AND NOT EXISTS (SELECT 1 FROM torrent_infohashes t \
+                             WHERE t.infohash = s.infohash AND t.events > 0)",
+    )
+    .execute(s.pool())
+    .await
+    .unwrap();
     let gone = sqlx::query("DELETE FROM dht_torrents WHERE supplied_by = 'w2'")
         .execute(s.pool())
         .await
         .unwrap()
         .rows_affected();
     assert_eq!(gone, 3);
+    let left: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM liveness_schedule WHERE infohash = ANY($1)")
+            .bind(&w2_hashes)
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+    assert_eq!(left, 0, "no seed checks left for the removed fakes");
     // The server's own crawler records no supplier.
     let own = info("Server.Own.2024.1080p", "0");
     let ho = sha1(&own);

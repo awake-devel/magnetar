@@ -7,9 +7,12 @@
 //!
 //! D113: every upload item (dict or status report) must be for a hash the uploading worker
 //! holds: queued in `dht_seen` with `holder` = that worker (set by its own triage). Anything
-//! else is ignored, so a worker cannot inject a dict it was never handed, nor finalise another
-//! worker's or the server's hashes. A worker's block report blocks only the sighted hash (origin
-//! `worker`); its claimed hybrid SHA-1 is dropped.
+//! else is ignored, so a worker cannot upload for, finalise or block hashes another worker or
+//! the server holds (a holder changes only after `TAKEOVER_GRACE_SECS`). It *can* triage hashes
+//! itself and then upload dicts it made up for them: that is bounded by the hourly triage cap
+//! and traced by `dht_torrents.supplied_by` (docs/WORKERS.md §7). A worker's block report
+//! blocks only the sighted hash (origin `worker`, never stops Nostr ingest); its claimed hybrid
+//! SHA-1 is dropped.
 
 use std::collections::HashSet;
 
