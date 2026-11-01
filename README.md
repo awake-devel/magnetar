@@ -107,6 +107,13 @@ Every endpoint except `GET /health` requires `Authorization: Bearer <token>`, so
 can reach the port (other local users, the tailnet, the LAN) still cannot use the API without
 it.
 
+**What the server does not trust.** Everything that arrives from the network is treated as
+hostile: torrent metadata from DHT peers is size-checked before it is built, every tracker,
+relay and download body has a cap, and no tracker, relay, DHT node or download peer on a
+private address (LAN, localhost, tailnet, your own public IP) is ever contacted. A worker token
+cannot touch hashes another machine is working on, the torrents a worker adds are capped per
+hour and traced to it, and its blocks never hide a torrent published on Nostr (ARCHITECTURE.md D110–D113, docs/WORKERS.md).
+
 ## Configuration
 
 See [docs/CONFIG.md](docs/CONFIG.md) for all the details.
