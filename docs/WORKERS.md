@@ -64,6 +64,11 @@ any change an older peer could misread.
 | `/api/v1/worker/dht/triage` | `{items:[{h, via}]}` (≤ 2000) → `{fetch:[h], blocked, known}` | |
 | `/api/v1/worker/dht/results` | `{items:[DhtResult]}` (≤ 1000, ≤ 32 MiB) → `{stored, not_new, blocked, rejected, applied, ignored}` | |
 
+Hello, heartbeat and lease bodies are limited to 64 KiB (413 above; the 32 MiB limit is for
+result uploads). The server drops control characters from `version`, `arch` and the DHT
+`mode` and keeps at most 64 characters of each and 64 DHT ports before it logs, stores or
+shows them in `/api/v1/stats` (D111).
+
 `DhtResult = {sighted, via, peers_seen, kind, …}` with `kind` one of `metadata {raw}` (the raw
 bencoded info dict, base64), `blocked {v1?, tier, rule_version}` (hash only), `private`,
 `v2_only`, `invalid {code}`, `oversize`, `failed {code}`.

@@ -320,13 +320,13 @@ async fn fetch_release(
     if !resp.status().is_success() {
         return Err(format!("{url}: HTTP {}", resp.status()));
     }
-    if resp.content_length().is_some_and(|n| n as usize > MAX_GZ) {
-        return Err(format!("{url}: too large"));
-    }
-    let gz = resp.bytes().await.map_err(|e| format!("{url}: {e}"))?;
-    if gz.len() > MAX_GZ {
-        return Err(format!("{url}: too large"));
-    }
+    // Streamed with the cap (D111): a body without Content-Length is not buffered whole first.
+    let gz = magnetar_core::body::read_capped(resp, MAX_GZ)
+        .await
+        .map_err(|e| match e {
+            magnetar_core::body::BodyError::TooLarge { .. } => format!("{url}: too large"),
+            e => format!("{url}: {e}"),
+        })?;
     let mut out = Vec::new();
     {
         use std::io::Read;
@@ -481,6 +481,40 @@ mod tests {
             t.lookup("198.51.100.1".parse().unwrap(), true),
             GeoHit::default()
         );
+    }
+
+    /// D111: a release served without Content-Length and larger than MAX_GZ is cut off at the
+    /// cap while it streams, not buffered whole (here: it never ends, so a whole-body read
+    /// would wait for the 180 s download timeout).
+    #[tokio::test]
+    async fn release_download_is_capped_while_streaming() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/x.mmdb.gz", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = conn.read(&mut buf).await;
+            let head = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+            if conn.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            let chunk = vec![0u8; 1 << 20];
+            for _ in 0..(MAX_GZ >> 20) + 2 {
+                if conn.write_all(&chunk).await.is_err() {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(300)).await;
+        });
+        let client = magnetar_core::http::client(Duration::from_secs(300)).unwrap();
+        let res = tokio::time::timeout(
+            Duration::from_secs(30),
+            fetch_release(&client, &url, "country"),
+        )
+        .await
+        .expect("the download was buffered past MAX_GZ");
+        assert_eq!(res.unwrap_err(), format!("{url}: too large"));
     }
 
     /// The real databases, when present (`MAGNETAR_TEST_GEOIP_DIR`): known addresses resolve.

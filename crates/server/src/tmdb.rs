@@ -955,10 +955,7 @@ impl Tmdb {
                 "poster content-type {content_type:?}"
             )));
         }
-        let bytes = resp.bytes().await.map_err(reqwest::Error::without_url)?;
-        if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
-            return Err(Error::Invalid(format!("poster of {} bytes", bytes.len())));
-        }
+        let bytes = read_image(resp).await?;
         let sha = hex::encode(Sha256::digest(&bytes));
         let file = image_path(&self.cfg.image_dir, &sha, &content_type);
         if !file.is_file() {
@@ -1090,6 +1087,22 @@ pub fn image_path(dir: &Path, sha: &str, content_type: &str) -> PathBuf {
         .join(format!("{sha}.{}", ext_of(content_type)))
 }
 
+/// A poster body, streamed with the MAX_IMAGE_BYTES cap (D111): never buffered whole first.
+async fn read_image(resp: reqwest::Response) -> Result<Vec<u8>> {
+    let bytes = magnetar_core::body::read_capped(resp, MAX_IMAGE_BYTES)
+        .await
+        .map_err(|e| match e {
+            magnetar_core::body::BodyError::TooLarge { cap } => {
+                Error::Invalid(format!("poster larger than {cap} bytes"))
+            }
+            magnetar_core::body::BodyError::Http(e) => e.without_url().into(),
+        })?;
+    if bytes.is_empty() {
+        return Err(Error::Invalid("empty poster".into()));
+    }
+    Ok(bytes)
+}
+
 async fn write_atomic(file: &Path, bytes: &[u8]) -> Result<()> {
     let io = |e: std::io::Error| Error::Other(format!("{}: {e}", file.display()));
     if let Some(dir) = file.parent() {
@@ -1190,6 +1203,35 @@ mod tests {
 
     fn langs() -> Vec<String> {
         vec!["en-US".into(), "fr-FR".into()]
+    }
+
+    /// D111: a poster streamed past MAX_IMAGE_BYTES without Content-Length (and never ending)
+    /// is cut off at the cap; a whole-body read would wait for the client timeout.
+    #[tokio::test]
+    async fn poster_read_is_capped_while_streaming() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/w342/p.jpg", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = conn.read(&mut buf).await;
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nConnection: close\r\n\r\n";
+            if conn.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = conn
+                .write_all(&vec![0u8; MAX_IMAGE_BYTES + (1 << 20)])
+                .await;
+            tokio::time::sleep(Duration::from_secs(300)).await;
+        });
+        let client = magnetar_core::http::client(Duration::from_secs(300)).unwrap();
+        let resp = client.get(&url).send().await.unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(10), read_image(resp))
+            .await
+            .expect("the poster was buffered past MAX_IMAGE_BYTES");
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("larger than"), "{err}");
     }
 
     #[test]

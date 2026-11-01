@@ -9,6 +9,16 @@ use crate::error::{Error, Result};
 /// Hashes per request: 50 × 60 chars keeps the URL around 3 KB, well inside common limits.
 pub const HTTP_SCRAPE_BATCH: usize = 50;
 
+/// Largest scrape answer read (D111). One file entry is about 80 bytes (20-byte key and three
+/// counters), so 50 of them take 4 KB; trackers that add `name` or `flags` stay far below this.
+/// A larger body is a broken or hostile tracker and fails the slot without being buffered.
+pub const MAX_SCRAPE_BODY: usize = 256 << 10;
+
+/// Most bencode values (keys included) a scrape answer may decode to (D111): 50 entries of
+/// about 8 values each plus the envelope. Priced with `count_values` before decoding, since
+/// 2-byte values (`le`) cost ~30× their size once decoded.
+pub const MAX_SCRAPE_VALUES: usize = 4096;
+
 /// RFC 3986 unreserved characters stay literal; every other byte is `%XX`.
 const INFO_HASH_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'.')
@@ -65,8 +75,9 @@ pub async fn scrape_chunk(
     }
     let resp = client.get(&url).send().await?;
     let status = resp.status();
-    let body = resp.bytes().await?;
+    let body = crate::body::read_capped(resp, MAX_SCRAPE_BODY).await;
     if !status.is_success() {
+        let body = body.unwrap_or_default();
         return Err(Error::Server {
             status: status.as_u16(),
             msg: format!(
@@ -75,6 +86,7 @@ pub async fn scrape_chunk(
             ),
         });
     }
+    let body = body.map_err(|e| Error::Network(format!("{tracker}: scrape answer: {e}")))?;
     parse_response(tracker, &body, chunk)
 }
 
@@ -85,6 +97,11 @@ fn parse_response(
     body: &[u8],
     chunk: &[[u8; 20]],
 ) -> Result<Vec<Option<ScrapeStats>>> {
+    if bencode::count_values(body, MAX_SCRAPE_VALUES) > MAX_SCRAPE_VALUES {
+        return Err(Error::Network(format!(
+            "{tracker}: scrape answer has more than {MAX_SCRAPE_VALUES} values"
+        )));
+    }
     let root = bencode::decode(body)
         .map_err(|e| Error::Network(format!("{tracker}: bad bencode: {e}")))?;
     if let Some(reason) = root.get(b"failure reason") {

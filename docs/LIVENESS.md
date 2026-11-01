@@ -21,7 +21,9 @@ One batch (`MAGNETAR_LIVENESS_BATCH`, default 2000 infohashes):
    and its connection id (reused for 60 s, as BEP 15 allows), so a busy tracker sees one
    connect a minute. A tracker that fails (timeout, error action, HTTP error, bad answer) is
    skipped for 2 min, doubling per failure in a row up to 6 h; while it backs off its hashes
-   count as unanswered for it.
+   count as unanswered for it. An HTTP scrape answer is read in chunks up to 256 KiB and
+   decoded only if it holds at most 4096 bencode values (D111); a larger one fails the tracker
+   like any bad answer, without being buffered.
 3. **Torrents without a tracker** (two thirds of production) are scraped on the trackers
    their magnet links get (`magnet::DEFAULT_TRACKERS`: opentrackr, stealth.si,
    torrent.eu.org). Those answers only count when they report seeders: zero from a tracker

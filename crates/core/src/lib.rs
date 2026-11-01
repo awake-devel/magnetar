@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod blocklist;
+pub mod body;
 pub mod classify;
 pub mod crawler;
 #[cfg(feature = "dht-crawl")]

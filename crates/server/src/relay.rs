@@ -27,6 +27,20 @@ pub const MAX_NEG_SESSIONS: usize = 10;
 pub const MAX_NEG_ITEMS: usize = 500_000;
 pub const MAX_SUBSCRIPTIONS: usize = 32;
 pub const MAX_SUB_ID_LEN: usize = 64;
+/// Most filters in one REQ (D111). Each filter is one SQL query of up to `MAX_LIMIT` events,
+/// all buffered before EOSE, and every live event is matched against each; our crawler sends
+/// at most 2 per REQ. strfry's default is 200, nostr-rs-relay's 10.
+pub const MAX_FILTERS_PER_REQ: usize = 10;
+
+/// The filters of a REQ (everything after the subscription id), counted before any is parsed.
+fn req_filters(raw: &[Value]) -> Result<Vec<Filter>, String> {
+    if raw.len() > MAX_FILTERS_PER_REQ {
+        return Err(format!(
+            "blocked: more than {MAX_FILTERS_PER_REQ} filters in one REQ"
+        ));
+    }
+    raw.iter().map(Filter::from_json).collect()
+}
 
 pub async fn ws_handler(ws: WebSocketUpgrade, State(st): State<AppState>) -> Response {
     ws.max_message_size(MAX_MESSAGE_BYTES)
@@ -244,8 +258,7 @@ impl Session {
         let Some(sub) = sub_id(msg.get(1)) else {
             return vec![notice("invalid: bad subscription id")];
         };
-        let filters: Result<Vec<Filter>, String> = msg[2..].iter().map(Filter::from_json).collect();
-        let filters = match filters {
+        let filters = match req_filters(&msg[2..]) {
             Ok(f) if f.is_empty() => return vec![closed(&sub, "invalid: no filters")],
             Ok(f) => f,
             Err(e) => {

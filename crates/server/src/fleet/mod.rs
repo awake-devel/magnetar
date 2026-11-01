@@ -15,7 +15,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -36,6 +36,14 @@ pub const MAX_TRIAGE: usize = 2000;
 pub const MAX_RESULTS: usize = 1000;
 /// Default `MAGNETAR_WORKER_LEASE_SECS`.
 pub const DEFAULT_LEASE_SECS: u64 = 900;
+/// Body limit of the small worker calls (hello, heartbeat, lease) (D111): their JSON is a few
+/// hundred bytes; the 32 MiB [`BODY_LIMIT`] is for info dict uploads only.
+pub const SMALL_BODY_LIMIT: usize = 64 << 10;
+/// Longest `version` / `arch` / DHT `mode` kept from a worker (D111): real ones are
+/// `0.3.1`, `aarch64`, `polite`. Longer text is cut, control characters are dropped.
+pub const MAX_WORKER_LABEL: usize = 64;
+/// Most DHT ports kept from a heartbeat or hello (D111): a worker runs one port per shard.
+pub const MAX_WORKER_PORTS: usize = 64;
 /// A worker heard from this recently counts as connected.
 const CONNECTED_SECS: i64 = 120;
 /// Rates are averaged over this many one-minute buckets.
@@ -365,6 +373,32 @@ impl Fleet {
     }
 }
 
+/// Worker-supplied text as it is logged, stored and shown in `/api/v1/stats` (D111): control
+/// characters (newlines that would forge log lines, ANSI escapes) dropped, at most
+/// [`MAX_WORKER_LABEL`] characters.
+pub fn clean_label(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_WORKER_LABEL)
+        .collect()
+}
+
+fn clean_hello(mut h: Hello) -> Hello {
+    h.version = clean_label(&h.version);
+    h.arch = clean_label(&h.arch);
+    h.dht = h.dht.as_deref().map(clean_label);
+    h.dht_ports.truncate(MAX_WORKER_PORTS);
+    h
+}
+
+fn clean_heartbeat(mut h: Heartbeat) -> Heartbeat {
+    if let Some(d) = &mut h.dht {
+        d.mode = clean_label(&d.mode);
+        d.ports.truncate(MAX_WORKER_PORTS);
+    }
+    h
+}
+
 fn api_error(status: StatusCode, code: &'static str, msg: impl Into<String>) -> Response {
     ApiError::new(status, code, msg).into_response()
 }
@@ -410,9 +444,18 @@ pub async fn worker_auth(State(st): State<AppState>, mut req: Request, next: Nex
 /// The worker routes (auth and body limits are added by `api::router`).
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route(HELLO, post(hello))
-        .route(HEARTBEAT, post(heartbeat))
-        .route(LEASE, post(lease))
+        .route(
+            HELLO,
+            post(hello).layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
+        )
+        .route(
+            HEARTBEAT,
+            post(heartbeat).layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
+        )
+        .route(
+            LEASE,
+            post(lease).layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
+        )
         .route(LIVENESS_RESULTS, post(liveness_results))
         .route(RELEASE, post(release))
         .route(TRIAGE, post(ingest::triage))
@@ -430,7 +473,7 @@ async fn hello(
     Extension(WorkerName(name)): Extension<WorkerName>,
     body: Result<Json<Hello>, axum::extract::rejection::JsonRejection>,
 ) -> ApiResult<Json<HelloResponse>> {
-    let h = json(body)?;
+    let h = clean_hello(json(body)?);
     tracing::info!(
         worker = %name,
         version = %h.version,
@@ -459,7 +502,7 @@ async fn heartbeat(
     Extension(WorkerName(name)): Extension<WorkerName>,
     body: Result<Json<Heartbeat>, axum::extract::rejection::JsonRejection>,
 ) -> ApiResult<StatusCode> {
-    let h = json(body)?;
+    let h = clean_heartbeat(json(body)?);
     st.fleet.with(&name, |e| e.heartbeat = Some(h));
     Ok(StatusCode::NO_CONTENT)
 }
