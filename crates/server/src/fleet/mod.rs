@@ -34,6 +34,15 @@ use proto::*;
 pub const BODY_LIMIT: usize = 32 << 20;
 pub const MAX_TRIAGE: usize = 2000;
 pub const MAX_RESULTS: usize = 1000;
+/// Upload requests (`dht/results`, `liveness/results`) read at once, server-wide (D113). One at
+/// the [`BODY_LIMIT`] holds about 90 MB while it is parsed (the body, its JSON strings, the
+/// decoded dicts), so 4 bound uploads to ~360 MB on the home server; a worker's uploader sends
+/// one batch at a time, so the two crawl workers never wait on each other in normal running.
+pub const UPLOAD_CONCURRENCY: usize = 4;
+/// Upload requests of one worker read at once: its DHT uploader and its seed-check results.
+pub const UPLOAD_CONCURRENCY_PER_WORKER: usize = 2;
+/// `Retry-After` of a 503 when the upload slots are full: about one batch's processing time.
+pub const UPLOAD_RETRY_AFTER_SECS: u64 = 5;
 /// Default `MAGNETAR_WORKER_LEASE_SECS`.
 pub const DEFAULT_LEASE_SECS: u64 = 900;
 /// A worker heard from this recently counts as connected.
@@ -212,6 +221,17 @@ pub struct Fleet {
     screen: Option<Arc<dyn Screen>>,
     /// One verification batch at a time (bounded memory: D67 pricing per dict).
     verify: tokio::sync::Semaphore,
+    /// Upload requests being read and processed, server-wide (D113: [`UPLOAD_CONCURRENCY`]).
+    uploads: Arc<tokio::sync::Semaphore>,
+    /// The same per worker ([`UPLOAD_CONCURRENCY_PER_WORKER`]), created on first use.
+    worker_uploads: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+}
+
+/// Held while one upload request is read and processed ([`Fleet::upload_permit`]).
+#[derive(Debug)]
+pub struct UploadPermit {
+    _global: tokio::sync::OwnedSemaphorePermit,
+    _worker: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl Default for Fleet {
@@ -239,7 +259,28 @@ impl Fleet {
             entries: Mutex::default(),
             screen,
             verify: tokio::sync::Semaphore::new(1),
+            uploads: Arc::new(tokio::sync::Semaphore::new(UPLOAD_CONCURRENCY)),
+            worker_uploads: Mutex::default(),
         }
+    }
+
+    /// A slot to read one upload of `worker`, or None when the server-wide or the worker's
+    /// slots are all taken (the caller answers 503 at once: waiting would hold the connection
+    /// and its body anyway).
+    pub fn upload_permit(&self, worker: &str) -> Option<UploadPermit> {
+        let w = self
+            .worker_uploads
+            .lock()
+            .unwrap()
+            .entry(worker.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(UPLOAD_CONCURRENCY_PER_WORKER)))
+            .clone();
+        let worker = w.try_acquire_owned().ok()?;
+        let global = self.uploads.clone().try_acquire_owned().ok()?;
+        Some(UploadPermit {
+            _global: global,
+            _worker: worker,
+        })
     }
 
     /// From the configuration, with the process-wide screen.
@@ -403,6 +444,28 @@ pub async fn worker_auth(State(st): State<AppState>, mut req: Request, next: Nex
         );
     }
     st.fleet.touch(&name, magnetar_core::now());
+    // Uploads take a slot before their body is read (D113), held until the answer is built.
+    let path = req.uri().path();
+    let _permit = if path == DHT_RESULTS || path == LIVENESS_RESULTS {
+        match st.fleet.upload_permit(&name) {
+            Some(p) => Some(p),
+            None => {
+                tracing::debug!(worker = %name, "worker upload refused: upload slots full");
+                let mut r = api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "busy",
+                    "the server is processing other uploads; retry later",
+                );
+                r.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from(UPLOAD_RETRY_AFTER_SECS),
+                );
+                return r;
+            }
+        }
+    } else {
+        None
+    };
     req.extensions_mut().insert(WorkerName(name));
     next.run(req).await
 }
@@ -614,6 +677,103 @@ mod tests {
         let e = parse_tokens(&format!("eee:{T1}"), Some(T1)).unwrap_err();
         assert!(e.to_string().contains("differ"), "{e}");
         assert!(parse_tokens("", None).unwrap().is_empty());
+    }
+
+    /// An API router whose database is never reachable (lazy pool to a closed port, short
+    /// acquire timeout): enough for everything decided before a query runs. No network beyond
+    /// loopback.
+    pub(crate) fn offline_state(fleet: Fleet) -> AppState {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(300))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/none")
+            .unwrap();
+        AppState::new(
+            Arc::new(crate::store::PgStore::from_pool(pool)),
+            "phone-token",
+        )
+        .with_fleet(Arc::new(fleet))
+    }
+
+    async fn serve(state: AppState) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = crate::api::router(state);
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    /// An upload whose body never finishes: it holds its slot while the server waits for it.
+    async fn stalled_upload(addr: std::net::SocketAddr, token: &str) -> tokio::net::TcpStream {
+        use tokio::io::AsyncWriteExt;
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = format!(
+            "POST {DHT_RESULTS} HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {token}\r\n\
+             {API_HEADER}: {WORKER_API}\r\ncontent-type: application/json\r\n\
+             content-length: 1000\r\n\r\n{{\"items\": ["
+        );
+        s.write_all(head.as_bytes()).await.unwrap();
+        s
+    }
+
+    async fn upload_status(addr: std::net::SocketAddr, token: &str) -> (u16, Option<String>) {
+        let r = reqwest::Client::new()
+            .post(format!("http://{addr}{DHT_RESULTS}"))
+            .bearer_auth(token)
+            .header(API_HEADER, WORKER_API.to_string())
+            .json(&serde_json::json!({"items": []}))
+            .send()
+            .await
+            .unwrap();
+        let ra = r
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .map(|v| v.to_str().unwrap().to_string());
+        (r.status().as_u16(), ra)
+    }
+
+    /// D113: uploads are bounded per worker and server-wide before their bodies are read; a
+    /// full server answers 503 with Retry-After at once, and a freed slot is usable again.
+    #[tokio::test]
+    async fn uploads_are_bounded_before_their_bodies_are_read() {
+        let t3 = "cccccccccccccccccccccccccccccccc";
+        let tokens = parse_tokens(&format!("w1:{T1},w2:{T2},w3:{t3}"), None).unwrap();
+        let addr = serve(offline_state(Fleet::new(
+            FleetConfig {
+                tokens,
+                ..Default::default()
+            },
+            None,
+        )))
+        .await;
+        // w1 fills its own slots: its next upload is refused, another worker's is not.
+        let mut held = Vec::new();
+        for _ in 0..UPLOAD_CONCURRENCY_PER_WORKER {
+            held.push(stalled_upload(addr, T1).await);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let (code, ra) = upload_status(addr, T1).await;
+        assert_eq!(code, 503, "w1 is over its own limit");
+        assert_eq!(ra, Some(UPLOAD_RETRY_AFTER_SECS.to_string()));
+        // w2 fills the rest of the server-wide slots: now w3 is refused too.
+        for _ in UPLOAD_CONCURRENCY_PER_WORKER..UPLOAD_CONCURRENCY {
+            held.push(stalled_upload(addr, T2).await);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let (code, ra) = upload_status(addr, t3).await;
+        assert_eq!(code, 503, "the server-wide slots are full");
+        assert!(ra.is_some());
+        // A stalled upload goes away: its slot comes back (the request then fails on the
+        // unreachable database, which is past the limit).
+        drop(held.pop());
+        let mut code = 503;
+        for _ in 0..50 {
+            code = upload_status(addr, t3).await.0;
+            if code != 503 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_ne!(code, 503, "a freed slot is reused");
     }
 
     #[test]

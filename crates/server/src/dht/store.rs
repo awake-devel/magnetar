@@ -52,6 +52,20 @@ pub async fn triage_geo(
     now: i64,
     fetch_known: bool,
 ) -> sqlx::Result<TriageOutcome> {
+    triage_for(pool, batch, geo, now, fetch_known, None).await
+}
+
+/// [`triage_geo`] on behalf of `holder` (D113): the rows it queues (new, or due again) record
+/// that crawl worker as their holder, so only it may upload a dict or a status for them. None =
+/// the server's own crawler.
+pub async fn triage_for(
+    pool: &PgPool,
+    batch: &[([u8; 20], Via)],
+    geo: &[Option<crate::geo::GeoCode>],
+    now: i64,
+    fetch_known: bool,
+    holder: Option<&str>,
+) -> sqlx::Result<TriageOutcome> {
     let hashes: Vec<Vec<u8>> = batch.iter().map(|(h, _)| h.to_vec()).collect();
     let vias: Vec<i16> = batch.iter().map(|(_, v)| v.code()).collect();
     let g = |i: usize| geo.get(i).copied().flatten();
@@ -77,12 +91,13 @@ pub async fn triage_geo(
             FROM input i
         ), up AS (
             INSERT INTO dht_seen AS s (infohash, first_seen, last_seen, via, status, attempts,
-                                       next_attempt_at, src_cc, src_asn)
-            SELECT h, $3, $3, via, 0, 0, $3 + $5, cc, asn FROM cls WHERE NOT blocked AND NOT known
+                                       next_attempt_at, src_cc, src_asn, holder)
+            SELECT h, $3, $3, via, 0, 0, $3 + $5, cc, asn, $9 FROM cls
+            WHERE NOT blocked AND NOT known
             ORDER BY h
             ON CONFLICT (infohash) DO UPDATE
                 SET last_seen = EXCLUDED.last_seen, status = 0, via = EXCLUDED.via,
-                    next_attempt_at = EXCLUDED.next_attempt_at,
+                    next_attempt_at = EXCLUDED.next_attempt_at, holder = EXCLUDED.holder,
                     src_cc = COALESCE(s.src_cc, EXCLUDED.src_cc),
                     src_asn = CASE WHEN s.src_cc IS NULL THEN EXCLUDED.src_asn ELSE s.src_asn END
                 WHERE (s.status IN (0, 2) AND s.next_attempt_at IS NOT NULL
@@ -104,6 +119,7 @@ pub async fn triage_geo(
     .bind(ANNOUNCE_RETRY_SECS)
     .bind(&ccs)
     .bind(&asns)
+    .bind(holder)
     .fetch_one(pool)
     .await?;
     Ok(TriageOutcome {
@@ -119,7 +135,8 @@ pub async fn triage_geo(
 
 /// Rows due again (expired lease or failure backoff), at most `limit`: known/blocked ones are
 /// settled (known → final `skipped_known`, blocked → deleted), the rest get a new lease and are
-/// returned with their `via` code.
+/// returned with their `via` code. The server's crawler takes them over: a worker that held one
+/// no longer does (D113).
 pub async fn take_due(pool: &PgPool, now: i64, limit: i64) -> sqlx::Result<Vec<([u8; 20], i16)>> {
     let rows: Vec<(Vec<u8>, i16)> = sqlx::query_as(
         r#"
@@ -141,7 +158,8 @@ pub async fn take_due(pool: &PgPool, now: i64, limit: i64) -> sqlx::Result<Vec<(
             UPDATE dht_seen s SET status = 7, next_attempt_at = NULL
             FROM cls WHERE s.infohash = cls.infohash AND cls.known AND NOT cls.blocked
         )
-        UPDATE dht_seen s SET status = 0, last_seen = $1, next_attempt_at = $1 + $3
+        UPDATE dht_seen s SET status = 0, last_seen = $1, next_attempt_at = $1 + $3,
+            holder = NULL
         FROM cls WHERE s.infohash = cls.infohash AND NOT cls.known AND NOT cls.blocked
         RETURNING s.infohash, s.via
         "#,

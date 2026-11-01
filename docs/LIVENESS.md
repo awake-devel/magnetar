@@ -75,8 +75,18 @@ and the dead badge) until it is replaced.
 an hour the first 100 results of every saved search (lane 2). The API only records boosts in
 memory; the loop writes them before its next batch. A boost also makes the torrent due at
 once when its last check is older than 1 h (viewed), 6 h (saved search) or 12 h (search).
-A forced check (`POST /api/v1/torrents/{ih}/liveness`, the app's "Check" button) is one-shot,
-outside the rate limits, and goes through the same schedule.
+A forced check (`POST /api/v1/torrents/{ih}/liveness`, the app's "Check" button) runs at once
+and goes through the same schedule. Since D113 it uses the checker's own scraper (its
+per-tracker rate limits and backoff, UDP connections, DHT nodes and pace), so it may wait for a
+tracker the running batch is scraping (at most 30 s, then the stored answer); the same
+infohash is scraped at most once a minute (a repeat gets the stored answer); at most 20 forced
+checks a minute and 2 at once server-wide, past that `429` with `Retry-After`.
+
+**Trackers per torrent (D113).** At most 30 distinct trackers are scraped for one torrent (its
+own first, then the extra trackers): events can list made-up trackers by the thousand, and each
+is a new flow through the router. Each tracker contact of a batch also waits for a permit of
+the process's shared DHT pacer when there is one (D109: the crawler or `MAGNETAR_LIVENESS_DHT`
+on), so scrapes slow down with the router health brake like the walks.
 
 ## History
 

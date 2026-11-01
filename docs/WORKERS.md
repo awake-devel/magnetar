@@ -103,10 +103,10 @@ apply to it), from its own line: trackers see another IP, so the per-tracker rat
 3. The worker collects peers and fetches the info dict, keeps the **raw bytes**, classifies
    it and runs the hard blocklist (D53) on every name/path variant **before anything leaves
    the machine**: a blocked torrent is reported as `blocked` with its hash (and a hybrid's
-   SHA-1) only — no name, no file, no dict. The server records it in `blocked_infohashes`
-   (origin `dht`), only for a hash it handed out and still holds queued, and a hybrid's
-   claimed SHA-1 only when nothing is stored under it: a worker cannot block what the index
-   already has.
+   SHA-1) only — no name, no file, no dict. The server records the sighted hash in
+   `blocked_infohashes` (origin `worker`), only when this worker holds it (see 6). The claimed
+   hybrid SHA-1 is not used (D113): the server never saw the dict, and the claim let a worker
+   block any hash; a hybrid sighted under its v1 is fetched and screened on its own.
 4. Otherwise the raw dict is uploaded. The server **verifies it again**
    (`metainfo::outcome_from_raw`: size ≤ its `MAGNETAR_DHT_METADATA_MAX`, SHA-1 or truncated
    SHA-256 of the exact bytes = the infohash, value count before decoding, parse), then hands
@@ -115,9 +115,22 @@ apply to it), from its own line: trackers see another IP, so the per-tracker rat
    and logged by hash; the row keeps its lease. The wire format has no field for a category or
    a verdict on a dict: nothing a worker says about content is trusted.
 5. Statuses (`no_peers`, other failures with the 1 h / 6 h / 24 h backoff, private, v2-only,
-   invalid) are applied only to hashes the server holds queued. `oversize` is final only from
+   invalid) are applied only to hashes the worker holds (see 6). `oversize` is final only from
    a worker whose limit is at least the server's; a smaller worker (the Pi's 4 MiB) leaves the
    torrent to someone with room (normal backoff).
+6. **Holders (D113).** Triage records the worker it queued a hash for in `dht_seen.holder`
+   (NULL = the server's own crawler; its retry loop takes a row back by clearing it). Every
+   item of an upload, dict or status, is for a hash this worker holds, or it is `ignored`
+   before anything is decoded: a worker cannot inject a dict under a hash it was never handed,
+   nor finalise or block another worker's or the server's hashes. Each hash counts once per
+   upload.
+7. **Upload slots (D113).** `dht/results` and `liveness/results` take a slot before their body
+   is read: 4 server-wide (one 32 MiB upload holds ~90 MB while parsed), 2 per worker. With
+   none free the server answers 503 with `Retry-After: 5`, and the worker retries with backoff.
+   The worker retries only 408, 429 and 5xx (and network errors); any other 4xx (400, 413,
+   422) refuses that body for good, so the worker splits it in halves and drops a single
+   refused item with a warning (`upload_dropped` in its report), instead of resending it
+   forever.
 
 ### What a worker keeps (D100)
 
@@ -278,8 +291,12 @@ docker compose -f docker/compose.worker.yml --env-file docker/worker.env up -d
 docker compose -f docker/compose.worker.yml logs -f worker
 ```
 
-The EEE profile is the file's default; override any value in `docker/worker.env`. The
-container reaches a Tailscale name through the host when the host resolves it for Docker; if
+The EEE profile is the file's default; override any value in `docker/worker.env`. Every
+setting in that file reaches the container (`env_file:`), also ones the compose file does not
+list (`MAGNETAR_DHT_METADATA_MAX`, `MAGNETAR_BLOCKLIST_FILE`, …); keep passing `--env-file` as
+above, since the listed ones are read from it (D113). `MAGNETAR_DHT_PORT` and
+`MAGNETAR_DHT_NODES` are fixed by the `ports:` mapping. `docker/worker.env` holds the worker
+token: it is gitignored, keep it mode 600. The container reaches a Tailscale name through the host when the host resolves it for Docker; if
 `docker compose … exec worker getent hosts <server>.<tailnet>.ts.net` finds nothing (Docker
 copies the host's upstream DNS, not MagicDNS), set `MAGNETAR_WORKER_SERVER_HOST` and
 `MAGNETAR_WORKER_SERVER_IP` (the server's `tailscale ip -4`) in `docker/worker.env`: the
@@ -372,4 +389,8 @@ health probe are the safeguards.
   the server's own DHT crawler runs; otherwise they wait until sighted again after the lease.
 - A worker trusts the server it is pointed at (TLS checks the name); the server trusts a
   worker's seed-check numbers and failure statuses (they only move schedules), never its
-  content claims.
+  content claims, and only for hashes it holds (D113).
+- A worker can still block (or mark failed, private, …) a hash it triaged itself: it chooses
+  what it triages. Blocks from a worker's word are origin `worker` in `blocked_infohashes`, so
+  after a token leak `DELETE FROM blocked_infohashes WHERE origin = 'worker'` undoes them
+  (they also stop a Nostr event for the same hash, like any block, D53).

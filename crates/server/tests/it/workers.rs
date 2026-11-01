@@ -696,6 +696,128 @@ async fn uploads_are_verified_classified_and_screened_by_the_server() {
     assert_eq!(w[1]["stored_total"], 1, "{w}");
 }
 
+/// D113: a worker's dicts and status reports apply only to hashes it holds (queued for it by
+/// its own triage). Another worker's hash, a hash nobody triaged, or one the server's retry
+/// loop took back are ignored; a block report blocks only the sighted hash, never a claimed v1.
+#[tokio::test]
+async fn uploads_apply_only_to_hashes_the_worker_holds() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    let (base, _) = spawn(s, 900).await;
+    let c1 = Client::new(&base, W1).unwrap();
+    let c2 = Client::new(&base, W2).unwrap();
+    let stored = |h: [u8; 20]| async move {
+        count(
+            s,
+            "SELECT count(*) FROM dht_torrents WHERE infohash = $1",
+            &hex::encode(h),
+        )
+        .await
+    };
+    let blocked_n = |h: String| async move {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM blocked_infohashes WHERE infohash = $1")
+            .bind(h)
+            .fetch_one(s.pool())
+            .await
+            .unwrap()
+    };
+    let status = |h: [u8; 20]| async move {
+        sqlx::query_scalar::<_, i16>("SELECT status FROM dht_seen WHERE infohash = $1")
+            .bind(h.as_slice())
+            .fetch_one(s.pool())
+            .await
+            .unwrap()
+    };
+    let report = |h: [u8; 20], outcome: DhtOutcome| DhtResult {
+        sighted: hex::encode(h),
+        via: "sample".into(),
+        peers_seen: 1,
+        outcome,
+    };
+
+    // h is w1's: w2 can neither store its dict nor finalise it.
+    let plain = info("Held.Film.2024.1080p", "0");
+    let h = sha1(&plain);
+    triage_one(&c1, h).await;
+    let a = upload(&c2, vec![meta(h, &plain)]).await;
+    assert_eq!((a.stored, a.ignored), (0, 1), "not w2's hash");
+    assert_eq!(stored(h).await, 0);
+    for o in [
+        DhtOutcome::Private,
+        DhtOutcome::Failed {
+            code: "no_peers".into(),
+        },
+        DhtOutcome::Blocked {
+            v1: None,
+            tier: "hard".into(),
+            rule_version: 1,
+        },
+    ] {
+        let a = upload(&c2, vec![report(h, o)]).await;
+        assert_eq!((a.applied, a.blocked, a.ignored), (0, 0, 1));
+    }
+    assert_eq!(status(h).await, 0, "still queued for w1");
+    assert_eq!(blocked_n(hex::encode(h)).await, 0);
+
+    // A self-made dict under a hash nobody triaged: ignored, not injected.
+    let forged = info("Injected.Film.2024.1080p", "0");
+    let hx = sha1(&forged);
+    let a = upload(&c2, vec![meta(hx, &forged)]).await;
+    assert_eq!((a.stored, a.ignored), (0, 1));
+    assert_eq!(stored(hx).await, 0);
+
+    // A block report for a hash w2 holds blocks that hash only (origin worker), not the
+    // claimed hybrid v1.
+    let hs = [0x51u8; 20];
+    let victim = [0x52u8; 20];
+    triage_one(&c2, hs).await;
+    let a = upload(
+        &c2,
+        vec![report(
+            hs,
+            DhtOutcome::Blocked {
+                v1: Some(hex::encode(victim)),
+                tier: "hard".into(),
+                rule_version: 1,
+            },
+        )],
+    )
+    .await;
+    assert_eq!(a.blocked, 1);
+    let origin: String =
+        sqlx::query_scalar("SELECT origin FROM blocked_infohashes WHERE infohash = $1")
+            .bind(hex::encode(hs))
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+    assert_eq!(origin, "worker");
+    assert_eq!(
+        blocked_n(hex::encode(victim)).await,
+        0,
+        "claimed v1 not blocked"
+    );
+
+    // The holder itself is accepted.
+    let a = upload(&c1, vec![meta(h, &plain)]).await;
+    assert_eq!((a.stored, a.ignored), (1, 0));
+
+    // A lease the server's retry loop took back is no longer the worker's.
+    let late = info("Late.Film.2024.1080p", "0");
+    let hl = sha1(&late);
+    triage_one(&c1, hl).await;
+    sqlx::query("UPDATE dht_seen SET next_attempt_at = 0 WHERE infohash = $1")
+        .bind(hl.as_slice())
+        .execute(s.pool())
+        .await
+        .unwrap();
+    let taken = magnetar_server::dht::store::take_due(s.pool(), magnetar_core::now(), 10)
+        .await
+        .unwrap();
+    assert!(taken.iter().any(|(t, _)| *t == hl));
+    let a = upload(&c1, vec![meta(hl, &late)]).await;
+    assert_eq!((a.stored, a.ignored), (0, 1), "the server holds it now");
+}
+
 fn worker_dht(ports: Vec<u16>) -> DhtOptions {
     DhtOptions {
         mode: Mode::Aggressive,

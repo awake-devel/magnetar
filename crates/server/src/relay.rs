@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::api::{AppState, ingest_one};
+use crate::api::{AppState, client_message, ingest_one};
 use crate::filter::Filter;
 
 /// Max WebSocket message (D3, negentropy frames).
@@ -265,8 +265,9 @@ impl Session {
             match self.st.store.query_events(f).await {
                 Ok(evs) => events.extend(evs),
                 Err(e) => {
+                    tracing::warn!("relay: REQ {sub}: {e}");
                     self.remove_sub(&sub);
-                    return vec![closed(&sub, &format!("error: {e}"))];
+                    return vec![closed(&sub, &format!("error: {}", client_message(&e)))];
                 }
             }
         }
@@ -316,7 +317,10 @@ impl Session {
         }
         let items = match self.st.store.neg_items(&filter, MAX_NEG_ITEMS).await {
             Ok(items) => items,
-            Err(e) => return neg_err(&sub, &format!("error: {e}")),
+            Err(e) => {
+                tracing::warn!("relay: NEG-OPEN {sub}: {e}");
+                return neg_err(&sub, &format!("error: {}", client_message(&e)));
+            }
         };
         if items.len() > MAX_NEG_ITEMS {
             return neg_err(&sub, "blocked: this query is too big");

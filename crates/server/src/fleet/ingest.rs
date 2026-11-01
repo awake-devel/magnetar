@@ -4,8 +4,14 @@
 //! then classified and screened by the server's own classifier and blocklist (exactly
 //! `dht::persist::persist_batch`, the server crawler's writer). The protocol has no field for
 //! a category or a verdict on a dict. Nothing here logs a name.
+//!
+//! D113: every upload item (dict or status report) must be for a hash the uploading worker
+//! holds: queued in `dht_seen` with `holder` = that worker (set by its own triage). Anything
+//! else is ignored, so a worker cannot inject a dict it was never handed, nor finalise another
+//! worker's or the server's hashes. A worker's block report blocks only the sighted hash (origin
+//! `worker`); its claimed hybrid SHA-1 is dropped.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -71,12 +77,13 @@ pub async fn triage(
     }
     st.crawlmap.add_upload(&r.geo_nodes, &r.as_names);
     let now = magnetar_core::now();
-    let o = store::triage_geo(
+    let o = store::triage_for(
         st.store.pool(),
         &batch,
         &geo,
         now,
         st.fleet.config().fetch_known,
+        Some(&name),
     )
     .await
     .map_err(|e| {
@@ -100,21 +107,26 @@ pub async fn triage(
     }))
 }
 
-/// A worker's block report: sighted hash, claimed SHA-1 of a hybrid, rule version.
-type BlockReport = ([u8; 20], Option<[u8; 20]>, i16);
+/// A worker's block report: sighted hash, rule version.
+type BlockReport = ([u8; 20], i16);
 
-/// The `dht_seen` rows among `hashes` that are queued (status 0): what a worker may report a
-/// status for.
-async fn queued(pool: &PgPool, hashes: &[[u8; 20]]) -> sqlx::Result<HashSet<[u8; 20]>> {
+/// The `dht_seen` rows among `hashes` that `worker` holds (queued, `holder` = it, D113): the
+/// only hashes it may upload a dict or report a status for.
+pub async fn held(
+    pool: &PgPool,
+    worker: &str,
+    hashes: &[[u8; 20]],
+) -> sqlx::Result<HashSet<[u8; 20]>> {
     if hashes.is_empty() {
         return Ok(HashSet::new());
     }
     let v: Vec<Vec<u8>> = hashes.iter().map(|h| h.to_vec()).collect();
     let rows: Vec<Vec<u8>> = sqlx::query_scalar(
-        "SELECT infohash FROM dht_seen WHERE infohash = ANY($1) AND status = $2",
+        "SELECT infohash FROM dht_seen WHERE infohash = ANY($1) AND status = $2 AND holder = $3",
     )
     .bind(&v)
     .bind(store::STATUS_QUEUED)
+    .bind(worker)
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -123,45 +135,22 @@ async fn queued(pool: &PgPool, hashes: &[[u8; 20]]) -> sqlx::Result<HashSet<[u8;
         .collect())
 }
 
-/// Hashes a worker's blocklist stopped (hash only). Only for queued hashes (the server handed
-/// them out), and a hybrid's claimed SHA-1 only when nothing is stored under it, so a worker
-/// cannot block what the index already holds. Same rows as the server's own block: the hashes
-/// in `blocked_infohashes` (origin `dht`), the queued row gone.
+/// Hashes a worker's blocklist stopped (hash only), each one the worker holds. Recorded under
+/// origin `worker` (D113), so the hashes a worker's word blocked can be told apart (and
+/// cleared) if a worker token leaks. The worker's claimed hybrid SHA-1 is not used: the server
+/// never saw the dict, and the claim let a worker block any hash, even one queued by someone
+/// else; a hybrid sighted under its v1 is fetched and screened on its own. The queued row goes.
 async fn record_blocked(pool: &PgPool, items: &[BlockReport], now: i64) -> sqlx::Result<()> {
     if items.is_empty() {
         return Ok(());
     }
-    let extra: Vec<String> = items
-        .iter()
-        .filter_map(|(s, v1, _)| v1.filter(|v| v != s).map(hex::encode))
-        .collect();
-    let known: HashSet<String> = if extra.is_empty() {
-        HashSet::new()
-    } else {
-        sqlx::query_scalar("SELECT infohash FROM torrent_infohashes WHERE infohash = ANY($1)")
-            .bind(&extra)
-            .fetch_all(pool)
-            .await?
-            .into_iter()
-            .collect()
-    };
-    let mut hashes: Vec<String> = Vec::new();
-    let mut versions: Vec<i16> = Vec::new();
-    for (s, v1, rv) in items {
-        hashes.push(hex::encode(s));
-        versions.push(*rv);
-        if let Some(v) = v1.filter(|v| v != s).map(hex::encode)
-            && !known.contains(&v)
-        {
-            hashes.push(v);
-            versions.push(*rv);
-        }
-    }
-    let sighted: Vec<Vec<u8>> = items.iter().map(|(s, _, _)| s.to_vec()).collect();
+    let hashes: Vec<String> = items.iter().map(|(s, _)| hex::encode(s)).collect();
+    let versions: Vec<i16> = items.iter().map(|(_, v)| *v).collect();
+    let sighted: Vec<Vec<u8>> = items.iter().map(|(s, _)| s.to_vec()).collect();
     let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO blocked_infohashes (infohash, blocked_at, rule_version, origin)
-         SELECT h, $2, v, 'dht' FROM unnest($1::text[], $3::int2[]) AS u(h, v) ORDER BY h
+         SELECT h, $2, v, 'worker' FROM unnest($1::text[], $3::int2[]) AS u(h, v) ORDER BY h
          ON CONFLICT (infohash) DO NOTHING",
     )
     .bind(&hashes)
@@ -216,6 +205,15 @@ pub async fn dht_results(
             .map_or(cfg.metadata_max as u64, |h| h.metadata_max)
     });
 
+    // Only hashes this worker holds (D113), each once; the rest is ignored before any decoding.
+    let sighted: Vec<[u8; 20]> = r
+        .items
+        .iter()
+        .filter_map(|it| parse_hash(&it.sighted))
+        .collect();
+    let mine = held(pool, &name, &sighted).await.map_err(store_err)?;
+    let mut seen: HashSet<[u8; 20]> = HashSet::new();
+
     // Decode first; dicts are verified together off the async threads.
     let mut dicts: Vec<([u8; 20], Via, usize, Vec<u8>)> = Vec::new();
     let mut reports: Vec<([u8; 20], Via, usize, DhtOutcome)> = Vec::new();
@@ -224,6 +222,10 @@ pub async fn dht_results(
             ack.rejected += 1;
             continue;
         };
+        if !mine.contains(&h) || !seen.insert(h) {
+            ack.ignored += 1;
+            continue;
+        }
         let via = via_of(&it.via);
         let peers = it.peers_seen as usize;
         match it.outcome {
@@ -273,30 +275,14 @@ pub async fn dht_results(
         .filter(|r| matches!(r.result, Ok(Outcome::Ok(_))))
         .count() as u64;
 
-    // Status reports only for hashes the server handed out and still holds queued.
-    let report_hashes: Vec<[u8; 20]> = reports.iter().map(|r| r.0).collect();
-    let q = queued(pool, &report_hashes).await.map_err(store_err)?;
+    // Status reports: already limited to hashes this worker holds (above).
     let mut blocked: Vec<BlockReport> = Vec::new();
-    let mut seen_reports: HashMap<[u8; 20], ()> = HashMap::new();
     for (h, via, peers, o) in reports {
-        if !q.contains(&h) || seen_reports.insert(h, ()).is_some() {
-            ack.ignored += 1;
-            continue;
-        }
         let result = match o {
             DhtOutcome::Metadata { .. } => unreachable!("split above"),
-            DhtOutcome::Blocked {
-                v1, rule_version, ..
-            } => {
-                let v1 = match v1.as_deref().map(parse_hash) {
-                    Some(None) => {
-                        ack.rejected += 1;
-                        continue;
-                    }
-                    Some(Some(v)) => Some(v),
-                    None => None,
-                };
-                blocked.push((h, v1, rule_version));
+            // The claimed hybrid v1 is not used (see `record_blocked`).
+            DhtOutcome::Blocked { rule_version, .. } => {
+                blocked.push((h, rule_version));
                 continue;
             }
             DhtOutcome::Private => Ok(Outcome::Private),

@@ -47,6 +47,11 @@ pub const TRACKER_BACKOFF_MAX: Duration = Duration::from_secs(6 * 3600);
 const TRACKER_IDLE_FORGET: Duration = Duration::from_secs(12 * 3600);
 /// DHT nodes kept between walks.
 pub const DHT_NODE_CACHE: usize = 4096;
+/// Distinct trackers scraped for one torrent, its own first, then `extra_trackers` (D113). One
+/// NIP-35 event carries at most 30, real torrents name 5–20; without a cap a torrent whose
+/// events list thousands of made-up trackers turns each check into thousands of new flows
+/// (each a NAT entry on the home router, D109).
+pub const MAX_TRACKERS_PER_TORRENT: usize = 30;
 
 #[derive(Clone, Debug)]
 pub struct LivenessConfig {
@@ -63,6 +68,11 @@ pub struct LivenessConfig {
     /// against the same queries-per-second budget as the crawler and follow its brake. None:
     /// unpaced (one-shot checks, tests).
     pub dht_pacer: Option<Arc<dyn dht::WalkPacer>>,
+    /// Pace of new tracker contacts (D113): one permit before each tracker's scrapes in a batch
+    /// (its first datagram or GET opens the flow; the rest of the group reuses it and follows
+    /// `tracker_rps`). The server passes its shared DHT pacer, so scrapes follow the router
+    /// health brake like the walks. None: unpaced (one-shot checks on the phone, tests).
+    pub tracker_pacer: Option<Arc<dyn dht::WalkPacer>>,
     /// Added to every torrent's own trackers.
     pub extra_trackers: Vec<String>,
     /// Scraped for torrents without any usable tracker of their own. Their answers only count
@@ -81,6 +91,7 @@ impl Default for LivenessConfig {
             dht_budget: Duration::from_secs(12),
             dht_concurrency: 2,
             dht_pacer: None,
+            tracker_pacer: None,
             extra_trackers: Vec::new(),
             fallback_trackers: Vec::new(),
         }
@@ -254,6 +265,10 @@ impl Scraper {
             ans.stats.resize(ans.hashes.len(), None);
             return ans;
         }
+        // A new contact waits for the shared pace (and its router health brake, D113).
+        if let Some(p) = &self.cfg.tracker_pacer {
+            p.acquire().await;
+        }
         let interval = Duration::from_secs_f64(1.0 / self.cfg.tracker_rps.max(0.01));
         let chunks: Vec<Vec<[u8; 20]>> = ans
             .hashes
@@ -340,6 +355,9 @@ impl Scraper {
             item_hash.push(Some(i));
             let mut seen: Vec<Tracker> = Vec::new();
             for t in trackers.iter().chain(&cfg.extra_trackers) {
+                if seen.len() >= MAX_TRACKERS_PER_TORRENT {
+                    break;
+                }
                 if let Some(t) = normalize_tracker(t)
                     && !seen.contains(&t)
                 {

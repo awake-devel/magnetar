@@ -1207,6 +1207,68 @@ async fn slow_pacer_keeps_answers_and_cached_nodes() {
     );
 }
 
+/// D113: one torrent's trackers are capped, and every tracker contact waits for the tracker
+/// pacer (the server passes its shared pace, so scrapes follow the router health brake); a
+/// pacer that grants nothing sends nothing.
+#[tokio::test]
+async fn tracker_contacts_are_capped_and_wait_for_the_pacer() {
+    let max = liveness::MAX_TRACKERS_PER_TORRENT;
+    let mut urls = Vec::new();
+    let mut logs = Vec::new();
+    for _ in 0..max + 10 {
+        let (u, l) = fake_udp_tracker(UdpBehavior {
+            cap: 75,
+            ..Default::default()
+        })
+        .await;
+        urls.push(u);
+        logs.push(l);
+    }
+    let pacer = Arc::new(TestPacer::default());
+    let scraper = liveness::Scraper::new(LivenessConfig {
+        tracker_pacer: Some(pacer.clone()),
+        tracker_concurrency: 64,
+        ..cfg()
+    });
+    let (out, report) = scraper.check(&items_of(&[h(1)], &urls), 1).await;
+    let asked = logs
+        .iter()
+        .filter(|l| l.connects.load(Ordering::SeqCst) > 0)
+        .count();
+    assert_eq!(report.trackers, max as u64);
+    assert_eq!(asked, max, "trackers past the cap are never contacted");
+    assert_eq!(
+        pacer.granted.load(Ordering::SeqCst),
+        max,
+        "one permit per tracker contact"
+    );
+    assert_eq!(out[0].source, LivenessSource::Udp);
+
+    let (u, log) = fake_udp_tracker(UdpBehavior {
+        cap: 75,
+        ..Default::default()
+    })
+    .await;
+    let scraper = liveness::Scraper::new(LivenessConfig {
+        tracker_pacer: Some(Arc::new(TestPacer {
+            closed: true,
+            ..Default::default()
+        })),
+        ..cfg()
+    });
+    let r = tokio::time::timeout(
+        Duration::from_millis(500),
+        scraper.check(&items_of(&[h(2)], &[u]), 1),
+    )
+    .await;
+    assert!(r.is_err(), "waits for a permit");
+    assert_eq!(
+        log.connects.load(Ordering::SeqCst),
+        0,
+        "no permit, no packet"
+    );
+}
+
 #[test]
 fn walks_follow_the_pace() {
     let ten = Duration::from_secs(10);
