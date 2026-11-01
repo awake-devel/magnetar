@@ -253,10 +253,25 @@ runs for N seconds; either way it prints a JSON report (seed checks, DHT counter
 server answered, RSS, CPU) when it stops. Exit status 2 = refused by the server (token,
 version), 1 = other error (e.g. UDP port taken), 0 = stopped.
 
-### Profiles (router benchmarks of 2026-10-26)
+### Profiles (router benchmarks of 2026-10-26, collectors of 2026-10-31)
 
 Both lines were measured with the stage-1 router benchmark (KRPC, new TCP attempts, held
 connections; ~30 % margin under the knees).
+
+**What limits a worker is `MAGNETAR_DHT_PEER_LOOKUPS`, not `MAGNETAR_DHT_QPS`** (D114). Each
+peer collection waits ~8.6 s for its walk, so the old fixed default of 64 kept the profiles
+below at ~160–180 real q/s, whatever their `QPS`. Since D114 the default is 0.4 per q/s; the
+settings measured with the real worker on 2026-10-31 (docs/benchmarks/2026-10-31-worker-
+collectors, stop at the first router fault, production at about two thirds of the last clean
+step):
+
+| | last clean step | fault at | production setting | stored / min |
+|---|---|---|---|---:|
+| EEE | 384 lookups, TCP 300/s, 256 fetches, 500 open: 837 q/s, 2 734 / 5 min | 512 (WAN loss) | `PEER_LOOKUPS=256 QPS=700 TCP_RATE=200 FETCH_CONCURRENCY=192 TCP_MAX=450` | ~420 |
+| RPI | 256 lookups, TCP 200/s, 128 fetches, 450 open: 591 q/s, 1 931 / 5 min, CPU 67 % | 384 (gateway stops answering) | `PEER_LOOKUPS=128 QPS=450 TCP_RATE=150 FETCH_CONCURRENCY=64 TCP_MAX=350` | ~240 |
+
+EEE's worker also needs more memory than the unit's 300 MB cap at 256 collectors (peak 422 MB over 8 h): a drop-in
+with `MemoryHigh=900M`, `MemoryMax=1200M` (`systemctl edit magnetar-worker`).
 
 **EEE** (x86_64, 4 cores, 7.7 GB, Docker; router: no knee up to 1600 KRPC q/s, TCP attempts
 clean to 400/s, 480 held):

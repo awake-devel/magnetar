@@ -1,0 +1,11 @@
+{"phase": "baseline", "gw_answers": true, "cf_med": 6.0, "lat_limit": 46.0, "gw_med": 0.84, "gw_limit": 10.8, "ct": 3540, "ctmax": 262144, "t": "21:52:49"}
+{"phase": "step", "rate": "150/128/350", "s": 30, "cf_med": 6.2, "lost": 0, "gw": 0.7, "gw_med": 0.68, "ct": 12359, "fault": null, "t": "21:53:19"}
+{"phase": "step", "rate": "150/128/350", "s": 60, "cf_med": 6.1, "lost": 0, "gw": 0.9, "gw_med": 0.91, "ct": 24137, "fault": null, "t": "21:53:49"}
+{"phase": "step", "rate": "150/128/350", "s": 90, "cf_med": 6.2, "lost": 0, "gw": 1.0, "gw_med": 0.86, "ct": 21431, "fault": null, "t": "21:54:19"}
+{"phase": "step", "rate": "150/128/350", "s": 120, "cf_med": 6.0, "lost": 0, "gw": 0.9, "gw_med": 0.85, "ct": 15872, "fault": null, "t": "21:54:50"}
+{"phase": "step", "rate": "150/128/350", "s": 151, "cf_med": 5.9, "lost": 0, "gw": 0.8, "gw_med": 0.67, "ct": 26192, "fault": null, "t": "21:55:20"}
+{"phase": "step", "rate": "150/128/350", "s": 180, "cf_med": 5.9, "lost": 0, "gw": 0.6, "gw_med": 0.78, "ct": 24763, "fault": null, "t": "21:55:49"}
+{"phase": "step", "rate": "150/128/350", "s": 210, "cf_med": 6.1, "lost": 0, "gw": 0.7, "gw_med": 0.67, "ct": 18139, "fault": null, "t": "21:56:19"}
+{"phase": "step", "rate": "150/128/350", "s": 240, "cf_med": 5.9, "lost": 0, "gw": 0.7, "gw_med": 0.66, "ct": 26277, "fault": null, "t": "21:56:49"}
+{"phase": "step", "rate": "150/128/350", "s": 271, "cf_med": 6.2, "lost": 0, "gw": 0.7, "gw_med": 0.65, "ct": 20398, "fault": null, "t": "21:57:20"}
+{"phase": "pass", "rate": "150/128/350", "t": "21:57:50"}

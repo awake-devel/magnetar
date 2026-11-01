@@ -114,6 +114,15 @@ pub fn default_tcp_rate(qps: u32) -> u32 {
     (qps / 2).clamp(5, 150)
 }
 
+/// Default peer collections at once in aggressive mode for a query rate (D114): 0.4 per q/s,
+/// 8–4096. A collection waits ~8.6 s for its walk, so a fixed 64 capped the real send rate at
+/// ~150–180 q/s whatever `MAGNETAR_DHT_QPS` said; measured on the workers 2026-10-31, every
+/// collection costs ~2.35 q/s (eee: 256 → 607 q/s, rpi: 128 → 348 q/s), so 0.4 per q/s fills
+/// the budget without queueing far past it.
+pub fn default_peer_lookups(qps: u32) -> usize {
+    (qps as usize * 2 / 5).clamp(8, 4096)
+}
+
 /// The pacer every DHT sender of the process shares (D109): the crawler's engine and the seed
 /// checker's walks. Its rate is `MAGNETAR_DHT_QPS` (or the mode's default) with the crawler on,
 /// `MAGNETAR_LIVENESS_DHT_QPS` with only seed checks; None when no DHT traffic is configured.
@@ -163,7 +172,11 @@ impl DhtOptions {
             peer_lookups: cfg
                 .dht_peer_lookups
                 .map(|n| n as usize)
-                .unwrap_or(if aggressive { 64 } else { 8 }),
+                .unwrap_or(if aggressive {
+                    default_peer_lookups(qps)
+                } else {
+                    8
+                }),
             lookup_timeout: Duration::from_millis(u64::from(cfg.dht_lookup_timeout_ms)),
             peers_per_hash: cfg.dht_peers_per_hash as usize,
             sample_priority: if cfg.dht_sample_priority.is_finite() {
@@ -1457,6 +1470,42 @@ mod tests {
         assert!(hand(&tx, &mut batch));
         assert_eq!(rx.try_recv().unwrap().len(), 2);
         assert!(hand(&tx, &mut Vec::new()), "nothing to hand");
+    }
+
+    #[test]
+    fn peer_lookups_follow_the_query_rate() {
+        use super::{DhtOptions, default_peer_lookups};
+        use crate::config::{Cli, DhtMode};
+        use clap::Parser;
+        assert_eq!(default_peer_lookups(200), 80, "the aggressive default rate");
+        assert_eq!(default_peer_lookups(640), 256, "eee's measured setting");
+        assert_eq!(default_peer_lookups(5), 8, "a floor");
+        assert_eq!(
+            default_peer_lookups(20_000),
+            4096,
+            "the ONT setting is the cap"
+        );
+        let opts = |args: &[&str]| {
+            let mut v = vec!["magnetar-server"];
+            v.extend(args);
+            v.push("serve");
+            let cli = Cli::try_parse_from(v).unwrap();
+            DhtOptions::from_config(&cli.config, DhtMode::Aggressive).unwrap()
+        };
+        // D114: the old fixed 64 held 640 q/s to ~180 real q/s.
+        assert_eq!(opts(&["--dht-qps", "640"]).peer_lookups, 256);
+        assert_eq!(opts(&[]).peer_lookups, 80);
+        assert_eq!(
+            opts(&["--dht-qps", "640", "--dht-peer-lookups", "100"]).peer_lookups,
+            100,
+            "an explicit setting wins"
+        );
+        let polite = Cli::try_parse_from(["magnetar-server", "serve"]).unwrap();
+        let polite = DhtOptions::from_config(&polite.config, DhtMode::Polite).unwrap();
+        assert_eq!(
+            polite.peer_lookups, 8,
+            "polite mode keeps its small fixed default"
+        );
     }
 
     #[test]

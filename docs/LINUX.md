@@ -219,8 +219,9 @@ target must be the host's architecture, nothing is emulated.
   own `rust` package will not do, it only has the `<arch>-alpine-linux-musl` standard
   library, and the script stops with that message. On Debian/Ubuntu: rustup plus
   `apt install musl-tools`; the script then uses `musl-gcc` as the C compiler.
-  **UNVERIFIED:** only the docker mode was run (x86_64, 2026-10-25); the aarch64 binary is
-  built by CI and has not been run here.
+  **UNVERIFIED:** only the docker mode was run (x86_64, 2026-10-25). The CI-built aarch64
+  release binary (v0.3.1) runs as a crawl worker on a Raspberry Pi 3B since 2026-10-31;
+  `serve` on aarch64 has not been run.
 
 Then install it with `MAGNETAR_BINARY=dist/magnetar-server-x86_64-linux sh scripts/install-linux.sh`.
 

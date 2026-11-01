@@ -73,7 +73,7 @@ of the app on an Android 17 (API 37) x86_64 emulator against a live server crawl
 | Saved searches with ntfy push (server) and local notifications (phone) | server, app | Tested (local notifications; ntfy against a fake server only) |
 | Downloads with librqbit on the server and on the phone (fallback: open the magnet in another app) | server, ffi | Tested on x86_64; **arm64 phone downloads UNVERIFIED** |
 | Docker image `ghcr.io/awake-devel/magnetar` (linux/amd64 + linux/arm64) with Postgres 18 in `compose.yml` | Docker, CI | New: see docs/DOCKER.md for what was verified. arm64 is built natively on GitHub's arm64 runners only, **UNVERIFIED** on a device |
-| Static Linux server binaries (x86_64, aarch64) on every release, with `SHA256SUMS` | CI | New: see docs/LINUX.md. aarch64 built on GitHub's arm64 runners only, **UNVERIFIED** on a device |
+| Static Linux server binaries (x86_64, aarch64) on every release, with `SHA256SUMS` | CI | See docs/LINUX.md. aarch64: the worker mode runs on a Raspberry Pi 3B (v0.3.1, since 2026-10-31); `serve` on arm64 **UNVERIFIED** |
 
 No analytics, no Google services, no accounts. The app talks to relays, trackers, your own
 server and, if you set it up, ntfy.
@@ -94,12 +94,13 @@ tailscale serve --bg 127.0.0.1:8787       # optional: https://<machine>.<tailnet
 Then install `magnetar-<tag>.apk` from the release on the phone, and in Settings enter the
 server URL (`https://<machine>.<tailnet>.ts.net`) and the API token.
 
-- Docker details (variables, volumes, upgrades, backups): [docs/DOCKER.md](docs/DOCKER.md)
+- Docker details (variables, volumes, upgrades, backups): [docs/DOCKER.md](docs/DOCKER.md).
+  Nightly dumps to another machine: `scripts/backup.sh` (DOCKER.md "Backups")
 - Without Docker, with the static binary and your own Postgres: [docs/LINUX.md](docs/LINUX.md)
 - Share the crawling with other machines (seed checks and DHT, no database on them): [docs/WORKERS.md](docs/WORKERS.md)
-- Nothing here installs systemd units, timers or udev rules. Docker's restart policy keeps
-  the containers up; LINUX.md has examples you can adapt if you want the binary started at
-  boot.
+- Nothing installs systemd units, timers or udev rules by itself. Docker's restart policy
+  keeps the containers up; `packaging/` has optional units (a crawl worker, the nightly
+  backup) with their install steps, and LINUX.md has examples for starting the binary at boot.
 
 **Why a token?** The server listens on loopback by default and expects a proxy in front.
 Every endpoint except `GET /health` requires `Authorization: Bearer <token>`, so whatever
@@ -196,8 +197,10 @@ has the full list with sources.
   needs JNI. UDP trackers and DHT still work.
 - **The token is the only lock.** Anyone who has it, or who can read the server's `.env`, has
   full API access. Put HTTPS in front of the server (Tailscale serve or a reverse proxy).
-- **arm64 server builds are UNVERIFIED on hardware.** The image and binary for arm64 are built
-  on GitHub's native arm64 runners; they have not run on a Raspberry Pi or an ARM NAS yet.
+- **The arm64 binary has run on a Pi as a crawl worker only.** The v0.3.1 `aarch64` release
+  binary has run `magnetar-server worker` (DHT crawler and seed checks) on a Raspberry Pi 3B
+  under the systemd unit since 2026-10-31 with no restart. The full server with Postgres on
+  arm64, and the arm64 Docker image, are still **UNVERIFIED** on hardware.
 
 ## Legal
 
