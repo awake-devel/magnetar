@@ -1187,9 +1187,9 @@ mod tests {
         assert_eq!(count_values(b"llelelee", 100), 4);
         // stops past the limit
         assert_eq!(count_values(&b"le".repeat(1000), 10), 11);
-        // malformed input ends the count, never panics
-        assert_eq!(count_values(b"99999999999999999999999:x", 10), 1);
-        assert_eq!(count_values(b"i12", 10), 1);
+        // malformed input is priced past the limit (D110), never panics
+        assert_eq!(count_values(b"99999999999999999999999:x", 10), 11);
+        assert_eq!(count_values(b"i12", 10), 11);
         assert_eq!(max_values(16 << 20), 2 << 20);
         assert_eq!(max_values(1 << 10), 64 * 1024);
         assert_eq!(decode_cost(10, 2), 30 + 128);

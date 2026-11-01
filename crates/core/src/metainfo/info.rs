@@ -14,6 +14,22 @@ const PAD_DIR: &str = ".pad";
 /// BitComet's padding files, from before BEP 47 (`_____padding_file_N_…`).
 const BITCOMET_PAD: &str = "_____padding_file_";
 
+/// Longest name and display path kept, in bytes (D110): the Nostr title cap
+/// (`nip35::MAX_TITLE_BYTES`). Real names are well under 300 bytes; a longer one is cut on a
+/// character boundary so the title, its tsvector and the release parser stay small. The
+/// blocklist input ([`InfoSummary::all_names`]) keeps the full strings.
+pub const DISPLAY_MAX: usize = 1024;
+/// Longest BEP 52 file-tree path joined, in raw bytes with separators (D110): Linux `PATH_MAX`,
+/// so no client could write a longer one. Longer → [`InfoError::TooComplex`].
+pub const TREE_PATH_MAX: usize = 4096;
+/// The file tree's output (keys plus two copies of each joined path: blocklist and display)
+/// may total at most this many raw bytes per byte of the info dict, plus [`TREE_OUTPUT_SLACK`]
+/// (D110). A real tree costs ~2× (each leaf repeats its directories once per copy, and a leaf's
+/// own bencode is ~60 bytes); one huge directory key over many leaves asked for terabytes.
+const TREE_OUTPUT_FACTOR: usize = 4;
+/// Fixed allowance on top of [`TREE_OUTPUT_FACTOR`], so tiny dicts with deep paths still parse.
+const TREE_OUTPUT_SLACK: usize = 64 * 1024;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InfoFile {
     pub path: String,
@@ -144,6 +160,18 @@ fn join(parts: &[&[u8]], strict: bool) -> Option<String> {
     Some(out)
 }
 
+/// Cut `s` to at most `max` bytes on a character boundary (no-op when it fits).
+pub fn truncate_utf8(s: &mut String, max: usize) {
+    if s.len() <= max {
+        return;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+}
+
 fn is_padding(attr: Option<&[u8]>, first: Option<&[u8]>, last: Option<&[u8]>) -> bool {
     attr.is_some_and(|a| a.contains(&b'p'))
         || first == Some(PAD_DIR.as_bytes())
@@ -182,6 +210,11 @@ pub fn parse_info(raw: &[u8]) -> Result<InfoSummary, InfoError> {
     let piece_length = v.get(b"piece length").and_then(Value::as_int);
     let has_pieces = v.get(b"pieces").and_then(Value::as_bytes).is_some();
     let tree = v.get(b"file tree").filter(|t| t.as_dict().is_some());
+    // Raw bytes the file tree may still produce (D110), checked before each join.
+    let mut budget = raw
+        .len()
+        .saturating_mul(TREE_OUTPUT_FACTOR)
+        .saturating_add(TREE_OUTPUT_SLACK);
 
     let mut files = Vec::new();
     if let Some(list) = v.get(b"files") {
@@ -230,7 +263,14 @@ pub fn parse_info(raw: &[u8]) -> Result<InfoSummary, InfoError> {
         });
     } else if let Some(t) = tree {
         // v2-only dicts: the file tree is the only file list.
-        walk_tree(t, &mut Vec::new(), &mut files, &mut all_names, 0)?;
+        walk_tree(
+            t,
+            &mut Vec::new(),
+            &mut files,
+            &mut all_names,
+            &mut budget,
+            0,
+        )?;
     } else {
         return Err(InfoError::BadFiles);
     }
@@ -238,7 +278,14 @@ pub fn parse_info(raw: &[u8]) -> Result<InfoSummary, InfoError> {
         // Hybrid: the v1 list is displayed, the v2 keys still go to the blocklist. A tree that
         // does not walk is an invalid hybrid (the screen must see every name, not a prefix).
         let mut ignored = Vec::new();
-        walk_tree(t, &mut Vec::new(), &mut ignored, &mut all_names, 0)?;
+        walk_tree(
+            t,
+            &mut Vec::new(),
+            &mut ignored,
+            &mut all_names,
+            &mut budget,
+            0,
+        )?;
     }
     let total_size = files
         .iter()
@@ -250,6 +297,12 @@ pub fn parse_info(raw: &[u8]) -> Result<InfoSummary, InfoError> {
     }
     if total_size == 0 {
         return Err(InfoError::Empty);
+    }
+    // Display strings are capped (D110); the screen already has the full ones in all_names.
+    let mut name = name;
+    truncate_utf8(&mut name, DISPLAY_MAX);
+    for f in &mut files {
+        truncate_utf8(&mut f.path, DISPLAY_MAX);
     }
     Ok(InfoSummary {
         name,
@@ -264,12 +317,21 @@ pub fn parse_info(raw: &[u8]) -> Result<InfoSummary, InfoError> {
     })
 }
 
+/// Take `n` raw bytes from the tree's output budget, or fail before anything is allocated.
+fn spend(budget: &mut usize, n: usize) -> Result<(), InfoError> {
+    *budget = budget.checked_sub(n).ok_or(InfoError::TooComplex)?;
+    Ok(())
+}
+
 /// BEP 52 `file tree`: dict keys are path elements; a key `""` holding `length` marks a file.
+/// Every leaf joins its whole prefix, so the output is priced first (D110): at most
+/// [`TREE_PATH_MAX`] bytes per path and `budget` bytes in all, else [`InfoError::TooComplex`].
 fn walk_tree<'a>(
     node: &'a Value,
     prefix: &mut Vec<&'a [u8]>,
     files: &mut Vec<InfoFile>,
     names: &mut Vec<String>,
+    budget: &mut usize,
     depth: usize,
 ) -> Result<(), InfoError> {
     // The decoder caps nesting at 64; this keeps our own recursion bounded the same way.
@@ -289,9 +351,16 @@ fn walk_tree<'a>(
                 .and_then(|l| u64::try_from(l).ok())
                 .ok_or(InfoError::BadFiles)?;
             let attr = child.get(b"attr").and_then(Value::as_bytes);
+            // Raw length of the joined path (depth ≤ 64, so this sum is cheap).
+            let path_len = prefix.iter().map(|p| p.len()).sum::<usize>() + prefix.len() - 1;
+            if path_len > TREE_PATH_MAX {
+                return Err(InfoError::TooComplex);
+            }
+            let padding = is_padding(attr, prefix.first().copied(), prefix.last().copied());
+            spend(budget, path_len * if padding { 1 } else { 2 })?;
             // The whole path too, as stored for v1 files (a screen rule may span elements).
             names.push(join(prefix, false).unwrap_or_default());
-            if !is_padding(attr, prefix.first().copied(), prefix.last().copied()) {
+            if !padding {
                 files.push(InfoFile {
                     path: join(prefix, false).unwrap_or_default(),
                     size: len,
@@ -299,9 +368,10 @@ fn walk_tree<'a>(
             }
             continue;
         }
+        spend(budget, k.len())?;
         names.push(text(k));
         prefix.push(k);
-        let r = walk_tree(child, prefix, files, names, depth + 1);
+        let r = walk_tree(child, prefix, files, names, budget, depth + 1);
         prefix.pop();
         r?;
     }
@@ -427,6 +497,135 @@ mod tests {
             parse_info(b"d9:file treed0:d6:lengthi1eee4:name1:ae"),
             Err(InfoError::BadFiles)
         );
+    }
+
+    /// A v2-only info dict whose file tree is `tree` (a dict value).
+    fn v2_with_tree(tree: Value) -> Vec<u8> {
+        bencode::encode(&Value::Dict(vec![
+            (b"file tree".to_vec(), tree),
+            (b"meta version".to_vec(), Value::Int(2)),
+            (b"name".to_vec(), Value::Bytes(b"t".to_vec())),
+            (b"piece length".to_vec(), Value::Int(16384)),
+        ]))
+    }
+
+    /// A tree leaf: `{"": {length, pieces root}}`.
+    fn leaf(len: i64) -> Value {
+        Value::Dict(vec![(
+            Vec::new(),
+            Value::Dict(vec![
+                (b"length".to_vec(), Value::Int(len)),
+                (b"pieces root".to_vec(), Value::Bytes(vec![b'r'; 32])),
+            ]),
+        )])
+    }
+
+    /// `n` leaves named 0000, 0001, … under `dir`.
+    fn wide_dir(dir: Vec<u8>, n: usize) -> Value {
+        let leaves = (0..n)
+            .map(|i| (format!("{i:04}").into_bytes(), leaf(1)))
+            .collect();
+        Value::Dict(vec![(dir, Value::Dict(leaves))])
+    }
+
+    #[test]
+    fn file_tree_output_is_bounded_before_joining() {
+        // D110, the audit's shape: one big directory key over many tiny leaves. Each leaf
+        // used to copy the key twice (8 MB here from a ~30 KB dict; terabytes at 16 MiB).
+        let raw = v2_with_tree(wide_dir(vec![b'k'; 4000], 1000));
+        assert!(raw.len() < 128 * 1024);
+        assert_eq!(parse_info(&raw), Err(InfoError::TooComplex));
+        // One path longer than PATH_MAX is refused on its own.
+        let raw = v2_with_tree(wide_dir(vec![b'k'; TREE_PATH_MAX], 1));
+        assert_eq!(parse_info(&raw), Err(InfoError::TooComplex));
+        // A hybrid's tree is priced too (it feeds the blocklist input).
+        let tree = bencode::encode(&wide_dir(vec![b'k'; 4000], 1000));
+        let mut hybrid = b"d9:file tree".to_vec();
+        hybrid.extend_from_slice(&tree);
+        hybrid.extend_from_slice(b"6:lengthi5e4:name1:a6:pieces0:e");
+        assert_eq!(parse_info(&hybrid), Err(InfoError::TooComplex));
+    }
+
+    #[test]
+    fn real_file_trees_fit_the_budget() {
+        // A season pack: 3000 files under two shared directories, and one deep long path.
+        let season = Value::Dict(vec![(
+            b"Season 01".to_vec(),
+            Value::Dict(
+                (0..3000)
+                    .map(|i| {
+                        let name = format!("Some.Show.2020.S01E{i:04}.1080p.WEB-DL.x264-GRP.mkv");
+                        (name.into_bytes(), leaf(1_000_000))
+                    })
+                    .collect(),
+            ),
+        )]);
+        let tree = Value::Dict(vec![(
+            b"Some Show (2020) Complete [1080p WEB-DL]".to_vec(),
+            season,
+        )]);
+        let s = parse_info(&v2_with_tree(tree)).unwrap();
+        assert_eq!(s.files.len(), 3000);
+        assert!(
+            s.files[0]
+                .path
+                .starts_with("Some Show (2020) Complete [1080p WEB-DL]/Season 01/")
+        );
+        // 60 nested 64-byte directories (the decoder's depth limit): a 3.9 KB path, under
+        // TREE_PATH_MAX.
+        let mut node = leaf(7);
+        for i in 0..60 {
+            node = Value::Dict(vec![(
+                format!("{i:02}{}", "d".repeat(62)).into_bytes(),
+                node,
+            )]);
+        }
+        let s = parse_info(&v2_with_tree(node)).unwrap();
+        assert_eq!(s.files.len(), 1);
+        // The display path is capped, the blocklist input keeps the whole path.
+        assert_eq!(s.files[0].path.len(), DISPLAY_MAX);
+        assert!(s.all_names.iter().any(|n| n.len() == 60 * 64 + 59));
+    }
+
+    #[test]
+    fn name_and_paths_are_capped_on_a_char_boundary() {
+        // D110: the DHT title and each display path stop at DISPLAY_MAX bytes.
+        let long = "é".repeat(DISPLAY_MAX); // 2 bytes each
+        let raw = bencode::encode(&Value::Dict(vec![
+            (
+                b"files".to_vec(),
+                Value::List(vec![Value::Dict(vec![
+                    (b"length".to_vec(), Value::Int(5)),
+                    (
+                        b"path".to_vec(),
+                        Value::List(vec![Value::Bytes(format!("x{long}").into_bytes())]),
+                    ),
+                ])]),
+            ),
+            (b"name".to_vec(), Value::Bytes(long.clone().into_bytes())),
+        ]));
+        let s = parse_info(&raw).unwrap();
+        assert_eq!(s.name.len(), DISPLAY_MAX);
+        assert!(s.name.chars().all(|c| c == 'é'));
+        // "x" + é…: the cut falls inside an é and backs off one byte.
+        assert_eq!(s.files[0].path.len(), DISPLAY_MAX - 1);
+        // The screen still sees every byte.
+        assert!(s.all_names.contains(&long));
+        assert!(s.all_names.contains(&format!("x{long}")));
+        // A single-file torrent's path is its name: capped the same way.
+        let raw = format!(
+            "d6:lengthi1e4:name{}:{}e",
+            3 * DISPLAY_MAX,
+            "a".repeat(3 * DISPLAY_MAX)
+        );
+        let s = parse_info(raw.as_bytes()).unwrap();
+        assert_eq!(
+            (s.name.len(), s.files[0].path.len()),
+            (DISPLAY_MAX, DISPLAY_MAX)
+        );
+        let mut t = String::from("aé");
+        truncate_utf8(&mut t, 2);
+        assert_eq!(t, "a");
     }
 
     proptest! {

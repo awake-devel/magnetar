@@ -241,27 +241,84 @@ const FOLDS: &[(&str, &str)] = &[
     ("24-bit", "24bit"),
 ];
 
-/// ASCII-case-insensitive replace of every `from` (lowercase) by `to`.
+/// ASCII-case-insensitive replace of every `from` (lowercase) by `to`, pattern by pattern in
+/// [`FOLDS`] order, leftmost matches first (a later pattern sees the earlier replacements).
+///
+/// Linear (D110): the name is lowercased once and each pattern is one scan that rebuilds both
+/// strings, so the cost is |FOLDS| × the name's length. It used to re-lowercase the whole
+/// string and `replace_range` once per match, quadratic on a hostile DHT name.
 fn fold(name: &str) -> String {
+    // Lowercasing can change byte lengths for non-ASCII text (`İ`, the Kelvin sign): match
+    // positions are only usable when every character keeps its length; otherwise nothing is
+    // folded (as before).
+    let mut low = name.to_lowercase();
+    if low.len() != name.len()
+        || (!name.is_ascii()
+            && name
+                .chars()
+                .any(|c| c.to_lowercase().map(char::len_utf8).sum::<usize>() != c.len_utf8()))
+    {
+        return name.to_string();
+    }
     let mut out = name.to_string();
+    let mut pairs = Bigrams::of(low.as_bytes());
     for (from, to) in FOLDS {
-        let mut search_from = 0;
-        loop {
-            let lower = out.to_lowercase();
-            // Lowercasing can change byte lengths for non-ASCII text: only use positions when
-            // both strings line up.
-            if lower.len() != out.len() {
-                break;
-            }
-            let Some(rel) = lower[search_from..].find(from) else {
-                break;
-            };
-            let at = search_from + rel;
-            out.replace_range(at..at + from.len(), to);
-            search_from = at + to.len();
+        // Most patterns are absent: the bigram table rules them out without a scan.
+        if !pairs.may_contain(from.as_bytes()) || !low.contains(from) {
+            continue;
         }
+        let mut next_out = String::with_capacity(out.len());
+        let mut next_low = String::with_capacity(low.len());
+        let mut last = 0;
+        // A replacement brings its own pairs, and new ones at its edges, where a later
+        // pattern may now match: they are added (stale pairs only cost a `contains`).
+        pairs.add(to.as_bytes());
+        let (first, end) = (to.as_bytes()[0], to.as_bytes()[to.len() - 1]);
+        for (at, _) in low.match_indices(from) {
+            next_out.push_str(&out[last..at]);
+            next_low.push_str(&low[last..at]);
+            if let Some(&b) = next_low.as_bytes().last() {
+                pairs.add(&[b, first]);
+            }
+            next_out.push_str(to);
+            next_low.push_str(to); // every `to` is lowercase ASCII
+            last = at + from.len();
+            if let Some(&b) = low.as_bytes().get(last) {
+                pairs.add(&[end, b]);
+            }
+        }
+        next_out.push_str(&out[last..]);
+        next_low.push_str(&low[last..]);
+        out = next_out;
+        low = next_low;
     }
     out
+}
+
+/// Which byte pairs occur in a string: one bit per pair (8 KiB), built in one pass.
+struct Bigrams(Vec<u64>);
+
+impl Bigrams {
+    fn of(s: &[u8]) -> Self {
+        let mut b = Bigrams(vec![0u64; (1 << 16) / 64]);
+        b.add(s);
+        b
+    }
+
+    fn add(&mut self, s: &[u8]) {
+        for w in s.windows(2) {
+            let i = usize::from(w[0]) << 8 | usize::from(w[1]);
+            self.0[i / 64] |= 1 << (i % 64);
+        }
+    }
+
+    /// False when some pair of `pat` never occurs (so `pat` cannot either).
+    fn may_contain(&self, pat: &[u8]) -> bool {
+        pat.windows(2).all(|w| {
+            let i = usize::from(w[0]) << 8 | usize::from(w[1]);
+            self.0[i / 64] & (1 << (i % 64)) != 0
+        })
+    }
 }
 
 fn tokenize(name: &str) -> Vec<Tok> {
@@ -2226,6 +2283,80 @@ pub fn resolution_rank(r: Option<&str>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `fold` before D110 (quadratic), kept as the reference for the linear one.
+    fn fold_quadratic(name: &str) -> String {
+        let mut out = name.to_string();
+        for (from, to) in FOLDS {
+            let mut search_from = 0;
+            loop {
+                let lower = out.to_lowercase();
+                if lower.len() != out.len() {
+                    break;
+                }
+                let Some(rel) = lower[search_from..].find(from) else {
+                    break;
+                };
+                let at = search_from + rel;
+                out.replace_range(at..at + from.len(), to);
+                search_from = at + to.len();
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn fold_matches_the_old_fold() {
+        let names = [
+            "Movie.2020.1080p.Blu-Ray.DD+5.1.x-264-GRP",
+            "Show S01E01 WEB-DL DTS-HD MA HE-AAC-LC 10-bit",
+            "he-aac-lc chained: HE-AAC then AAC-LC",
+            "Film (2019) Director's Cut Open.Matte Dolby Vision HDR10+ E-AC-3",
+            "Dual Áudio PT-BR Multi-Subs multi-sub MULTI.SUB vost-fr Sous-Titres",
+            "ÉTÉ 16-bit 24-bit 8-bit 12-bit 10 bit DUAL AUDIO dual.audio",
+            "dts:x dts-x DTS-MA vc-1 MPEG-2 web-rip x-265 e-ac3",
+            "nothing to fold here",
+            "",
+            "İstanbul 10-bit", // lowercase grows: nothing folded, as before
+            "Ⅻ dd+ ǅ blu-ray Σίσυφος",
+            "dd+dd+dd+ blu-rayblu-ray 10-bit10-bit",
+        ];
+        for n in names {
+            assert_eq!(fold(n), fold_quadratic(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn fold_is_linear_on_a_hostile_name() {
+        // D110: the old fold took ~27 s on this 1 MB name in a debug build (hours at 16 MiB).
+        let name = "16-bit ".repeat((1 << 20) / 7);
+        let t = std::time::Instant::now();
+        let out = fold(&name);
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            t.elapsed()
+        );
+        assert_eq!(out, "16bit ".repeat((1 << 20) / 7));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn fold_matches_the_old_fold_on_fragments(
+            parts in proptest::collection::vec(
+                proptest::sample::select(vec![
+                    "dd+", "DD+", "hdr10+", "E-AC-3", "e-ac3", "Blu-Ray", "web-dl", "dts-hd",
+                    "dts:x", "Dolby.Vision", "director's cut", "multi-sub", "multi-subs",
+                    "dual áudio", "Dual Áudio", "HE-AAC", "aac-lc", "x-264", "10-bit", "10 bit",
+                    "-", ".", " ", "a", "é", "É", "x", "1", "0", "bit", "multi", "sub", "s",
+                ]),
+                0..40,
+            )
+        ) {
+            let name: String = parts.concat();
+            proptest::prop_assert_eq!(fold(&name), fold_quadratic(&name));
+        }
+    }
 
     fn p(name: &str) -> ReleaseAttrs {
         parse_release(name, &[], Category::Video)
