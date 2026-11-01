@@ -1,10 +1,19 @@
 //! BEP 48 HTTP scrape.
+//!
+//! Tracker URLs come from Nostr events, so every request goes through a [`TrackerClient`]
+//! (D112): an IP-literal host is checked against the address policy before the request, a name
+//! is checked when it is resolved (the client's DNS resolver drops non-public addresses, so the
+//! connect goes to a checked address), redirects are never followed and no proxy is used.
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_encode};
 
 use super::bencode::{self, Value};
 use super::udp::ScrapeStats;
 use crate::error::{Error, Result};
+use crate::netaddr::{self, AddrPolicy, PolicyResolver};
 
 /// Hashes per request: 50 × 60 chars keeps the URL around 3 KB, well inside common limits.
 pub const HTTP_SCRAPE_BATCH: usize = 50;
@@ -26,6 +35,32 @@ const INFO_HASH_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'~');
 
+/// HTTP client for tracker scrapes (D112). BEP 48 scrapes need no redirect: a 3xx answer is a
+/// failed scrape, so a public tracker cannot bounce the request to `http://192.168.1.1/...`.
+/// No proxy either: a proxy would resolve the name itself, past the check.
+#[derive(Clone, Debug)]
+pub struct TrackerClient {
+    http: reqwest::Client,
+    policy: AddrPolicy,
+}
+
+impl TrackerClient {
+    /// `timeout` bounds each whole request, DNS lookup included. Production passes
+    /// [`AddrPolicy::PUBLIC`]; tests on 127.0.0.1 pass [`AddrPolicy::loopback_for_tests`].
+    pub fn new(timeout: Duration, policy: AddrPolicy) -> Result<Self> {
+        let http = crate::http::builder(timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .dns_resolver(Arc::new(PolicyResolver { policy, timeout }))
+            .build()?;
+        Ok(Self { http, policy })
+    }
+
+    pub fn policy(&self) -> AddrPolicy {
+        self.policy
+    }
+}
+
 /// announce URL -> scrape URL (last path segment starting with "announce"), None if unsupported.
 pub fn scrape_url(announce: &str) -> Option<String> {
     let mut url = url::Url::parse(announce.trim()).ok()?;
@@ -43,7 +78,7 @@ pub fn scrape_url(announce: &str) -> Option<String> {
 
 /// Scrape on an http(s) tracker. Result positional to `hashes`.
 pub async fn scrape(
-    client: &reqwest::Client,
+    client: &TrackerClient,
     tracker: &str,
     hashes: &[[u8; 20]],
 ) -> crate::Result<Vec<Option<ScrapeStats>>> {
@@ -56,7 +91,7 @@ pub async fn scrape(
 
 /// One scrape request (callers keep `chunk` within [`HTTP_SCRAPE_BATCH`]).
 pub async fn scrape_chunk(
-    client: &reqwest::Client,
+    client: &TrackerClient,
     tracker: &str,
     chunk: &[[u8; 20]],
 ) -> crate::Result<Vec<Option<ScrapeStats>>> {
@@ -73,7 +108,16 @@ pub async fn scrape_chunk(
         url.extend(percent_encode(h, INFO_HASH_SET));
         sep = '&';
     }
-    let resp = client.get(&url).send().await?;
+    let parsed =
+        url::Url::parse(&url).map_err(|e| Error::Invalid(format!("tracker {tracker}: {e}")))?;
+    // IP literals never reach the resolver: check them here.
+    netaddr::check_url_host(client.policy, tracker, &parsed)?;
+    let resp = client
+        .http
+        .get(parsed)
+        .send()
+        .await
+        .map_err(|e| send_error(tracker, e))?;
     let status = resp.status();
     let body = crate::body::read_capped(resp, MAX_SCRAPE_BODY).await;
     if !status.is_success() {
@@ -88,6 +132,18 @@ pub async fn scrape_chunk(
     }
     let body = body.map_err(|e| Error::Network(format!("{tracker}: scrape answer: {e}")))?;
     parse_response(tracker, &body, chunk)
+}
+
+/// A name the resolver refused comes back wrapped in reqwest's connect error: keep it typed.
+fn send_error(tracker: &str, e: reqwest::Error) -> Error {
+    let mut src = std::error::Error::source(&e);
+    while let Some(s) = src {
+        if let Some(Error::Refused(msg)) = s.downcast_ref::<Error>() {
+            return Error::Refused(format!("{tracker}: {msg}"));
+        }
+        src = s.source();
+    }
+    Error::from(e)
 }
 
 /// `files` maps raw hash → stats. A hash missing from a successful answer is unknown to the

@@ -62,6 +62,16 @@ real hardware are marked **UNVERIFIED**.
   unknown. [D45]
 - UDP scrape batches are 74 infohashes, and a truncated reply counts as unanswered.
   [bittorrent.md §1]
+- **Trackers and DHT nodes on private addresses are never contacted**, including a tracker
+  you run on your own LAN or tailnet: seed checks, untrusted relays and the DHT walk only talk
+  to public addresses, and there is no setting to change that. Configured relays (seeds,
+  indexers, monitors) may still be local. [D112]
+- **Downloads only partly follow the address policy.** librqbit gets a peer blocklist of the
+  private, loopback, CGNAT/tailnet, ULA and link-local ranges (and their IPv4-mapped forms),
+  checked before every peer connection. Its own tracker requests and its own DHT node are not
+  filtered, and NAT64/6to4 forms of private addresses are not in the list. Downloads are off by
+  default (`MAGNETAR_DOWNLOADS=false`); the blocklist is **UNVERIFIED** against a live swarm
+  (only checked on a session built offline). [D112]
 
 ## Android
 

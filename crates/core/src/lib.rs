@@ -20,6 +20,7 @@ pub mod magnet;
 #[cfg(feature = "dht-crawl")]
 pub mod metainfo;
 pub mod model;
+pub mod netaddr;
 pub mod nip35;
 pub mod nip66;
 pub mod notify;

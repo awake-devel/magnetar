@@ -4,31 +4,16 @@
 //! 127.0.0.1:5432), the router's admin page or other LAN hosts; the sampler and the peer lookups
 //! would then spray them. Every address is checked before a UDP send (and stage 2 checks it
 //! before a TCP connect): non-global IPv4 ranges and our own external address are refused.
+//! The ranges are the crate-wide policy in [`crate::netaddr`] (D112).
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 
-/// Ranges never contacted: 0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.0.0/24,
-/// 192.168/16, 198.18/15, 224/4 (multicast) and 240/4 (reserved, broadcast).
-const BLOCKED: &[(u32, u8)] = &[
-    (0x0000_0000, 8),
-    (0x0a00_0000, 8),
-    (0x6440_0000, 10),
-    (0x7f00_0000, 8),
-    (0xa9fe_0000, 16),
-    (0xac10_0000, 12),
-    (0xc000_0000, 24),
-    (0xc0a8_0000, 16),
-    (0xc612_0000, 15),
-    (0xe000_0000, 4),
-    (0xf000_0000, 4),
-];
-
-/// Whether `ip` is a globally routable unicast IPv4 address by the list above.
+/// Whether `ip` is a globally routable unicast IPv4 address: the shared policy
+/// ([`crate::netaddr::BLOCKED_V4`], D112), which covers the ranges D55 listed (0/8, 10/8,
+/// 100.64/10, 127/8, 169.254/16, 172.16/12, 192.0.0/24, 192.168/16, 198.18/15, 224/4, 240/4)
+/// plus the documentation nets and the 6to4 relay anycast.
 pub fn is_global(ip: Ipv4Addr) -> bool {
-    let v = u32::from(ip);
-    !BLOCKED
-        .iter()
-        .any(|&(net, len)| v & (u32::MAX << (32 - u32::from(len))) == net)
+    crate::netaddr::is_public_v4(ip)
 }
 
 /// The address check, with our own external address once known.

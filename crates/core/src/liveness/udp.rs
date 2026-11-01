@@ -5,6 +5,10 @@
 //! for at most 60 s, also across calls: a long-lived checker (the server, D45) sends one connect
 //! per minute per tracker instead of one per batch. Responses are positional; trackers silently
 //! truncate at 75 entries, so a missing tail entry is `None`.
+//!
+//! The tracker's host is resolved through the shared address policy (D112): a tracker whose
+//! name or literal points at loopback, the LAN, the tailnet or another non-public address gets
+//! [`Error::Refused`] and no datagram, and the socket is connected to the checked address.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -12,6 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 
 use crate::error::{Error, Result};
+use crate::netaddr::AddrPolicy;
 
 pub const UDP_SCRAPE_BATCH: usize = 74;
 
@@ -33,16 +38,18 @@ pub struct ScrapeStats {
     pub completed: u32,
 }
 
-/// Scrape `hashes` (raw 20-byte) on a udp:// tracker URL. Positional; None = not answered (truncated).
+/// Scrape `hashes` (raw 20-byte) on a udp:// tracker URL. Positional; None = not answered
+/// (truncated). Only addresses `policy` allows are contacted.
 pub async fn scrape(
     tracker: &str,
     hashes: &[[u8; 20]],
     timeout: std::time::Duration,
+    policy: AddrPolicy,
 ) -> crate::Result<Vec<Option<ScrapeStats>>> {
     if hashes.is_empty() {
         return Ok(Vec::new());
     }
-    let mut t = UdpTracker::new(tracker);
+    let mut t = UdpTracker::new(tracker, policy);
     let mut out = Vec::with_capacity(hashes.len());
     for chunk in hashes.chunks(UDP_SCRAPE_BATCH) {
         out.extend(t.scrape_chunk(chunk, timeout).await?);
@@ -53,14 +60,16 @@ pub async fn scrape(
 /// One udp:// tracker: socket, address and connection id kept between scrapes.
 pub struct UdpTracker {
     url: String,
+    policy: AddrPolicy,
     sock: Option<(UdpSocket, Instant)>,
     conn: Option<(u64, Instant)>,
 }
 
 impl UdpTracker {
-    pub fn new(url: &str) -> Self {
+    pub fn new(url: &str, policy: AddrPolicy) -> Self {
         Self {
             url: url.to_string(),
+            policy,
             sock: None,
             conn: None,
         }
@@ -99,7 +108,7 @@ impl UdpTracker {
             .as_ref()
             .is_none_or(|(_, at)| at.elapsed() >= DNS_MAX_AGE)
         {
-            self.sock = Some((open(&self.url, timeout).await?, Instant::now()));
+            self.sock = Some((open(&self.url, self.policy, timeout).await?, Instant::now()));
             self.conn = None;
         }
         let sock = &self.sock.as_ref().expect("just opened").0;
@@ -138,8 +147,8 @@ impl UdpTracker {
 }
 
 /// Resolve and connect a fresh socket to the tracker.
-async fn open(tracker: &str, timeout: Duration) -> Result<UdpSocket> {
-    let addr = resolve(tracker, timeout).await?;
+async fn open(tracker: &str, policy: AddrPolicy, timeout: Duration) -> Result<UdpSocket> {
+    let addr = resolve(tracker, policy, timeout).await?;
     let bind: SocketAddr = if addr.is_ipv4() {
         ([0u8; 4], 0).into()
     } else {
@@ -150,8 +159,8 @@ async fn open(tracker: &str, timeout: Duration) -> Result<UdpSocket> {
     Ok(sock)
 }
 
-/// `udp://host:port[/path]` → socket address, IPv4 preferred.
-async fn resolve(tracker: &str, timeout: Duration) -> Result<SocketAddr> {
+/// `udp://host:port[/path]` → socket address allowed by `policy`, IPv4 preferred.
+async fn resolve(tracker: &str, policy: AddrPolicy, timeout: Duration) -> Result<SocketAddr> {
     let url = url::Url::parse(tracker.trim())
         .map_err(|e| Error::Invalid(format!("tracker url {tracker}: {e}")))?;
     if url.scheme() != "udp" {
@@ -163,14 +172,8 @@ async fn resolve(tracker: &str, timeout: Duration) -> Result<SocketAddr> {
     let port = url
         .port()
         .ok_or_else(|| Error::Invalid(format!("udp tracker without port: {tracker}")))?;
-    // IPv6 literals come back bracketed from host_str.
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    let addrs: Vec<SocketAddr> =
-        tokio::time::timeout(timeout, tokio::net::lookup_host((host, port)))
-            .await
-            .map_err(|_| Error::Timeout(format!("{tracker}: DNS lookup")))?
-            .map_err(net(tracker))?
-            .collect();
+    // IPv6 literals come back bracketed from host_str; `resolve` strips them.
+    let addrs = policy.resolve(tracker, host, port, timeout).await?;
     addrs
         .iter()
         .find(|a| a.is_ipv4())

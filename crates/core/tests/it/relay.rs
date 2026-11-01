@@ -167,6 +167,53 @@ async fn connect_failures() {
     assert!(started.elapsed() < Duration::from_secs(2));
 }
 
+/// D112: an untrusted relay URL whose host is (or resolves to) a non-public address gets no
+/// TCP connect at all; with the test seam the checked connect reaches a real relay.
+#[tokio::test]
+async fn connect_checked_refuses_local_relays() {
+    use magnetar_core::netaddr::AddrPolicy;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    let _hold = tokio::spawn(async move {
+        let mut socks = Vec::new();
+        while let Ok((s, _)) = l.accept().await {
+            h.fetch_add(1, Ordering::SeqCst);
+            socks.push(s);
+        }
+    });
+    for url in [
+        format!("ws://localhost:{port}"),
+        format!("ws://127.0.0.1:{port}/any/path"),
+        format!("ws://[::ffff:127.0.0.1]:{port}"),
+        "wss://192.168.1.1".to_string(),
+        "ws://100.100.1.1:8443".to_string(),
+        "ws://[fd00::1]:80".to_string(),
+    ] {
+        let err = RelayConn::connect_checked(&url, T, AddrPolicy::PUBLIC)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, Error::Refused(_)), "{url}: {err:?}");
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "a connect reached loopback");
+
+    let relay = FakeRelay::start(generated(3), Behaviour::default()).await;
+    let mut conn = RelayConn::connect_checked(&relay.url, T, AddrPolicy::loopback_for_tests())
+        .await
+        .unwrap();
+    let page = conn
+        .fetch_page(json!({"kinds": [2003], "limit": 10}), T)
+        .await
+        .unwrap();
+    assert_eq!(page.events.len(), 3);
+}
+
 #[tokio::test]
 #[ignore = "network: live relay"]
 async fn live_fetch_page_tls() {

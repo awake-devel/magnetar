@@ -197,6 +197,11 @@ pub fn valid_tracker(s: &str) -> Option<String> {
     if host.contains(['%', '\\']) || !u.username().is_empty() {
         return None;
     }
+    // Loopback, LAN, tailnet and other non-public literals and localhost names are never
+    // stored (D112). Other names are checked again when a scrape resolves them.
+    if crate::netaddr::is_local_host(&u) {
+        return None;
+    }
     Some(u.to_string())
 }
 
@@ -373,6 +378,30 @@ mod tests {
         assert_eq!(category_of(&[], &s(&["livres"])), Category::Book);
         assert_eq!(category_of(&[], &[]), Category::Other);
         assert_eq!(category_of(&s(&["assumeutxo"]), &[]), Category::Other);
+    }
+
+    /// D112: trackers pointing at loopback, the LAN, the tailnet or other local ranges are not
+    /// stored, so they are never scraped (nor handed to workers in seed-check leases).
+    #[test]
+    fn local_trackers_are_not_stored() {
+        for bad in [
+            "http://192.168.1.1/announce?x=y",
+            "http://192.168.1.1/cgi-bin/announce",
+            "udp://192.168.1.1:53",
+            "udp://127.0.0.1:5432/announce",
+            "http://100.100.1.1:8443/announce",
+            "http://10.0.0.1/announce",
+            "udp://[::1]:6969/announce",
+            "udp://[fd00::1]:6969/announce",
+            "http://[::ffff:192.168.1.1]/announce",
+            "http://169.254.169.254/announce",
+            "http://localhost:8080/announce",
+            "udp://tracker.localhost:6969",
+        ] {
+            assert_eq!(valid_tracker(bad), None, "{bad}");
+        }
+        assert!(valid_tracker("udp://1.1.1.1:6969/announce").is_some());
+        assert!(valid_tracker("http://[2606:4700::1111]/announce").is_some());
     }
 
     #[test]

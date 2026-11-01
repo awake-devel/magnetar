@@ -20,6 +20,7 @@ use tokio::time::Instant;
 
 use crate::ingest::{IngestOutcome, ingest_into};
 use crate::model::*;
+use crate::netaddr::AddrPolicy;
 use crate::relay::{CONNECT_TIMEOUT, RelayConn};
 use crate::relayurl::normalize_relay;
 use crate::store::{Store, keys};
@@ -157,8 +158,14 @@ pub async fn crawl_once<S: Store + ?Sized>(
         hints: Mutex::new(HashMap::new()),
     };
 
-    let urls = select_relays(store, cfg, now).await?;
-    let mut runs: Vec<RelayRun> = urls.into_iter().map(RelayRun::new).collect();
+    let urls = select_relays_trusted(store, cfg, now).await?;
+    let mut runs: Vec<RelayRun> = urls
+        .into_iter()
+        .map(|(url, trusted)| RelayRun {
+            trusted,
+            ..RelayRun::new(url)
+        })
+        .collect();
     let concurrency = cfg.concurrency.max(1);
 
     // Phase 1: connect + forward sweeps everywhere.
@@ -256,6 +263,21 @@ pub async fn select_relays<S: Store + ?Sized>(
     cfg: &CrawlConfig,
     now: i64,
 ) -> crate::Result<Vec<String>> {
+    Ok(select_relays_trusted(store, cfg, now)
+        .await?
+        .into_iter()
+        .map(|(url, _)| url)
+        .collect())
+}
+
+/// [`select_relays`] with whether each relay is trusted config (a seed, or stored as `seed` /
+/// `manual`). Only trusted relays may sit on the LAN; every other one is connected through the
+/// address policy (D112).
+async fn select_relays_trusted<S: Store + ?Sized>(
+    store: &S,
+    cfg: &CrawlConfig,
+    now: i64,
+) -> crate::Result<Vec<(String, bool)>> {
     let infos: HashMap<String, RelayInfo> = store
         .list_relays()
         .await?
@@ -293,8 +315,8 @@ pub async fn select_relays<S: Store + ?Sized>(
         }
     }
 
-    // (events_found, next_try_at, seed position, publishers listing it, url)
-    let mut cands: Vec<(u64, i64, usize, u32, String)> = Vec::new();
+    // (events_found, next_try_at, seed position, publishers listing it, url, trusted)
+    let mut cands: Vec<(u64, i64, usize, u32, String, bool)> = Vec::new();
     let mut seen: HashSet<&str> = HashSet::new();
     for url in seeds.keys().chain(freq.keys()).chain(infos.keys()) {
         if !seen.insert(url.as_str()) {
@@ -316,6 +338,7 @@ pub async fn select_relays<S: Store + ?Sized>(
             seeds.get(url).copied().unwrap_or(usize::MAX),
             freq.get(url).copied().unwrap_or(0),
             url.clone(),
+            trusted,
         ));
     }
     let (mut proven, mut rotation): (Vec<_>, Vec<_>) = cands.into_iter().partition(|c| c.0 > 0);
@@ -333,7 +356,11 @@ pub async fn select_relays<S: Store + ?Sized>(
             .then(a.4.cmp(&b.4))
     });
 
-    let mut out: Vec<String> = proven.into_iter().chain(rotation).map(|c| c.4).collect();
+    let mut out: Vec<(String, bool)> = proven
+        .into_iter()
+        .chain(rotation)
+        .map(|c| (c.4, c.5))
+        .collect();
     out.truncate(cfg.max_relays);
     Ok(out)
 }
@@ -355,11 +382,15 @@ struct RelayRun {
     /// Of `found`, new torrent events (kind 2003): `relays.torrents_found` (D102).
     torrents: u64,
     new_torrents: Vec<String>,
+    /// Configured relay (seed, manual, indexer): connected as is, LAN allowed. Others go
+    /// through the address policy (D112).
+    trusted: bool,
 }
 
 impl RelayRun {
     fn new(url: String) -> Self {
         Self {
+            trusted: true,
             url,
             conn: None,
             attempted: false,
@@ -439,7 +470,13 @@ impl<'a, S: Store + ?Sized> Ctx<'a, S> {
             return;
         }
         run.attempted = true;
-        match RelayConn::connect(&run.url, left.min(CONNECT_TIMEOUT)).await {
+        let timeout = left.min(CONNECT_TIMEOUT);
+        let conn = if run.trusted {
+            RelayConn::connect(&run.url, timeout).await
+        } else {
+            RelayConn::connect_checked(&run.url, timeout, AddrPolicy::PUBLIC).await
+        };
+        match conn {
             Ok(c) => {
                 run.conn = Some(c);
                 run.connected = true;
