@@ -16,6 +16,7 @@ use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
 use crate::error::{Error, Result};
 use crate::model::RawEvent;
+use crate::netaddr::AddrPolicy;
 
 pub const MAX_MESSAGE_BYTES: usize = 16 << 20;
 /// Connect never waits longer than this, whatever the caller asks.
@@ -132,6 +133,18 @@ fn tls() -> Arc<rustls::ClientConfig> {
         .clone()
 }
 
+/// TCP connect to the first of `addrs` (all already checked) that answers.
+async fn connect_any(addrs: &[std::net::SocketAddr]) -> std::io::Result<TcpStream> {
+    let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, "no address");
+    for a in addrs {
+        match TcpStream::connect(a).await {
+            Ok(s) => return Ok(s),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 /// NOTICEs that mean the current REQ will never get its EOSE (strfry answers malformed or
 /// unsupported REQs with a NOTICE only).
 fn notice_is_fatal(msg: &str) -> bool {
@@ -150,8 +163,23 @@ fn notice_is_fatal(msg: &str) -> bool {
 }
 
 impl RelayConn {
-    /// Connect to a ws(s):// url (query string kept, e.g. `?token=` for our own relay).
+    /// Connect to a ws(s):// url (query string kept, e.g. `?token=` for our own relay). For
+    /// trusted URLs only (our own server, configured seeds and indexers, which may live on the
+    /// LAN): it connects wherever DNS says. A relay URL learned from events goes through
+    /// [`RelayConn::connect_checked`].
     pub async fn connect(url: &str, timeout: Duration) -> Result<Self> {
+        Self::open(url, timeout, None).await
+    }
+
+    /// [`RelayConn::connect`] for an untrusted relay URL (D112): the host is resolved here, only
+    /// addresses `policy` allows are kept ([`Error::Refused`] if none is), and the TCP connect
+    /// goes to one of those checked addresses, so a name with A records for 192.168.1.1, a
+    /// compose-network or tailnet address never gets the upgrade request.
+    pub async fn connect_checked(url: &str, timeout: Duration, policy: AddrPolicy) -> Result<Self> {
+        Self::open(url, timeout, Some(policy)).await
+    }
+
+    async fn open(url: &str, timeout: Duration, policy: Option<AddrPolicy>) -> Result<Self> {
         let err = |msg: String| Error::Relay {
             relay: url.to_string(),
             msg,
@@ -162,16 +190,53 @@ impl RelayConn {
         let config = WebSocketConfig::default()
             .max_message_size(Some(MAX_MESSAGE_BYTES))
             .max_frame_size(Some(MAX_MESSAGE_BYTES));
-        let connect = tokio_tungstenite::connect_async_tls_with_config(
-            request,
-            Some(config),
-            true,
-            Some(Connector::Rustls(tls())),
-        );
-        let (ws, _) = tokio::time::timeout(timeout.min(CONNECT_TIMEOUT), connect)
-            .await
-            .map_err(|_| Error::Timeout(format!("connect {url}")))?
-            .map_err(|e| err(format!("connect: {e}")))?;
+        let timeout = timeout.min(CONNECT_TIMEOUT);
+        let deadline = Instant::now() + timeout;
+        let ws = match policy {
+            None => {
+                let connect = tokio_tungstenite::connect_async_tls_with_config(
+                    request,
+                    Some(config),
+                    true,
+                    Some(Connector::Rustls(tls())),
+                );
+                tokio::time::timeout_at(deadline, connect)
+                    .await
+                    .map_err(|_| Error::Timeout(format!("connect {url}")))?
+                    .map_err(|e| err(format!("connect: {e}")))?
+                    .0
+            }
+            Some(policy) => {
+                let uri = request.uri();
+                let host = uri
+                    .host()
+                    .ok_or_else(|| err("bad url: no host".into()))?
+                    .to_string();
+                let port = match (uri.port_u16(), uri.scheme_str()) {
+                    (Some(p), _) => p,
+                    (None, Some("wss")) => 443,
+                    (None, Some("ws")) => 80,
+                    _ => return Err(err("bad url: not ws/wss".into())),
+                };
+                let addrs = policy.resolve(url, &host, port, timeout).await?;
+                let stream = tokio::time::timeout_at(deadline, connect_any(&addrs))
+                    .await
+                    .map_err(|_| Error::Timeout(format!("connect {url}")))?
+                    .map_err(|e| err(format!("connect: {e}")))?;
+                let _ = stream.set_nodelay(true);
+                let handshake = tokio_tungstenite::client_async_tls_with_config(
+                    request,
+                    stream,
+                    Some(config),
+                    Some(Connector::Rustls(tls())),
+                );
+                tokio::time::timeout_at(deadline, handshake)
+                    .await
+                    .map_err(|_| Error::Timeout(format!("connect {url}")))?
+                    .map_err(|e| err(format!("connect: {e}")))?
+                    .0
+            }
+        };
         Ok(Self {
             url: url.to_string(),
             ws,

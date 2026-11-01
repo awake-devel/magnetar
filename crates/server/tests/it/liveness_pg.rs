@@ -62,6 +62,8 @@ fn service() -> LivenessService {
         use_dht: false,
         tracker_rps: 100.0,
         tracker_timeout: std::time::Duration::from_millis(300),
+        // The fake trackers live on 127.0.0.1 (D112 test seam).
+        addr_policy: magnetar_core::liveness::AddrPolicy::loopback_for_tests(),
         ..Default::default()
     })
 }

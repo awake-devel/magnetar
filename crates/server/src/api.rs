@@ -150,6 +150,7 @@ impl From<Error> for ApiError {
             Error::Network(_) | Error::Relay { .. } | Error::Server { .. } => {
                 (StatusCode::BAD_GATEWAY, "upstream")
             }
+            Error::Refused(_) => (StatusCode::BAD_GATEWAY, "refused"),
             Error::Timeout(_) => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
             Error::Store(_) => (StatusCode::INTERNAL_SERVER_ERROR, "store"),
             Error::Other(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),

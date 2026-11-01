@@ -89,6 +89,74 @@ fn info(id: usize, h: &ManagedTorrent) -> DownloadInfo {
     }
 }
 
+/// File (under `state_dir`) holding librqbit's peer blocklist.
+const PEER_BLOCKLIST_FILE: &str = "peer-blocklist.txt";
+
+/// The shared address policy's ranges (D112) in the P2P blocklist format librqbit reads
+/// (`name:first-last`, one range per line), plus the IPv4-mapped form of every IPv4 range.
+/// librqbit checks it before every outgoing peer connect and on every incoming one, so a tracker
+/// or DHT peer cannot make a download dial 192.168.1.1, 127.0.0.1 or the tailnet. NAT64 and 6to4
+/// addresses that embed a private IPv4 address are not listed (librqbit matches ranges only).
+pub fn peer_blocklist() -> String {
+    use crate::netaddr::{BLOCKED_V4, BLOCKED_V6};
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    let mut out = String::from("# magnetar: non-public ranges (D112)\n");
+    for &(net, len) in BLOCKED_V4 {
+        let first = u32::from(net);
+        let last = first | (u32::MAX.checked_shr(u32::from(len)).unwrap_or(0));
+        let (a, b) = (Ipv4Addr::from(first), Ipv4Addr::from(last));
+        out.push_str(&format!("local:{a}-{b}\n"));
+        let mapped = |v: Ipv4Addr| v.to_ipv6_mapped();
+        out.push_str(&format!("mapped:{}-{}\n", mapped(a), mapped(b)));
+    }
+    // ::ffff:0:0/96 (IPv4-mapped) is cut out of the IPv6 ranges that contain it (::/8): mapped
+    // addresses are judged by their IPv4 part, listed above.
+    let mapped_first = u128::from(Ipv4Addr::UNSPECIFIED.to_ipv6_mapped());
+    let mapped_last = u128::from(Ipv4Addr::BROADCAST.to_ipv6_mapped());
+    let mut push6 = |first: u128, last: u128| {
+        let (a, b) = (Ipv6Addr::from(first), Ipv6Addr::from(last));
+        out.push_str(&format!("local6:{a}-{b}\n"));
+    };
+    for &(net, len) in BLOCKED_V6 {
+        let first = u128::from(net);
+        let last = first | (u128::MAX.checked_shr(u32::from(len)).unwrap_or(0));
+        if first <= mapped_first && mapped_last <= last {
+            push6(first, mapped_first - 1);
+            push6(mapped_last + 1, last);
+        } else {
+            push6(first, last);
+        }
+    }
+    out
+}
+
+/// Session options: persistence and DHT state under `state_dir`, peer blocklist written there.
+async fn session_options(state_dir: &std::path::Path) -> Result<SessionOptions> {
+    let path = state_dir.join(PEER_BLOCKLIST_FILE);
+    tokio::fs::write(&path, peer_blocklist())
+        .await
+        .map_err(|e| Error::Other(format!("write {}: {e}", path.display())))?;
+    let blocklist_url = url::Url::from_file_path(&path)
+        .map_err(|()| Error::Other(format!("blocklist path {}", path.display())))?;
+    Ok(SessionOptions {
+        dht: Some(DhtSessionConfig {
+            bootstrap_addrs: None,
+            port: None,
+            persistence: Some(DhtPersistenceConfig {
+                dump_interval: None,
+                config_filename: Some(state_dir.join("dht.json")),
+            }),
+        }),
+        persistence: Some(SessionPersistenceConfig::Json {
+            folder: Some(state_dir.join("session")),
+        }),
+        fastresume: true,
+        client_name_and_version: Some(concat!("magnetar/", env!("CARGO_PKG_VERSION")).into()),
+        blocklist_url: Some(blocklist_url.into()),
+        ..Default::default()
+    })
+}
+
 impl Downloader {
     /// Explicit session + DHT persistence under `state_dir` (never ProjectDirs).
     pub async fn new(output_dir: PathBuf, state_dir: PathBuf) -> Result<Self> {
@@ -98,22 +166,7 @@ impl Downloader {
                 .await
                 .map_err(|e| Error::Other(format!("create {}: {e}", d.display())))?;
         }
-        let opts = SessionOptions {
-            dht: Some(DhtSessionConfig {
-                bootstrap_addrs: None,
-                port: None,
-                persistence: Some(DhtPersistenceConfig {
-                    dump_interval: None,
-                    config_filename: Some(state_dir.join("dht.json")),
-                }),
-            }),
-            persistence: Some(SessionPersistenceConfig::Json {
-                folder: Some(session_dir),
-            }),
-            fastresume: true,
-            client_name_and_version: Some(concat!("magnetar/", env!("CARGO_PKG_VERSION")).into()),
-            ..Default::default()
-        };
+        let opts = session_options(&state_dir).await?;
         let session = Session::new_with_opts(output_dir.clone(), opts)
             .await
             .map_err(other)?;
@@ -287,6 +340,56 @@ impl Downloader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D112: the session librqbit builds from our options refuses LAN, loopback, tailnet, ULA
+    /// and link-local peers. The session is started without DHT, listener or LSD, so nothing
+    /// leaves the machine.
+    #[tokio::test]
+    async fn session_blocks_local_peers() {
+        let dir = std::env::temp_dir().join(format!("magnetar-dl-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        let opts = SessionOptions {
+            dht: None,
+            listen: None,
+            persistence: None,
+            fastresume: false,
+            disable_local_service_discovery: true,
+            disable_trackers: true,
+            ..session_options(&dir).await.unwrap()
+        };
+        let session = Session::new_with_opts(dir.join("out"), opts).await.unwrap();
+        for ip in [
+            "192.168.1.1",
+            "127.0.0.1",
+            "10.1.2.3",
+            "100.100.1.1",
+            "172.18.0.2",
+            "169.254.1.1",
+            "0.0.0.0",
+            // 255.255.255.255 is the one gap: librqbit stores ranges end-exclusive with a
+            // saturating +1, so the very last address cannot be listed (a TCP connect to the
+            // broadcast address fails anyway). 255.255.255.254 is in.
+            "255.255.255.254",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:192.168.1.1",
+        ] {
+            let ip: std::net::IpAddr = ip.parse().unwrap();
+            assert!(session.blocklist.has(ip), "{ip} must be blocked");
+        }
+        for ip in [
+            "1.1.1.1",
+            "87.98.162.88",
+            "2606:4700::1111",
+            "::ffff:1.1.1.1",
+        ] {
+            let ip: std::net::IpAddr = ip.parse().unwrap();
+            assert!(!session.blocklist.has(ip), "{ip} must stay allowed");
+        }
+        session.stop().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[tokio::test]
     async fn session_lifecycle_offline() {

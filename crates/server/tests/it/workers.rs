@@ -789,6 +789,8 @@ async fn two_workers_share_seed_checks_and_the_dht() {
         use_dht: false,
         tracker_rps: 100.0,
         tracker_timeout: Duration::from_millis(300),
+        // The fake tracker lives on 127.0.0.1 (D112 test seam).
+        addr_policy: magnetar_core::liveness::AddrPolicy::loopback_for_tests(),
         ..Default::default()
     };
     let (_tx, stop) = tokio::sync::watch::channel(false);

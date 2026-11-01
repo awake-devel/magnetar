@@ -22,12 +22,20 @@ pub fn tls_config() -> rustls::ClientConfig {
         .with_no_client_auth()
 }
 
-/// reqwest client with our TLS config and a timeout.
-pub fn client(timeout: Duration) -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+/// Builder with our user agent, TLS config and timeouts.
+pub fn builder(timeout: Duration) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
         .user_agent(concat!("magnetar/", env!("CARGO_PKG_VERSION")))
         .timeout(timeout)
         .connect_timeout(Duration::from_secs(10))
         .tls_backend_preconfigured(tls_config())
-        .build()?)
+}
+
+/// reqwest client with our TLS config and a timeout, for first-party and configured hosts only
+/// (our own server, TMDB, IMDb datasets, GeoIP, ntfy, AniDB lists). It follows redirects
+/// (reqwest's default, 10 hops) and connects wherever DNS says: never use it for a URL that came
+/// from a Nostr event, a tracker or a DHT peer. Trackers use
+/// [`crate::liveness::http::TrackerClient`] (no redirects, address policy at connect, D112).
+pub fn client(timeout: Duration) -> Result<reqwest::Client> {
+    Ok(builder(timeout).build()?)
 }

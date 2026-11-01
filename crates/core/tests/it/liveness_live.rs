@@ -46,9 +46,14 @@ async fn udp_live(tracker: &str) {
     let items = fixture();
     let hashes: Vec<[u8; 20]> = items.iter().map(|(h, _)| raw(h)).collect();
     let start = Instant::now();
-    let res = udp::scrape(tracker, &hashes, Duration::from_secs(3))
-        .await
-        .unwrap();
+    let res = udp::scrape(
+        tracker,
+        &hashes,
+        Duration::from_secs(3),
+        liveness::AddrPolicy::PUBLIC,
+    )
+    .await
+    .unwrap();
     let answered = res.iter().flatten().count();
     let alive = res.iter().flatten().filter(|s| s.seeders > 0).count();
     let top = res.iter().flatten().map(|s| s.seeders).max();
@@ -83,7 +88,8 @@ async fn live_http_nyaa() {
         .collect();
     assert!(!items.is_empty());
     let hashes: Vec<[u8; 20]> = items.iter().map(|(h, _)| raw(h)).collect();
-    let client = magnetar_core::http::client(Duration::from_secs(10)).unwrap();
+    let client =
+        http::TrackerClient::new(Duration::from_secs(10), liveness::AddrPolicy::PUBLIC).unwrap();
     let start = Instant::now();
     let res = http::scrape(&client, tracker, &hashes).await.unwrap();
     for ((h, _), s) in items.iter().zip(&res) {

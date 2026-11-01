@@ -16,6 +16,10 @@ pub enum Error {
     Server { status: u16, msg: String },
     #[error("store: {0}")]
     Store(String),
+    /// An outbound target resolved to a loopback, private, link-local, tailnet or other
+    /// non-public address and was not contacted (D112, `netaddr`).
+    #[error("refused: {0}")]
+    Refused(String),
     #[error("timeout: {0}")]
     Timeout(String),
     #[error("{0}")]

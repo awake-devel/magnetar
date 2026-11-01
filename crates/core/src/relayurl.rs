@@ -84,30 +84,15 @@ pub fn normalize_relay(raw: &str, allow_onion: bool) -> Option<String> {
     (s.len() <= MAX_RELAY_URL_LEN).then_some(s)
 }
 
+/// The shared address policy (D112). A literal is only the first check: a relay learned from
+/// events is also checked on its resolved address when connected
+/// ([`crate::relay::RelayConn::connect_checked`]).
 fn public_v4(ip: Ipv4Addr) -> bool {
-    let [a, b, ..] = ip.octets();
-    !(ip.is_private()
-        || ip.is_loopback()
-        || ip.is_link_local()
-        || ip.is_unspecified()
-        || ip.is_broadcast()
-        || ip.is_documentation()
-        || ip.is_multicast()
-        || a == 0
-        // 100.64.0.0/10 carrier-grade NAT (also Tailscale).
-        || (a == 100 && (64..128).contains(&b)))
+    crate::netaddr::is_public_v4(ip)
 }
 
 fn public_v6(ip: Ipv6Addr) -> bool {
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return public_v4(v4);
-    }
-    let first = ip.segments()[0];
-    !(ip.is_loopback()
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        || (first & 0xfe00) == 0xfc00 // unique local
-        || (first & 0xffc0) == 0xfe80) // link local
+    crate::netaddr::is_public_v6(ip)
 }
 
 #[cfg(test)]

@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 use crate::model::{Liveness, LivenessSource};
+pub use crate::netaddr::AddrPolicy;
 use crate::store::Store;
 use udp::ScrapeStats;
 
@@ -69,6 +70,10 @@ pub struct LivenessConfig {
     /// when they report seeders: zero from a tracker the torrent never named means "not
     /// registered there", so the DHT is asked instead (D45).
     pub fallback_trackers: Vec<String>,
+    /// Addresses tracker scrapes and DHT walks may be sent to (D112): public only. Tests with
+    /// fake trackers or nodes on 127.0.0.1 use [`AddrPolicy::loopback_for_tests`]; no setting
+    /// changes it.
+    pub addr_policy: AddrPolicy,
 }
 
 impl Default for LivenessConfig {
@@ -83,6 +88,7 @@ impl Default for LivenessConfig {
             dht_pacer: None,
             extra_trackers: Vec::new(),
             fallback_trackers: Vec::new(),
+            addr_policy: AddrPolicy::PUBLIC,
         }
     }
 }
@@ -123,7 +129,7 @@ pub async fn check_batch(
 /// Tracker and DHT state shared by every batch of a long-lived checker.
 pub struct Scraper {
     cfg: LivenessConfig,
-    http: Option<reqwest::Client>,
+    http: Option<http::TrackerClient>,
     trackers: Mutex<HashMap<Tracker, Arc<tokio::sync::Mutex<Slot>>>>,
     dht_nodes: dht::NodeCache,
 }
@@ -172,7 +178,7 @@ impl Scraper {
 
     /// With an explicit DHT node cache (tests point it at local nodes).
     pub fn with_dht_nodes(cfg: LivenessConfig, nodes: dht::NodeCache) -> Self {
-        let http = crate::http::client(cfg.tracker_timeout * 2).ok();
+        let http = http::TrackerClient::new(cfg.tracker_timeout * 2, cfg.addr_policy).ok();
         Self {
             cfg,
             http,
@@ -268,7 +274,7 @@ impl Scraper {
                 Tracker::Udp(url) => {
                     let timeout = self.cfg.tracker_timeout;
                     slot.udp
-                        .get_or_insert_with(|| udp::UdpTracker::new(url))
+                        .get_or_insert_with(|| udp::UdpTracker::new(url, self.cfg.addr_policy))
                         .scrape_chunk(&chunk, timeout)
                         .await
                 }
@@ -419,6 +425,7 @@ impl Scraper {
                             &raw_ref[i],
                             cfg.dht_budget,
                             cfg.dht_pacer.as_deref(),
+                            cfg.addr_policy,
                         )
                         .await,
                     )
