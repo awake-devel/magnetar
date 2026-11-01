@@ -66,11 +66,20 @@ real hardware are marked **UNVERIFIED**.
   you run on your own LAN or tailnet: seed checks, untrusted relays and the DHT walk only talk
   to public addresses, and there is no setting to change that. Configured relays (seeds,
   indexers, monitors) may still be local. [D112]
+- **Our own public address is refused only once it is known**: interface addresses (and the
+  /64 of each public IPv6 one) always, the WAN IPv4 only after the DHT crawler's vote, a UPnP
+  answer or `MAGNETAR_OWN_ADDRS`. The server container with `MAGNETAR_DHT=off` needs the
+  setting. Interface reads on Android are **UNVERIFIED**. [D112]
+- **Tracker scrapes ignore `HTTP_PROXY`/`HTTPS_PROXY`**: a proxy would resolve tracker names
+  itself, past the address check. [D112]
 - **Downloads only partly follow the address policy.** librqbit gets a peer blocklist of the
   private, loopback, CGNAT/tailnet, ULA and link-local ranges (and their IPv4-mapped forms),
-  checked before every peer connection. Its own tracker requests and its own DHT node are not
-  filtered, and NAT64/6to4 forms of private addresses are not in the list. Downloads are off by
-  default (`MAGNETAR_DOWNLOADS=false`); the blocklist is **UNVERIFIED** against a live swarm
+  checked before every peer connection, plus our own addresses as they are when the session
+  starts. Magnet `tr=` trackers on a private or own literal or a `localhost` name are dropped
+  before librqbit sees them, but a tracker *name* that resolves to a private address is still
+  announced to, and librqbit's own DHT node is not filtered. NAT64/6to4 forms of private
+  addresses are not in the list. `MAGNETAR_DOWNLOADS` defaults to
+  `true`; set it to `false` to keep librqbit off; the blocklist is **UNVERIFIED** against a live swarm
   (only checked on a session built offline). [D112]
 
 ## Android

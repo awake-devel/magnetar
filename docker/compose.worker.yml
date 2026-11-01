@@ -52,6 +52,8 @@ services:
       MAGNETAR_LIVENESS_DHT_QPS: ${MAGNETAR_LIVENESS_DHT_QPS:-20}
       # Crawl map (docs/CRAWLMAP.md): on | country | off; databases in the worker state dir.
       MAGNETAR_GEOIP: ${MAGNETAR_GEOIP:-on}
+      # Our own addresses, never contacted (D112); the crawler's vote adds the WAN IPv4 itself.
+      MAGNETAR_OWN_ADDRS: ${MAGNETAR_OWN_ADDRS:-}
       RUST_LOG: ${RUST_LOG:-info}
     # Only when Docker's DNS cannot resolve a Tailscale (MagicDNS) name: set both variables
     # (the server's name and its `tailscale ip -4`). The default entry is inert.

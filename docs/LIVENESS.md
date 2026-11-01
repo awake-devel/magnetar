@@ -50,20 +50,31 @@ or node could aim checks at the home router, Postgres on 127.0.0.1, a tailnet se
 LAN host. Every target is checked against one policy (`netaddr::is_public`: no loopback,
 RFC 1918, 100.64/10 CGNAT/Tailscale, link-local, ULA fd00::/8 and the rest of fc00::/7,
 multicast, documentation, benchmarking or reserved ranges, and no IPv4-mapped, NAT64 or 6to4
-address carrying one of those) on the address actually connected to, after DNS:
+address carrying one of those) on the address actually connected to, after DNS. Our own
+public addresses are refused too: this host's public interface addresses and the /64 of each
+public IPv6 one (where the other LAN hosts live), the WAN address the DHT crawler or UPnP
+learns, and `MAGNETAR_OWN_ADDRS`. Any IPv4 spelling a resolver accepts (`127.1`,
+`2130706433`, `0x7f.0.0.1`, a trailing dot) counts as the address it spells.
 
 - HTTP trackers: an IP-literal host is checked before the request; a name goes through a DNS
-  resolver that keeps only public addresses, so the connect goes to a checked one. Redirects
-  are never followed (a 3xx is a failed scrape) and no proxy is used.
+  resolver that keeps only public addresses, so the connect goes to a checked one. Up to 3
+  redirects are followed, each hop checked the same way (a 4th, or a hop to a refused
+  address, is a failed scrape). No proxy is used: a proxy would resolve the name itself, past
+  the check, so `HTTP_PROXY`/`HTTPS_PROXY` do not apply to scrapes.
 - UDP trackers: the name is resolved through the policy and the socket is connected to the
   checked address.
 - DHT walks: seeds and every `nodes` entry are checked before a query is sent; the node cache
   only holds nodes that passed.
-- At ingest, trackers with a non-public IP literal or a `localhost` name are not stored, so
-  workers never lease them either.
+- At ingest, trackers with a non-public IP literal (in any spelling) or a `localhost` name are
+  not stored, so workers never lease them either.
 
 A refused tracker fails like an unreachable one (`Error::Refused`) and backs off. There is no
 setting to allow private targets; only in-process tests use a loopback seam.
+
+The server container on the Docker bridge has only private interface addresses and, with
+`MAGNETAR_DHT=off`, no DHT vote: it knows the line's WAN address only from UPnP or from
+`MAGNETAR_OWN_ADDRS` (set it to the WAN IPv4 to close the hairpin case). Workers learn it from
+their crawler's vote once it settles.
 
 ### Node farms on the DHT
 
