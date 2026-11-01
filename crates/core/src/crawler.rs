@@ -270,9 +270,10 @@ pub async fn select_relays<S: Store + ?Sized>(
         .collect())
 }
 
-/// [`select_relays`] with whether each relay is trusted config (a seed, or stored as `seed` /
-/// `manual`). Only trusted relays may sit on the LAN; every other one is connected through the
-/// address policy (D112).
+/// [`select_relays`] with whether each relay is trusted config: one of the current
+/// `cfg.seed_relays`, or a row stored as `manual`. A row stored as `seed` whose URL is no longer
+/// configured is not trusted. Only trusted relays may sit on the LAN; every other one is
+/// connected through the address policy (D112).
 async fn select_relays_trusted<S: Store + ?Sized>(
     store: &S,
     cfg: &CrawlConfig,
@@ -326,9 +327,9 @@ async fn select_relays_trusted<S: Store + ?Sized>(
         if info.is_some_and(|i| !i.enabled || i.next_try_at > now) {
             continue;
         }
-        // Rows learned from events before the normalizer rejected them (e.g. a LAN host).
-        let trusted = seeds.contains_key(url)
-            || info.is_some_and(|i| matches!(i.source.as_str(), "seed" | "manual"));
+        // Rows learned from events before the normalizer rejected them (e.g. a LAN host), and
+        // seeds since removed from the config, are not trusted.
+        let trusted = seeds.contains_key(url) || info.is_some_and(|i| i.source == "manual");
         if !trusted && normalize_relay(url, false).is_none() {
             continue;
         }
@@ -382,15 +383,16 @@ struct RelayRun {
     /// Of `found`, new torrent events (kind 2003): `relays.torrents_found` (D102).
     torrents: u64,
     new_torrents: Vec<String>,
-    /// Configured relay (seed, manual, indexer): connected as is, LAN allowed. Others go
-    /// through the address policy (D112).
+    /// Configured relay (current seed, manual row, indexer): connected as is, LAN allowed.
+    /// Others go through the address policy (D112). [`RelayRun::new`] starts untrusted; only
+    /// `crawl_once` (from the selection) and the indexer phase set it.
     trusted: bool,
 }
 
 impl RelayRun {
     fn new(url: String) -> Self {
         Self {
-            trusted: true,
+            trusted: false,
             url,
             conn: None,
             attempted: false,
@@ -402,6 +404,15 @@ impl RelayRun {
             found: 0,
             torrents: 0,
             new_torrents: Vec::new(),
+        }
+    }
+
+    /// Connect: as is when trusted, else through the address policy (D112).
+    async fn open(&self, timeout: Duration) -> crate::Result<RelayConn> {
+        if self.trusted {
+            RelayConn::connect(&self.url, timeout).await
+        } else {
+            RelayConn::connect_checked(&self.url, timeout, AddrPolicy::PUBLIC).await
         }
     }
 
@@ -471,12 +482,7 @@ impl<'a, S: Store + ?Sized> Ctx<'a, S> {
         }
         run.attempted = true;
         let timeout = left.min(CONNECT_TIMEOUT);
-        let conn = if run.trusted {
-            RelayConn::connect(&run.url, timeout).await
-        } else {
-            RelayConn::connect_checked(&run.url, timeout, AddrPolicy::PUBLIC).await
-        };
-        match conn {
+        match run.open(timeout).await {
             Ok(c) => {
                 run.conn = Some(c);
                 run.connected = true;
@@ -793,7 +799,11 @@ impl<'a, S: Store + ?Sized> Ctx<'a, S> {
         let publishers_ref = &publishers;
         futures::stream::iter(indexers)
             .for_each_concurrent(self.cfg.concurrency.max(1), |url| async move {
-                let mut run = RelayRun::new(url);
+                // Indexers are configuration (`cfg.indexers`).
+                let mut run = RelayRun {
+                    trusted: true,
+                    ..RelayRun::new(url)
+                };
                 let work = self.metadata_from(&mut run, root_ref, publishers_ref, deadline);
                 let _ = tokio::time::timeout_at(deadline + GRACE, work).await;
                 if let Some(conn) = run.conn.take() {
@@ -830,7 +840,7 @@ impl<'a, S: Store + ?Sized> Ctx<'a, S> {
         deadline: Instant,
     ) {
         let left = deadline.saturating_duration_since(Instant::now());
-        match RelayConn::connect(&run.url, left.min(CONNECT_TIMEOUT)).await {
+        match run.open(left.min(CONNECT_TIMEOUT)).await {
             Ok(c) => run.conn = Some(c),
             Err(e) => {
                 self.error(&run.url, &e.to_string());
@@ -1106,6 +1116,13 @@ mod tests {
         ] {
             assert!(!is_refusal(r), "{r}");
         }
+    }
+
+    /// D112: a run is untrusted unless its caller says otherwise, so a relay URL that reaches
+    /// a new code path goes through the address policy.
+    #[test]
+    fn relay_runs_start_untrusted() {
+        assert!(!RelayRun::new("ws://192.168.1.1:7777".into()).trusted);
     }
 
     #[test]

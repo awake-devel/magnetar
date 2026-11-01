@@ -542,7 +542,8 @@ test):
   resolved names and pass the same check). Counted in stats, never logged per address. The
   ranges are the crate-wide policy `netaddr::is_public` (D112), which also drops the
   documentation nets and 192.88.99/24, and which the seed checker's DHT walk, tracker scrapes,
-  untrusted relays and librqbit's peer blocklist use too.
+  untrusted relays and librqbit's peer blocklist use too. The external address the vote settles
+  on is also handed to that policy (`netaddr::OWN`), so those other paths refuse it as well.
 - **Reflection**: our responses are at most a few hundred bytes larger than the query; the
   response caps of §3.4 rule 4 (300/s, 5/s per IP) bound what a spoofed-source flood can
   reflect.

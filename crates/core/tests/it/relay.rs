@@ -168,7 +168,10 @@ async fn connect_failures() {
 }
 
 /// D112: an untrusted relay URL whose host is (or resolves to) a non-public address gets no
-/// TCP connect at all; with the test seam the checked connect reaches a real relay.
+/// TCP connect at all; with the test seam the checked connect reaches a real relay. Only
+/// loopback targets: if the policy regressed, a LAN or tailnet URL here would make the test
+/// connect to the router or the tailnet. Those ranges are covered without a connect by
+/// `netaddr::tests` (`AddrPolicy::resolve` on literals).
 #[tokio::test]
 async fn connect_checked_refuses_local_relays() {
     use magnetar_core::netaddr::AddrPolicy;
@@ -190,9 +193,8 @@ async fn connect_checked_refuses_local_relays() {
         format!("ws://localhost:{port}"),
         format!("ws://127.0.0.1:{port}/any/path"),
         format!("ws://[::ffff:127.0.0.1]:{port}"),
-        "wss://192.168.1.1".to_string(),
-        "ws://100.100.1.1:8443".to_string(),
-        "ws://[fd00::1]:80".to_string(),
+        format!("ws://127.1:{port}"),
+        format!("ws://2130706433:{port}"),
     ] {
         let err = RelayConn::connect_checked(&url, T, AddrPolicy::PUBLIC)
             .await
