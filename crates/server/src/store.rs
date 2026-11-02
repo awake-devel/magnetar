@@ -696,6 +696,9 @@ impl PgStore {
         };
         let magnet = magnet::build_magnet(infohash, Some(&d.title), &[], total_size);
         let files = d.files.0.clone();
+        let probe = crate::probes::probe_for(&self.pool, infohash, &files)
+            .await
+            .map_err(db)?;
         Ok(TorrentDetail {
             summary,
             description: String::new(),
@@ -725,6 +728,7 @@ impl PgStore {
             comments: Vec::new(),
             media,
             dht: Some(d.info()),
+            probe,
         })
     }
 
@@ -1600,6 +1604,17 @@ impl Store for PgStore {
             })
             .collect();
         let magnet = magnet::build_magnet(infohash, Some(&canon.title), &trackers, total_size);
+        // D117: probe indexes point into the `files` shown (the Nostr event's here), and an
+        // adult Nostr row shows no probe either.
+        let probe = if dht.is_some()
+            && !crate::probes::adult(&canon.category, &canon.title, &canon.files.0)
+        {
+            crate::probes::probe_for(&self.pool, infohash, &canon.files.0)
+                .await
+                .map_err(db)?
+        } else {
+            None
+        };
         Ok(Some(TorrentDetail {
             summary,
             description: canon.description.clone(),
@@ -1615,6 +1630,7 @@ impl Store for PgStore {
             comments: comments.into_iter().map(Into::into).collect(),
             media,
             dht: dht.map(DhtDetailRow::info),
+            probe,
         }))
     }
 

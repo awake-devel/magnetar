@@ -471,7 +471,7 @@ async fn crawler_maps_its_ports_and_reports_live_stats() {
         metadata_max: 1 << 20,
         tcp_rate: 1000,
         tcp_max: 350,
-        probe: Vec::new(),
+        health_targets: Vec::new(),
         screen: None,
         upnp: Some(cfg(gw)),
         service: Some(svc.clone()),

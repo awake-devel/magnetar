@@ -36,6 +36,8 @@ RestartSec=30
 RestartPreventExitStatus=2
 # Crawling keeps hundreds of TCP connections open.
 LimitNOFILE=65536
+# No core dumps: with header probes on, piece bytes are held in memory (D117).
+LimitCORE=0
 # Memory: the worker's own governor slows down at MAGNETAR_WORKER_RSS_MAX_MB (200 on a Pi);
 # these are the hard backstops.
 MemoryHigh=220M

@@ -48,6 +48,8 @@ pub const METRICS: &[&str] = &[
     crate::crawlmap::ROUTE_SERIES[3],
     crate::crawlmap::ROUTE_SERIES[4],
     crate::crawlmap::ROUTE_SERIES[5],
+    // D118: DHT rows a probe backfill added for Nostr-only torrents (not discoveries).
+    crate::probe_backfill::DHT_ROWS_SERIES,
     TORRENTS_TOTAL,
     TORRENTS_PUBLISHED,
     RELAYS_DISCOVERED,

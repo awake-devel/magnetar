@@ -168,13 +168,37 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
             )),
         });
     let cfg = Arc::new(cfg);
-    let mut daemons = vec![
-        tokio::spawn(daemons::crawler_loop(
+    // D118: with MAGNETAR_NOSTR_CRAWL=false no relay is contacted (crawl, indexer metadata,
+    // NIP-66 discovery); the saved-search notifier, which lives in the crawl loop, runs alone.
+    let nostr = daemons::nostr_loops(&cfg);
+    let mut daemons = Vec::new();
+    if nostr.crawl {
+        daemons.push(tokio::spawn(daemons::crawler_loop(
             store.clone(),
             cfg.clone(),
             state.crawler.clone(),
             stop_rx.clone(),
-        )),
+        )));
+    }
+    if nostr.discovery {
+        daemons.push(tokio::spawn(discovery::discovery_loop(
+            store.clone(),
+            cfg.clone(),
+            stop_rx.clone(),
+        )));
+    }
+    if nostr.notify_alone {
+        tracing::info!(
+            "Nostr relay crawl off (MAGNETAR_NOSTR_CRAWL=false): no relay crawl, indexer \
+             metadata or NIP-66 discovery; saved-search notifications still run"
+        );
+        daemons.push(tokio::spawn(daemons::notify_loop(
+            store.clone(),
+            cfg.clone(),
+            stop_rx.clone(),
+        )));
+    }
+    daemons.extend([
         tokio::spawn(liveness::liveness_loop(
             store.clone(),
             state.liveness.clone(),
@@ -183,11 +207,6 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
             stop_rx.clone(),
         )),
         tokio::spawn(daemons::trust_loop(store.clone(), stop_rx.clone())),
-        tokio::spawn(discovery::discovery_loop(
-            store.clone(),
-            cfg.clone(),
-            stop_rx.clone(),
-        )),
         tokio::spawn(enrich::enrich_loop(
             store.clone(),
             cfg.clone(),
@@ -200,7 +219,7 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
             cfg.clone(),
             stop_rx.clone(),
         )),
-    ];
+    ]);
     if let Some(svc) = &state.dht {
         daemons.push(tokio::spawn(crate::dht::dht_loop(
             store.pool().clone(),

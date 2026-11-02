@@ -30,7 +30,7 @@ enums in `snake_case`). Checked for the app rebuild in 2026-10 (D77).
 | Empty-query browse | same | D76: no text and no source filter → DHT-only torrents only once a seed check found peers. Text searches and `origin=dht` list every DHT result. |
 | Result row | `TorrentSummary` | `title, category, total_size, file_count, created_at, seeders, leechers, dead, best_peers` (max of tracker seeders and DHT peer estimate; show this when `seeders` is null), `trust, publisher_count, origin (nostr/dht/both), media_title, media_year, media_kind, media_id, media_rating, attrs` (resolution, languages, …), `matched_file`. |
 | Filter sheet counts | `POST /api/v1/facets` (`{query, fields, size}`) or `GET /api/v1/facets?field=…` | Disjunctive counts (docs/FILTERS.md); 503 while the index builds. |
-| Detail | `GET /api/v1/torrents/{infohash}` | `TorrentDetail`: summary, `magnet` (ready to hand to a torrent app), files, description, events, comments, trackers, `trust` (score + factors), `media` (`MediaInfo` incl. `poster`), `dht` (`DhtInfo` for DHT rows). 404 unknown. |
+| Detail | `GET /api/v1/torrents/{infohash}` | `TorrentDetail`: summary, `magnet` (ready to hand to a torrent app), files, description, events, comments, trackers, `trust` (score + factors), `media` (`MediaInfo` incl. `poster`), `dht` (`DhtInfo` for DHT rows), `probe` (`ProbeInfo`, header-probe results, absent when never probed; see below). 404 unknown. |
 | Seed check now | `POST /api/v1/torrents/{infohash}/liveness` | `Liveness {seeders, leechers, dht_peers_est, source, checked_at, expires_at, …}`. Works for DHT-only torrents since D77 (was 404). Rate-limited since D113: a repeat within a minute returns the stored result, more than 20 a minute server-wide → `429` with `Retry-After`. |
 | Seed history chart | `GET /api/v1/torrents/{infohash}/liveness-history?days=N` | ≤ 90 days, oldest first. |
 | Title page | `GET /api/v1/media/{id}/releases` (+ search query string) or `POST` (`SearchQuery`) | `MediaReleases {media, total, truncated, groups}`; `GET /api/v1/media/{id}/torrents` = flat `SearchPage`. |
@@ -91,6 +91,53 @@ app's API token gets 401 there. `GET /api/v1/stats` gains `workers` (one `Worker
 configured worker: connected, version, leases held, seed results and metadata per minute, DHT
 state; empty without workers), and `/health` lists the feature `workers` when tokens are
 configured. Clients may ignore both.
+
+Worker wire additions for header probes (D117, docs/PROBES.md), all optional (worker API stays
+1): `DhtResult.probe` (`ProbeReport {v, status, bytes_in, uploaded, peers, files: [ProbeFile]}`,
+only with a `metadata` item), `DhtAck.probe_stored` / `probe_rejected`, and
+`WorkerDhtState.probe` (`WorkerProbeState` counters) in the heartbeat and `workers[].dht`.
+Probe backfill (D118, docs/PROBES.md §10), all optional too: the routes `probe/lease` and
+`probe/release`, `DhtAck.backfill_stored` (new DHT rows from backfill dicts, not in `stored`),
+`WorkerDhtState.discover` and `.backfill` (`WorkerBackfillState`),
+`WorkerStats.backfill_*_total`, and `StatsResponse.probe_backfill` (`ProbeBackfillStats`: the
+server's queue, absent without workers).
+
+## Header probes (D117)
+
+`TorrentDetail.probe` (absent when the torrent was never probed or the server now classifies
+it adult; older servers never send it; the Android app does not read it yet, its decoder
+ignores unknown keys):
+
+```json
+"probe": {
+  "version": 1, "probed_at": 1793500000, "status": "ok", "verified": true,
+  "files": [{
+    "index": 0, "path": "Movie.2024.2160p.mkv", "size": 6000000000,
+    "label": "video.mkv", "description": "Matroska video", "confidence": 97, "verified": true,
+    "flags": ["agreed"],
+    "video": {"container": "matroska", "duration_ms": 7200000,
+              "video": [{"codec": "hevc", "width": 3840, "height": 2160, "bit_depth": 10,
+                         "hdr": ["dolby_vision", "hdr10"]}],
+              "audio": [{"codec": "eac3", "channels": 6, "lang": "fre", "atmos": true}],
+              "subs": [{"codec": "subrip", "lang": "eng"}]}
+  }]
+}
+```
+
+- `index` points into `files` of the same response (the Nostr event's list when there is one,
+  else the DHT row's); `path` is that entry's path. A probed file the shown list does not hold
+  (matched by path, with or without the root folder, and size) is left out.
+- `label` is a sniff label id (`video.mkv`, `game.ps5.pkg`, `exe.pe`, …), `confidence` 80–100.
+- `verified`: the bytes the detection read were SHA-1 checked against the torrent's piece
+  hashes; `false` means 16 KiB blocks from one peer, not checked (docs/PROBES.md §3).
+- `flags`: `extension_mismatch`, `suspicious_executable` (worth a warning in a client),
+  `incomplete`, `agreed` (two peers gave the same verdict), `disagree`, `surprise_verified`,
+  `surprise_changed`, `surprise_unverified`.
+- `game` (console files): `platform` (`ps5`, `switch`, …), `kind`, `format`, `title_id`,
+  `content_id`, `db_id`, `title`, `version`, `region`.
+- Languages are ISO 639-2/B lowercase. Every optional field is left out when unknown.
+
+No search filter on probe results yet (docs/ROADMAP.md).
 
 ## Not in the API (phone-local by design)
 

@@ -30,6 +30,7 @@ magnetar-server --version
 | `MAGNETAR_NTFY_TOPIC` | unset (e.g. `magnetar-$(openssl rand -hex 12)`) | Topics are public secrets. ntfy.sh allows 250 messages a day; Magnetar sends at most one per poll (every 15 min, so ≤ 96 a day) covering all saved searches with new hits (D34) |
 | `MAGNETAR_DOWNLOADS` | `true` | Start the librqbit download engine with `serve`. `false` saves memory and disk on a device that only indexes; download requests then answer `downloads_unavailable`. The engine runs its own DHT node (librqbit, up to 250 q/s while downloading), outside Magnetar's pace and router probe: `false` on a small home router (D109) |
 | `MAGNETAR_DOWNLOAD_DIR` | `~/Downloads/magnetar` (image: `/data/downloads`) | librqbit output for server downloads |
+| `MAGNETAR_NOSTR_CRAWL` | `true` | Crawl Nostr relays with `serve` (D118). `false`: no relay is contacted at all (the relay crawl, its indexer metadata of kinds 0/3/10000/10002, NIP-66 discovery); the API, phone sync (`events/batch`, `/relay`), seed checks, enrichment, trust scoring from the stored graph, the saved-search notifier (alone, every 15 min) and the worker endpoints keep running. `crawl-once` still crawls when run by hand |
 | `MAGNETAR_CRAWL_INTERVAL_SECS` | `900` | Pause between crawl passes, at least 60. `0` = continuous: passes run back to back with a 30 s pause (120 s after a failed pass or when every relay is backed off). Use it on an always-on server with bandwidth to spare. Indexer metadata and saved-search notifications still run at most every 15 min (ARCHITECTURE.md D32) |
 | `MAGNETAR_CRAWL_MAX_RELAYS` | `30` | Relays crawled per pass (at least 1). Seeds come first, then the best-yielding stored relays |
 | `MAGNETAR_CRAWL_EXPLORE_RELAYS` | `10` | Of `MAGNETAR_CRAWL_MAX_RELAYS`, slots kept for relays with no events yet: never-tried first, then the one whose last success is oldest. This is how newly discovered relays (NIP-65 lists, relay hints, kind-3 maps) get crawled. `0` disables exploration |
@@ -168,6 +169,31 @@ URL), `MAGNETAR_WORKER_TOKEN` (required), `MAGNETAR_WORKER_STATE_DIR` (`<state d
 `MAGNETAR_WORKER_UPLOAD_BUFFER_MB` (`16`), plus the `MAGNETAR_DHT_*` and `MAGNETAR_LIVENESS_*`
 variables above (worker defaults: pool 200 000, 64 fetches, UPnP off). Profiles for the EEE
 and RPI lines: docs/WORKERS.md §3.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `MAGNETAR_DHT_DISCOVER` | `true` | worker only (D118): find new torrents (BEP 51 sampling, triage of hashes heard in incoming `get_peers` / `announce_peer`). `false`: the engine runs no sampler and nothing it hears goes to the server; the DHT node only serves peer lookups (the probe backfill). It still answers queries as a node in `aggressive` mode; `polite` is the quieter choice then. Ignored by `serve` and `dht` |
+
+### Header probes (docs/PROBES.md, ARCHITECTURE.md D117)
+
+**Worker settings only.** `serve`, `dht` and every other command never build a prober: with
+`MAGNETAR_PROBE=true` they log a warning and ignore it (`compose.yml` pins it to `false`). Probes
+follow the worker crawler's metadata fetches, so they also need `MAGNETAR_DHT`.
+
+| Variable | Default | EEE / RPI profile | Notes |
+|---|---|---|---|
+| `MAGNETAR_PROBE` | `false` | `false` (production: `true`, docs/PROBES.md §8) | after a verified dict that passed the blocklist and is not adult, read the few 16 KiB blocks sniff needs from the peer that sent it (and one more) to learn real file types, console ids and video / audio quality; results go up with the dict |
+| `MAGNETAR_PROBE_UPLOAD` | `false` | `false` (production: `true`) | **on is sharing**: announce (`HAVE`) and serve the whole SHA-1-checked pieces a probe holds, only to that probe's peers, at most 4 MiB and 256 KiB/s per probe, from memory only. Off: no piece data ever leaves, `HAVE_NONE`, never an unchoke |
+| `MAGNETAR_PROBE_WHOLE_PIECE_MAX` | `1048576` | same | pieces up to this length (16 KiB–16 MiB, at most `MAGNETAR_PROBE_MAX_BYTES`) are fetched whole and hash-checked, so their results count as verified: 55 % of sampled torrents, 1.23 MiB per torrent on average (planner, policy D′). Longer pieces: only the blocks sniff reads, stored as unverified, unless a result is surprising |
+| `MAGNETAR_PROBE_PER_MIN` | `30` | `120` / `12` | probes started per minute (1–6000), paced with no burst; a torrent that finishes while no turn is free is not probed (counted `rate`). Pi: ~0.2 probe/s × 1.23 MiB keeps it well under its ~3 000 packets/s router knee (**UNVERIFIED**) |
+| `MAGNETAR_PROBE_PARALLEL` | `8` | `32` / `4` | probes at once (1–256); memory ≤ parallel × `MAGNETAR_PROBE_MAX_BYTES` (Pi: 32 MiB of its 200 MB RSS cap). Busy: not probed (`busy`) |
+| `MAGNETAR_PROBE_PEERS` | `2` | same | connections one probe may use (1–8): the metadata peer, plus one for the agreement read or when the first stays choked. They count against `MAGNETAR_DHT_TCP_MAX` and the TCP pace |
+| `MAGNETAR_PROBE_MAX_BYTES` | `8388608` | same | piece bytes one probe may download (64 KiB–64 MiB). Blocks mode p99 is 3.1 MiB; whole-piece mode p99 10.7 MiB, so ~1–2 % end `incomplete` |
+| `MAGNETAR_PROBE_BACKFILL` | `false` | `false` | probe torrents indexed before probes existed (D118, docs/PROBES.md §10): lease them from the server (DHT rows and Nostr-only rows that a default search shows, i.e. not from a blocked publisher and at or above the trust threshold; most known seeders first), look their peers up in the DHT, fetch the info dict again and probe it through the same connection. Needs `MAGNETAR_PROBE=true` (ignored with a warning otherwise); paced by the probe settings (at most 2 × `MAGNETAR_PROBE_PARALLEL` leased torrents in the worker at once, each waiting up to 30 s for its probe turn). Same traffic shape as new finds: one DHT lookup, metadata TCP attempts and a probe per torrent (**UNVERIFIED** on real swarms) |
+
+Fixed (docs/PROBES.md §5): 15 s unchoke wait, 10 s stall, 45 s per probe, 64 requests in flight
+(capped by the peer's `reqq`), 8 target files, sniff caps per file (16 KiB first read, 64 KiB
+for video, 6 rounds, 4 MiB), dicts over 2 MiB not probed, upload 4 MiB and 256 KiB/s per probe.
 
 ### Built-in seed relays (ARCHITECTURE.md §9)
 

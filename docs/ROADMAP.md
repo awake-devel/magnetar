@@ -19,14 +19,23 @@ monitors such as nostr.watch, and relay lists in popular clients' public code.
 ### Header probes
 Check a torrent's contents block by block from its peers: verify that it really contains what
 its file list says. Never on torrents tagged adult or matched by the blocklist. Warn when no VPN
-is active, since probing connects to peers from the server's IP. Per-machine limits for the
+is active, since probing connects to peers from the server's IP (as built: probes run on the
+crawl workers only, which log this at start; no VPN detection yet). Per-machine limits for the
 crawl workers come from the router benchmarks (docs/benchmarks/).
 
 Status: the detector is done (D116, `crates/sniff`: file types by content, console game ids,
-video and audio recon from sparse byte ranges). Left: (C) the probe engine in the worker
-(piece planner, message whitelist, `probe_attrs` / `probe_files` storage, the opt-in upload
-below, a trial on eee with both upload settings), then (D) games enrichment keyed by the ids
-`sniff` reads (GameTDB files after GameTDB answers about automated downloads; Wikidata).
+video and audio recon from sparse byte ranges). (C) is built (D117, docs/PROBES.md): the probe
+engine on the workers (piece planner, message whitelist, streaming SHA-1, the opt-in upload
+below), results uploaded with the dict and stored in `probe_attrs` / `probe_files`, shown in
+the detail API. Left:
+- **next: the eee trial** with both upload settings (off, then on), under the router
+  watchdog, measuring unchoke share, bytes and packets per probe, verified share and peer
+  reactions; then the Pi. That is how the production switch (user decision: on) is
+  recommended to happen, docs/PROBES.md §8;
+- probe facets in the search index and filters (`tags`), a VPN check (the backfill of rows
+  stored before C and of Nostr-only rows is built: D118, docs/PROBES.md §10);
+- (D) games enrichment keyed by the ids `sniff` reads (GameTDB files after GameTDB answers
+  about automated downloads; Wikidata).
 
 **Legal note, required with the feature (README "Legal" and the feature's doc).** Today
 Magnetar only handles metadata: info dicts (names, sizes, hashes), never file data. Header
@@ -41,8 +50,9 @@ design must guarantee by default so a probe never shares: no piece data sent (ne
 needed for the check, and nothing kept after it. Protocol traffic (handshakes, requests) is not
 sharing. An opt-in setting (off by default) may serve the few whole, hash-checked pieces a probe
 holds to leechers, to get unchoked faster; its doc and the README must say that turning it on
-*is* sharing. Decision (user, 2026-11-02): the upstream default stays off; the user's own
-workers will run with it on after the eee trial measures both. **UNVERIFIED legal reading, not legal advice**; other countries differ
+*is* sharing. Decision (user, 2026-11-02): the upstream default stays off; production (the
+user's workers) runs with it on. Not switched on yet: the workers' env files are outside the
+repository and no agent may start peer traffic (docs/PROBES.md §8). **UNVERIFIED legal reading, not legal advice**; other countries differ
 (Germany, for example, fines downloads too).
 
 ### DHT engine: collapse at extreme settings

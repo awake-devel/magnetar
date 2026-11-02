@@ -267,7 +267,8 @@ async fn store(
             total_size, category, metadata_size, piece_length, first_seen, fetched_at,
             discovered_via, peers_seen, classifier_version, supplied_by)
         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-               COALESCE((SELECT first_seen FROM dht_seen WHERE infohash = $11), $12), $12,
+               COALESCE((SELECT first_seen FROM dht_seen WHERE infohash = $11),
+                        (SELECT min(created_at) FROM torrents WHERE infohash = $1), $12), $12,
                $13, $14, $15, $17
         WHERE NOT EXISTS (SELECT 1 FROM blocked_infohashes b WHERE b.infohash = $1)
           AND ($16 OR NOT EXISTS (SELECT 1 FROM torrent_infohashes t WHERE t.infohash = $1))
@@ -381,7 +382,7 @@ impl PersistOutcome {
 /// on without the row. Anything else aborts the batch and keeps its leases, to be retried:
 /// I/O, pool, protocol, and database errors that a retry can clear (deadlock or serialization
 /// 40, resources 53, lock timeout 55, cancel or statement timeout 57) or that we do not know.
-fn row_level(e: &sqlx::Error) -> bool {
+pub(crate) fn row_level(e: &sqlx::Error) -> bool {
     match e {
         sqlx::Error::Encode(_) => true,
         sqlx::Error::Database(d) => d.code().is_some_and(|c| row_level_sqlstate(&c)),
@@ -452,6 +453,33 @@ pub async fn persist_batch_from(
     now: i64,
     supplied_by: Option<&str>,
 ) -> sqlx::Result<PersistOutcome> {
+    persist_inner(pool, items, screen, fetch_known, now, supplied_by, false).await
+}
+
+/// [`persist_batch_from`] for dicts a worker re-fetched for a probe backfill lease (D118):
+/// stored also when the infohash is known from Nostr (`fetch_known`), and marked as backfill
+/// in the transaction (`magnetar.origin`), so the insert triggers count the new rows under
+/// `probe_backfill_dht_rows` instead of `dht_torrents_added` / `dht_stored_<via>` (they are
+/// not discoveries). A new row's `first_seen` is the oldest Nostr event's `created_at`.
+pub async fn persist_backfill_batch(
+    pool: &PgPool,
+    items: &[FetchResult],
+    screen: Option<&dyn Screen>,
+    now: i64,
+    supplied_by: Option<&str>,
+) -> sqlx::Result<PersistOutcome> {
+    persist_inner(pool, items, screen, true, now, supplied_by, true).await
+}
+
+async fn persist_inner(
+    pool: &PgPool,
+    items: &[FetchResult],
+    screen: Option<&dyn Screen>,
+    fetch_known: bool,
+    now: i64,
+    supplied_by: Option<&str>,
+    backfill: bool,
+) -> sqlx::Result<PersistOutcome> {
     let mut o = PersistOutcome::default();
     // Classify and screen first, outside the transaction and off the async workers: on a
     // hostile 16 MiB info dict this is seconds of CPU (D71).
@@ -473,6 +501,12 @@ pub async fn persist_batch_from(
         None => vec![None; items.len()],
     };
     let mut tx = pool.begin().await?;
+    if backfill {
+        // Read by the dht_torrents insert triggers (migration 20261106000000).
+        sqlx::query("SELECT set_config('magnetar.origin', 'backfill', true)")
+            .execute(&mut *tx)
+            .await?;
+    }
     for (it, decision) in items.iter().zip(decisions) {
         match &it.result {
             Ok(Outcome::Ok(f)) => {

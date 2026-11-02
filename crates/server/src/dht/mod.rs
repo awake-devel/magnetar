@@ -75,7 +75,7 @@ pub struct DhtOptions {
     /// TCP connections open at once (`MAGNETAR_DHT_TCP_MAX`, D66).
     pub tcp_max: usize,
     /// Router health probe targets (`MAGNETAR_DHT_PROBE`; empty = off, D66).
-    pub probe: Vec<SocketAddr>,
+    pub health_targets: Vec<SocketAddr>,
     pub mode: Mode,
     pub ports: Vec<u16>,
     pub qps: u32,
@@ -196,7 +196,7 @@ impl DhtOptions {
             screen: screen::global_screen(),
             tcp_rate: cfg.dht_tcp_rate.unwrap_or_else(|| default_tcp_rate(qps)),
             tcp_max: cfg.dht_tcp_max as usize,
-            probe: health::parse_targets(&cfg.dht_probe),
+            health_targets: health::parse_targets(&cfg.dht_probe),
             // Polite mode uses an ephemeral port: nothing to map. `serve` maps by default in
             // aggressive mode; the bounded `dht` command clears this unless asked (D72).
             upnp: (aggressive && cfg.dht_upnp.unwrap_or(true)).then(|| {
@@ -1279,7 +1279,7 @@ pub async fn run(
     let _attached = hub.attach(dht.clone(), p.fetcher.clone());
     if own_hub {
         tasks.spawn(health::health_loop(
-            p.opts.probe.clone(),
+            p.opts.health_targets.clone(),
             hub.clone(),
             int_rx.clone(),
         ));

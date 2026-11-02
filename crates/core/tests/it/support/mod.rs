@@ -2,6 +2,8 @@
 #![allow(dead_code)]
 
 pub mod fake_relay;
+#[cfg(feature = "probe")]
+pub mod fake_seeder;
 pub mod store;
 
 use magnetar_core::model::RawEvent;

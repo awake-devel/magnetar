@@ -26,6 +26,8 @@ pub mod nip35;
 pub mod nip66;
 pub mod notify;
 pub mod pow;
+#[cfg(feature = "probe")]
+pub mod probe;
 pub mod query;
 pub mod relay;
 pub mod relayurl;

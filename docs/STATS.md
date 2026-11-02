@@ -115,6 +115,11 @@ Per DHT route (D102): `dht_seen_sample`, `dht_seen_get_peers`, `dht_seen_announc
 `dht_seen` rows) and `dht_stored_sample`, `dht_stored_get_peers`, `dht_stored_announce` (new
 `dht_torrents` rows), counters from statement triggers, from migration `20261103000000` on.
 
+`probe_backfill_dht_rows` (D118): `dht_torrents` rows a header-probe backfill added for
+torrents known only from Nostr (the dict re-fetched to probe them). They are not discoveries:
+from migration `20261106000000` on they are counted here and not in `dht_torrents_added` or
+`dht_stored_<via>`, and not in a worker's `stored_total`.
+
 ### `GET /api/v1/stats/sources`, `GET /api/v1/stats/map`
 
 Where discoveries come from and the crawl map by country / network: docs/CRAWLMAP.md.

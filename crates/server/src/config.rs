@@ -125,6 +125,12 @@ pub struct Config {
     /// Start the librqbit download engine with `serve`.
     #[arg(long, env = "MAGNETAR_DOWNLOADS", default_value_t = true, action = clap::ArgAction::Set)]
     pub downloads: bool,
+    /// Crawl Nostr relays with `serve` (D118): the relay crawl, its indexer metadata (kinds
+    /// 0/3/10000/10002) and NIP-66 relay discovery. Off: no relay is contacted; the API, phone
+    /// sync, seed checks, enrichment, trust scoring, the saved-search notifier and the worker
+    /// endpoints keep running.
+    #[arg(long, env = "MAGNETAR_NOSTR_CRAWL", default_value_t = true, action = clap::ArgAction::Set)]
+    pub nostr_crawl: bool,
     /// Pause between crawl passes; 0 = continuous (back to back, see `crawl_interval`).
     #[arg(long, env = "MAGNETAR_CRAWL_INTERVAL_SECS", default_value_t = 900)]
     pub crawl_interval_secs: u64,
@@ -234,6 +240,11 @@ pub struct Config {
     /// Native DHT crawler (docs/DHT.md): off, polite or aggressive.
     #[arg(long, env = "MAGNETAR_DHT", value_enum, default_value = "off")]
     pub dht: DhtMode,
+    /// Worker: find new torrents in the DHT (D118): BEP 51 sampling and the triage of hashes
+    /// heard in incoming `get_peers` / `announce_peer`. Off: the worker's DHT node only looks
+    /// peers up (probe backfill); nothing new is sampled or triaged. Ignored by `serve` / `dht`.
+    #[arg(long, env = "MAGNETAR_DHT_DISCOVER", default_value_t = true, action = clap::ArgAction::Set)]
+    pub dht_discover: bool,
     /// First UDP port; virtual node i listens on PORT + i (aggressive; polite is ephemeral).
     #[arg(long, env = "MAGNETAR_DHT_PORT", default_value_t = 6891, value_parser = clap::value_parser!(u16).range(1..=65504))]
     pub dht_port: u16,
@@ -353,6 +364,38 @@ pub struct Config {
     /// Worker: results (info dicts) buffered for upload at most, MB; fetching waits beyond.
     #[arg(long, env = "MAGNETAR_WORKER_UPLOAD_BUFFER_MB", default_value_t = 16, value_parser = clap::value_parser!(u64).range(1..=1024))]
     pub worker_upload_buffer_mb: u64,
+    // --- Header probes (docs/PROBES.md, D117): crawl workers only ---
+    /// Worker: after a metadata fetch, read the few blocks of the torrent's files that sniff
+    /// needs (real file types, console ids, video/audio quality) and upload the results. Off
+    /// by default; ignored (logged) by `serve` and `dht`: the main server never probes.
+    #[arg(long, env = "MAGNETAR_PROBE", default_value_t = false, action = clap::ArgAction::Set)]
+    pub probe: bool,
+    /// Worker: announce and serve the whole hash-checked pieces a probe holds, to that probe's
+    /// peers, within fixed caps (4 MiB and 256 KiB/s per probe). **On is sharing.** Off: never
+    /// a byte of piece data out, `HAVE_NONE`, never an unchoke.
+    #[arg(long, env = "MAGNETAR_PROBE_UPLOAD", default_value_t = false, action = clap::ArgAction::Set)]
+    pub probe_upload: bool,
+    /// Worker: pieces up to this length are fetched whole and SHA-1 checked (results then
+    /// count as verified); longer ones only as the 16 KiB blocks sniff reads, unverified.
+    #[arg(long, env = "MAGNETAR_PROBE_WHOLE_PIECE_MAX", default_value_t = 1024 * 1024, value_parser = clap::value_parser!(u64).range(16_384..=16_777_216))]
+    pub probe_whole_piece_max: u64,
+    /// Worker: header probes started per minute at most (paced, no burst).
+    #[arg(long, env = "MAGNETAR_PROBE_PER_MIN", default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=6000))]
+    pub probe_per_min: u32,
+    /// Worker: header probes at once.
+    #[arg(long, env = "MAGNETAR_PROBE_PARALLEL", default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=256))]
+    pub probe_parallel: u32,
+    /// Worker: peer connections one probe may use (the metadata peer included).
+    #[arg(long, env = "MAGNETAR_PROBE_PEERS", default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=8))]
+    pub probe_peers: u32,
+    /// Worker: piece bytes one probe may download, bytes.
+    #[arg(long, env = "MAGNETAR_PROBE_MAX_BYTES", default_value_t = 8 * 1024 * 1024, value_parser = clap::value_parser!(u64).range(65_536..=67_108_864))]
+    pub probe_max_bytes: u64,
+    /// Worker: probe torrents indexed before probes existed (D118): lease them from the server,
+    /// look their peers up in the DHT, fetch the info dict again and probe it. Needs
+    /// `MAGNETAR_PROBE=true` and `MAGNETAR_DHT`; paced by the probe settings.
+    #[arg(long, env = "MAGNETAR_PROBE_BACKFILL", default_value_t = false, action = clap::ArgAction::Set)]
+    pub probe_backfill: bool,
 }
 
 impl Config {
@@ -509,6 +552,78 @@ mod tests {
             args.push("serve");
             assert!(Cli::try_parse_from(args).is_err(), "{bad:?}");
         }
+    }
+
+    /// D118: the Nostr crawl and DHT discovery are on by default, backfill off; each can be
+    /// switched.
+    #[test]
+    fn crawl_switches() {
+        let d = Cli::try_parse_from(["magnetar-server", "worker"])
+            .unwrap()
+            .config;
+        assert!(d.nostr_crawl && d.dht_discover && !d.probe_backfill);
+        let off = Cli::try_parse_from([
+            "magnetar-server",
+            "--nostr-crawl",
+            "false",
+            "--dht-discover",
+            "false",
+            "--probe-backfill",
+            "true",
+            "worker",
+        ])
+        .unwrap()
+        .config;
+        assert!(!off.nostr_crawl && !off.dht_discover && off.probe_backfill);
+    }
+
+    /// D117: header probes are off by default, upload too, and the settings are bounded.
+    #[test]
+    fn probe_settings() {
+        let d = Cli::try_parse_from(["magnetar-server", "worker"])
+            .unwrap()
+            .config;
+        assert!(!d.probe && !d.probe_upload);
+        assert_eq!(
+            (
+                d.probe_whole_piece_max,
+                d.probe_per_min,
+                d.probe_parallel,
+                d.probe_peers,
+                d.probe_max_bytes
+            ),
+            (1 << 20, 30, 8, 2, 8 << 20)
+        );
+        assert!(crate::worker::probe_config(&d).is_none());
+        let on = Cli::try_parse_from([
+            "magnetar-server",
+            "--probe",
+            "true",
+            "--probe-max-bytes",
+            "524288",
+            "worker",
+        ])
+        .unwrap()
+        .config;
+        let pc = crate::worker::probe_config(&on).unwrap();
+        assert!(!pc.upload, "upload stays off unless set");
+        assert_eq!(pc.whole_piece_max, 524_288, "a whole piece fits the budget");
+        for bad in [
+            ["--probe-peers", "0"],
+            ["--probe-peers", "9"],
+            ["--probe-per-min", "0"],
+            ["--probe-max-bytes", "1000"],
+            ["--probe-whole-piece-max", "1"],
+        ] {
+            let mut args = vec!["magnetar-server"];
+            args.extend(bad);
+            args.push("worker");
+            assert!(Cli::try_parse_from(args).is_err(), "{bad:?}");
+        }
+        let serve = Cli::try_parse_from(["magnetar-server", "--probe", "true", "serve"]).unwrap();
+        assert!(crate::probes::not_here(&serve.config, &serve.command).is_some());
+        let worker = Cli::try_parse_from(["magnetar-server", "--probe", "true", "worker"]).unwrap();
+        assert!(crate::probes::not_here(&worker.config, &worker.command).is_none());
     }
 
     #[test]

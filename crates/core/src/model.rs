@@ -480,6 +480,156 @@ pub struct TorrentDetail {
     /// The DHT crawler's verified metadata (D51); None when the DHT does not hold it.
     #[serde(default)]
     pub dht: Option<DhtInfo>,
+    /// What a crawl worker's header probe read from the files themselves (D117,
+    /// docs/PROBES.md); None when never probed. Older servers send none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<ProbeInfo>,
+}
+
+/// Header-probe results of a torrent (D117): real file types, console game ids and video /
+/// audio quality, detected by content from a few blocks of each probed file.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProbeInfo {
+    /// Version of the probe that wrote it (`PROBE_VERSION`).
+    pub version: u16,
+    pub probed_at: i64,
+    /// `ok` (every target file read to the end) or `partial`.
+    pub status: String,
+    /// Every listed result was read from hash-checked pieces.
+    pub verified: bool,
+    pub files: Vec<ProbeFileInfo>,
+}
+
+/// One probed file, with its path from the server's own file list.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProbeFileInfo {
+    /// Index in `TorrentDetail::files` of the same detail (the Nostr event's list when there
+    /// is one, else the DHT row's).
+    pub index: u32,
+    pub path: String,
+    pub size: u64,
+    /// sniff label id (`video.mkv`, `game.ps5.pkg`, `exe.pe`, ...).
+    pub label: String,
+    /// The label's description from sniff's registry.
+    pub description: String,
+    /// 80..=100 (weaker detections are not stored).
+    pub confidence: u8,
+    /// The bytes the detection read were SHA-1 checked against the torrent's piece hashes.
+    pub verified: bool,
+    /// `extension_mismatch`, `suspicious_executable`, `incomplete`, `agreed`, `disagree`,
+    /// `surprise_verified`, `surprise_changed`, `surprise_unverified`.
+    pub flags: Vec<String>,
+    pub game: Option<ProbeGame>,
+    pub video: Option<ProbeVideo>,
+}
+
+/// One probed file as a worker uploads it and the server stores it (`probe_files.files`):
+/// `i` is the display index in the info dict. Paths never travel: the server has them.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProbeFile {
+    pub i: u32,
+    pub size: u64,
+    pub label: String,
+    pub confidence: u8,
+    pub verified: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub flags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub game: Option<ProbeGame>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video: Option<ProbeVideo>,
+}
+
+/// Console package or image ids (sniff `GameInfo`, the fields worth keeping).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProbeGame {
+    /// sniff platform, snake_case (`ps5`, `switch`, `wii`, ...).
+    pub platform: String,
+    /// `package`, `image`, `compressed_image`, `metadata`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Short format name (`PS5 FIH`, `NSP`, ...).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_id: Option<String>,
+    /// Key of the platform's game database (GameTDB id, Sony serial, Xbox title id).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub db_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+}
+
+/// Video recon of a container (sniff `VideoInfo`, the fields worth keeping).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProbeVideo {
+    /// `matroska`, `webm`, `mp4`, `mov`, `avi`, `mpegts`, `m2ts`, ...
+    pub container: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitrate_kbps: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub video: Vec<ProbeVideoTrack>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub audio: Vec<ProbeAudioTrack>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub subs: Vec<ProbeSubTrack>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProbeVideoTrack {
+    /// FFmpeg codec name (`hevc`, `h264`, `av1`, ...).
+    pub codec: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// Frames per second × 1000.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fps_milli: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bit_depth: Option<u8>,
+    /// `hdr10`, `hdr10_plus`, `hlg`, `dolby_vision`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hdr: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProbeAudioTrack {
+    pub codec: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channels: Option<u8>,
+    /// ISO 639-2 (bibliographic) lowercase, as Matroska writes it (`eng`, `fre`, `ger`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub atmos: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dts_x: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProbeSubTrack {
+    pub codec: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
 }
 
 /// What a `media` row describes (D40).

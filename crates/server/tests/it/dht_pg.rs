@@ -470,7 +470,7 @@ fn opts(ports: usize) -> DhtOptions {
         metadata_max: 1 << 20,
         tcp_rate: 1000,
         tcp_max: 350,
-        probe: Vec::new(),
+        health_targets: Vec::new(),
         screen: None,
         upnp: None,
         service: None,
@@ -732,7 +732,23 @@ async fn announce_after_get_peers_keeps_its_peer() {
     for h in &hashes[..3] {
         tokens.push(get_peers(*h).await);
     }
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // Wait for the triage itself (rows in `dht_seen`), not a fixed 1.5 s: under a loaded
+    // workspace run the triage write came late and every announce found the hashes still
+    // queued (`(0, 3, 6)`). Then a short pause for the fetch task to take the first one.
+    let first3: Vec<Vec<u8>> = hashes[..3].iter().map(|h| h.to_vec()).collect();
+    let triaged = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM dht_seen WHERE infohash = ANY($1)")
+            .bind(&first3)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        if n == 3 || tokio::time::Instant::now() >= triaged {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
     // ...when their announces arrive (one joins the collection, two move up a lane).
     for (h, t) in hashes[..3].iter().zip(tokens) {
         announce_with(*h, t).await;

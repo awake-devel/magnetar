@@ -20,6 +20,8 @@ mod metainfo_librqbit;
 mod nip35_fixtures;
 mod nip66;
 mod notify_ntfy;
+mod probe;
+mod probe_hostile;
 mod relay;
 mod release_sample;
 mod sync_negentropy;

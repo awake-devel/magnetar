@@ -13,6 +13,9 @@ downloads = ["dep:librqbit"]
 enrich = ["dep:parse-torrent-title"]
 # Native DHT crawler (server only, docs/DHT.md, D49): KRPC node, BEP 51 sampling, passive capture.
 dht-crawl = []
+# Header probes (docs/PROBES.md, D117): after a metadata fetch, read the few blocks that
+# crates/sniff needs to learn real file types. Crawl workers only; never the phone build.
+probe = ["dht-crawl", "dep:sniff", "nix/process"]
 
 [dependencies]
 nostr.workspace = true
@@ -38,6 +41,7 @@ data-encoding.workspace = true
 librqbit = { workspace = true, optional = true }
 parse-torrent-title = { workspace = true, optional = true }
 unicode-normalization = { workspace = true }
+sniff = { workspace = true, optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 nix.workspace = true

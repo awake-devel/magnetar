@@ -30,13 +30,13 @@ use magnetar_server::{AppState, PgStore};
 use serde_json::{Value as J, json};
 use tokio::net::UdpSocket;
 
-const W1: &str = "w1-token-aaaaaaaaaaaaaaaaaaaaaaaa";
-const W2: &str = "w2-token-bbbbbbbbbbbbbbbbbbbbbbbb";
+pub(crate) const W1: &str = "w1-token-aaaaaaaaaaaaaaaaaaaaaaaa";
+pub(crate) const W2: &str = "w2-token-bbbbbbbbbbbbbbbbbbbbbbbb";
 
-type Bodies = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+pub(crate) type Bodies = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
 /// The API router with workers `w1`/`w2`, recording every worker DHT request body.
-async fn spawn(store: &PgStore, lease_secs: i64) -> (String, Bodies) {
+pub(crate) async fn spawn(store: &PgStore, lease_secs: i64) -> (String, Bodies) {
     spawn_cap(
         store,
         lease_secs,
@@ -84,7 +84,7 @@ async fn spawn_cap(store: &PgStore, lease_secs: i64, triage_new_per_hour: u64) -
     (format!("http://{addr}"), bodies)
 }
 
-fn http() -> reqwest::Client {
+pub(crate) fn http() -> reqwest::Client {
     reqwest::Client::new()
 }
 
@@ -376,7 +376,7 @@ fn state_dir() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("mg-worker-{:016x}", rand::random::<u64>()))
 }
 
-fn opts(
+pub(crate) fn opts(
     base: &str,
     token: &str,
     dht: Option<DhtOptions>,
@@ -397,7 +397,10 @@ fn opts(
         heartbeat_every: Duration::from_secs(1),
         geo: None,
         pacer: None,
-        probe: Vec::new(),
+        health_targets: Vec::new(),
+        probe: None,
+        discover: true,
+        backfill: false,
     }
 }
 
@@ -514,7 +517,7 @@ async fn leases_are_exclusive_expire_and_come_back() {
     assert!(none.items.is_empty());
 }
 
-async fn triage_one(c: &Client, h: [u8; 20]) {
+pub(crate) async fn triage_one(c: &Client, h: [u8; 20]) {
     let r: TriageResponse = c
         .post(
             TRIAGE,
@@ -532,7 +535,7 @@ async fn triage_one(c: &Client, h: [u8; 20]) {
     assert_eq!(r.fetch, vec![hex::encode(h)]);
 }
 
-fn meta(sighted: [u8; 20], raw: &[u8]) -> DhtResult {
+pub(crate) fn meta(sighted: [u8; 20], raw: &[u8]) -> DhtResult {
     DhtResult {
         sighted: hex::encode(sighted),
         via: "sample".into(),
@@ -540,14 +543,15 @@ fn meta(sighted: [u8; 20], raw: &[u8]) -> DhtResult {
         outcome: DhtOutcome::Metadata {
             raw: data_encoding::BASE64.encode(raw),
         },
+        probe: None,
     }
 }
 
-async fn upload(c: &Client, items: Vec<DhtResult>) -> DhtAck {
+pub(crate) async fn upload(c: &Client, items: Vec<DhtResult>) -> DhtAck {
     c.post(DHT_RESULTS, &DhtResults { items }).await.unwrap()
 }
 
-async fn count(s: &PgStore, sql: &'static str, h: &str) -> i64 {
+pub(crate) async fn count(s: &PgStore, sql: &'static str, h: &str) -> i64 {
     sqlx::query_scalar(sql)
         .bind(h)
         .fetch_one(s.pool())
@@ -692,6 +696,7 @@ async fn uploads_are_verified_classified_and_screened_by_the_server() {
             tier: "hard".into(),
             rule_version: 1,
         },
+        probe: None,
     };
     let a = upload(&c2, vec![blocked(&hex::encode(hr)), blocked(&ih(0x900))]).await;
     assert_eq!((a.blocked, a.ignored), (1, 1));
@@ -733,6 +738,7 @@ async fn uploads_are_verified_classified_and_screened_by_the_server() {
         outcome: DhtOutcome::Failed {
             code: "no_peers".into(),
         },
+        probe: None,
     };
     let a = upload(
         &c2,
@@ -813,6 +819,7 @@ async fn uploads_apply_only_to_hashes_the_worker_holds() {
         via: "sample".into(),
         peers_seen: 1,
         outcome,
+        probe: None,
     };
 
     // h is w1's: w2 can neither store its dict nor finalise it.
@@ -1046,6 +1053,7 @@ async fn worker_blocks_do_not_stop_nostr_ingest() {
                 tier: "hard".into(),
                 rule_version: 1,
             },
+            probe: None,
         }],
     )
     .await;
@@ -1114,6 +1122,7 @@ async fn due_rows_of_another_worker_are_not_taken_over_before_the_grace() {
             via: "sample".into(),
             peers_seen: 1,
             outcome: DhtOutcome::Private,
+            probe: None,
         }],
     )
     .await;
@@ -1139,6 +1148,7 @@ async fn due_rows_of_another_worker_are_not_taken_over_before_the_grace() {
             outcome: DhtOutcome::Failed {
                 code: "no_peers".into(),
             },
+            probe: None,
         }],
     )
     .await;
@@ -1206,7 +1216,7 @@ async fn a_bad_copy_does_not_shadow_a_good_one() {
     assert_eq!((a.applied, a.stored, a.ignored), (1, 0, 1));
 }
 
-fn worker_dht(ports: Vec<u16>) -> DhtOptions {
+pub(crate) fn worker_dht(ports: Vec<u16>) -> DhtOptions {
     DhtOptions {
         mode: Mode::Aggressive,
         ports,
@@ -1224,7 +1234,7 @@ fn worker_dht(ports: Vec<u16>) -> DhtOptions {
         metadata_max: 1 << 20,
         tcp_rate: 1000,
         tcp_max: 350,
-        probe: Vec::new(),
+        health_targets: Vec::new(),
         screen: screen::global_screen(),
         upnp: None,
         service: None,
@@ -1234,7 +1244,7 @@ fn worker_dht(ports: Vec<u16>) -> DhtOptions {
     }
 }
 
-fn tweak(ip: Ipv4Addr, boot: SocketAddrV4) -> impl FnOnce(&mut EngineConfig) {
+pub(crate) fn tweak(ip: Ipv4Addr, boot: SocketAddrV4) -> impl FnOnce(&mut EngineConfig) {
     move |c: &mut EngineConfig| {
         c.bind = ip;
         c.bootstrap = vec![boot];
@@ -1354,6 +1364,10 @@ async fn two_workers_share_seed_checks_and_the_dht() {
         }
         let up: DhtResults = serde_json::from_slice(body).unwrap();
         for it in up.items {
+            assert!(
+                it.probe.is_none(),
+                "MAGNETAR_PROBE off: no header probe (D117)"
+            );
             if let DhtOutcome::Metadata { raw } = &it.outcome {
                 *uploads.entry(it.sighted.clone()).or_default() += 1;
                 let raw = data_encoding::BASE64.decode(raw.as_bytes()).unwrap();

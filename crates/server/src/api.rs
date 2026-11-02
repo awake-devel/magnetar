@@ -829,6 +829,10 @@ async fn stats(State(st): State<AppState>) -> ApiResult<Json<StatsResponse>> {
         None => None,
     };
     let workers = st.fleet.stats(st.store.pool(), magnetar_core::now()).await;
+    let probe_backfill = st
+        .fleet
+        .backfill_stats(st.store.pool(), magnetar_core::now())
+        .await;
     Ok(Json(StatsResponse {
         store,
         crawler,
@@ -836,6 +840,7 @@ async fn stats(State(st): State<AppState>) -> ApiResult<Json<StatsResponse>> {
         liveness,
         dht,
         workers,
+        probe_backfill,
     }))
 }
 

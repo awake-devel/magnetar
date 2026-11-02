@@ -1,0 +1,602 @@
+//! Header probes against fake peers on 127.0.0.1 (D117): blocks only on big pieces, whole
+//! verified pieces on small ones, lying peers, the surprise check, chokes with and without BEP 6,
+//! allowed-fast, `reqq`, hostile peers and the no-upload whitelist, upload mode and its caps,
+//! identity, the single hand-off connection, the byte budget, and the fetcher with probes off.
+//! Only the `allow_loopback` test seam differs from production; no other traffic.
+#![cfg(feature = "probe")]
+
+use std::collections::HashSet;
+use std::net::SocketAddrV4;
+use std::sync::Arc;
+use std::time::Duration;
+
+use magnetar_core::identity::{CLIENT_NAME, PEER_ID_PREFIX};
+use magnetar_core::metainfo::{FetchConfig, Fetcher, Outcome};
+use magnetar_core::probe::{ProbeConfig, ProbeJob, ProbeResult, ProbeStatus, Prober};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::Instant;
+
+use crate::support::fake_seeder::{self as fs, ALLOWED_IDS, Has, Junk, Opts, Torrent, Unchoke};
+
+const KIB: u64 = 1024;
+const MIB: u64 = 1024 * 1024;
+
+fn ebml(id: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut v = id.to_vec();
+    if data.len() < 0x7f {
+        v.push(0x80 | data.len() as u8);
+    } else {
+        v.extend_from_slice(&(0x4000u16 | data.len() as u16).to_be_bytes());
+    }
+    v.extend_from_slice(data);
+    v
+}
+
+/// A Matroska header (HEVC + E-AC-3, as sniff's fixtures) then filler: `video.mkv` at 97.
+fn mkv(size: usize) -> Vec<u8> {
+    let mut head = ebml(&[0x42, 0x86], &[1]);
+    head.extend(ebml(&[0x42, 0x82], b"matroska"));
+    let mut out = ebml(&[0x1A, 0x45, 0xDF, 0xA3], &head);
+    let mut entries = Vec::new();
+    for (i, (ty, codec)) in [(1u8, "V_MPEGH/ISO/HEVC"), (2, "A_EAC3")]
+        .iter()
+        .enumerate()
+    {
+        let mut te = ebml(&[0xD7], &[i as u8 + 1]);
+        te.extend(ebml(&[0x83], &[*ty]));
+        te.extend(ebml(&[0x86], codec.as_bytes()));
+        entries.extend(ebml(&[0xAE], &te));
+    }
+    let mut seg = ebml(
+        &[0x15, 0x49, 0xA9, 0x66],
+        &ebml(&[0x2A, 0xD7, 0xB1], &[0x0F, 0x42, 0x40]),
+    );
+    seg.extend(ebml(&[0x16, 0x54, 0xAE, 0x6B], &entries));
+    seg.extend(ebml(&[0x1F, 0x43, 0xB6, 0x75], &[0u8; 32]));
+    out.extend(ebml(&[0x18, 0x53, 0x80, 0x67], &seg));
+    fill(out, size)
+}
+
+/// A Windows PE header (as sniff's fixtures) then filler: `exe.pe` at 97.
+fn pe(size: usize) -> Vec<u8> {
+    let mut b = vec![0u8; 0x600];
+    let mut put = |at: usize, v: &[u8]| b[at..at + v.len()].copy_from_slice(v);
+    put(0, b"MZ");
+    put(0x3C, &0x80u32.to_le_bytes());
+    put(0x80, b"PE\0\0");
+    put(0x84, &0x8664u16.to_le_bytes());
+    put(0x86, &1u16.to_le_bytes());
+    put(0x94, &240u16.to_le_bytes());
+    put(0x96, &0x22u16.to_le_bytes());
+    let opt = 0x98;
+    put(opt, &0x20bu16.to_le_bytes());
+    put(opt + 68, &2u16.to_le_bytes());
+    let sec = opt + 240;
+    put(sec, b".text\0\0\0");
+    put(sec + 16, &0x200u32.to_le_bytes());
+    put(sec + 20, &0x400u32.to_le_bytes());
+    fill(b, size)
+}
+
+fn fill(mut v: Vec<u8>, size: usize) -> Vec<u8> {
+    let start = v.len();
+    v.extend((start..size).map(|i| (i * 31 + 7) as u8));
+    v
+}
+
+fn fetcher(probe: bool) -> Fetcher {
+    Fetcher::new(FetchConfig {
+        allow_loopback: true,
+        connect_timeout: Duration::from_secs(1),
+        handshake_timeout: Duration::from_secs(2),
+        peer_timeout: Duration::from_secs(3),
+        hash_budget: Duration::from_secs(10),
+        metadata_max: 1 << 20,
+        connects_per_sec: 1000,
+        keep_raw: true,
+        probe,
+        ..FetchConfig::default()
+    })
+}
+
+fn cfg() -> ProbeConfig {
+    ProbeConfig {
+        unchoke_wait: Duration::from_secs(2),
+        stall: Duration::from_secs(2),
+        session: Duration::from_secs(20),
+        second_peer_after: Duration::from_millis(300),
+        upload_linger: Duration::from_millis(800),
+        per_min: 60_000,
+        ..ProbeConfig::default()
+    }
+}
+
+/// Metadata from `first` (the hand-off), then a probe with `others` as further peers.
+async fn probe(
+    t: &Arc<Torrent>,
+    first: &fs::Seeder,
+    others: &[SocketAddrV4],
+    c: ProbeConfig,
+) -> ProbeResult {
+    let f = fetcher(true);
+    let (r, h) = f.fetch_with_handoff(t.hash, &[first.addr]).await;
+    let Ok(Outcome::Ok(fe)) = r else {
+        panic!("metadata: {r:?}");
+    };
+    let h = h.expect("a hand-off with probes on");
+    assert_eq!(h.answered, vec![first.addr]);
+    let p = Prober::new(c, f);
+    let slot = p.try_slot().expect("a slot");
+    let r = p
+        .probe(
+            slot,
+            ProbeJob {
+                info_hash: t.hash,
+                raw: fe.raw.expect("keep_raw").into(),
+                files: fe.info.files.clone(),
+                conn: Some(h.conn),
+                peers: others.to_vec(),
+            },
+        )
+        .await;
+    let s = p.stats();
+    assert_eq!(s.started, 1);
+    assert_eq!(s.bytes_in, r.bytes_in);
+    // Let the fake peers read what is still in flight before the test reads their logs.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    r
+}
+
+fn label(r: &ProbeResult) -> Vec<(&str, bool)> {
+    r.files
+        .iter()
+        .map(|f| (f.detection.label.as_str(), f.verified))
+        .collect()
+}
+
+fn assert_whitelist(l: &fs::Log) {
+    let bad: Vec<u8> = l
+        .ids
+        .iter()
+        .copied()
+        .filter(|i| !ALLOWED_IDS.contains(i))
+        .collect();
+    assert!(bad.is_empty(), "forbidden ids sent: {bad:?}");
+    assert_eq!(l.forbidden, 0);
+    assert_eq!(l.piece_bytes, 0);
+    assert!(l.haves.is_empty() && l.unchokes == 0);
+    // ut_metadata: requests (0) and rejects (2) only, never data (1).
+    assert!(l.metadata_types.iter().all(|t| *t == 0 || *t == 2));
+}
+
+/// 1, 11, 12: a single MKV with 4 MiB pieces: only the head blocks, unverified, within the caps,
+/// one TCP connection for metadata and probe, honest identity.
+#[tokio::test]
+async fn blocks_only_on_big_pieces() {
+    let t = Torrent::new("x", vec![("Movie.2024.2160p.mkv", mkv(6_000_000))], 4 * MIB);
+    let s = fs::start(t.clone(), Opts::default()).await;
+    let r = probe(&t, &s, &[], cfg()).await;
+    assert_eq!(r.status, ProbeStatus::Ok, "{r:?}");
+    assert_eq!(label(&r), vec![("video.mkv", false)]);
+    let f = &r.files[0];
+    assert!(f.detection.flags.unverified);
+    assert_eq!(f.detection.video.as_ref().unwrap().video[0].codec, "hevc");
+    assert_eq!(
+        r.bytes_in,
+        64 * KIB,
+        "the 64 KiB video head, in 16 KiB blocks"
+    );
+    let l = s.log();
+    assert_eq!(l.accepts, 1, "metadata and probe on one connection");
+    assert_eq!(l.served, 4);
+    assert_whitelist(&l);
+    assert!(l.peer_ids[0].starts_with(&PEER_ID_PREFIX));
+    assert_eq!(l.client, vec![CLIENT_NAME.to_string()]);
+    assert_eq!(
+        l.reserved[0],
+        [0, 0, 0, 0, 0, 0x10, 0, 0x04],
+        "BEP 10 + BEP 6"
+    );
+    // HAVE_NONE first (both fast), then the extended handshake, then INTERESTED.
+    assert_eq!(&l.ids[..3], &[15, 20, 2]);
+}
+
+/// 2: 256 KiB pieces: whole pieces, SHA-1 checked, verified.
+#[tokio::test]
+async fn small_pieces_are_fetched_whole_and_verified() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(3_000_000))], 256 * KIB);
+    let s = fs::start(t.clone(), Opts::default()).await;
+    let r = probe(&t, &s, &[], cfg()).await;
+    assert_eq!(label(&r), vec![("video.mkv", true)], "{r:?}");
+    assert!(!r.files[0].detection.flags.unverified);
+    assert_eq!(r.bytes_in, 256 * KIB, "one whole piece");
+    assert_whitelist(&s.log());
+}
+
+fn flipped(d: &[u8]) -> Arc<Vec<u8>> {
+    Arc::new(d.iter().map(|b| b ^ 0x5A).collect())
+}
+
+/// 3: a lying peer with small pieces fails the hash and is dropped; an honest second peer gives
+/// the verified result; alone, no result.
+#[tokio::test]
+async fn lying_peer_with_small_pieces() {
+    let data = mkv(2_000_000);
+    let t = Torrent::new("x", vec![("Movie.mkv", data.clone())], 256 * KIB);
+    let liar = Opts {
+        lie: Some(flipped(&t.data)),
+        ..Opts::default()
+    };
+    let bad = fs::start(t.clone(), liar.clone()).await;
+    let good = fs::start(t.clone(), Opts::default()).await;
+    let r = probe(&t, &bad, &[good.addr], cfg()).await;
+    assert_eq!(label(&r), vec![("video.mkv", true)], "{r:?}");
+    assert_eq!(r.peers_used, 2);
+    assert!(good.log().served > 0);
+    let alone = fs::start(t.clone(), liar).await;
+    let r = probe(&t, &alone, &[], cfg()).await;
+    assert!(r.files.is_empty(), "{r:?}");
+}
+
+/// 4: a lying peer with big pieces serves a PE header in an `.mkv`: the surprise check fetches
+/// the whole piece, the hash fails, nothing is stored. With an honest peer as well, the
+/// verified bytes win (`surprise_changed`). An honest PE behind a media name is verified and
+/// keeps its label (`surprise_verified`).
+#[tokio::test]
+async fn surprise_check_on_big_pieces() {
+    let t = Torrent::new("x", vec![("Movie.2024.mkv", mkv(6_000_000))], 4 * MIB);
+    let evil = Arc::new(pe(t.data.len()));
+    let liar = Opts {
+        lie: Some(evil.clone()),
+        ..Opts::default()
+    };
+    let bad = fs::start(t.clone(), liar.clone()).await;
+    let r = probe(&t, &bad, &[], cfg()).await;
+    assert!(r.files.is_empty(), "nothing from a liar: {r:?}");
+    assert_eq!(r.surprises, 1);
+
+    let bad = fs::start(t.clone(), liar).await;
+    let good = fs::start(t.clone(), Opts::default()).await;
+    let r = probe(&t, &bad, &[good.addr], cfg()).await;
+    assert_eq!(label(&r), vec![("video.mkv", true)], "{r:?}");
+    assert_eq!(r.files[0].notes, vec!["surprise_changed"]);
+
+    let real = Torrent::new("x", vec![("Movie.2024.mkv", pe(6_000_000))], 4 * MIB);
+    let s = fs::start(real.clone(), Opts::default()).await;
+    let r = probe(&real, &s, &[], cfg()).await;
+    assert_eq!(label(&r), vec![("exe.pe", true)], "{r:?}");
+    let d = &r.files[0].detection;
+    assert!(d.flags.suspicious_executable && d.flags.extension_mismatch);
+    assert_eq!(r.files[0].notes, vec!["surprise_verified"]);
+    assert!(r.bytes_in >= 4 * MIB && r.bytes_in <= cfg().max_bytes);
+}
+
+/// 5: no Fast extension: no HAVE_NONE, no bitfield; a choke drops the outstanding requests,
+/// they are asked again after the unchoke and the transfer finishes.
+#[tokio::test]
+async fn no_fast_extension_and_rechoke() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(3_000_000))], 256 * KIB);
+    let s = fs::start(
+        t.clone(),
+        Opts {
+            fast: false,
+            rechoke_after: Some(3),
+            delay: Duration::from_millis(5),
+            ..Opts::default()
+        },
+    )
+    .await;
+    let r = probe(&t, &s, &[], cfg()).await;
+    assert_eq!(label(&r), vec![("video.mkv", true)], "{r:?}");
+    let l = s.log();
+    assert_whitelist(&l);
+    assert!(!l.ids.contains(&15) && !l.ids.contains(&5));
+    assert!(
+        l.requests > 16,
+        "dropped requests asked again: {}",
+        l.requests
+    );
+}
+
+/// 6: a peer that never unchokes: `Choked` within the unchoke wait; an allowed-fast target piece
+/// is fetched while choked.
+#[tokio::test]
+async fn never_unchoked_and_allowed_fast() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(3_000_000))], 4 * MIB);
+    let s = fs::start(
+        t.clone(),
+        Opts {
+            unchoke: Unchoke::Never,
+            ..Opts::default()
+        },
+    )
+    .await;
+    let started = Instant::now();
+    let r = probe(&t, &s, &[], cfg()).await;
+    assert_eq!(r.status, ProbeStatus::Choked, "{r:?}");
+    assert!(!r.unchoked);
+    assert!(started.elapsed() < Duration::from_secs(6));
+    let s = fs::start(
+        t.clone(),
+        Opts {
+            unchoke: Unchoke::Never,
+            allowed_fast: vec![0],
+            ..Opts::default()
+        },
+    )
+    .await;
+    let r = probe(&t, &s, &[], cfg()).await;
+    assert_eq!(label(&r), vec![("video.mkv", false)], "{r:?}");
+    assert!(!r.unchoked);
+}
+
+/// 7: upload off against a hostile seeder (it asks us for blocks and metadata all along), many
+/// times: only whitelisted ids go out, never a piece, unchoke, have, bitfield or metadata data.
+#[tokio::test]
+async fn upload_off_never_shares_with_a_hostile_peer() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(2_000_000))], 256 * KIB);
+    let s = fs::start(
+        t.clone(),
+        Opts {
+            hostile: true,
+            ..Opts::default()
+        },
+    )
+    .await;
+    for _ in 0..12 {
+        let r = probe(&t, &s, &[], cfg()).await;
+        assert_eq!(label(&r), vec![("video.mkv", true)], "{r:?}");
+    }
+    let l = s.log();
+    assert_whitelist(&l);
+    assert!(
+        l.rejects_got > 0,
+        "a fast peer's requests get reject_request"
+    );
+    assert!(
+        l.metadata_types.contains(&2),
+        "metadata requests get a reject"
+    );
+
+    // Negative control: a client that does send them is caught (the detector is not vacuous).
+    let mut c = tokio::net::TcpStream::connect(s.addr).await.unwrap();
+    let mut hs = magnetar_core::metainfo::wire::handshake_with(&t.hash, &[1; 20], true).to_vec();
+    use magnetar_core::metainfo::wire::frame;
+    hs.extend(frame(1, &[]));
+    hs.extend(frame(4, &0u32.to_be_bytes()));
+    hs.extend(frame(5, &[0x80]));
+    let mut p = vec![0, 0, 0, 0, 0, 0, 0, 0];
+    p.extend_from_slice(&[0; 16]);
+    hs.extend(frame(7, &p));
+    c.write_all(&hs).await.unwrap();
+    let mut buf = [0u8; 68];
+    c.read_exact(&mut buf).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(s.log().forbidden >= l.forbidden + 4);
+}
+
+/// 8: upload on: HAVE only for verified held pieces, pieces only inside them, other requests
+/// rejected, never a bitfield or have_all, the byte cap and the rate cap kept.
+#[tokio::test]
+async fn upload_mode_shares_only_verified_pieces_within_caps() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(1_000_000))], 256 * KIB);
+    // The hand-off peer lacks piece 0 (the file's head) and wants it; a seed has it.
+    let leech = Opts {
+        has: Has::Pieces(vec![1, 2, 3]),
+        leech: Some(3),
+        ..Opts::default()
+    };
+    let a = fs::start(t.clone(), leech.clone()).await;
+    let b = fs::start(t.clone(), Opts::default()).await;
+    let c = ProbeConfig {
+        upload: true,
+        upload_max_bytes: 512 * KIB,
+        upload_rate: 16 * MIB,
+        ..cfg()
+    };
+    let r = probe(&t, &a, &[b.addr], c).await;
+    assert_eq!(label(&r), vec![("video.mkv", true)], "{r:?}");
+    let l = a.log();
+    assert_eq!(l.haves, vec![0], "only the verified piece");
+    assert!(l.unchokes >= 1);
+    assert!(
+        !l.ids.contains(&5) && !l.ids.contains(&14),
+        "no bitfield, no have_all"
+    );
+    assert!(l.piece_bytes_ok, "served bytes are the torrent's");
+    assert!(
+        l.pieces_got.iter().all(|(i, _, _)| *i == 0),
+        "{:?}",
+        l.pieces_got
+    );
+    assert_eq!(l.piece_bytes, 512 * KIB, "the byte cap: {}", l.piece_bytes);
+    assert_eq!(r.uploaded, 512 * KIB);
+    assert!(
+        l.rejects_got >= 1,
+        "the request for a piece it does not hold"
+    );
+    assert!(l.chokes >= 1, "choked at the cap");
+    // The seed is not interested: never unchoked, gets the HAVE only.
+    let lb = b.log();
+    assert_eq!(lb.unchokes, 0);
+    assert_eq!(lb.piece_bytes, 0);
+
+    // Rate cap: 64 KiB/s over the linger.
+    let a = fs::start(t.clone(), leech.clone()).await;
+    let b = fs::start(t.clone(), Opts::default()).await;
+    let c = ProbeConfig {
+        upload: true,
+        upload_rate: 64 * KIB,
+        upload_linger: Duration::from_millis(1500),
+        ..cfg()
+    };
+    let started = Instant::now();
+    let r = probe(&t, &a, &[b.addr], c).await;
+    let secs = started.elapsed().as_secs_f64();
+    let got = a.log().piece_bytes;
+    assert!(got > 0);
+    assert!(
+        (got as f64) <= 64.0 * 1024.0 * (secs + 1.0),
+        "{got} B in {secs:.2} s"
+    );
+    assert_eq!(r.uploaded, got);
+
+    // Same peers, upload off: nothing shared.
+    let a = fs::start(t.clone(), leech).await;
+    let b = fs::start(t.clone(), Opts::default()).await;
+    let r = probe(&t, &a, &[b.addr], cfg()).await;
+    assert_eq!(label(&r), vec![("video.mkv", true)]);
+    assert_whitelist(&a.log());
+    assert_whitelist(&b.log());
+}
+
+/// 9: `reqq=4`: never more than 4 requests outstanding (control: more without it).
+#[tokio::test]
+async fn reqq_caps_the_pipeline() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(1_000_000))], 256 * KIB);
+    let s = fs::start(
+        t.clone(),
+        Opts {
+            reqq: Some(4),
+            delay: Duration::from_millis(2),
+            ..Opts::default()
+        },
+    )
+    .await;
+    let r = probe(&t, &s, &[], cfg()).await;
+    assert_eq!(label(&r), vec![("video.mkv", true)]);
+    assert!(s.log().max_outstanding <= 4, "{}", s.log().max_outstanding);
+    let s = fs::start(
+        t.clone(),
+        Opts {
+            delay: Duration::from_millis(2),
+            ..Opts::default()
+        },
+    )
+    .await;
+    probe(&t, &s, &[], cfg()).await;
+    assert!(s.log().max_outstanding > 4);
+}
+
+/// 10: hostile input never panics: oversize pieces, spare bitfield bits, unrequested blocks,
+/// floods, a `have` past the end. Blocks out of order and rejects are taken in stride.
+#[tokio::test]
+async fn hostile_input_is_survived() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(1_000_000))], 256 * KIB);
+    for junk in [
+        Junk::OversizePiece,
+        Junk::SpareBits,
+        Junk::Unrequested,
+        Junk::BadHave,
+    ] {
+        let s = fs::start(
+            t.clone(),
+            Opts {
+                junk,
+                ..Opts::default()
+            },
+        )
+        .await;
+        let r = probe(&t, &s, &[], cfg()).await;
+        assert!(r.files.is_empty(), "{junk:?}: the peer is dropped: {r:?}");
+    }
+    for o in [
+        Opts {
+            junk: Junk::Flood,
+            ..Opts::default()
+        },
+        Opts {
+            out_of_order: true,
+            ..Opts::default()
+        },
+        Opts {
+            reject_every: Some(3),
+            ..Opts::default()
+        },
+    ] {
+        let s = fs::start(t.clone(), o.clone()).await;
+        let good = fs::start(t.clone(), Opts::default()).await;
+        let r = probe(&t, &s, &[good.addr], cfg()).await;
+        assert_eq!(label(&r), vec![("video.mkv", true)], "{o:?}: {r:?}");
+    }
+}
+
+/// 13: probes off: the fetcher's wire is what it was before D117 (BEP 10 bit only, no
+/// HAVE_NONE, no INTERESTED) and there is no hand-off.
+#[tokio::test]
+async fn fetcher_without_probes_is_unchanged() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(100_000))], 256 * KIB);
+    let s = fs::start(t.clone(), Opts::default()).await;
+    let f = fetcher(false);
+    let (r, h) = f.fetch_with_handoff(t.hash, &[s.addr]).await;
+    assert!(matches!(r, Ok(Outcome::Ok(_))));
+    assert!(h.is_none());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let l = s.log();
+    assert_eq!(l.reserved[0], [0, 0, 0, 0, 0, 0x10, 0, 0]);
+    let ids: HashSet<u8> = l.ids.iter().copied().collect();
+    assert_eq!(
+        ids,
+        HashSet::from([20]),
+        "extended messages only: {:?}",
+        l.ids
+    );
+    // `connect_for_probe` refuses on a fetcher without probes.
+    assert!(f.connect_for_probe(t.hash, s.addr).await.is_err());
+}
+
+/// 14: the byte budget stops the probe: cut short, flagged incomplete.
+#[tokio::test]
+async fn byte_budget_stops_the_probe() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(6_000_000))], 4 * MIB);
+    let s = fs::start(t.clone(), Opts::default()).await;
+    let r = probe(
+        &t,
+        &s,
+        &[],
+        ProbeConfig {
+            max_bytes: 32 * KIB,
+            ..cfg()
+        },
+    )
+    .await;
+    assert!(r.incomplete, "{r:?}");
+    assert!(r.bytes_in <= 32 * KIB);
+    assert!(s.log().served <= 2);
+}
+
+/// Two-peer agreement on the main payload's first read, when a second peer is connected.
+#[tokio::test]
+async fn second_peer_agreement() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(6_000_000))], 4 * MIB);
+    // The hand-off peer has nothing yet (a second peer is connected), then everything.
+    let late = Opts {
+        has: Has::Pieces(vec![]),
+        have_all_after: Some(Duration::from_millis(100)),
+        ..Opts::default()
+    };
+    let slow = Opts {
+        delay: Duration::from_millis(250),
+        delay_first: 4,
+        ..Opts::default()
+    };
+    let a = fs::start(t.clone(), late.clone()).await;
+    let b = fs::start(t.clone(), slow.clone()).await;
+    let r = probe(&t, &a, &[b.addr], cfg()).await;
+    assert_eq!(label(&r), vec![("video.mkv", false)], "{r:?}");
+    assert_eq!(r.files[0].agreed, 2, "{r:?}");
+    assert!(a.log().served >= 4 && b.log().served >= 4);
+    // The late peer lies: the peers disagree, the surprise check verifies from the honest one.
+    let a = fs::start(
+        t.clone(),
+        Opts {
+            lie: Some(Arc::new(pe(t.data.len()))),
+            ..late
+        },
+    )
+    .await;
+    let b = fs::start(t.clone(), slow).await;
+    let r = probe(&t, &a, &[b.addr], cfg()).await;
+    assert_eq!(label(&r), vec![("video.mkv", true)], "{r:?}");
+    assert_eq!(r.files[0].notes, vec!["disagree", "surprise_verified"]);
+}
