@@ -22,6 +22,12 @@ its file list says. Never on torrents tagged adult or matched by the blocklist. 
 is active, since probing connects to peers from the server's IP. Per-machine limits for the
 crawl workers come from the router benchmarks (docs/benchmarks/).
 
+Status: the detector is done (D116, `crates/sniff`: file types by content, console game ids,
+video and audio recon from sparse byte ranges). Left: (C) the probe engine in the worker
+(piece planner, message whitelist, `probe_attrs` / `probe_files` storage, the opt-in upload
+below, a trial on eee with both upload settings), then (D) games enrichment keyed by the ids
+`sniff` reads (GameTDB files after GameTDB answers about automated downloads; Wikidata).
+
 **Legal note, required with the feature (README "Legal" and the feature's doc).** Today
 Magnetar only handles metadata: info dicts (names, sizes, hashes), never file data. Header
 probes download pieces of the files themselves, so the legal position becomes blurry and the
@@ -30,9 +36,13 @@ README must say so when they ship. The user's point for France: what is enforced
 Downloading a fragment to learn what a torrent contains is not the targeted act, but it is not
 explicitly lawful either: copying from an unlawful source is not covered by the private-copy
 exception (CJEU C-435/12 *ACI Adam*, 2014), so do not write that probing is legal. What the
-design must guarantee so a probe never shares: no upload at all (never unchoke, no `HAVE` or
-bitfield of real pieces, not announced as a seeder), only the bytes needed for the check, and
-nothing kept after it. **UNVERIFIED legal reading, not legal advice**; other countries differ
+design must guarantee by default so a probe never shares: no piece data sent (never unchoke,
+`HAVE_NONE` instead of a bitfield of real pieces, not announced as a seeder), only the bytes
+needed for the check, and nothing kept after it. Protocol traffic (handshakes, requests) is not
+sharing. An opt-in setting (off by default) may serve the few whole, hash-checked pieces a probe
+holds to leechers, to get unchoked faster; its doc and the README must say that turning it on
+*is* sharing. Decision (user, 2026-11-02): the upstream default stays off; the user's own
+workers will run with it on after the eee trial measures both. **UNVERIFIED legal reading, not legal advice**; other countries differ
 (Germany, for example, fines downloads too).
 
 ### DHT engine: collapse at extreme settings

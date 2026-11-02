@@ -1,0 +1,81 @@
+# Font signatures.
+
+[[rule]]
+id = "ttf"
+label = "font.ttf"
+confidence = 92
+type = "bytes"
+hex = ["00010000", "74727565"]   # 1.0 or 'true'
+  [[rule.then]]
+  offset = 4
+  type = "u16be"
+  test = "1..=64"
+  field = "tables"
+  [[rule.then]]          # first table tag
+  offset = 12
+  type = "ascii"
+  len = 4
+  class = "printable"
+
+[[rule]]
+id = "otf"
+label = "font.otf"
+confidence = 92
+type = "string"
+value = "OTTO"
+  [[rule.then]]
+  offset = 4
+  type = "u16be"
+  test = "1..=64"
+  field = "tables"
+  [[rule.then]]
+  offset = 12
+  type = "ascii"
+  len = 4
+  class = "printable"
+
+[[rule]]
+id = "ttc"
+label = "font.ttc"
+confidence = 97
+type = "string"
+value = "ttcf"
+  [[rule.then]]
+  offset = 4
+  type = "u32be"
+  test = "0x10000|0x20000"
+
+[[rule]]
+id = "woff"
+label = "font.woff"
+confidence = 97
+type = "string"
+value = "wOFF"
+  [[rule.then]]          # flavor: TrueType, CFF ('OTTO') or Apple 'true'
+  offset = 4
+  type = "u32be"
+  test = "0x00010000|0x4F54544F|0x74727565"
+  optional = true
+
+[[rule]]
+id = "woff2"
+label = "font.woff2"
+confidence = 97
+type = "string"
+value = "wOF2"
+  [[rule.then]]          # flavor: TrueType, CFF ('OTTO'), Apple 'true' or a collection ('ttcf')
+  offset = 4
+  type = "u32be"
+  test = "0x00010000|0x4F54544F|0x74727565|0x74746366"
+  optional = true
+
+[[rule]]
+id = "type1"
+label = "font.type1"
+confidence = 95
+type = "bytes"
+hex = "8001"
+  [[rule.then]]
+  offset = 6
+  type = "string"
+  value = "%!PS-AdobeFont"

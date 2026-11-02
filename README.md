@@ -42,8 +42,10 @@ It runs in two places, and both of them crawl:
      Postgres 18 (tsvector + pg_trgm)
 ```
 
-The crates are `crates/core` (shared logic, no database driver) and `crates/server`
-(Postgres, the API, the relay endpoint and the daemons); `android/` is the app (package
+The crates are `crates/core` (shared logic, no database driver), `crates/server`
+(Postgres, the API, the relay endpoint and the daemons) and `crates/sniff` (a standalone file
+type and video detector that works on the byte ranges a probe fetches; not wired into the
+server yet, see crates/sniff/README.md); `android/` is the app (package
 `app.magnetar`), a Kotlin client of the server's REST API since the rebuild (docs/APP.md,
 D79; the Rust `crates/ffi` library it used before is deleted).
 

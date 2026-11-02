@@ -1,0 +1,230 @@
+# Image signatures. PNG/APNG, BMP, ICO and the weak TGA/PCX headers are Rust checks in
+# src/formats/image.rs.
+
+[[rule]]
+id = "jpeg"
+label = "image.jpeg"
+confidence = 95
+type = "bytes"
+hex = "FFD8FF"
+  [[rule.then]]
+  offset = 3
+  type = "u8"
+  test = ">=0xC0"
+  [[rule.then]]          # APP0 JFIF / APP1 Exif identifier: the structure that makes 95
+  offset = 6
+  type = "string"
+  value = ['JFIF\0', 'Exif\0', 'JFXX\0']
+  optional = true
+
+[[rule]]
+id = "gif"
+label = "image.gif"
+confidence = 98
+type = "string"
+value = ["GIF87a", "GIF89a"]
+  [[rule.then]]
+  offset = 6
+  type = "u16le"
+  field = "width"
+  [[rule.then]]
+  offset = 8
+  type = "u16le"
+  field = "height"
+
+[[rule]]
+id = "tiff"
+label = "image.tiff"
+confidence = 92
+type = "string"
+value = ['II*\0', 'MM\0*']
+  [[rule.then]]          # first IFD offset present
+  offset = 4
+  type = "u32le"
+  [[rule.then]]
+  offset = 8
+  type = "string"
+  value = 'CR\x02'
+  optional = true
+  label = "image.raw.cr2"
+  confidence = 95
+
+[[rule]]
+id = "bigtiff"
+label = "image.tiff"
+confidence = 90
+type = "string"
+value = ['II+\0', 'MM\0+']
+set = { variant = "bigtiff" }
+  [[rule.then]]          # offset size 8, reserved 0
+  offset = 4
+  type = "bytes"
+  hex = ["08000000", "00080000"]
+  optional = true
+
+[[rule]]
+id = "psd"
+label = "image.psd"
+confidence = 97
+type = "string"
+value = "8BPS"
+  [[rule.then]]
+  offset = 4
+  type = "u16be"
+  test = "1|2"
+  field = "version"
+
+[[rule]]
+id = "xpm"
+label = "image.xpm"
+confidence = 97
+type = "string"
+value = "/* XPM */"
+
+[[rule]]
+id = "jxl"
+label = "image.jxl"
+confidence = 95
+type = "bytes"
+hex = ["FF0A", "0000000C4A584C200D0A870A"]
+
+[[rule]]
+id = "jp2"
+label = "image.jp2"
+confidence = 97
+type = "bytes"
+hex = "0000000C6A5020200D0A870A"
+
+[[rule]]
+id = "j2k"
+label = "image.jp2"
+confidence = 90
+type = "bytes"
+hex = "FF4FFF51"
+set = { variant = "j2k codestream" }
+  [[rule.then]]          # SIZ length 38 + 3 per component (1-4 components)
+  offset = 4
+  type = "u16be"
+  test = "41|44|47|50"
+  optional = true
+
+[[rule]]
+id = "jp2_weak"
+label = "image.jp2"
+confidence = 80
+type = "bytes"
+hex = "0000000C6A50"
+
+[[rule]]
+id = "qoi"
+label = "image.qoi"
+confidence = 97
+type = "string"
+value = "qoif"
+  [[rule.then]]          # channels 3 or 4
+  offset = 12
+  type = "u8"
+  test = "3|4"
+  optional = true
+    [[rule.then.then]]   # colorspace 0 or 1
+    offset = 13
+    type = "u8"
+    test = "0|1"
+
+[[rule]]
+id = "exr"
+label = "image.exr"
+confidence = 97
+type = "bytes"
+hex = "762F3101"
+  [[rule.then]]          # version 2
+  offset = 4
+  type = "u8"
+  test = "2"
+  optional = true
+
+[[rule]]
+id = "dds"
+label = "image.dds"
+confidence = 97
+type = "string"
+value = "DDS "
+  [[rule.then]]
+  offset = 4
+  type = "u32le"
+  test = "124"
+
+[[rule]]
+id = "pnm"
+label = "image.pnm"
+confidence = 85
+type = "string"
+value = "P"
+  [[rule.then]]
+  offset = 1
+  type = "u8"
+  test = "0x31..=0x37"
+  [[rule.then]]
+  offset = 2
+  type = "u8"
+  test = "9|10|11|12|13|32"
+
+[[rule]]
+id = "raf"
+label = "image.raw.raf"
+confidence = 95
+type = "string"
+value = "FUJIFILMCCD-RAW"
+
+[[rule]]
+id = "tga_footer"        # TGA 2.0 footer, last 18 bytes
+label = "image.tga"
+confidence = 95
+offset = -18
+type = "string"
+value = 'TRUEVISION-XFILE.\0'
+
+[[rule]]
+id = "icns"
+label = "image.icns"
+confidence = 85
+type = "string"
+value = "icns"
+  [[rule.then]]
+  offset = 4
+  type = "u32be"
+  test = "=$size"
+  optional = true
+  confidence = 97
+
+[[rule]]
+id = "radiance_hdr"
+label = "image.hdr"
+confidence = 98
+type = "string"
+value = ['#?RADIANCE\n', '#?RGBE\n']
+
+[[rule]]
+id = "xcf"
+label = "image.xcf"
+confidence = 99
+type = "string"
+value = "gimp xcf "
+
+[[rule]]
+id = "ktx"
+label = "image.ktx"
+confidence = 99
+type = "bytes"
+hex = ["AB4B5458203131BB0D0A1A0A", "AB4B5458203230BB0D0A1A0A"]
+
+[[rule]]
+id = "fits"
+label = "image.fits"
+confidence = 97
+type = "string"
+value = "SIMPLE  ="
+  [[rule.then]]
+  offset = 29
+  type = "string"
+  value = "T"

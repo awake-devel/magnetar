@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/server"]
+members = ["crates/core", "crates/server", "crates/sniff"]
 
 [workspace.package]
 version = "0.3.2"
@@ -44,6 +44,11 @@ flate2 = "=1.1.10"
 httpdate = "=1.0.3"
 anitomy-ng = { version = "=1.0.10", default-features = false }
 ruzstd = "=0.9.0"
+# Content sniffing (crates/sniff): substring search, archive header CRCs, TOML signature files.
+memchr = "=2.8.3"
+crc32fast = "=1.5.3"
+toml = { version = "=1.1.8", default-features = false, features = ["std", "parse", "serde"] }
+proptest = { version = "=1.12.0", default-features = false, features = ["std"] }
 tantivy = { version = "=0.27.0", default-features = false, features = ["mmap", "lz4-compression"] }
 # MMDB reader for the crawl map's DB-IP Lite databases (D104; ISC, oschwald/maxminddb-rust).
 maxminddb = { version = "=0.32.0", default-features = false }

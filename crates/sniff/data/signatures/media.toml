@@ -1,0 +1,508 @@
+# Audio/video signatures at fixed offsets. Formats needing structure (RIFF size, Ogg pages,
+# MPEG audio frame chains, MPEG-TS/PS, elementary streams, DV, PGS, Matroska, MP4, ASF) are Rust
+# checks in src/formats/media.rs. Syntax: data/signatures/README.md.
+
+[[rule]]
+id = "w64"
+label = "audio.w64"
+confidence = 90
+type = "string"
+value = 'riff\x2e\x91\xcf\x11'
+
+[[rule]]
+id = "flac"
+label = "audio.flac"
+confidence = 97
+type = "string"
+value = "fLaC"
+  [[rule.then]]          # first metadata block is STREAMINFO (type 0)
+  offset = 4
+  type = "u8"
+  mask = 0x7f
+  test = "0"
+  [[rule.then]]          # STREAMINFO length 34
+  offset = 5
+  type = "bytes"
+  hex = "000022"
+  optional = true
+  [[rule.then]]
+  offset = 18
+  type = "u32be"
+  shift = 12
+  field = "sample_rate"
+  optional = true
+
+[[rule]]
+id = "dts"
+label = "audio.dts"
+confidence = 85
+type = "bytes"
+hex = ["7FFE8001", "FE7F0180", "1FFFE800", "FF1F00E8"]
+
+[[rule]]
+id = "dts_hd"
+label = "audio.dts"
+confidence = 95
+type = "string"
+value = "DTSHDHDR"
+set = { variant = "dts-hd file" }
+
+[[rule]]
+id = "truehd"
+label = "audio.truehd"
+confidence = 92
+offset = 4
+type = "bytes"
+hex = "F8726FBA"
+  [[rule.then]]          # major sync signature
+  offset = 12
+  type = "u16be"
+  test = "0xB752"
+  optional = true
+
+[[rule]]
+id = "mlp"
+label = "audio.mlp"
+confidence = 90
+offset = 4
+type = "bytes"
+hex = "F8726FBB"
+  [[rule.then]]          # major sync signature
+  offset = 12
+  type = "u16be"
+  test = "0xB752"
+  optional = true
+
+[[rule]]
+id = "wavpack"
+label = "audio.wavpack"
+confidence = 95
+type = "string"
+value = "wvpk"
+  [[rule.then]]          # stream version 0x402-0x410
+  offset = 8
+  type = "u16le"
+  test = "0x402..=0x410"
+  optional = true
+
+[[rule]]
+id = "tta"
+label = "audio.tta"
+confidence = 95
+type = "string"
+value = "TTA1"
+  [[rule.then]]          # format 1 (PCM), 2 (encrypted), 3 (float)
+  offset = 4
+  type = "u16le"
+  test = "1..=3"
+  optional = true
+    [[rule.then.then]]   # bits per sample
+    offset = 8
+    type = "u16le"
+    test = "8|16|24|32"
+
+[[rule]]
+id = "ape"
+label = "audio.ape"
+confidence = 95
+type = "string"
+value = "MAC "
+  [[rule.then]]
+  offset = 4
+  type = "u16le"
+  test = "3800..5000"
+  field = "version"
+  [[rule.then]]          # 3.98+ descriptor: descriptor 52 bytes, header 24 bytes
+  offset = 8
+  type = "u32le"
+  test = "52"
+  optional = true
+
+[[rule]]
+id = "aiff"
+label = "audio.aiff"
+confidence = 95
+type = "string"
+value = "FORM"
+  [[rule.then]]
+  offset = 8
+  type = "string"
+  value = ["AIFF", "AIFC"]
+
+[[rule]]
+id = "caf"
+label = "audio.caf"
+confidence = 95
+type = "string"
+value = "caff"
+  [[rule.then]]
+  offset = 4
+  type = "u16be"
+  test = "1"
+
+[[rule]]
+id = "au"
+label = "audio.au"
+confidence = 90
+type = "string"
+value = ".snd"
+  [[rule.then]]
+  offset = 4
+  type = "u32be"
+  test = ">=24"
+  [[rule.then]]          # encoding 1-27
+  offset = 12
+  type = "u32be"
+  test = "1..=27"
+  optional = true
+
+[[rule]]
+id = "amr"
+label = "audio.amr"
+confidence = 95
+type = "string"
+value = "#!AMR"
+
+[[rule]]
+id = "voc"
+label = "audio.voc"
+confidence = 95
+type = "string"
+value = 'Creative Voice File\x1a'
+
+[[rule]]
+id = "midi"
+label = "audio.midi"
+confidence = 95
+type = "string"
+value = "MThd"
+  [[rule.then]]
+  offset = 4
+  type = "u32be"
+  test = "6"
+
+[[rule]]
+id = "optimfrog"
+label = "audio.optimfrog"
+confidence = 90
+type = "string"
+value = "OFR "
+
+[[rule]]
+id = "dsf"
+label = "audio.dsf"
+confidence = 95
+type = "string"
+value = "DSD "
+  [[rule.then]]          # DSD chunk size 28, then the fmt chunk
+  offset = 4
+  type = "u64le"
+  test = "28"
+  optional = true
+
+[[rule]]
+id = "dff"
+label = "audio.dff"
+confidence = 95
+type = "string"
+value = "FRM8"
+  [[rule.then]]
+  offset = 12
+  type = "string"
+  value = "DSD "
+
+[[rule]]
+id = "flv"
+label = "video.flv"
+confidence = 96
+type = "string"
+value = 'FLV\x01'
+  [[rule.then]]          # flags: only bits 0 (video) and 2 (audio) may be set
+  offset = 4
+  type = "u8"
+  mask = 0xFA
+  test = "0"
+  [[rule.then]]          # header size
+  offset = 5
+  type = "u32be"
+  test = "9"
+  [[rule.then]]
+  offset = 4
+  type = "u8"
+  mask = 0x01
+  field = "has_video"
+  [[rule.then]]
+  offset = 4
+  type = "u8"
+  mask = 0x04
+  shift = 2
+  field = "has_audio"
+
+[[rule]]
+id = "y4m"
+label = "video.y4m"
+confidence = 98
+type = "string"
+value = "YUV4MPEG2 "
+
+[[rule]]
+id = "nut"
+label = "video.nut"
+confidence = 98
+type = "string"
+value = 'nut/multimedia container\0'
+
+[[rule]]
+id = "ivf"
+label = "video.ivf"
+confidence = 97
+type = "string"
+value = "DKIF"
+  [[rule.then]]
+  offset = 6
+  type = "u16le"
+  test = "32"
+  [[rule.then]]
+  offset = 8
+  type = "ascii"
+  len = 4
+  field = "fourcc"
+  optional = true
+
+[[rule]]
+id = "realmedia"
+label = "video.rm"
+confidence = 95
+type = "string"
+value = ".RMF"
+  [[rule.then]]          # .RMF header size
+  offset = 4
+  type = "u32be"
+  test = "16..=32"
+  optional = true
+    [[rule.then.then]]   # object version 0 or 1
+    offset = 8
+    type = "u16be"
+    test = "0|1"
+
+[[rule]]
+id = "bink"
+label = "video.bink"
+confidence = 80
+type = "string"
+value = ["BIK", "KB2"]
+  [[rule.then]]          # width
+  offset = 20
+  type = "u32le"
+  test = "1..=7680"
+  optional = true
+    [[rule.then.then]]   # height
+    offset = 24
+    type = "u32le"
+    test = "1..=4320"
+
+[[rule]]
+id = "smacker"
+label = "video.smacker"
+confidence = 85
+type = "string"
+value = ["SMK2", "SMK4"]
+  [[rule.then]]          # width
+  offset = 4
+  type = "u32le"
+  test = "1..=4096"
+  optional = true
+
+[[rule]]
+id = "mxf"
+label = "video.mxf"
+confidence = 97
+type = "bytes"
+hex = "060E2B34020501010D01020101"
+
+[[rule]]
+id = "mxf_run_in"        # partition pack after a run-in of up to 64 KiB
+label = "video.mxf"
+confidence = 85
+fetch = false
+type = "search"
+range = 65536
+hex = "060E2B34020501010D01020101"
+
+# ---------------------------------------------------------------- tracker and chip music
+
+[[rule]]
+id = "mod"               # ProTracker family: channel tag at 1080
+label = "audio.mod"
+confidence = 85
+offset = 1080
+type = "string"
+value = ["M.K.", "M!K!", "FLT4", "FLT8", "4CHN", "6CHN", "8CHN", "OCTA", "CD81"]
+
+[[rule]]
+id = "s3m"
+label = "audio.s3m"
+confidence = 95
+offset = 44
+type = "string"
+value = "SCRM"
+  [[rule.then]]
+  offset = 29
+  type = "u8"
+  test = "0x10"
+
+[[rule]]
+id = "xm"
+label = "audio.xm"
+confidence = 98
+type = "string"
+value = "Extended Module: "
+
+[[rule]]
+id = "it"
+label = "audio.it"
+confidence = 90
+type = "string"
+value = "IMPM"
+  [[rule.then]]          # created-with tracker version
+  offset = 0x28
+  type = "u16le"
+  test = "0x0100..0x8000"
+  [[rule.then]]          # compatible-with version (0x0200 / 0x0214)
+  offset = 0x2A
+  type = "u16le"
+  test = "0x0100..=0x0300"
+  [[rule.then]]          # global volume 0-128
+  offset = 0x30
+  type = "u8"
+  test = "<=128"
+
+[[rule]]
+id = "musepack"          # SV8 "MPCK", SV7 "MP+" with stream version 7
+label = "audio.musepack"
+confidence = 95
+type = "string"
+value = "MPCK"
+  [[rule.then]]          # first packet: stream header
+  offset = 4
+  type = "string"
+  value = "SH"
+  optional = true
+
+[[rule]]
+id = "musepack_sv7"
+label = "audio.musepack"
+confidence = 90
+type = "string"
+value = "MP+"
+  [[rule.then]]
+  offset = 3
+  type = "u8"
+  mask = 0x0F
+  test = "7"
+
+[[rule]]
+id = "nsf"
+label = "audio.nsf"
+confidence = 98
+type = "string"
+value = ['NESM\x1a', "NSFE"]
+  [[rule.then]]          # NESM version 1 or 2
+  offset = 5
+  type = "u8"
+  test = "1|2"
+  optional = true
+    [[rule.then.then]]   # load address in cartridge space
+    offset = 8
+    type = "u16le"
+    test = ">=0x8000"
+    [[rule.then.then]]   # init address
+    offset = 10
+    type = "u16le"
+    test = ">=0x8000"
+  [[rule.then]]          # NSFE: INFO chunk first
+  offset = 8
+  type = "string"
+  value = "INFO"
+  optional = true
+
+[[rule]]
+id = "spc"
+label = "audio.spc"
+confidence = 99
+type = "string"
+value = "SNES-SPC700 Sound File Data"
+
+[[rule]]
+id = "vgm"
+label = "audio.vgm"
+confidence = 95
+type = "string"
+value = "Vgm "
+  [[rule.then]]
+  offset = 8
+  type = "u32le"
+  test = "0x100..=0x200"
+  field = "version"
+
+[[rule]]
+id = "gbs"
+label = "audio.gbs"
+confidence = 95
+type = "string"
+value = 'GBS\x01'
+  [[rule.then]]          # load / init / play addresses in ROM space
+  offset = 6
+  type = "u16le"
+  test = "0x0400..0x8000"
+  optional = true
+    [[rule.then.then]]
+    offset = 8
+    type = "u16le"
+    test = "0x0400..0x8000"
+    [[rule.then.then]]
+    offset = 10
+    type = "u16le"
+    test = "0x0400..0x8000"
+    [[rule.then.then]]   # at least one song
+    offset = 4
+    type = "u8"
+    test = ">=1"
+    [[rule.then.then]]   # title
+    offset = 0x10
+    type = "cstring"
+    len = 32
+    class = "printable"
+
+[[rule]]
+id = "psf"               # PSF family: 1 PS1, 2 PS2, 0x11 Saturn, 0x12 DC, 0x21 N64, 0x22 GBA, 0x23 SNES
+label = "audio.psf"
+confidence = 92
+type = "string"
+value = "PSF"
+  [[rule.then]]
+  offset = 3
+  type = "u8"
+  test = "1|2|0x11|0x12|0x13|0x21|0x22|0x23|0x24|0x25|0x41"
+  field = "psf_type"
+  [[rule.then]]          # reserved and compressed program sizes within the file
+  offset = 4
+  type = "u32le"
+  test = "<=$size"
+  optional = true
+    [[rule.then.then]]
+    offset = 8
+    type = "u32le"
+    test = "<=$size"
+
+[[rule]]
+id = "sid"
+label = "audio.sid"
+confidence = 97
+type = "string"
+value = ["PSID", "RSID"]
+  [[rule.then]]
+  offset = 4
+  type = "u16be"
+  test = "1..=4"
+  field = "version"
