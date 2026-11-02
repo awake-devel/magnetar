@@ -154,6 +154,17 @@ apply to it), from its own line: trackers see another IP, so the per-tracker rat
    422) refuses that body for good, so the worker splits it in halves and drops a single
    refused item with a warning (`upload_dropped` in its report), instead of resending it
    forever.
+8. **Header probes (D117, docs/PROBES.md; `MAGNETAR_PROBE`, off by default).** On a worker
+   with probes on, a verified dict that passed step 3 (not blocked, not adult, dict ≤ 2 MiB)
+   keeps its metadata connection: while no brake or pressure is on and a probe slot and turn
+   are free, the probe reads the few blocks sniff needs and its report rides with the dict
+   (`DhtResult.probe`) once it ends (≤ 45 s; a stop sends the dict without it). Only
+   detections of confidence 80+ travel, with display indexes and no paths. The server checks
+   every field against **its own** file list (index, size) and sniff's label registry, and
+   stores it (`probe_attrs`, `probe_files`, `supplied_by` = the worker) only for a row it
+   stored itself, did not classify adult (category `porn` or the adult signal, the worker's
+   own gate) and did not block; a refused probe never costs its
+   dict (`DhtAck.probe_stored` / `probe_rejected`). The server never probes.
 
 ### What a worker keeps (D100)
 
@@ -200,7 +211,9 @@ leases_held, liveness_results_total, liveness_results_per_min, triaged_total, qu
 metadata_total, metadata_per_min, stored_total, blocked_total, rejected_total, rss_mb,
 mem_available_mb, pressure` and `dht {mode, nodes, ports, qps, answered_share, brake_active,
 health_brakes, sampling_paused, routing_nodes, pool, queue, unique_per_min, metadata_per_min,
-upload_backlog, external_ip_known}`. Rates are counted by the server from what it accepted
+upload_backlog, external_ip_known, probe}` (`probe`: header-probe counters when on, D117:
+`upload, started, ok, partial, choked, no_pieces, failed, skipped [[reason, n]], bytes_in,
+uploaded, files, verified_files, surprises`). Rates are counted by the server from what it accepted
 (10-minute window); memory and DHT come from the last heartbeat. The app is unchanged: the
 field has a default, older apps ignore it.
 
@@ -307,6 +320,14 @@ MAGNETAR_GEOIP=country
 
 `MAGNETAR_GEOIP=country` keeps the crawl map's database at ~8 MB on the Pi (no networks from
 it); `off` saves that too. Not measured on the Pi.
+
+**Header probes** (D117, docs/PROBES.md; off by default on both, production lines in
+docs/PROBES.md §8). Profile values, all **UNVERIFIED** until the eee trial measures them:
+
+| | `MAGNETAR_PROBE_PER_MIN` | `MAGNETAR_PROBE_PARALLEL` | why |
+|---|---:|---:|---|
+| EEE | 120 | 32 | ~2 probes/s × 1.23 MiB ≈ 2.5 MB/s in, well inside its line |
+| RPI | 12 | 4 | packets/s is its limit (~3 000 out at the router knee, the crawl already uses ~⅔); 0.2 probe/s ≈ 260 packets/s; memory 4 × 8 MiB |
 
 Optional on the Pi (root): `sysctl net.netfilter.nf_conntrack_max=32768` removes the
 conntrack limit (the governor then rarely brakes).
@@ -422,7 +443,10 @@ health probe are the safeguards.
 
 ## 7. Not done / not verified
 
-- Nostr relay crawling on workers (D99), header probes (not built), UPnP by default.
+- Nostr relay crawling on workers (D99), UPnP by default. Header probes (D117) are built but
+  not yet run on eee or the Pi: their rates, unchoke share and peer reactions are
+  **UNVERIFIED** (docs/PROBES.md §9). Probes only follow a worker's own fetches: rows stored
+  before them and Nostr-only rows are not probed (backfill leases are not built).
 - Hashes leased to a worker that dies come back through the server's DHT retry loop only when
   the server's own DHT crawler runs; otherwise they wait until sighted again, by another worker
   at least 1 h after the lease's end (D113), or by the same worker at once.
@@ -442,6 +466,11 @@ health probe are the safeguards.
                       WHERE t.infohash = s.infohash AND t.events > 0);
   DELETE FROM dht_torrents WHERE supplied_by = '<name>';
   ```
+
+  Header probes of those rows go with them (`probe_attrs` references `dht_torrents`); probes
+  that token wrote on rows others supplied: `DELETE FROM probe_attrs WHERE supplied_by =
+  '<name>'`. The server cannot re-check a probe's bytes (the same gap as a dict, D113); it
+  checks every field against its own file list and only stores probes of rows it stored.
  Rows stored before migration `20261104120000` have no
   supplier and cannot be told apart.
 - A worker can still block (or mark failed, private, …) a hash it triaged itself. Blocks from a

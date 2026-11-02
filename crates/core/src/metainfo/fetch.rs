@@ -17,6 +17,14 @@
 //!
 //! Peers are untrusted: every length is checked, unknown messages are skipped within a byte
 //! budget, and nothing here logs a name or path (docs/DHT.md §7.1).
+//!
+//! Header probes (D117, [`FetchConfig::probe`], crawl workers only): the handshake also sets the
+//! BEP 6 Fast Extension bit, `HAVE_NONE` goes before our extended handshake to peers that set it
+//! too, `INTERESTED` goes in the same write as the `ut_metadata` requests, and the peer's
+//! choke / have / bitfield / allowed-fast messages are recorded ([`PeerState`]) instead of
+//! skipped. [`Fetcher::fetch_with_handoff`] then hands the live connection of the peer that
+//! gave the dict to the probe ([`Handoff`]). With probes off every byte on the wire is what it
+//! was before D117.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddrV4;
@@ -30,7 +38,8 @@ use serde::Serialize;
 use sha2::Digest;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::Semaphore;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use super::info::{
@@ -50,6 +59,11 @@ const DISCARD_BUDGET: u64 = 4 * 1024 * 1024;
 const MAX_REJECTS_SENT: usize = 64;
 /// Budget accounting unit (the semaphore counts KiB so 256 MiB fits its u32 permits).
 const UNIT: usize = 1024;
+/// Largest raw bitfield remembered for a probe (BEP 3; 64 KiB = 524 288 pieces). A longer one
+/// drops the peer.
+pub const MAX_BITFIELD: usize = 64 * 1024;
+/// `have` / `allowed_fast` entries remembered per peer before the metadata is known.
+pub const MAX_HAVES: usize = 4096;
 /// Bytes one decoded bencode value may cost, used to price a decode before it runs: `Value` is
 /// 32 B and a dict entry (key and value, two counted values) 56 B, in a `Vec` that may have
 /// doubled, plus the allocator's chunk for each short key and string buffer (D110: a tree of tiny leaves peaks at ~102 B per value, string
@@ -114,6 +128,10 @@ pub struct FetchConfig {
     /// Keep the verified raw bytes in [`Fetched::raw`] (crawl workers upload them for the
     /// server to verify again, D97). Off on the server: the bytes are dropped after parsing.
     pub keep_raw: bool,
+    /// Header probes on this fetcher (D117, `MAGNETAR_PROBE`, crawl workers only): the BEP 6
+    /// bit, `HAVE_NONE`, early `INTERESTED`, recorded peer state and the connection hand-off.
+    /// Off: every metadata connection is byte for byte what it was before D117.
+    pub probe: bool,
 }
 
 impl Default for FetchConfig {
@@ -138,6 +156,7 @@ impl Default for FetchConfig {
             fake_ban: Duration::from_secs(3600),
             fake_cap: 50_000,
             keep_raw: false,
+            probe: false,
         }
     }
 }
@@ -271,6 +290,179 @@ impl FetchFailure {
     }
 }
 
+/// What a peer told us about its pieces and its choke state while the metadata was fetched
+/// (header probes, D117). Raw: the piece count is only known once the dict is verified, and
+/// the probe checks the bitfield against it then.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerState {
+    /// The peer chokes us (BEP 3: every connection starts choked).
+    pub choked: bool,
+    /// The peer said it is interested in us.
+    pub interested: bool,
+    /// The raw `bitfield` payload (at most [`MAX_BITFIELD`] bytes).
+    pub bitfield: Option<Vec<u8>>,
+    /// `have` indices, at most [`MAX_HAVES`] (later ones set `overflow`).
+    pub have: Vec<u32>,
+    /// BEP 6 `have_all` / `have_none` (the last one received wins).
+    pub have_all: bool,
+    pub have_none: bool,
+    /// BEP 6 `allowed_fast` indices, at most [`MAX_HAVES`].
+    pub allowed_fast: Vec<u32>,
+    /// More `have` messages than remembered.
+    pub overflow: bool,
+}
+
+impl Default for PeerState {
+    fn default() -> Self {
+        Self {
+            choked: true,
+            interested: false,
+            bitfield: None,
+            have: Vec::new(),
+            have_all: false,
+            have_none: false,
+            allowed_fast: Vec::new(),
+            overflow: false,
+        }
+    }
+}
+
+impl PeerState {
+    /// Record one non-extended message (`id`, `body`). Err when it breaks a size rule.
+    pub fn record(&mut self, id: u8, body: &[u8]) -> Result<(), PeerError> {
+        let index = || -> Result<u32, PeerError> {
+            let b: [u8; 4] = body.try_into().map_err(|_| PeerError::Protocol)?;
+            Ok(u32::from_be_bytes(b))
+        };
+        match id {
+            wire::MSG_CHOKE => self.choked = true,
+            wire::MSG_UNCHOKE => self.choked = false,
+            wire::MSG_INTERESTED => self.interested = true,
+            wire::MSG_NOT_INTERESTED => self.interested = false,
+            wire::MSG_HAVE => {
+                let i = index()?;
+                if self.have.len() < MAX_HAVES {
+                    self.have.push(i);
+                } else {
+                    self.overflow = true;
+                }
+            }
+            wire::MSG_BITFIELD => {
+                if body.len() > MAX_BITFIELD {
+                    return Err(PeerError::Protocol);
+                }
+                self.bitfield = Some(body.to_vec());
+            }
+            wire::MSG_HAVE_ALL => {
+                self.have_all = true;
+                self.have_none = false;
+            }
+            wire::MSG_HAVE_NONE => {
+                self.have_none = true;
+                self.have_all = false;
+            }
+            wire::MSG_ALLOWED_FAST => {
+                let i = index()?;
+                if self.allowed_fast.len() < MAX_HAVES && !self.allowed_fast.contains(&i) {
+                    self.allowed_fast.push(i);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// True for the message ids [`PeerState::record`] keeps.
+    pub fn records(id: u8) -> bool {
+        matches!(
+            id,
+            wire::MSG_CHOKE
+                | wire::MSG_UNCHOKE
+                | wire::MSG_INTERESTED
+                | wire::MSG_NOT_INTERESTED
+                | wire::MSG_HAVE
+                | wire::MSG_BITFIELD
+                | wire::MSG_HAVE_ALL
+                | wire::MSG_HAVE_NONE
+                | wire::MSG_ALLOWED_FAST
+        )
+    }
+}
+
+/// A live peer connection handed from the metadata fetch to a header probe (D117). It holds
+/// one of the fetcher's `max_connections` permits until dropped, so probes and metadata
+/// fetches share the router's single cap on open connections.
+pub struct PeerConn {
+    pub addr: SocketAddrV4,
+    /// The peer's handshake reserved bytes (BEP 6 bit: [`wire::has_fast`]).
+    pub reserved: [u8; 8],
+    pub peer_id: [u8; 20],
+    pub ext: ExtHandshake,
+    pub state: PeerState,
+    /// We sent `HAVE_NONE` (both sides set the BEP 6 bit).
+    pub sent_have_none: bool,
+    /// We sent `INTERESTED`.
+    pub sent_interested: bool,
+    /// Buffered reader: bytes the peer sent after the last metadata block stay in it.
+    #[cfg_attr(not(feature = "probe"), allow(dead_code))]
+    pub(crate) rd: BufReader<OwnedReadHalf>,
+    #[cfg_attr(not(feature = "probe"), allow(dead_code))]
+    pub(crate) wr: OwnedWriteHalf,
+    pub(crate) _permit: OwnedSemaphorePermit,
+}
+
+impl PeerConn {
+    /// Both sides set the BEP 6 Fast Extension bit.
+    pub fn fast(&self) -> bool {
+        self.sent_have_none
+    }
+}
+
+impl std::fmt::Debug for PeerConn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerConn")
+            .field("fast", &self.fast())
+            .field("ext", &self.ext)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What [`Fetcher::fetch_with_handoff`] hands to a header probe.
+#[derive(Debug)]
+pub struct Handoff {
+    /// The connection of the peer that gave the verified dict.
+    pub conn: PeerConn,
+    /// Every peer that took our BitTorrent handshake for this hash (the hand-off peer
+    /// included), in the order they answered: candidates for a probe's second peer.
+    pub answered: Vec<SocketAddrV4>,
+}
+
+/// The connection parts a session returns when asked to keep it.
+struct Live {
+    rd: BufReader<OwnedReadHalf>,
+    wr: OwnedWriteHalf,
+    reserved: [u8; 8],
+    peer_id: [u8; 20],
+    ext: ExtHandshake,
+    state: PeerState,
+    sent_have_none: bool,
+    sent_interested: bool,
+}
+
+type SessionOut = (
+    Vec<u8>,
+    Identity,
+    Result<InfoSummary, InfoError>,
+    Option<Live>,
+);
+type PeerOut = (
+    Vec<u8>,
+    Identity,
+    Result<InfoSummary, InfoError>,
+    Option<PeerConn>,
+);
+
 /// Counters for reports (never addresses or names).
 #[derive(Default)]
 struct Counters {
@@ -358,8 +550,8 @@ struct Inner {
     /// Permits `decode_budget` was created with.
     decode_units: usize,
     connects: Mutex<Pace>,
-    /// Open TCP connections.
-    conns: Semaphore,
+    /// Open TCP connections (a probe's connections hold their permit too, D117).
+    conns: Arc<Semaphore>,
     /// While in the future, connection attempts are paced at half the rate (D66).
     braked_until: Mutex<Option<Instant>>,
     /// Router health brake level (D109): attempts paced at 1/2^level of the rate.
@@ -645,7 +837,9 @@ impl Fetcher {
                 decode_budget: Semaphore::new(decode_units),
                 decode_units,
                 connects: Mutex::new(Pace::new(cfg.connects_per_sec.max(1), now)),
-                conns: Semaphore::new(cfg.max_connections.clamp(1, Semaphore::MAX_PERMITS)),
+                conns: Arc::new(Semaphore::new(
+                    cfg.max_connections.clamp(1, Semaphore::MAX_PERMITS),
+                )),
                 braked_until: Mutex::new(None),
                 brake_level: std::sync::atomic::AtomicU8::new(0),
                 reputation: Mutex::new(Reputation::new(
@@ -716,6 +910,20 @@ impl Fetcher {
         }
     }
 
+    /// The router health brake level last set ([`Fetcher::set_brake_level`]).
+    pub fn brake_level(&self) -> u8 {
+        self.inner.brake_level.load(Ordering::Relaxed)
+    }
+
+    /// True while [`Fetcher::brake_until`] halves the attempt rate.
+    pub fn braked(&self) -> bool {
+        self.inner
+            .braked_until
+            .lock()
+            .unwrap()
+            .is_some_and(|u| Instant::now() < u)
+    }
+
     /// Fetch, verify and parse the info dict of `info_hash` from `peers` (tried in order, the
     /// first `max_peers`, `parallel` at once). Returns on the first verified dict.
     pub async fn fetch(
@@ -723,11 +931,47 @@ impl Fetcher {
         info_hash: [u8; 20],
         peers: &[SocketAddrV4],
     ) -> Result<Outcome, FetchFailure> {
+        self.fetch_counted(info_hash, peers, false, None)
+            .await
+            .map(|(o, _)| o)
+    }
+
+    /// [`Fetcher::fetch`], and with [`FetchConfig::probe`] on, the live connection of the peer
+    /// that gave a usable dict ([`Outcome::Ok`]) plus every peer that took our handshake for
+    /// the hash (D117). Without `probe`, or for any other outcome, no hand-off: the connection
+    /// is closed as [`Fetcher::fetch`] closes it.
+    pub async fn fetch_with_handoff(
+        &self,
+        info_hash: [u8; 20],
+        peers: &[SocketAddrV4],
+    ) -> (Result<Outcome, FetchFailure>, Option<Handoff>) {
+        let keep = self.inner.cfg.probe;
+        let answered = Mutex::new(Vec::new());
+        let r = self
+            .fetch_counted(info_hash, peers, keep, keep.then_some(&answered))
+            .await;
+        match r {
+            Ok((o @ Outcome::Ok(_), Some(conn))) => {
+                let answered = answered.into_inner().unwrap_or_default();
+                (Ok(o), Some(Handoff { conn, answered }))
+            }
+            Ok((o, _)) => (Ok(o), None),
+            Err(e) => (Err(e), None),
+        }
+    }
+
+    async fn fetch_counted(
+        &self,
+        info_hash: [u8; 20],
+        peers: &[SocketAddrV4],
+        keep: bool,
+        answered: Option<&Mutex<Vec<SocketAddrV4>>>,
+    ) -> Result<(Outcome, Option<PeerConn>), FetchFailure> {
         let started = Instant::now();
         add(&self.inner.c.hashes, 1);
         let r = tokio::time::timeout(
             self.inner.cfg.hash_budget,
-            self.fetch_inner(info_hash, peers),
+            self.fetch_inner(info_hash, peers, keep, answered),
         )
         .await
         .unwrap_or(Err(FetchFailure {
@@ -738,7 +982,7 @@ impl Fetcher {
         }));
         let c = &self.inner.c;
         match &r {
-            Ok(Outcome::Ok(f)) => {
+            Ok((Outcome::Ok(f), _)) => {
                 add(&c.ok, 1);
                 add(&c.metadata_bytes, f.metadata_size as u64);
                 add(&c.ok_ms_total, started.elapsed().as_millis() as u64);
@@ -746,9 +990,9 @@ impl Fetcher {
                     add(&c.hybrid, 1);
                 }
             }
-            Ok(Outcome::Private) => add(&c.private, 1),
-            Ok(Outcome::V2Only) => add(&c.v2_only, 1),
-            Ok(Outcome::Invalid(_)) => add(&c.invalid, 1),
+            Ok((Outcome::Private, _)) => add(&c.private, 1),
+            Ok((Outcome::V2Only, _)) => add(&c.v2_only, 1),
+            Ok((Outcome::Invalid(_), _)) => add(&c.invalid, 1),
             Err(f) if f.oversize => add(&c.oversize, 1),
             Err(_) => add(&c.failed, 1),
         }
@@ -759,7 +1003,9 @@ impl Fetcher {
         &self,
         info_hash: [u8; 20],
         peers: &[SocketAddrV4],
-    ) -> Result<Outcome, FetchFailure> {
+        keep: bool,
+        answered: Option<&Mutex<Vec<SocketAddrV4>>>,
+    ) -> Result<(Outcome, Option<PeerConn>), FetchFailure> {
         let cfg = &self.inner.cfg;
         // Peers the reputation cache skips do not use up the per-hash cap.
         let mut skipped = 0usize;
@@ -789,12 +1035,12 @@ impl Fetcher {
                 let Some(p) = todo.next() else { break };
                 tried += 1;
                 add(&self.inner.c.peers_tried, 1);
-                running.push(self.peer(info_hash, p));
+                running.push(self.peer(info_hash, p, keep, answered));
             }
             let Some(r) = running.next().await else { break };
             match r {
-                Ok((raw, id, parsed)) => {
-                    return Ok(self.outcome(info_hash, raw, id, parsed, tried));
+                Ok((raw, id, parsed, conn)) => {
+                    return Ok((self.outcome(info_hash, raw, id, parsed, tried), conn));
                 }
                 Err(e) => {
                     if let Some(i) = PEER_ERRORS.iter().position(|x| *x == e) {
@@ -831,22 +1077,23 @@ impl Fetcher {
         outcome_of(sighted, len, raw, id, parsed, tried)
     }
 
-    /// One peer session. Returns the raw bytes, identity and parse result of verified bytes.
-    async fn peer(
+    /// Address filter, the open-connection permit, the attempt pace (slowed while the health
+    /// probe brakes, D66, D109), then the TCP connect.
+    async fn connect(
         &self,
-        info_hash: [u8; 20],
         addr: SocketAddrV4,
-    ) -> Result<(Vec<u8>, Identity, Result<InfoSummary, InfoError>), PeerError> {
+    ) -> Result<(TcpStream, OwnedSemaphorePermit), PeerError> {
         if !self.inner.filter.allows(&addr) {
             return Err(PeerError::Filtered);
         }
         let cfg = &self.inner.cfg;
         // Global bounds (home router NAT, docs/DHT.md §4 step 7): open connections, then the
         // attempt pace (slowed while the health probe brakes, D66, D109).
-        let _conn = self
+        let permit = self
             .inner
             .conns
-            .acquire()
+            .clone()
+            .acquire_owned()
             .await
             .map_err(|_| PeerError::Closed)?;
         let now = Instant::now();
@@ -870,12 +1117,34 @@ impl Fetcher {
             .map_err(|_| PeerError::Connect)?;
         add(&self.inner.c.connected, 1);
         let _ = stream.set_nodelay(true);
+        Ok((stream, permit))
+    }
+
+    /// One peer session. Returns the raw bytes, identity and parse result of verified bytes,
+    /// and the live connection when `keep` (header probes, D117).
+    async fn peer(
+        &self,
+        info_hash: [u8; 20],
+        addr: SocketAddrV4,
+        keep: bool,
+        answered: Option<&Mutex<Vec<SocketAddrV4>>>,
+    ) -> Result<PeerOut, PeerError> {
+        let cfg = &self.inner.cfg;
+        let (stream, permit) = self.connect(addr).await?;
         let connected = Instant::now();
         let mut hs: Option<[u8; 20]> = None;
         let mut ext = false;
         let r = tokio::time::timeout(
             cfg.peer_timeout,
-            self.session(stream, info_hash, connected, &mut hs, &mut ext),
+            self.session(
+                stream,
+                info_hash,
+                connected,
+                &mut hs,
+                &mut ext,
+                keep,
+                answered.map(|a| (a, addr)),
+            ),
         )
         .await
         .unwrap_or(Err(PeerError::Timeout));
@@ -897,9 +1166,70 @@ impl Fetcher {
             }
             _ => {}
         }
-        r
+        let (raw, id, parsed, live) = r?;
+        let conn = live.map(|l| PeerConn {
+            addr,
+            reserved: l.reserved,
+            peer_id: l.peer_id,
+            ext: l.ext,
+            state: l.state,
+            sent_have_none: l.sent_have_none,
+            sent_interested: l.sent_interested,
+            rd: l.rd,
+            wr: l.wr,
+            _permit: permit,
+        });
+        Ok((raw, id, parsed, conn))
     }
 
+    /// Our handshake (with the BEP 6 bit when probing), the peer's, then (probing and both
+    /// sides fast) `HAVE_NONE` and our extended handshake in one write. Returns the peer's
+    /// handshake and whether `HAVE_NONE` went out.
+    async fn handshakes(
+        &self,
+        rd: &mut BufReader<OwnedReadHalf>,
+        wr: &mut OwnedWriteHalf,
+        info_hash: [u8; 20],
+        accepted: &mut Option<[u8; 20]>,
+        answered: Option<(&Mutex<Vec<SocketAddrV4>>, SocketAddrV4)>,
+        extra: &[u8],
+    ) -> Result<(wire::PeerHandshake, bool), PeerError> {
+        let cfg = &self.inner.cfg;
+        let c = &self.inner.c;
+        let hello = wire::handshake_with(&info_hash, &self.inner.peer_id, cfg.probe);
+        wr.write_all(&hello).await?;
+        add(&c.tcp_bytes_out, hello.len() as u64);
+        let mut b = [0u8; wire::HANDSHAKE_LEN];
+        rd.read_exact(&mut b).await?;
+        add(&c.tcp_bytes_in, b.len() as u64);
+        let theirs = wire::parse_handshake(&b, &info_hash).map_err(|e| match e {
+            WireError::NoExtensions => PeerError::NoExtensions,
+            _ => PeerError::Handshake,
+        })?;
+        *accepted = Some(theirs.peer_id);
+        if let Some((list, addr)) = answered {
+            let mut l = list.lock().unwrap();
+            if l.len() < 64 && !l.contains(&addr) {
+                l.push(addr);
+            }
+        }
+        // BEP 6: with both bits set, the first message MUST be have_all, have_none or a
+        // bitfield; a probe has nothing, so `HAVE_NONE` (D117). Without the bit: nothing.
+        let fast = cfg.probe && wire::has_fast(&theirs.reserved);
+        // BEP 10: the extended handshake goes to peers that set the extension bit, so ours
+        // is sent only once theirs is known to have it.
+        let mut out = Vec::with_capacity(128);
+        if fast {
+            out.extend_from_slice(&wire::frame(wire::MSG_HAVE_NONE, &[]));
+        }
+        out.extend_from_slice(&wire::our_extended_handshake(&cfg.client));
+        out.extend_from_slice(extra);
+        wr.write_all(&out).await?;
+        add(&c.tcp_bytes_out, out.len() as u64);
+        Ok((theirs, fast))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn session(
         &self,
         stream: TcpStream,
@@ -907,43 +1237,41 @@ impl Fetcher {
         connected: Instant,
         accepted: &mut Option<[u8; 20]>,
         ext_seen: &mut bool,
-    ) -> Result<(Vec<u8>, Identity, Result<InfoSummary, InfoError>), PeerError> {
+        keep: bool,
+        answered: Option<(&Mutex<Vec<SocketAddrV4>>, SocketAddrV4)>,
+    ) -> Result<SessionOut, PeerError> {
         let cfg = &self.inner.cfg;
         let c = &self.inner.c;
         let (rd, mut wr) = stream.into_split();
         let mut rd = BufReader::with_capacity(32 * 1024, rd);
-        let hello = wire::handshake(&info_hash, &self.inner.peer_id);
-        wr.write_all(&hello).await?;
-        add(&c.tcp_bytes_out, hello.len() as u64);
+        // Probing: the peer's piece and choke messages are recorded, not skipped (D117).
+        let mut state = PeerState::default();
+        let mut track = cfg.probe.then_some(&mut state);
 
         let hs_deadline = connected + cfg.handshake_timeout;
         let mut discard = DISCARD_BUDGET;
-        let ext: ExtHandshake = tokio::time::timeout_at(hs_deadline, async {
-            let mut b = [0u8; wire::HANDSHAKE_LEN];
-            rd.read_exact(&mut b).await?;
-            add(&c.tcp_bytes_in, b.len() as u64);
-            let theirs = wire::parse_handshake(&b, &info_hash).map_err(|e| match e {
-                WireError::NoExtensions => PeerError::NoExtensions,
-                _ => PeerError::Handshake,
-            })?;
-            *accepted = Some(theirs.peer_id);
-            // BEP 10: the extended handshake goes to peers that set the extension bit, so ours
-            // is sent only once theirs is known to have it.
-            let ours = wire::our_extended_handshake(&cfg.client);
-            wr.write_all(&ours).await?;
-            add(&c.tcp_bytes_out, ours.len() as u64);
-            loop {
-                if let Msg::Extended(p) = read_msg(&mut rd, &mut discard, &c.tcp_bytes_in).await? {
-                    if p.first() == Some(&wire::EXT_HANDSHAKE) {
-                        *ext_seen = true;
-                        return wire::parse_ext_handshake(&p[1..]).map_err(|_| PeerError::Protocol);
+        let (theirs, sent_have_none, ext): (wire::PeerHandshake, bool, ExtHandshake) =
+            tokio::time::timeout_at(hs_deadline, async {
+                let (theirs, fast) = self
+                    .handshakes(&mut rd, &mut wr, info_hash, accepted, answered, &[])
+                    .await?;
+                loop {
+                    if let Msg::Extended(p) =
+                        read_msg(&mut rd, &mut discard, &c.tcp_bytes_in, track.as_deref_mut())
+                            .await?
+                    {
+                        if p.first() == Some(&wire::EXT_HANDSHAKE) {
+                            *ext_seen = true;
+                            let e = wire::parse_ext_handshake(&p[1..])
+                                .map_err(|_| PeerError::Protocol)?;
+                            return Ok::<_, PeerError>((theirs, fast, e));
+                        }
+                        charge(&mut discard, p.len())?;
                     }
-                    charge(&mut discard, p.len())?;
                 }
-            }
-        })
-        .await
-        .map_err(|_| PeerError::Timeout)??;
+            })
+            .await
+            .map_err(|_| PeerError::Timeout)??;
 
         let their_id = ext.ut_metadata.ok_or(PeerError::NoUtMetadata)?;
         let size = match ext.metadata_size {
@@ -962,7 +1290,12 @@ impl Fetcher {
             .await
             .map_err(|_| PeerError::Closed)?;
         let n = wire::block_count(size);
-        let mut req = Vec::with_capacity(n * 32);
+        let mut req = Vec::with_capacity(n * 32 + 5);
+        // Probing: `INTERESTED` in the same write, so a choke delay overlaps the metadata
+        // download (wire report: one RTT saved, D117).
+        if cfg.probe {
+            req.extend_from_slice(&wire::frame(wire::MSG_INTERESTED, &[]));
+        }
         for piece in 0..n {
             req.extend_from_slice(&wire::metadata_request(their_id, piece as u32));
         }
@@ -974,7 +1307,9 @@ impl Fetcher {
         let mut missing = n;
         let mut rejects = 0usize;
         while missing > 0 {
-            let Msg::Extended(p) = read_msg(&mut rd, &mut discard, &c.tcp_bytes_in).await? else {
+            let Msg::Extended(p) =
+                read_msg(&mut rd, &mut discard, &c.tcp_bytes_in, track.as_deref_mut()).await?
+            else {
                 continue;
             };
             if p.first() != Some(&wire::OUR_UT_METADATA) {
@@ -1019,8 +1354,18 @@ impl Fetcher {
                 MetadataMsg::Unknown => charge(&mut discard, p.len())?,
             }
         }
-        drop(rd);
-        drop(wr);
+        // The connection goes to a header probe only when asked (probing, D117); otherwise it
+        // closes here, as before.
+        let mut live = keep.then(|| Live {
+            rd,
+            wr,
+            reserved: theirs.reserved,
+            peer_id: theirs.peer_id,
+            ext,
+            state,
+            sent_have_none,
+            sent_interested: cfg.probe,
+        });
 
         // Verify, price, then parse off the async threads, `decode_parallel` at once. The hash
         // and the value count allocate nothing; the decode reserves its priced cost (raw bytes
@@ -1047,7 +1392,7 @@ impl Fetcher {
                 Match::Sha1 => Identity::V1 { v2: None },
                 Match::TruncatedSha256 { v1, v2 } => Identity::Hybrid { v1, v2 },
             };
-            return Ok((raw, id, Err(InfoError::TooComplex)));
+            return Ok((raw, id, Err(InfoError::TooComplex), None));
         }
         let cost_units = decode_cost(size, values, cfg.metadata_max)
             .div_ceil(UNIT)
@@ -1066,7 +1411,74 @@ impl Fetcher {
         })
         .await
         .map_err(|_| PeerError::Closed)?;
-        Ok((raw, id, parsed))
+        if parsed.is_err() {
+            live = None;
+        }
+        Ok((raw, id, parsed, live))
+    }
+
+    /// A connection to `addr` for a header probe of `info_hash` (D117): the same address
+    /// filter, open-connection cap, attempt pace and brake, peer id and `v` as a metadata
+    /// fetch, BEP 6 bit set, `HAVE_NONE` to peers that set it too, our extended handshake and
+    /// `INTERESTED`, then the peer's extended handshake (within `handshake_timeout`). No
+    /// metadata is asked for.
+    pub async fn connect_for_probe(
+        &self,
+        info_hash: [u8; 20],
+        addr: SocketAddrV4,
+    ) -> Result<PeerConn, PeerError> {
+        let cfg = &self.inner.cfg;
+        let c = &self.inner.c;
+        if !cfg.probe {
+            return Err(PeerError::Filtered);
+        }
+        let (stream, permit) = self.connect(addr).await?;
+        let connected = Instant::now();
+        let (rd, mut wr) = stream.into_split();
+        let mut rd = BufReader::with_capacity(32 * 1024, rd);
+        let mut state = PeerState::default();
+        let mut discard = DISCARD_BUDGET;
+        let mut accepted = None;
+        let interested = wire::frame(wire::MSG_INTERESTED, &[]);
+        let (theirs, fast, ext) =
+            tokio::time::timeout_at(connected + cfg.handshake_timeout, async {
+                let (theirs, fast) = self
+                    .handshakes(
+                        &mut rd,
+                        &mut wr,
+                        info_hash,
+                        &mut accepted,
+                        None,
+                        &interested,
+                    )
+                    .await?;
+                loop {
+                    if let Msg::Extended(p) =
+                        read_msg(&mut rd, &mut discard, &c.tcp_bytes_in, Some(&mut state)).await?
+                    {
+                        if p.first() == Some(&wire::EXT_HANDSHAKE) {
+                            let e = wire::parse_ext_handshake(&p[1..])
+                                .map_err(|_| PeerError::Protocol)?;
+                            return Ok::<_, PeerError>((theirs, fast, e));
+                        }
+                        charge(&mut discard, p.len())?;
+                    }
+                }
+            })
+            .await
+            .map_err(|_| PeerError::Timeout)??;
+        Ok(PeerConn {
+            addr,
+            reserved: theirs.reserved,
+            peer_id: theirs.peer_id,
+            ext,
+            state,
+            sent_have_none: fast,
+            sent_interested: true,
+            rd,
+            wr,
+            _permit: permit,
+        })
     }
 }
 
@@ -1088,11 +1500,14 @@ enum Msg {
 }
 
 /// Read one length-prefixed message. `extended` messages up to [`MAX_EXTENDED`] are returned;
-/// others are skipped within the per-peer `discard` budget.
+/// others are skipped within the per-peer `discard` budget. With `state` (header probes, D117)
+/// the peer's choke, interest and piece-availability messages are recorded in it (still
+/// charged to the budget); `piece` messages are skipped either way.
 async fn read_msg<R: AsyncRead + Unpin>(
     r: &mut R,
     discard: &mut u64,
     bytes_in: &AtomicU64,
+    state: Option<&mut PeerState>,
 ) -> Result<Msg, PeerError> {
     let len = r.read_u32().await? as usize;
     add(bytes_in, 4);
@@ -1115,6 +1530,15 @@ async fn read_msg<R: AsyncRead + Unpin>(
         return Err(PeerError::Protocol);
     }
     *discard -= body;
+    if let Some(st) = state.filter(|_| PeerState::records(id)) {
+        if body > MAX_BITFIELD as u64 {
+            return Err(PeerError::Protocol);
+        }
+        let mut v = vec![0u8; body as usize];
+        r.read_exact(&mut v).await?;
+        st.record(id, &v)?;
+        return Ok(Msg::Other);
+    }
     let copied = tokio::io::copy(&mut r.take(body), &mut tokio::io::sink()).await?;
     if copied != body {
         return Err(PeerError::Closed);

@@ -75,6 +75,7 @@ of the app on an Android 17 (API 37) x86_64 emulator against a live server crawl
 | Saved searches with ntfy push (server) and local notifications (phone) | server, app | Tested (local notifications; ntfy against a fake server only) |
 | Downloads with librqbit on the server and on the phone (fallback: open the magnet in another app) | server, ffi | Tested on x86_64; **arm64 phone downloads UNVERIFIED** |
 | Docker image `ghcr.io/awake-devel/magnetar` (linux/amd64 + linux/arm64) with Postgres 18 in `compose.yml` | Docker, CI | New: see docs/DOCKER.md for what was verified. arm64 is built natively on GitHub's arm64 runners only, **UNVERIFIED** on a device |
+| Header probes on crawl workers (off by default): after fetching a torrent's metadata, read the few 16 KiB blocks needed to learn each main file's real type by content, console game ids and video / audio quality (codec, resolution, HDR, audio languages), hash-checked when pieces are small; shown on the detail page's API. Downloads file data: read "Legal" below | worker, server | New (D117, docs/PROBES.md): loopback fake peers and Postgres in automated tests; **UNVERIFIED** on real swarms (the eee trial is next) |
 | Static Linux server binaries (x86_64, aarch64) on every release, with `SHA256SUMS` | CI | See docs/LINUX.md. aarch64: the worker mode runs on a Raspberry Pi 3B (v0.3.1, since 2026-10-31); `serve` on arm64 **UNVERIFIED** |
 
 No analytics, no Google services, no accounts. The app talks to relays, trackers, your own
@@ -213,8 +214,29 @@ has the full list with sources.
 
 ## Legal
 
-Magnetar indexes metadata that other people publish on public Nostr relays. It does not host,
-seed or distribute any content by itself. You are responsible for what you search for,
-download and share, and for complying with the laws of your country.
+Magnetar indexes metadata that other people publish on public Nostr relays and that the DHT
+carries (info dicts: names, sizes, hashes). It does not host content. You are responsible for
+what you search for, download and share, and for complying with the laws of your country.
+
+**Header probes download parts of files** (crawl workers, `MAGNETAR_PROBE`, off by default;
+docs/PROBES.md). With them on, Magnetar no longer handles only metadata: a worker connects to a
+torrent's peers and fetches the few blocks it needs to learn what the files really are, and the
+legal position becomes blurry.
+
+- In France what is enforced is *sharing*: Arcom's graduated response (formerly HADOPI) acts
+  on uploads seen in P2P swarms.
+- Downloading a fragment to learn what a torrent contains is not the act that is targeted, but
+  it is not explicitly lawful either: a copy from an unlawful source is not covered by the
+  private-copy exception (CJEU C-435/12 *ACI Adam*, 2014). Do not read this as "probing is
+  legal".
+- By default a probe never shares: it sends no piece data, never unchokes a peer, announces
+  `HAVE_NONE` (or nothing) instead of real pieces, fetches only the bytes it needs, and writes
+  nothing to disk (not dumped, not stored on purpose).
+- **Turning `MAGNETAR_PROBE_UPLOAD` on *is* sharing**: the worker then announces and serves
+  the whole hash-checked pieces a probe holds to that probe's peers (capped at 4 MiB and
+  256 KiB/s per probe).
+- Other countries differ (Germany, for example, fines downloads too).
+
+This is an **UNVERIFIED legal reading, not legal advice**.
 
 License: MIT (see `Cargo.toml`).

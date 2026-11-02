@@ -11,6 +11,13 @@
 //! Memory is bounded for small machines: the pool, queue and seen filter sizes come from the
 //! options, uploads wait in a byte-capped buffer (fetching stops when it is full), and the
 //! [`Governor`] pauses discovery under memory or conntrack pressure. Nothing here logs a name.
+//!
+//! Header probes (D117, `MAGNETAR_PROBE`, off by default): after a verified dict that passed
+//! the blocklist and is not adult, while no brake or pressure is on and the prober has a free
+//! slot under its per-minute pace, the metadata connection is handed to a
+//! [`magnetar_core::probe::Prober`] task that reads the few blocks sniff needs; its report
+//! travels with the dict ([`DhtResult::probe`]). A probe never delays the dict for more than
+//! its session cap, and a stop sends the dict without it.
 
 use std::collections::HashSet;
 use std::net::SocketAddrV4;
@@ -19,10 +26,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use magnetar_core::api::WorkerDhtState;
+use magnetar_core::api::{WorkerDhtState, WorkerProbeState};
 use magnetar_core::dht::{Dht, EngineConfig, EngineStats, Mode, Sighting, Via, collect_peers};
-use magnetar_core::metainfo::{FetchConfig, FetchStats, Fetcher, Outcome};
+use magnetar_core::metainfo::{FetchConfig, FetchStats, Fetcher, Handoff, InfoFile, Outcome};
 use magnetar_core::model::TorrentFile;
+use magnetar_core::probe::{self, ProbeConfig, ProbeJob, Prober, Skip};
 use serde::Serialize;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
@@ -130,6 +138,8 @@ pub struct CrawlReport {
     pub fetch: FetchStats,
     pub health: HealthStats,
     pub engine: EngineStats,
+    /// Header probes (D117), when on.
+    pub probe: Option<WorkerProbeState>,
 }
 
 struct Pending {
@@ -164,6 +174,27 @@ pub struct Crawl {
     dht: Mutex<Option<Dht>>,
     snap: Mutex<Snap>,
     max_results: usize,
+    /// Header probes (D117): Some only on a worker with `MAGNETAR_PROBE=true`.
+    prober: Option<Prober>,
+}
+
+fn probe_state(p: &Prober) -> WorkerProbeState {
+    let s = p.stats();
+    WorkerProbeState {
+        upload: p.config().upload,
+        started: s.started,
+        ok: s.ok,
+        partial: s.partial,
+        choked: s.choked,
+        no_pieces: s.no_pieces,
+        failed: s.failed,
+        skipped: s.skipped,
+        bytes_in: s.bytes_in,
+        uploaded: s.uploaded,
+        files: s.files,
+        verified_files: s.verified_files,
+        surprises: s.surprises,
+    }
 }
 
 impl Crawl {
@@ -210,6 +241,7 @@ impl Crawl {
             metadata_per_min: d(verified, s.verified) * 60.0 / secs,
             upload_backlog: get(&self.c.upload_backlog),
             external_ip_known: e.external_ip_known,
+            probe: self.prober.as_ref().map(probe_state),
         };
         *s = Snap {
             at: Some(now),
@@ -411,6 +443,7 @@ async fn collector(
                     outcome: DhtOutcome::Failed {
                         code: "no_peers".into(),
                     },
+                    probe: None,
                 },
                 _permit: None,
                 bytes: 64,
@@ -433,14 +466,35 @@ async fn collector(
     }
 }
 
-/// Classify and screen a verified dict here, before anything leaves the machine.
-fn outcome_item(p: &Crawl, job: &Job, outcome: Outcome) -> Option<DhtOutcome> {
-    Some(match outcome {
+/// What a header probe needs from the verified dict (D117).
+struct ProbeSeed {
+    raw: Arc<[u8]>,
+    files: Vec<InfoFile>,
+}
+
+/// A screened result, and the probe input when this torrent may be probed.
+struct Screened {
+    outcome: DhtOutcome,
+    seed: Option<ProbeSeed>,
+}
+
+/// Classify and screen a verified dict here, before anything leaves the machine. With probes
+/// on, also decide whether the torrent may be probed: only one that passed the blocklist and
+/// is not adult (D117), with a dict of at most [`probe::MAX_DICT`].
+fn outcome_item(p: &Crawl, job: &Job, outcome: Outcome) -> Option<Screened> {
+    let skip = |why: Skip| {
+        if let Some(pr) = &p.prober {
+            pr.skip(why);
+        }
+    };
+    let mut seed = None;
+    let outcome = match outcome {
         Outcome::Ok(f) => {
             let Some(screen) = p.opts.screen.as_deref() else {
                 // No blocklist loaded: nothing named may leave (fail closed). The server's
                 // lease brings the hash back later.
                 add(&p.c.unscreened, 1);
+                skip(Skip::NoBlocklist);
                 return None;
             };
             let files: Vec<TorrentFile> = f
@@ -456,6 +510,7 @@ fn outcome_item(p: &Crawl, job: &Job, outcome: Outcome) -> Option<DhtOutcome> {
             match screen.verdict(&f.info.all_names, class.adult()) {
                 Verdict::Block(tier) => {
                     add(&p.c.blocked_here, 1);
+                    skip(Skip::Blocklist);
                     DhtOutcome::Blocked {
                         v1: (f.v1 != job.info_hash).then(|| hex::encode(f.v1)),
                         tier: tier.as_str().into(),
@@ -464,6 +519,18 @@ fn outcome_item(p: &Crawl, job: &Job, outcome: Outcome) -> Option<DhtOutcome> {
                 }
                 Verdict::Allow => {
                     let raw = f.raw.as_deref()?;
+                    if p.prober.is_some() {
+                        if class.adult() {
+                            skip(Skip::Adult);
+                        } else if raw.len() > probe::MAX_DICT {
+                            skip(Skip::BigDict);
+                        } else {
+                            seed = Some(ProbeSeed {
+                                raw: Arc::from(raw),
+                                files: f.info.files.clone(),
+                            });
+                        }
+                    }
                     DhtOutcome::Metadata {
                         raw: data_encoding::BASE64.encode(raw),
                     }
@@ -475,7 +542,36 @@ fn outcome_item(p: &Crawl, job: &Job, outcome: Outcome) -> Option<DhtOutcome> {
         Outcome::Invalid(e) => DhtOutcome::Invalid {
             code: e.code().into(),
         },
-    })
+    };
+    Some(Screened { outcome, seed })
+}
+
+/// Further peers for a probe: those that took our handshake for this hash first, then the
+/// rest of the DHT's list; never the hand-off peer itself.
+fn probe_peers(h: &Handoff, found: &[SocketAddrV4]) -> Vec<SocketAddrV4> {
+    let mut seen: HashSet<SocketAddrV4> = HashSet::from([h.conn.addr]);
+    h.answered
+        .iter()
+        .chain(found)
+        .filter(|a| seen.insert(**a))
+        .copied()
+        .take(16)
+        .collect()
+}
+
+/// The worker-side gates of a probe (D117), in order: no brake (router health, answered
+/// share or pressure brake on the fetcher), no memory / conntrack pressure, then a slot under
+/// `MAGNETAR_PROBE_PARALLEL` and the `MAGNETAR_PROBE_PER_MIN` pace. Each refusal is counted.
+fn probe_slot(p: &Crawl, prober: &Prober) -> Option<probe::ProbeSlot> {
+    if p.fetcher.braked() || p.fetcher.brake_level() > 0 {
+        prober.skip(Skip::Brake);
+        return None;
+    }
+    if p.governor.pressure() || p.governor.conntrack_full() {
+        prober.skip(Skip::Pressure);
+        return None;
+    }
+    prober.try_slot()
 }
 
 fn cpu<R>(f: impl FnOnce() -> R) -> R {
@@ -501,25 +597,44 @@ async fn fetch_worker(
             },
             _ = stop_requested(&mut stop) => return,
         };
-        let result = tokio::select! {
-            r = p.fetcher.fetch(job.info_hash, &job.peers) => r,
+        // With probes on, a verified dict comes with its connection (D117).
+        let (result, handoff) = tokio::select! {
+            r = async {
+                if p.prober.is_some() {
+                    p.fetcher.fetch_with_handoff(job.info_hash, &job.peers).await
+                } else {
+                    (p.fetcher.fetch(job.info_hash, &job.peers).await, None)
+                }
+            } => r,
             _ = stop_requested(&mut stop) => return,
         };
-        let outcome = match result {
+        let (outcome, seed) = match result {
             Ok(o) => {
                 add(&p.c.verified, 1);
                 let Ok(_slot) = p.screen_slots.acquire().await else {
                     return;
                 };
                 match cpu(|| outcome_item(&p, &job, o)) {
-                    Some(o) => o,
+                    Some(s) => (s.outcome, s.seed),
                     None => continue,
                 }
             }
-            Err(f) if f.oversize => DhtOutcome::Oversize,
-            Err(f) => DhtOutcome::Failed {
-                code: f.code().into(),
-            },
+            Err(f) if f.oversize => (DhtOutcome::Oversize, None),
+            Err(f) => (
+                DhtOutcome::Failed {
+                    code: f.code().into(),
+                },
+                None,
+            ),
+        };
+        // Not probed: the connection closes now (its permit goes back to the fetcher).
+        let probe_input = match (seed, handoff, &p.prober) {
+            (Some(seed), Some(h), Some(_)) => Some((seed, h)),
+            (Some(_), None, Some(pr)) => {
+                pr.skip(Skip::NoHandoff);
+                None
+            }
+            _ => None,
         };
         let bytes = match &outcome {
             DhtOutcome::Metadata { raw } => raw.len() + 128,
@@ -540,13 +655,45 @@ async fn fetch_worker(
                 via: via_text(job.via).into(),
                 peers_seen: job.peers.len() as u32,
                 outcome,
+                probe: None,
             },
             _permit: Some(permit),
             bytes,
         };
-        if out.send(pending).await.is_err() {
-            return;
-        }
+        let probe = probe_input.and_then(|(seed, h)| {
+            let prober = p.prober.clone()?;
+            let slot = probe_slot(&p, &prober)?;
+            Some((prober, slot, seed, h))
+        });
+        let Some((prober, slot, seed, h)) = probe else {
+            if out.send(pending).await.is_err() {
+                return;
+            }
+            continue;
+        };
+        let pj = ProbeJob {
+            info_hash: job.info_hash,
+            raw: seed.raw,
+            files: seed.files,
+            peers: probe_peers(&h, &job.peers),
+            conn: Some(h.conn),
+        };
+        // The probe runs beside the fetches (bounded by the prober's slots and its session
+        // cap); the dict waits for it, never longer, and goes without it on a stop.
+        let (out, mut stop) = (out.clone(), stop.clone());
+        tokio::spawn(async move {
+            let mut pending = pending;
+            tokio::select! {
+                r = prober.probe(slot, pj) => {
+                    if let Some(rep) = crate::probes::report_of(&r) {
+                        pending.bytes += serde_json::to_vec(&rep).map_or(0, |b| b.len());
+                        pending.item.probe = Some(rep);
+                    }
+                }
+                _ = stop_requested(&mut stop) => {}
+            }
+            let _ = out.send(pending).await;
+        });
     }
 }
 
@@ -723,6 +870,8 @@ pub struct CrawlSetup {
     pub state_dir: PathBuf,
     pub upload_buffer: usize,
     pub max_results: usize,
+    /// Header probes (D117): None = off (the default; never on the main server).
+    pub probe: Option<ProbeConfig>,
 }
 
 /// Start the crawler; it runs until `stop` and returns its report.
@@ -782,7 +931,27 @@ pub async fn start(
         allow_loopback: cfg.allow_loopback,
         max_peers: opts.peers_per_hash.max(1),
         keep_raw: true,
+        // D117: the fast bit, HAVE_NONE, early INTERESTED and the hand-off only with probes;
+        // without them every metadata connection is byte for byte what it was.
+        probe: setup.probe.is_some(),
         ..FetchConfig::default()
+    });
+    let prober = setup.probe.map(|cfg| {
+        tracing::info!(
+            "worker header probes on (D117): {} per min, {} at once, {} peers, ≤ {} KiB per \
+             torrent, whole pieces ≤ {} KiB, upload {}",
+            cfg.per_min,
+            cfg.parallel,
+            cfg.peers,
+            cfg.max_bytes / 1024,
+            cfg.whole_piece_max / 1024,
+            if cfg.upload {
+                "ON (sharing verified pieces)"
+            } else {
+                "off"
+            }
+        );
+        Prober::new(cfg, fetcher.clone())
     });
     let units = u32::try_from((setup.upload_buffer / 1024).max(64)).unwrap_or(u32::MAX >> 4);
     let own_hub = opts.health.is_none();
@@ -805,6 +974,7 @@ pub async fn start(
         snap: Mutex::default(),
         max_results: setup.max_results.clamp(1, crate::fleet::MAX_RESULTS),
         opts,
+        prober,
     });
     let started = Instant::now();
     let state_dir = setup.state_dir;
@@ -849,7 +1019,7 @@ pub async fn start(
         let _attached = hub.attach(dht.clone(), p.fetcher.clone());
         if own_hub {
             tasks.spawn(health::health_loop(
-                p.opts.probe.clone(),
+                p.opts.health_targets.clone(),
                 hub.clone(),
                 int_rx.clone(),
             ));
@@ -950,6 +1120,7 @@ fn report(p: &Crawl, dht: &Dht, started: Instant) -> CrawlReport {
         fetch: p.fetcher.stats(),
         health: p.health.lock().unwrap().clone(),
         engine: e,
+        probe: p.prober.as_ref().map(probe_state),
     }
 }
 
@@ -1004,6 +1175,7 @@ mod tests {
             via: "sample".into(),
             peers_seen: 0,
             outcome: DhtOutcome::Private,
+            probe: None,
         }
     }
 

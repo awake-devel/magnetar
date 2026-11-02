@@ -169,6 +169,26 @@ URL), `MAGNETAR_WORKER_TOKEN` (required), `MAGNETAR_WORKER_STATE_DIR` (`<state d
 variables above (worker defaults: pool 200 000, 64 fetches, UPnP off). Profiles for the EEE
 and RPI lines: docs/WORKERS.md §3.
 
+### Header probes (docs/PROBES.md, ARCHITECTURE.md D117)
+
+**Worker settings only.** `serve`, `dht` and every other command never build a prober: with
+`MAGNETAR_PROBE=true` they log a warning and ignore it (`compose.yml` pins it to `false`). Probes
+follow the worker crawler's metadata fetches, so they also need `MAGNETAR_DHT`.
+
+| Variable | Default | EEE / RPI profile | Notes |
+|---|---|---|---|
+| `MAGNETAR_PROBE` | `false` | `false` (production: `true`, docs/PROBES.md §8) | after a verified dict that passed the blocklist and is not adult, read the few 16 KiB blocks sniff needs from the peer that sent it (and one more) to learn real file types, console ids and video / audio quality; results go up with the dict |
+| `MAGNETAR_PROBE_UPLOAD` | `false` | `false` (production: `true`) | **on is sharing**: announce (`HAVE`) and serve the whole SHA-1-checked pieces a probe holds, only to that probe's peers, at most 4 MiB and 256 KiB/s per probe, from memory only. Off: no piece data ever leaves, `HAVE_NONE`, never an unchoke |
+| `MAGNETAR_PROBE_WHOLE_PIECE_MAX` | `1048576` | same | pieces up to this length (16 KiB–16 MiB, at most `MAGNETAR_PROBE_MAX_BYTES`) are fetched whole and hash-checked, so their results count as verified: 55 % of sampled torrents, 1.23 MiB per torrent on average (planner, policy D′). Longer pieces: only the blocks sniff reads, stored as unverified, unless a result is surprising |
+| `MAGNETAR_PROBE_PER_MIN` | `30` | `120` / `12` | probes started per minute (1–6000), paced with no burst; a torrent that finishes while no turn is free is not probed (counted `rate`). Pi: ~0.2 probe/s × 1.23 MiB keeps it well under its ~3 000 packets/s router knee (**UNVERIFIED**) |
+| `MAGNETAR_PROBE_PARALLEL` | `8` | `32` / `4` | probes at once (1–256); memory ≤ parallel × `MAGNETAR_PROBE_MAX_BYTES` (Pi: 32 MiB of its 200 MB RSS cap). Busy: not probed (`busy`) |
+| `MAGNETAR_PROBE_PEERS` | `2` | same | connections one probe may use (1–8): the metadata peer, plus one for the agreement read or when the first stays choked. They count against `MAGNETAR_DHT_TCP_MAX` and the TCP pace |
+| `MAGNETAR_PROBE_MAX_BYTES` | `8388608` | same | piece bytes one probe may download (64 KiB–64 MiB). Blocks mode p99 is 3.1 MiB; whole-piece mode p99 10.7 MiB, so ~1–2 % end `incomplete` |
+
+Fixed (docs/PROBES.md §5): 15 s unchoke wait, 10 s stall, 45 s per probe, 64 requests in flight
+(capped by the peer's `reqq`), 8 target files, sniff caps per file (16 KiB first read, 64 KiB
+for video, 6 rounds, 4 MiB), dicts over 2 MiB not probed, upload 4 MiB and 256 KiB/s per probe.
+
 ### Built-in seed relays (ARCHITECTURE.md §9)
 
 `wss://nostr.oxtr.dev, wss://relay.nostr.net, wss://nos.lol, wss://relay.primal.net,

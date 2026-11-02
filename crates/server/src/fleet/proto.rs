@@ -226,6 +226,31 @@ pub struct DhtResult {
     pub peers_seen: u32,
     #[serde(flatten)]
     pub outcome: DhtOutcome,
+    /// The worker's header probe of this torrent (D117), only with a `metadata` outcome. Older
+    /// workers send none and older servers ignore it (no [`WORKER_API`] bump).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<ProbeReport>,
+}
+
+/// A header probe's result (D117, docs/PROBES.md): what sniff found in the blocks a worker
+/// read from the torrent's peers. Only detections of confidence 80+ travel; file paths never
+/// do (`i` is the display index in the info dict, which the server holds). The server checks
+/// every field against its own file list and sniff's label registry
+/// ([`crate::probes::validate`]) and stores it only for a torrent it stored and classified
+/// itself as not adult and not blocked.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProbeReport {
+    /// `magnetar_core::probe::PROBE_VERSION`.
+    pub v: u16,
+    /// `ok` or `partial` (other probe outcomes are not uploaded).
+    pub status: String,
+    /// Piece payload the probe received / served (upload mode).
+    pub bytes_in: u64,
+    pub uploaded: u64,
+    /// Peer connections it used.
+    pub peers: u8,
+    pub files: Vec<magnetar_core::model::ProbeFile>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -249,6 +274,12 @@ pub struct DhtAck {
     pub applied: u32,
     /// Reports for hashes not queued (lease expired and handed out again, or never queued).
     pub ignored: u32,
+    /// Header probes stored, and refused (bad field, no stored row, adult, blocked, a probe on
+    /// a non-metadata item). A refused probe never costs its dict. Absent from older servers.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub probe_stored: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub probe_rejected: u32,
 }
 
 pub fn parse_hash(h: &str) -> Option<[u8; 20]> {
@@ -273,6 +304,7 @@ mod tests {
                 tier: "hard".into(),
                 rule_version: 1,
             },
+            probe: None,
         };
         let j = serde_json::to_value(&r).unwrap();
         assert_eq!(j["kind"], "blocked");
@@ -288,6 +320,44 @@ mod tests {
             }
         );
         assert!(serde_json::from_str::<DhtResult>(r#"{"sighted":"x","kind":"what"}"#).is_err());
+    }
+
+    /// D117: the probe is optional both ways: an old worker's item has none, an item with one
+    /// round-trips, and a probe-less item serialises exactly as before.
+    #[test]
+    fn probe_is_optional() {
+        let old: DhtResult =
+            serde_json::from_str(r#"{"sighted":"x","kind":"metadata","raw":"ZA=="}"#).unwrap();
+        assert!(old.probe.is_none());
+        assert!(serde_json::to_value(&old).unwrap().get("probe").is_none());
+        let with = DhtResult {
+            probe: Some(ProbeReport {
+                v: 1,
+                status: "ok".into(),
+                bytes_in: 65536,
+                files: vec![magnetar_core::model::ProbeFile {
+                    i: 0,
+                    size: 9,
+                    label: "video.mkv".into(),
+                    confidence: 97,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..old
+        };
+        let j = serde_json::to_value(&with).unwrap();
+        assert_eq!(j["kind"], "metadata");
+        assert_eq!(j["probe"]["files"][0]["label"], "video.mkv");
+        assert_eq!(serde_json::from_value::<DhtResult>(j).unwrap(), with);
+        let ack: DhtAck = serde_json::from_str(r#"{"stored":1}"#).unwrap();
+        assert_eq!((ack.probe_stored, ack.probe_rejected), (0, 0));
+        assert!(
+            serde_json::to_value(&ack)
+                .unwrap()
+                .get("probe_stored")
+                .is_none()
+        );
     }
 
     #[test]

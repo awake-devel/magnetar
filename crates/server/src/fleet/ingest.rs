@@ -13,6 +13,10 @@
 //! and traced by `dht_torrents.supplied_by` (docs/WORKERS.md §7). A worker's block report
 //! blocks only the sighted hash (origin `worker`, never stops Nostr ingest); its claimed hybrid
 //! SHA-1 is dropped.
+//!
+//! D117: a dict item may carry the worker's header probe. It is checked and stored
+//! ([`crate::probes::store`]) after the dict is persisted, only for the row the server stored
+//! under the dict's v1 hash; a refused probe (`probe_rejected`) never costs its dict.
 
 use std::collections::HashSet;
 
@@ -136,6 +140,8 @@ struct Parsed {
     via: Via,
     peers: usize,
     kind: Kind,
+    /// The worker's header probe (D117), only on a dict item.
+    probe: Option<ProbeReport>,
 }
 
 enum Kind {
@@ -265,6 +271,11 @@ pub async fn dht_results(
         }
         let via = via_of(&it.via);
         let peers = it.peers_seen as usize;
+        let probe = it.probe;
+        if probe.is_some() && !matches!(it.outcome, DhtOutcome::Metadata { .. }) {
+            // A probe only travels with the dict it was read for (D117).
+            ack.probe_rejected += 1;
+        }
         let kind = match it.outcome {
             DhtOutcome::Metadata { raw } => match data_encoding::BASE64.decode(raw.as_bytes()) {
                 Ok(b) => Kind::Dict(b),
@@ -303,11 +314,13 @@ pub async fn dht_results(
         if !matches!(kind, Kind::Dict(_)) {
             reported.insert(h);
         }
+        let probe = probe.filter(|_| matches!(kind, Kind::Dict(_)));
         items.push(Parsed {
             h,
             via,
             peers,
             kind,
+            probe,
         });
     }
 
@@ -343,14 +356,29 @@ pub async fn dht_results(
     let mut results: Vec<FetchResult> = Vec::new();
     let mut blocked: Vec<BlockReport> = Vec::new();
     let mut done: HashSet<[u8; 20]> = HashSet::new();
+    // D117: probes of verified dicts, keyed by the hash the row is stored under (v1).
+    let mut probes: Vec<crate::probes::Upload> = Vec::new();
     for (p, verdict) in items.into_iter().zip(verdicts) {
         if done.contains(&p.h) {
             ack.ignored += 1;
             continue;
         }
         let result = match (p.kind, verdict) {
-            (Kind::Dict(_), Some(Ok(outcome))) => Ok(outcome),
+            (Kind::Dict(_), Some(Ok(outcome))) => {
+                match (p.probe, &outcome) {
+                    (Some(report), Outcome::Ok(f)) => probes.push(crate::probes::Upload {
+                        infohash: hex::encode(f.v1),
+                        report,
+                    }),
+                    (Some(_), _) => ack.probe_rejected += 1,
+                    (None, _) => {}
+                }
+                Ok(outcome)
+            }
             (Kind::Dict(_), Some(Err(e))) => {
+                if p.probe.is_some() {
+                    ack.probe_rejected += 1;
+                }
                 ack.rejected += 1;
                 tracing::warn!(
                     worker = %name,
@@ -407,6 +435,12 @@ pub async fn dht_results(
         ack.not_new += o.not_new as u32;
         ack.blocked += o.blocked as u32;
     }
+    // After the rows exist: only for torrents the server stored and classified itself.
+    let po = crate::probes::store(pool, &name, probes, now)
+        .await
+        .map_err(store_err)?;
+    ack.probe_stored += po.stored;
+    ack.probe_rejected += po.rejected;
     let rejected = u64::from(ack.rejected);
     fleet.with(&name, |e| {
         e.metadata += verified;

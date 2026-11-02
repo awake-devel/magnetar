@@ -3,6 +3,10 @@
 //! file. Run one module with `cargo test -p magnetar-server --test it <module>::`.
 
 mod common;
+/// The core tests' loopback BitTorrent peer (header probes, D117), shared as source.
+#[path = "../../../core/tests/it/support/fake_seeder.rs"]
+#[allow(dead_code)]
+mod fake_seeder;
 
 mod api;
 mod cli;
@@ -17,6 +21,7 @@ mod enrich_pg;
 mod filters;
 mod liveness_pg;
 mod notices;
+mod probe_pg;
 mod search_bench;
 mod search_index;
 mod stats;

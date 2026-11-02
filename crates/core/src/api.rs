@@ -197,6 +197,32 @@ pub struct WorkerDhtState {
     /// Results waiting for upload.
     pub upload_backlog: u64,
     pub external_ip_known: bool,
+    /// Header probes (D117), when the worker runs them. Older workers send none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe: Option<WorkerProbeState>,
+}
+
+/// A worker's header-probe counters since it started (D117). Counts only: never an address,
+/// a hash or a name.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WorkerProbeState {
+    /// `MAGNETAR_PROBE_UPLOAD` is on (the worker shares verified pieces).
+    pub upload: bool,
+    pub started: u64,
+    pub ok: u64,
+    pub partial: u64,
+    pub choked: u64,
+    pub no_pieces: u64,
+    pub failed: u64,
+    /// Probes not started, by reason (`rate`, `busy`, `adult`, `blocklist`, `brake`, ...).
+    pub skipped: Vec<(String, u64)>,
+    /// Piece payload received and served.
+    pub bytes_in: u64,
+    pub uploaded: u64,
+    pub files: u64,
+    pub verified_files: u64,
+    pub surprises: u64,
 }
 
 /// The DHT crawler on the server (D58, docs/DHT.md §10). Rates are over the last ~10 minutes

@@ -13,7 +13,8 @@
 # `ports:`).
 # Crawling makes this host's IP visible in BitTorrent swarms. Only the DHT UDP ports are
 # published; the worker never accepts TCP connections. UPnP stays off (MAGNETAR_DHT_UPNP).
-# No ulimits needed: the server binary raises its open-files soft limit itself.
+# No ulimits needed: the server binary raises its open-files soft limit itself. Core dumps are
+# off (`ulimits: core`): with header probes on, piece bytes are held in memory (D117).
 
 name: magnetar-worker
 
@@ -50,6 +51,16 @@ services:
       MAGNETAR_DHT_UPNP: ${MAGNETAR_DHT_UPNP:-false}
       MAGNETAR_LIVENESS_DHT_CONCURRENCY: ${MAGNETAR_LIVENESS_DHT_CONCURRENCY:-32}
       MAGNETAR_LIVENESS_DHT_QPS: ${MAGNETAR_LIVENESS_DHT_QPS:-20}
+      # Header probes (docs/PROBES.md, D117): off unless set in worker.env. They connect to
+      # torrent peers from this host and download parts of files; MAGNETAR_PROBE_UPLOAD=true
+      # also SHARES the verified pieces a probe holds (README "Legal"). Defaults: EEE profile.
+      MAGNETAR_PROBE: ${MAGNETAR_PROBE:-false}
+      MAGNETAR_PROBE_UPLOAD: ${MAGNETAR_PROBE_UPLOAD:-false}
+      MAGNETAR_PROBE_WHOLE_PIECE_MAX: ${MAGNETAR_PROBE_WHOLE_PIECE_MAX:-1048576}
+      MAGNETAR_PROBE_PER_MIN: ${MAGNETAR_PROBE_PER_MIN:-120}
+      MAGNETAR_PROBE_PARALLEL: ${MAGNETAR_PROBE_PARALLEL:-32}
+      MAGNETAR_PROBE_PEERS: ${MAGNETAR_PROBE_PEERS:-2}
+      MAGNETAR_PROBE_MAX_BYTES: ${MAGNETAR_PROBE_MAX_BYTES:-8388608}
       # Crawl map (docs/CRAWLMAP.md): on | country | off; databases in the worker state dir.
       MAGNETAR_GEOIP: ${MAGNETAR_GEOIP:-on}
       # Our own addresses, never contacted (D112); the crawler's vote adds the WAN IPv4 itself.
@@ -61,6 +72,8 @@ services:
       - "${MAGNETAR_WORKER_SERVER_HOST:-unset.magnetar.invalid}:${MAGNETAR_WORKER_SERVER_IP:-127.0.0.1}"
     ports:
       - "${MAGNETAR_DHT_PUBLISH:-6891-6894}:6891-6894/udp"
+    ulimits:
+      core: 0
     volumes:
       # State dir: /data/state/magnetar/worker (XDG_STATE_HOME=/data/state in the image).
       - worker-data:/data

@@ -156,6 +156,33 @@ fn detail() -> TorrentDetail {
             discovered_via: "sample".into(),
             infohash_v2: None,
         }),
+        probe: Some(magnetar_core::model::ProbeInfo {
+            version: 1,
+            probed_at: 1_789_000_040,
+            status: "ok".into(),
+            verified: true,
+            files: vec![magnetar_core::model::ProbeFileInfo {
+                index: 0,
+                path: "Big.Buck.Bunny.2008.mkv".into(),
+                size: 276_000_000,
+                label: "video.mkv".into(),
+                description: "Matroska video".into(),
+                confidence: 97,
+                verified: true,
+                flags: vec!["agreed".into()],
+                game: None,
+                video: Some(magnetar_core::model::ProbeVideo {
+                    container: "matroska".into(),
+                    video: vec![magnetar_core::model::ProbeVideoTrack {
+                        codec: "hevc".into(),
+                        height: Some(2160),
+                        hdr: vec!["dolby_vision".into()],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            }],
+        }),
     }
 }
 

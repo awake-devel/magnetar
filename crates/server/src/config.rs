@@ -353,6 +353,33 @@ pub struct Config {
     /// Worker: results (info dicts) buffered for upload at most, MB; fetching waits beyond.
     #[arg(long, env = "MAGNETAR_WORKER_UPLOAD_BUFFER_MB", default_value_t = 16, value_parser = clap::value_parser!(u64).range(1..=1024))]
     pub worker_upload_buffer_mb: u64,
+    // --- Header probes (docs/PROBES.md, D117): crawl workers only ---
+    /// Worker: after a metadata fetch, read the few blocks of the torrent's files that sniff
+    /// needs (real file types, console ids, video/audio quality) and upload the results. Off
+    /// by default; ignored (logged) by `serve` and `dht`: the main server never probes.
+    #[arg(long, env = "MAGNETAR_PROBE", default_value_t = false, action = clap::ArgAction::Set)]
+    pub probe: bool,
+    /// Worker: announce and serve the whole hash-checked pieces a probe holds, to that probe's
+    /// peers, within fixed caps (4 MiB and 256 KiB/s per probe). **On is sharing.** Off: never
+    /// a byte of piece data out, `HAVE_NONE`, never an unchoke.
+    #[arg(long, env = "MAGNETAR_PROBE_UPLOAD", default_value_t = false, action = clap::ArgAction::Set)]
+    pub probe_upload: bool,
+    /// Worker: pieces up to this length are fetched whole and SHA-1 checked (results then
+    /// count as verified); longer ones only as the 16 KiB blocks sniff reads, unverified.
+    #[arg(long, env = "MAGNETAR_PROBE_WHOLE_PIECE_MAX", default_value_t = 1024 * 1024, value_parser = clap::value_parser!(u64).range(16_384..=16_777_216))]
+    pub probe_whole_piece_max: u64,
+    /// Worker: header probes started per minute at most (paced, no burst).
+    #[arg(long, env = "MAGNETAR_PROBE_PER_MIN", default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=6000))]
+    pub probe_per_min: u32,
+    /// Worker: header probes at once.
+    #[arg(long, env = "MAGNETAR_PROBE_PARALLEL", default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=256))]
+    pub probe_parallel: u32,
+    /// Worker: peer connections one probe may use (the metadata peer included).
+    #[arg(long, env = "MAGNETAR_PROBE_PEERS", default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=8))]
+    pub probe_peers: u32,
+    /// Worker: piece bytes one probe may download, bytes.
+    #[arg(long, env = "MAGNETAR_PROBE_MAX_BYTES", default_value_t = 8 * 1024 * 1024, value_parser = clap::value_parser!(u64).range(65_536..=67_108_864))]
+    pub probe_max_bytes: u64,
 }
 
 impl Config {
@@ -509,6 +536,55 @@ mod tests {
             args.push("serve");
             assert!(Cli::try_parse_from(args).is_err(), "{bad:?}");
         }
+    }
+
+    /// D117: header probes are off by default, upload too, and the settings are bounded.
+    #[test]
+    fn probe_settings() {
+        let d = Cli::try_parse_from(["magnetar-server", "worker"])
+            .unwrap()
+            .config;
+        assert!(!d.probe && !d.probe_upload);
+        assert_eq!(
+            (
+                d.probe_whole_piece_max,
+                d.probe_per_min,
+                d.probe_parallel,
+                d.probe_peers,
+                d.probe_max_bytes
+            ),
+            (1 << 20, 30, 8, 2, 8 << 20)
+        );
+        assert!(crate::worker::probe_config(&d).is_none());
+        let on = Cli::try_parse_from([
+            "magnetar-server",
+            "--probe",
+            "true",
+            "--probe-max-bytes",
+            "524288",
+            "worker",
+        ])
+        .unwrap()
+        .config;
+        let pc = crate::worker::probe_config(&on).unwrap();
+        assert!(!pc.upload, "upload stays off unless set");
+        assert_eq!(pc.whole_piece_max, 524_288, "a whole piece fits the budget");
+        for bad in [
+            ["--probe-peers", "0"],
+            ["--probe-peers", "9"],
+            ["--probe-per-min", "0"],
+            ["--probe-max-bytes", "1000"],
+            ["--probe-whole-piece-max", "1"],
+        ] {
+            let mut args = vec!["magnetar-server"];
+            args.extend(bad);
+            args.push("worker");
+            assert!(Cli::try_parse_from(args).is_err(), "{bad:?}");
+        }
+        let serve = Cli::try_parse_from(["magnetar-server", "--probe", "true", "serve"]).unwrap();
+        assert!(crate::probes::not_here(&serve.config, &serve.command).is_some());
+        let worker = Cli::try_parse_from(["magnetar-server", "--probe", "true", "worker"]).unwrap();
+        assert!(crate::probes::not_here(&worker.config, &worker.command).is_none());
     }
 
     #[test]

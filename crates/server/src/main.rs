@@ -27,6 +27,10 @@ async fn main() -> anyhow::Result<()> {
     // D112: our own addresses are refused like private ones; a bad entry stops the process.
     magnetar_core::netaddr::OWN
         .configure(magnetar_core::netaddr::parse_nets(&cli.config.own_addrs)?);
+    // D117: header probes run on crawl workers only; the main server never probes.
+    if let Some(w) = magnetar_server::probes::not_here(&cli.config, &cli.command) {
+        tracing::warn!("{w}");
+    }
     match cli.command {
         Command::Serve => server::serve(cli.config).await,
         Command::Migrate => {

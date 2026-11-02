@@ -441,6 +441,126 @@ pub fn parse_info_bounded(raw: &[u8], output_max: usize) -> Result<InfoSummary, 
     })
 }
 
+/// Most bencode values [`layout`] decodes (the decode costs ~112 B per value, D110): a 2 MiB
+/// dict's worth (header probes skip larger dicts, D117).
+pub const LAYOUT_MAX_VALUES: usize = 256 * 1024;
+/// Largest piece length [`layout`] accepts: block offsets inside a piece are u32 on the wire.
+pub const LAYOUT_PIECE_MAX: u64 = 1 << 30;
+
+/// Where each display file sits in the v1 piece space (header probes, D117).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Layout {
+    pub piece_length: u64,
+    /// The `pieces` string: the SHA-1 of every piece, 20 bytes each.
+    pub pieces: Vec<u8>,
+    /// Absolute v1 offset of each display file: same order and count as
+    /// [`InfoSummary::files`] (padding files are gaps, BEP 47 and BitComet rules alike).
+    pub offsets: Vec<u64>,
+    pub sizes: Vec<u64>,
+    /// Length of the whole v1 piece space, padding files included.
+    pub total: u64,
+    /// BEP 52 hybrid (`meta version` 2 with a `file tree` next to the v1 list).
+    pub hybrid: bool,
+}
+
+impl Layout {
+    pub fn piece_count(&self) -> u32 {
+        u32::try_from(self.pieces.len() / 20).unwrap_or(u32::MAX)
+    }
+
+    /// The SHA-1 of piece `i`.
+    pub fn piece_hash(&self, i: u32) -> Option<[u8; 20]> {
+        let s = usize::try_from(i).ok()?.checked_mul(20)?;
+        self.pieces.get(s..s + 20)?.try_into().ok()
+    }
+
+    /// Length of piece `i` (the last one may be short).
+    pub fn piece_len(&self, i: u32) -> Option<u64> {
+        let start = u64::from(i).checked_mul(self.piece_length)?;
+        (start < self.total).then(|| (self.total - start).min(self.piece_length))
+    }
+}
+
+/// The v1 piece layout of a verified info dict (header probes, D117): piece length, piece
+/// hashes and the absolute offset of each display file, without building any name. At most
+/// [`LAYOUT_MAX_VALUES`] values are decoded ([`InfoError::TooComplex`] above). v2-only dicts
+/// (no `pieces`) and dicts whose piece count does not match their length are
+/// [`InfoError::BadFiles`].
+pub fn layout(raw: &[u8]) -> Result<Layout, InfoError> {
+    if bencode::count_values(raw, LAYOUT_MAX_VALUES) > LAYOUT_MAX_VALUES {
+        return Err(InfoError::TooComplex);
+    }
+    let v = bencode::decode(raw).map_err(|_| InfoError::Decode)?;
+    if v.as_dict().is_none() {
+        return Err(InfoError::Decode);
+    }
+    let piece_length = v
+        .get(b"piece length")
+        .and_then(Value::as_int)
+        .and_then(|l| u64::try_from(l).ok())
+        .filter(|l| (1..=LAYOUT_PIECE_MAX).contains(l))
+        .ok_or(InfoError::BadFiles)?;
+    let pieces = v
+        .get(b"pieces")
+        .and_then(Value::as_bytes)
+        .filter(|p| !p.is_empty() && p.len() % 20 == 0)
+        .ok_or(InfoError::BadFiles)?
+        .to_vec();
+    let mut offsets = Vec::new();
+    let mut sizes = Vec::new();
+    let mut pos = 0u64;
+    if let Some(list) = v.get(b"files") {
+        for f in list.as_list().ok_or(InfoError::BadFiles)? {
+            let len = f
+                .get(b"length")
+                .and_then(Value::as_int)
+                .and_then(|l| u64::try_from(l).ok());
+            let attr = f.get(b"attr").and_then(Value::as_bytes);
+            let parts = f
+                .get(b"path")
+                .map(|p| path_parts(p).ok_or(InfoError::BadFiles))
+                .transpose()?;
+            let first = parts.as_ref().and_then(|p| p.first().copied());
+            let last = parts.as_ref().and_then(|p| p.last().copied());
+            let len = len.ok_or(InfoError::BadFiles)?;
+            if !is_padding(attr, first, last) {
+                if parts.is_none_or(|p| p.is_empty()) {
+                    return Err(InfoError::BadFiles);
+                }
+                offsets.push(pos);
+                sizes.push(len);
+            }
+            pos = pos.checked_add(len).ok_or(InfoError::BadFiles)?;
+        }
+    } else if let Some(len) = v.get(b"length") {
+        let len = len
+            .as_int()
+            .and_then(|l| u64::try_from(l).ok())
+            .ok_or(InfoError::BadFiles)?;
+        offsets.push(0);
+        sizes.push(len);
+        pos = len;
+    } else {
+        return Err(InfoError::BadFiles);
+    }
+    if pos == 0 {
+        return Err(InfoError::Empty);
+    }
+    if pos.div_ceil(piece_length) != (pieces.len() / 20) as u64 {
+        return Err(InfoError::BadFiles);
+    }
+    let hybrid = v.get(b"meta version").and_then(Value::as_int) == Some(2)
+        && v.get(b"file tree").is_some_and(|t| t.as_dict().is_some());
+    Ok(Layout {
+        piece_length,
+        pieces,
+        offsets,
+        sizes,
+        total: pos,
+        hybrid,
+    })
+}
+
 /// BEP 52 `file tree`: dict keys are path elements; a key `""` holding `length` marks a file.
 /// Every leaf joins its whole prefix, so each string is priced in real bytes first (D110): at
 /// most [`TREE_PATH_MAX`] raw bytes per path and the parse's [`Budget`] in all, else
@@ -866,6 +986,92 @@ mod tests {
         assert_eq!(t, "a");
     }
 
+    /// A v1 multi-file dict from (path, size, attr) entries, with a consistent `pieces`.
+    fn v1_dict(files: &[(Vec<&str>, u64, Option<&str>)], pl: u64, extra: (&str, &str)) -> Vec<u8> {
+        let mut s = format!("d{}5:filesl", extra.0);
+        let mut total = 0u64;
+        for (path, size, attr) in files {
+            s.push('d');
+            if let Some(a) = attr {
+                s.push_str(&format!("4:attr{}:{a}", a.len()));
+            }
+            s.push_str(&format!("6:lengthi{size}e4:pathl"));
+            for p in path {
+                s.push_str(&format!("{}:{p}", p.len()));
+            }
+            s.push_str("ee");
+            total += size;
+        }
+        s.push('e');
+        s.push_str(extra.1);
+        let n = total.div_ceil(pl) as usize;
+        s.push_str(&format!(
+            "4:name3:top12:piece lengthi{pl}e6:pieces{}:",
+            n * 20
+        ));
+        let mut raw = s.into_bytes();
+        raw.extend(std::iter::repeat_n(b'h', n * 20));
+        raw.push(b'e');
+        raw
+    }
+
+    #[test]
+    fn layout_matches_parse_info_with_padding() {
+        let raw = v1_dict(
+            &[
+                (vec!["a.mkv"], 1000, None),
+                (vec![".pad", "24"], 24, Some("p")),
+                (vec!["b.srt"], 50, None),
+                (vec!["_____padding_file_0_"], 974, None),
+                (vec!["c", "d.nfo"], 7, Some("x")),
+            ],
+            1024,
+            ("", ""),
+        );
+        let info = parse_info(&raw).unwrap();
+        let l = layout(&raw).unwrap();
+        assert_eq!(
+            info.files.iter().map(|f| f.size).collect::<Vec<_>>(),
+            l.sizes
+        );
+        assert_eq!(l.offsets, vec![0, 1024, 2048]);
+        assert_eq!(l.total, 2055);
+        assert_eq!(l.piece_count(), 3);
+        assert_eq!(l.piece_len(2), Some(7));
+        assert_eq!(l.piece_len(3), None);
+        assert_eq!(l.piece_hash(0), Some([b'h'; 20]));
+        assert_eq!(l.piece_hash(3), None);
+        assert!(!l.hybrid);
+        // Single file.
+        let single = b"d6:lengthi1000e4:name9:movie.mkv12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaae";
+        let l = layout(single).unwrap();
+        assert_eq!((l.offsets, l.sizes, l.total), (vec![0], vec![1000], 1000));
+        // Piece count that does not match the length, v2-only, zero piece length.
+        let bad = b"d6:lengthi1000e4:name1:a12:piece lengthi16e6:pieces20:aaaaaaaaaaaaaaaaaaaae";
+        assert_eq!(layout(bad), Err(InfoError::BadFiles));
+        let v2 =
+            b"d9:file treed1:ad0:d6:lengthi5eeee12:meta versioni2e4:name1:a12:piece lengthi16384ee";
+        assert_eq!(layout(v2), Err(InfoError::BadFiles));
+        let zero = b"d6:lengthi10e4:name1:a12:piece lengthi0e6:pieces20:aaaaaaaaaaaaaaaaaaaae";
+        assert_eq!(layout(zero), Err(InfoError::BadFiles));
+        // Hybrid: the v1 list with BEP 47 padding to piece boundaries.
+        let hy = v1_dict(
+            &[
+                (vec!["a.bin"], 10, None),
+                (vec![".pad", "6"], 6, Some("p")),
+                (vec!["b.bin"], 3, None),
+            ],
+            16,
+            (
+                "9:file treed5:a.bind0:d6:lengthi10eee5:b.bind0:d6:lengthi3eeee",
+                "12:meta versioni2e",
+            ),
+        );
+        let l = layout(&hy).unwrap();
+        assert!(l.hybrid);
+        assert_eq!(l.offsets, vec![0, 16]);
+    }
+
     proptest! {
         #[test]
         fn priced_lengths_match_what_is_built(
@@ -888,8 +1094,48 @@ mod tests {
         }
 
         #[test]
+        fn layout_agrees_with_parse_info(
+            entries in proptest::collection::vec((1u64..5000, 0u8..4), 1..12),
+            pl in prop_oneof![Just(16u64), Just(1024), Just(16384), 1u64..4000],
+        ) {
+            // 0 = file, 1 = BEP 47 attr padding, 2 = `.pad` dir padding, 3 = BitComet padding.
+            let names: Vec<String> = (0..entries.len()).map(|i| format!("f{i}.bin")).collect();
+            let files: Vec<(Vec<&str>, u64, Option<&str>)> = entries
+                .iter()
+                .zip(&names)
+                .map(|((size, kind), n)| match kind {
+                    1 => (vec![n.as_str()], *size, Some("p")),
+                    2 => (vec![".pad", n.as_str()], *size, None),
+                    3 => (vec!["_____padding_file_1_"], *size, None),
+                    _ => (vec![n.as_str()], *size, None),
+                })
+                .collect();
+            let raw = v1_dict(&files, pl, ("", ""));
+            let info = parse_info(&raw);
+            let l = layout(&raw);
+            match (info, l) {
+                (Ok(info), Ok(l)) => {
+                    prop_assert_eq!(info.files.iter().map(|f| f.size).collect::<Vec<_>>(), l.sizes.clone());
+                    let mut pos = 0;
+                    let mut k = 0;
+                    for (size, kind) in &entries {
+                        if *kind == 0 {
+                            prop_assert_eq!(l.offsets[k], pos);
+                            k += 1;
+                        }
+                        pos += size;
+                    }
+                    prop_assert_eq!(l.total, pos);
+                }
+                (Err(InfoError::Empty), _) => {}
+                (a, b) => prop_assert!(false, "{a:?} vs {b:?}"),
+            }
+        }
+
+        #[test]
         fn arbitrary_bytes_never_panic(b in proptest::collection::vec(any::<u8>(), 0..400)) {
             let _ = parse_info(&b);
+            let _ = layout(&b);
             prop_assert!(bencode::count_values(&b, 64) <= 65);
         }
 

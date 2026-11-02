@@ -20,7 +20,9 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
-magnetar-core = { workspace = true, features = ["downloads", "enrich", "dht-crawl"] }
+magnetar-core = { workspace = true, features = ["downloads", "enrich", "dht-crawl", "probe"] }
+# Label registry and id checks for uploaded header-probe results (D117).
+sniff.workspace = true
 sqlx.workspace = true
 axum.workspace = true
 tokio.workspace = true

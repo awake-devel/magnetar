@@ -11,6 +11,7 @@ repository = "https://github.com/awake-devel/magnetar"
 
 [workspace.dependencies]
 magnetar-core = { path = "crates/core", default-features = false }
+sniff = { path = "crates/sniff" }
 nostr = { version = "0.45.5", default-features = false, features = ["std", "rand", "os-rng"] }
 negentropy = "0.5.2"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "macros", "migrate", "json", "chrono"] }

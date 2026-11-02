@@ -13,6 +13,27 @@ pub const HANDSHAKE_LEN: usize = 1 + 19 + 8 + 20 + 20;
 /// BEP 10: "bit 20 from the right … (reserved_byte[5] & 0x10)".
 pub const EXT_BYTE: usize = 5;
 pub const EXT_BIT: u8 = 0x10;
+/// BEP 6 (Fast Extension): "the third least significant bit in the 8th byte of the reserved
+/// bytes", `reserved[7] |= 0x04`.
+pub const FAST_BYTE: usize = 7;
+pub const FAST_BIT: u8 = 0x04;
+/// BEP 3 peer wire message ids.
+pub const MSG_CHOKE: u8 = 0;
+pub const MSG_UNCHOKE: u8 = 1;
+pub const MSG_INTERESTED: u8 = 2;
+pub const MSG_NOT_INTERESTED: u8 = 3;
+pub const MSG_HAVE: u8 = 4;
+pub const MSG_BITFIELD: u8 = 5;
+pub const MSG_PIECE_REQUEST: u8 = 6;
+pub const MSG_PIECE: u8 = 7;
+pub const MSG_CANCEL: u8 = 8;
+pub const MSG_PORT: u8 = 9;
+/// BEP 6 message ids.
+pub const MSG_SUGGEST: u8 = 13;
+pub const MSG_HAVE_ALL: u8 = 14;
+pub const MSG_HAVE_NONE: u8 = 15;
+pub const MSG_REJECT_REQUEST: u8 = 16;
+pub const MSG_ALLOWED_FAST: u8 = 17;
 /// BEP 10: the `extended` message id.
 pub const MSG_EXTENDED: u8 = 20;
 /// BEP 10: extended message id 0 is the extended handshake.
@@ -42,13 +63,27 @@ pub enum WireError {
 
 /// Our BEP 3 handshake: pstrlen, pstr, reserved (only the BEP 10 bit), infohash, peer id.
 pub fn handshake(info_hash: &[u8; 20], peer_id: &[u8; 20]) -> [u8; HANDSHAKE_LEN] {
+    handshake_with(info_hash, peer_id, false)
+}
+
+/// Our BEP 3 handshake, with the BEP 6 Fast Extension bit too when `fast` (header probes on,
+/// D117: the fetcher then sends `HAVE_NONE` to peers that set it as well).
+pub fn handshake_with(info_hash: &[u8; 20], peer_id: &[u8; 20], fast: bool) -> [u8; HANDSHAKE_LEN] {
     let mut out = [0u8; HANDSHAKE_LEN];
     out[0] = 19;
     out[1..20].copy_from_slice(PROTOCOL);
     out[20 + EXT_BYTE] = EXT_BIT;
+    if fast {
+        out[20 + FAST_BYTE] |= FAST_BIT;
+    }
     out[28..48].copy_from_slice(info_hash);
     out[48..68].copy_from_slice(peer_id);
     out
+}
+
+/// True when the reserved bytes of a handshake set the BEP 6 Fast Extension bit.
+pub fn has_fast(reserved: &[u8; 8]) -> bool {
+    reserved[FAST_BYTE] & FAST_BIT != 0
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,6 +160,8 @@ pub struct ExtHandshake {
     pub ut_metadata: Option<u8>,
     /// BEP 9 `metadata_size` (any integer as sent; the caller checks the range).
     pub metadata_size: Option<i64>,
+    /// BEP 10 `reqq`: outstanding requests the peer accepts (1..=65535 kept, else None).
+    pub reqq: Option<u32>,
 }
 
 /// Parse the payload of an extended handshake (after the extended id byte). Unknown keys are
@@ -141,9 +178,15 @@ pub fn parse_ext_handshake(payload: &[u8]) -> Result<ExtHandshake, WireError> {
         .and_then(|i| u8::try_from(i).ok())
         .filter(|&i| i != 0);
     let metadata_size = v.get(b"metadata_size").and_then(Value::as_int);
+    let reqq = v
+        .get(b"reqq")
+        .and_then(Value::as_int)
+        .and_then(|i| u32::try_from(i).ok())
+        .filter(|&i| (1..=65_535).contains(&i));
     Ok(ExtHandshake {
         ut_metadata,
         metadata_size,
+        reqq,
     })
 }
 
@@ -241,6 +284,11 @@ mod tests {
         assert_eq!(&h[28..48], &[7; 20]);
         assert_eq!(&h[48..68], &[9; 20]);
         assert!(parse_handshake(&h, &[7; 20]).is_ok());
+        assert!(!has_fast(&parse_handshake(&h, &[7; 20]).unwrap().reserved));
+        let f = handshake_with(&[7; 20], &[9; 20], true);
+        assert_eq!(&f[20..28], &[0, 0, 0, 0, 0, 0x10, 0, 0x04]);
+        assert!(has_fast(&parse_handshake(&f, &[7; 20]).unwrap().reserved));
+        assert_eq!(handshake_with(&[7; 20], &[9; 20], false), h);
         assert_eq!(parse_handshake(&h, &[8; 20]), Err(WireError::InfoHash));
         let mut no_ext = h;
         no_ext[25] = 0;
@@ -268,6 +316,11 @@ mod tests {
         let hs = parse_ext_handshake(b"d1:md11:ut_metadatai3ee13:metadata_sizei31235ee").unwrap();
         assert_eq!(hs.ut_metadata, Some(3));
         assert_eq!(hs.metadata_size, Some(31235));
+        assert_eq!(hs.reqq, None);
+        let q = parse_ext_handshake(b"d1:md11:ut_metadatai3ee4:reqqi250ee").unwrap();
+        assert_eq!(q.reqq, Some(250));
+        assert_eq!(parse_ext_handshake(b"d4:reqqi0ee").unwrap().reqq, None);
+        assert_eq!(parse_ext_handshake(b"d4:reqqi-5ee").unwrap().reqq, None);
         // 0 = disabled (BEP 10), out-of-range ids are not a u8.
         let off = parse_ext_handshake(b"d1:md11:ut_metadatai0eee").unwrap();
         assert_eq!(off.ut_metadata, None);

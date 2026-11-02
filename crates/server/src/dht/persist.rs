@@ -381,7 +381,7 @@ impl PersistOutcome {
 /// on without the row. Anything else aborts the batch and keeps its leases, to be retried:
 /// I/O, pool, protocol, and database errors that a retry can clear (deadlock or serialization
 /// 40, resources 53, lock timeout 55, cancel or statement timeout 57) or that we do not know.
-fn row_level(e: &sqlx::Error) -> bool {
+pub(crate) fn row_level(e: &sqlx::Error) -> bool {
     match e {
         sqlx::Error::Encode(_) => true,
         sqlx::Error::Database(d) => d.code().is_some_and(|c| row_level_sqlstate(&c)),

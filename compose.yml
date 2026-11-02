@@ -95,6 +95,12 @@ services:
       MAGNETAR_DHT_UPNP_GATEWAY:
       MAGNETAR_DHT_UPNP_LOCAL_IP:
       MAGNETAR_BLOCKLIST_FILE:
+      # Header probes (docs/PROBES.md, D117) run on crawl workers only: pinned off here, the
+      # main server never probes (it would only log a warning). Their tuning settings
+      # (MAGNETAR_PROBE_WHOLE_PIECE_MAX, _PER_MIN, _PARALLEL, _PEERS, _MAX_BYTES) are worker
+      # settings: docker/compose.worker.yml.
+      MAGNETAR_PROBE: "false"
+      MAGNETAR_PROBE_UPLOAD: "false"
       # Crawl map (docs/CRAWLMAP.md): DB-IP Lite databases downloaded into state/geoip.
       MAGNETAR_GEOIP:
       MAGNETAR_GEOIP_DIR:

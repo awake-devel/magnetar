@@ -55,7 +55,29 @@ pub struct WorkerOptions {
     /// The DHT pace shared by the crawler and the seed checks (D109), run by [`run`]; the
     /// router health probe targets that brake it.
     pub pacer: Option<Arc<magnetar_core::dht::limiter::Pacer>>,
-    pub probe: Vec<std::net::SocketAddr>,
+    /// Router health probe targets (`MAGNETAR_DHT_PROBE`, D109). Not the header probes.
+    pub health_targets: Vec<std::net::SocketAddr>,
+    /// Header probes (D117, `MAGNETAR_PROBE`): None = off. They follow the crawler's
+    /// metadata fetches, so they need `MAGNETAR_DHT` too.
+    pub probe: Option<magnetar_core::probe::ProbeConfig>,
+}
+
+/// The header-probe settings of a worker (D117): None unless `MAGNETAR_PROBE=true`.
+pub fn probe_config(cfg: &Config) -> Option<magnetar_core::probe::ProbeConfig> {
+    if !cfg.probe {
+        return None;
+    }
+    let max_bytes = cfg.probe_max_bytes;
+    Some(magnetar_core::probe::ProbeConfig {
+        upload: cfg.probe_upload,
+        // A whole piece must fit in the probe's own budget.
+        whole_piece_max: cfg.probe_whole_piece_max.min(max_bytes),
+        max_bytes,
+        peers: cfg.probe_peers as usize,
+        parallel: cfg.probe_parallel as usize,
+        per_min: cfg.probe_per_min,
+        ..magnetar_core::probe::ProbeConfig::default()
+    })
 }
 
 impl WorkerOptions {
@@ -96,6 +118,14 @@ impl WorkerOptions {
             liveness.is_some() || dht.is_some(),
             "worker: nothing to do (MAGNETAR_WORKER_LIVENESS=false and MAGNETAR_DHT=off)"
         );
+        let probe = probe_config(cfg);
+        if probe.is_some() && dht.is_none() {
+            tracing::warn!(
+                "worker: MAGNETAR_PROBE=true needs MAGNETAR_DHT (header probes follow the \
+                 crawler's metadata fetches); no probes"
+            );
+        }
+        let probe = probe.filter(|_| dht.is_some());
         Ok(Self {
             server,
             token,
@@ -121,7 +151,8 @@ impl WorkerOptions {
                 )
             }),
             pacer,
-            probe: crate::dht::health::parse_targets(&cfg.dht_probe),
+            health_targets: crate::dht::health::parse_targets(&cfg.dht_probe),
+            probe,
         })
     }
 }
@@ -318,7 +349,7 @@ pub async fn run(
     let health = opts.pacer.clone().map(|p| {
         let hub = crate::dht::health::HealthHub::new(Some(p));
         tokio::spawn(crate::dht::health::health_loop(
-            opts.probe.clone(),
+            opts.health_targets.clone(),
             hub.clone(),
             int_rx.clone(),
         ));
@@ -366,11 +397,30 @@ pub async fn run(
             if welcome.metadata_max > 0 {
                 d.metadata_max = d.metadata_max.min(welcome.metadata_max as usize);
             }
+            if let Some(pc) = &opts.probe {
+                // D117: probes connect to peers from this machine's address and download
+                // file data (and share it with MAGNETAR_PROBE_UPLOAD). Never a core dump of
+                // the piece bytes held in memory.
+                tracing::warn!(
+                    "worker: header probes connect to torrent peers from this machine's \
+                     address and download parts of files{} (docs/PROBES.md, legal note in \
+                     README)",
+                    if pc.upload {
+                        "; MAGNETAR_PROBE_UPLOAD=true also SHARES verified pieces"
+                    } else {
+                        ""
+                    }
+                );
+                if !magnetar_core::probe::harden_process() {
+                    tracing::warn!("worker: could not turn core dumps off (PR_SET_DUMPABLE)");
+                }
+            }
             let setup = crawl::CrawlSetup {
                 opts: d,
                 state_dir: opts.state_dir.clone(),
                 upload_buffer: opts.upload_buffer,
                 max_results: welcome.max_results as usize,
+                probe: opts.probe.clone(),
             };
             match crawl::start(
                 setup,

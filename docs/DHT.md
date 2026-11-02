@@ -652,6 +652,18 @@ holding the 256 MiB in-flight budget cannot starve the decodes; an announced has
 order is (§7.1): **screen** (D65) → store or block. Stage 2 has no classifier: rows are stored
 with `category = other`, `classifier_version = 0`, which stage 3 re-classifies.
 
+**Header probes (D117, docs/PROBES.md), crawl workers with `MAGNETAR_PROBE=true` only.** Their
+fetcher (`FetchConfig::probe`) also sets the BEP 6 Fast bit (`reserved[7] |= 0x04`), sends
+`HAVE_NONE` before its extended handshake when the peer set the bit too (nothing at all
+otherwise: never a bitfield), sends `INTERESTED` in the same write as the `ut_metadata`
+requests, records the peer's choke / unchoke / bitfield / `have` / `have_all` / `have_none` /
+`allowed_fast` (within the same 4 MiB skip budget; `piece` is still discarded), and hands the
+verified connection to the probe (`fetch_with_handoff`) instead of closing it; its permit stays
+counted under `MAGNETAR_DHT_TCP_MAX`. With probes off (the server, and every worker by default)
+the wire is unchanged: reserved bytes `[0,0,0,0,0,0x10,0,0]`, no `HAVE_NONE`, no `INTERESTED`
+(test `fetcher_without_probes_is_unchanged`). Whether the Fast bit changes metadata success on
+real peers is **UNVERIFIED**.
+
 ## 5. Trust treatment and display of DHT results (D51, as built in stage 4: D73, §16)
 
 **Rule**: an infohash with a `dht_torrents` row **always passes `min_trust`**. In the index,
