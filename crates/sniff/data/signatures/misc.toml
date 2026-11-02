@@ -1,0 +1,210 @@
+# Miscellaneous signatures.
+
+[[rule]]
+id = "sqlite"
+label = "misc.sqlite"
+confidence = 99
+type = "string"
+value = 'SQLite format 3\0'
+
+[[rule]]
+id = "par2"
+label = "misc.par2"
+confidence = 99
+type = "string"
+value = 'PAR2\0PKT'
+
+[[rule]]
+id = "torrent"
+label = "misc.torrent"
+confidence = 97
+type = "string"
+value = ["d8:announce", "d13:announce-list", "d4:info", "d10:created by", "d7:comment"]
+
+[[rule]]
+id = "kdbx"              # KeePass 2.x (and 1.x .kdb) databases
+label = "misc.keepass"
+confidence = 99
+type = "bytes"
+hex = ["03D9A29A67FB4BB5", "03D9A29A65FB4BB5"]
+
+[[rule]]
+id = "ds_store"
+label = "misc.ds_store"
+confidence = 99
+type = "bytes"
+hex = "0000000142756431"
+
+[[rule]]
+id = "git_pack"
+label = "misc.git_pack"
+confidence = 90
+type = "string"
+value = "PACK"
+  [[rule.then]]
+  offset = 4
+  type = "u32be"
+  test = "2|3"
+
+[[rule]]
+id = "blend"             # Blender: pointer size '_'/'-', endianness 'v'/'V', version digits
+label = "model.blend"
+confidence = 98
+type = "string"
+value = "BLENDER"
+  [[rule.then]]
+  offset = 7
+  type = "string"
+  value = ["_v", "_V", "-v", "-V"]
+  [[rule.then]]
+  offset = 9
+  type = "ascii"
+  len = 3
+  class = "digit"
+  field = "version"
+
+[[rule]]
+id = "fbx"
+label = "model.fbx"
+confidence = 99
+type = "string"
+value = 'Kaydara FBX Binary  \0'
+
+[[rule]]
+id = "glb"               # binary glTF 2: version 2, total length
+label = "model.glb"
+confidence = 90
+type = "string"
+value = "glTF"
+  [[rule.then]]
+  offset = 4
+  type = "u32le"
+  test = "2"
+    [[rule.then.then]]
+    offset = 8
+    type = "u32le"
+    test = "=$size"
+    optional = true
+    confidence = 97
+
+# ---------------------------------------------------------------- game data archives
+
+[[rule]]
+id = "unityfs"
+label = "gamedata.unity"
+confidence = 97
+type = "string"
+value = ['UnityFS\0', 'UnityWeb\0', 'UnityRaw\0', 'UnityArchive\0']
+  [[rule.then]]
+  offset = 0
+  type = "search"
+  range = 32
+  value = '\0'
+  [[rule.then]]
+  offset = 0
+  relative = true
+  type = "u32be"
+  test = "<=8"
+  field = "format"
+  optional = true
+
+[[rule]]
+id = "godot_pck"
+label = "gamedata.godot_pck"
+confidence = 95
+type = "string"
+value = "GDPC"
+  [[rule.then]]
+  offset = 4
+  type = "u32le"
+  test = "0..=3"
+  field = "pack_version"
+
+[[rule]]
+id = "valve_vpk"
+label = "gamedata.vpk"
+confidence = 95
+type = "u32le"
+test = "0x55AA1234"
+  [[rule.then]]
+  offset = 4
+  type = "u32le"
+  test = "1|2"
+  field = "version"
+
+[[rule]]
+id = "quake_pak"         # id Software PAK: le32 directory offset and size (64-byte entries)
+label = "gamedata.quake_pak"
+confidence = 85
+type = "string"
+value = "PACK"
+  [[rule.then]]
+  offset = 4
+  type = "u32le"
+  test = "12..=0xFFFFFFF"
+    [[rule.then.then]]
+    offset = 4
+    type = "u32le"
+    test = "<$size"
+  [[rule.then]]
+  offset = 8
+  type = "u32le"
+  mask = 0x3F
+  test = "0"
+
+[[rule]]
+id = "doom_wad"
+label = "gamedata.doom_wad"
+confidence = 92
+type = "string"
+value = ["IWAD", "PWAD"]
+  [[rule.then]]
+  offset = 4
+  type = "u32le"
+  test = "1..=65536"
+  field = "lumps"
+  [[rule.then]]
+  offset = 8
+  type = "u32le"
+  test = "<$size"
+
+[[rule]]
+id = "bethesda_bsa"      # Oblivion / Fallout 3 / Skyrim (0x67, 0x68, 0x69)
+label = "gamedata.bsa"
+confidence = 96
+type = "string"
+value = 'BSA\0'
+  [[rule.then]]
+  offset = 4
+  type = "u32le"
+  test = "0x67|0x68|0x69"
+  field = "version"
+
+[[rule]]
+id = "bethesda_ba2"      # Fallout 4 / Starfield
+label = "gamedata.ba2"
+confidence = 97
+type = "string"
+value = "BTDX"
+  [[rule.then]]
+  offset = 4
+  type = "u32le"
+  test = "1..=8"
+  [[rule.then]]
+  offset = 8
+  type = "string"
+  value = ["GNRL", "DX10", "GNMF"]
+
+[[rule]]
+id = "renpy_rpa"
+label = "gamedata.renpy_rpa"
+confidence = 96
+type = "string"
+value = ["RPA-3.0 ", "RPA-3.2 ", "RPA-2.0 "]
+
+[[rule]]
+id = "rgss"              # RPG Maker XP / VX / VX Ace encrypted archives
+label = "gamedata.rgss"
+confidence = 96
+type = "string"
+value = ['RGSSAD\0\x01', 'RGSSAD\0\x03']   # format version 1 (XP / VX) or 3 (VX Ace)

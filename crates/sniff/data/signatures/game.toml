@@ -1,0 +1,433 @@
+# Console signatures without a parser of their own. Packages and images with fields to
+# extract (PS5/PS4/PS3 packages, NSP, XCI, CCI, CIA, Wii/GameCube, STFS, ...) are Rust checks in
+# src/formats/console/.
+
+[[rule]]
+id = "psp_pbp"
+label = "game.psp.pbp"
+confidence = 97
+type = "string"
+value = '\0PBP'
+  [[rule.then]]          # PARAM.SFO offset = header size
+  offset = 8
+  type = "u32le"
+  test = "40"
+
+[[rule]]
+id = "nes"
+label = "game.nes.rom"
+confidence = 95
+type = "string"
+value = 'NES\x1a'
+
+[[rule]]
+id = "n64"               # z64 / v64 / n64 byte orders
+label = "game.n64.rom"
+confidence = 92
+type = "bytes"
+hex = ["80371240", "37804012", "40123780"]
+
+[[rule]]
+id = "gb"                # Nintendo logo start in the cartridge header
+label = "game.gb.rom"
+confidence = 95
+offset = 0x104
+type = "bytes"
+hex = "CEED6666CC0D"
+
+[[rule]]
+id = "switch_ncz"
+label = "game.switch.ncz"
+confidence = 95
+offset = 0x4000
+type = "string"
+value = "NCZSECTN"
+
+[[rule]]
+id = "3ds_cxi"
+label = "game.3ds.cxi"
+confidence = 93
+offset = 0x100
+type = "string"
+value = "NCCH"
+
+# ---------------------------------------------------------------- headers with typed fields
+# Captured `title`, `title_id`, `product_code`, `version`, `region_code` and `maker` fill the
+# detection's game record (see src/formats/console/mod.rs, game_from_label). Rust checks with
+# checksums (GB/GBC, GBA, N64, SNES) confirm these labels at 95+.
+
+[[rule]]
+id = "snes_lorom"        # weak probe; the Rust check verifies the checksum pair
+label = "game.snes.rom"
+confidence = 55
+offset = 0x7FC0
+type = "ascii"
+len = 21
+field = "title"
+  [[rule.then]]          # map mode: LoROM variants
+  offset = 0x7FD5
+  type = "u8"
+  test = "0x20|0x22|0x23|0x30|0x32|0x33"
+  [[rule.then]]          # ROM size, log2 KiB
+  offset = 0x7FD7
+  type = "u8"
+  test = "7..=13"
+  [[rule.then]]
+  offset = 0x7FD9
+  type = "u8"
+  test = "<=0x14"
+
+[[rule]]
+id = "snes_hirom"
+label = "game.snes.rom"
+confidence = 55
+offset = 0xFFC0
+type = "ascii"
+len = 21
+field = "title"
+  [[rule.then]]
+  offset = 0xFFD5
+  type = "u8"
+  test = "0x21|0x25|0x31|0x35|0x3A"
+  [[rule.then]]
+  offset = 0xFFD7
+  type = "u8"
+  test = "7..=13"
+  [[rule.then]]
+  offset = 0xFFD9
+  type = "u8"
+  test = "<=0x14"
+
+[[rule]]
+id = "megadrive"         # system name at 0x100
+label = "game.genesis.rom"
+confidence = 93
+offset = 0x100
+type = "string"
+value = ["SEGA MEGA DRIVE", "SEGA GENESIS", "SEGA_MEGA_DRIVE", " SEGA MEGA DRIVE", " SEGA GENESIS", "SEGA SSF"]
+  [[rule.then]]
+  offset = 0x150         # overseas title
+  type = "cstring"
+  len = 48
+  field = "title"
+  optional = true
+  [[rule.then]]
+  offset = 0x180         # "GM 00001009-00"
+  type = "ascii"
+  len = 14
+  class = "printable"
+  field = "product_code"
+  optional = true
+  confidence = 95
+  [[rule.then]]
+  offset = 0x183
+  type = "ascii"
+  len = 11
+  class = "printable"
+  field = "title_id"
+  optional = true
+  [[rule.then]]
+  offset = 0x1F0
+  type = "ascii"
+  len = 3
+  field = "region_code"
+  optional = true
+
+[[rule]]
+# TMSS only checks "SEGA" / " SEGA" at 0x100: homebrew and flashcart builds use other system
+# names (SGDK's "SEGA MEGAWIFI", "SEGA EVERDRIVE").
+id = "megadrive_sega"
+label = "game.genesis.rom"
+confidence = 90
+offset = 0x100
+type = "string"
+value = ["SEGA", " SEGA"]
+  [[rule.then]]          # product type: game, educational, system, boot ROM, ...
+  offset = 0x180
+  type = "string"
+  value = ["GM ", "AI ", "OS ", "BR ", "AL "]
+  [[rule.then]]          # region code: printable (JUE, 4, F, ...)
+  offset = 0x1F0
+  type = "ascii"
+  len = 1
+  class = "graphic"
+  [[rule.then]]
+  offset = 0x150         # overseas title
+  type = "cstring"
+  len = 48
+  field = "title"
+  optional = true
+  [[rule.then]]
+  offset = 0x180
+  type = "ascii"
+  len = 14
+  class = "printable"
+  field = "product_code"
+  optional = true
+  [[rule.then]]
+  offset = 0x183
+  type = "ascii"
+  len = 11
+  class = "printable"
+  field = "title_id"
+  optional = true
+  [[rule.then]]
+  offset = 0x1F0
+  type = "ascii"
+  len = 3
+  field = "region_code"
+  optional = true
+
+[[rule]]
+id = "sega32x"
+label = "game.32x.rom"
+confidence = 95
+strength = 120
+offset = 0x100
+type = "string"
+value = "SEGA 32X"
+  [[rule.then]]
+  offset = 0x150
+  type = "cstring"
+  len = 48
+  field = "title"
+  optional = true
+  [[rule.then]]
+  offset = 0x180
+  type = "ascii"
+  len = 14
+  class = "printable"
+  field = "product_code"
+  optional = true
+
+[[rule]]
+id = "sms"               # "TMR SEGA" at 0x7FF0; region nibble 5-7 = Game Gear
+label = "game.sms.rom"
+confidence = 92
+offset = 0x7FF0
+type = "string"
+value = "TMR SEGA"
+  [[rule.then]]
+  offset = 0x7FFF
+  type = "u8"
+  mask = 0xF0
+  test = "0x50..=0x70"
+  optional = true
+  label = "game.gg.rom"
+
+[[rule]]
+id = "segacd"            # cooked ISO / first track
+label = "game.segacd.iso"
+confidence = 96
+type = "string"
+value = "SEGADISCSYSTEM  "
+  [[rule.then]]
+  offset = 0x150
+  type = "cstring"
+  len = 48
+  field = "title"
+  optional = true
+  [[rule.then]]
+  offset = 0x180
+  type = "ascii"
+  len = 14
+  class = "printable"
+  field = "product_code"
+  optional = true
+  [[rule.then]]
+  offset = 0x1F0
+  type = "ascii"
+  len = 3
+  field = "region_code"
+  optional = true
+
+[[rule]]
+id = "segacd_raw"        # raw 2352-byte sectors: user data after the 16-byte sync/header
+label = "game.segacd.iso"
+confidence = 96
+offset = 0x10
+type = "string"
+value = "SEGADISCSYSTEM  "
+  [[rule.then]]
+  offset = 0
+  type = "bytes"
+  hex = "00FFFFFFFFFFFFFFFFFFFF00"
+  [[rule.then]]
+  offset = 0x160
+  type = "cstring"
+  len = 48
+  field = "title"
+  optional = true
+
+[[rule]]
+id = "saturn"            # IP.BIN: product number 0x20, version 0x2A, areas 0x40, title 0x60
+label = "game.saturn.iso"
+confidence = 97
+type = "string"
+value = "SEGA SEGASATURN "
+  [[rule.then]]
+  offset = 0x20
+  type = "ascii"
+  len = 10
+  class = "printable"
+  field = "title_id"
+  optional = true
+  [[rule.then]]
+  offset = 0x2A
+  type = "ascii"
+  len = 6
+  class = "printable"
+  field = "version"
+  optional = true
+  [[rule.then]]
+  offset = 0x40
+  type = "ascii"
+  len = 16
+  field = "region_code"
+  optional = true
+  [[rule.then]]
+  offset = 0x60
+  type = "cstring"
+  len = 112
+  field = "title"
+  optional = true
+
+[[rule]]
+id = "saturn_raw"
+label = "game.saturn.iso"
+confidence = 97
+offset = 0x10
+type = "string"
+value = "SEGA SEGASATURN "
+  [[rule.then]]
+  offset = 0
+  type = "bytes"
+  hex = "00FFFFFFFFFFFFFFFFFFFF00"
+  [[rule.then]]
+  offset = 0x30
+  type = "ascii"
+  len = 10
+  class = "printable"
+  field = "title_id"
+  optional = true
+  [[rule.then]]
+  offset = 0x70
+  type = "cstring"
+  len = 112
+  field = "title"
+  optional = true
+
+[[rule]]
+id = "dreamcast"         # IP.BIN of the data track: product 0x40, version 0x4A, title 0x80
+label = "game.dreamcast.iso"
+confidence = 97
+type = "string"
+value = "SEGA SEGAKATANA "
+  [[rule.then]]
+  offset = 0x40
+  type = "ascii"
+  len = 10
+  class = "printable"
+  field = "title_id"
+  optional = true
+  [[rule.then]]
+  offset = 0x4A
+  type = "ascii"
+  len = 6
+  class = "printable"
+  field = "version"
+  optional = true
+  [[rule.then]]
+  offset = 0x30
+  type = "ascii"
+  len = 8
+  field = "region_code"
+  optional = true
+  [[rule.then]]
+  offset = 0x80
+  type = "cstring"
+  len = 128
+  field = "title"
+  optional = true
+
+[[rule]]
+id = "dreamcast_raw"
+label = "game.dreamcast.iso"
+confidence = 97
+offset = 0x10
+type = "string"
+value = "SEGA SEGAKATANA "
+  [[rule.then]]
+  offset = 0
+  type = "bytes"
+  hex = "00FFFFFFFFFFFFFFFFFFFF00"
+  [[rule.then]]
+  offset = 0x50
+  type = "ascii"
+  len = 10
+  class = "printable"
+  field = "title_id"
+  optional = true
+  [[rule.then]]
+  offset = 0x90
+  type = "cstring"
+  len = 128
+  field = "title"
+  optional = true
+
+[[rule]]
+id = "lynx"              # LNX header: "LYNX", bank sizes, title at 0x0A
+label = "game.lynx.rom"
+confidence = 95
+type = "string"
+value = 'LYNX\0'
+  [[rule.then]]
+  offset = 0x0A
+  type = "cstring"
+  len = 32
+  field = "title"
+  optional = true
+  [[rule.then]]          # LNX header version 1
+  offset = 8
+  type = "u16le"
+  test = "1"
+  optional = true
+
+[[rule]]
+id = "a7800"             # A78 header: version byte, "ATARI7800", title at 0x11
+label = "game.a7800.rom"
+confidence = 96
+offset = 1
+type = "string"
+value = "ATARI7800"
+  [[rule.then]]
+  offset = 0x11
+  type = "cstring"
+  len = 32
+  field = "title"
+  optional = true
+
+[[rule]]
+id = "ngp"               # Neo Geo Pocket (Color): licence string, title at 0x24
+label = "game.ngp.rom"
+confidence = 95
+type = "string"
+value = ["COPYRIGHT BY SNK CORPORATION", " LICENSED BY SNK CORPORATION"]
+  [[rule.then]]
+  offset = 0x24
+  type = "cstring"
+  len = 12
+  field = "title"
+  optional = true
+
+[[rule]]
+id = "fds"               # fwNES header, or a bare disk side
+label = "game.fds.disk"
+confidence = 96
+type = "string"
+value = ['FDS\x1a', '\x01*NINTENDO-HVC*']
+  [[rule.then]]          # fwNES header: the first disk side follows
+  offset = 16
+  type = "string"
+  value = '\x01*NINTENDO-HVC*'
+  optional = true

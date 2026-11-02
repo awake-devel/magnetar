@@ -1,0 +1,182 @@
+# Executable and bytecode signatures. PE, ELF, Mach-O/Java class and shebang scripts are Rust
+# checks in src/formats/exe.rs.
+
+[[rule]]
+id = "wasm"
+label = "exe.wasm"
+confidence = 97
+type = "string"
+value = '\0asm'
+  [[rule.then]]
+  offset = 4
+  type = "u32le"
+  test = "1"
+
+[[rule]]
+id = "lnk"
+label = "exe.lnk"
+confidence = 99
+type = "bytes"
+hex = "4C0000000114020000000000C000000000000046"
+
+[[rule]]
+id = "dex"
+label = "exe.dex"
+confidence = 97
+type = "string"
+value = 'dex\n'
+  [[rule.then]]
+  offset = 7
+  type = "u8"
+  test = "0"
+
+[[rule]]
+id = "pyc"               # CPython bytecode: u16 magic, "\r\n", u32 flags 0..3
+label = "misc.pyc"
+confidence = 90
+type = "u16le"
+test = "2900..4200"
+field = "magic"
+  [[rule.then]]
+  offset = 2
+  type = "string"
+  value = '\r\n'
+  [[rule.then]]
+  offset = 4
+  type = "u32le"
+  test = "0..=3"
+
+[[rule]]
+id = "pgp"
+label = "misc.pgp"
+confidence = 95
+type = "string"
+value = "-----BEGIN PGP"
+
+[[rule]]
+id = "lua"               # precompiled Lua chunk, version byte 5.0-5.4
+label = "exe.lua"
+confidence = 95
+type = "string"
+value = '\x1bLua'
+  [[rule.then]]
+  offset = 4
+  type = "u8"
+  test = "0x50..=0x54"
+  field = "version"
+  [[rule.then]]          # format 0 (official), Lua 5.1+
+  offset = 5
+  type = "u8"
+  test = "0"
+  optional = true
+
+[[rule]]
+id = "psx_exe"
+label = "exe.psx"
+confidence = 98
+type = "string"
+value = "PS-X EXE"
+
+[[rule]]
+id = "ps3_self"          # PS3 SELF / SPRX (big-endian): version 2, header type 1
+label = "exe.ps3.self"
+confidence = 95
+type = "string"
+value = 'SCE\0'
+  [[rule.then]]
+  offset = 4
+  type = "u32be"
+  test = "2"
+  field = "version"
+  [[rule.then]]
+  offset = 10
+  type = "u16be"
+  test = "1"
+
+[[rule]]
+# PS Vita SELF / SUPRX / SKPRX (little-endian): version 3, header type 1. Checked on the
+# VitaShell 2.02 eboot.bin.
+id = "vita_self"
+label = "exe.vita.self"
+confidence = 95
+type = "string"
+value = 'SCE\0'
+  [[rule.then]]
+  offset = 4
+  type = "u32le"
+  test = "3"
+  field = "version"
+  [[rule.then]]
+  offset = 10
+  type = "u16le"
+  test = "1"
+  [[rule.then]]            # header length (0x1000 on the sample)
+  offset = 0x10
+  type = "u64le"
+  test = "0x80..0x100000"
+  [[rule.then]]            # signed file size (= the file length on the sample)
+  offset = 0x20
+  type = "u64le"
+  test = "=$size"
+  optional = true
+
+[[rule]]
+id = "ps4_self"          # PS4 / PS5 SELF: magic, version 0, mode 1, little-endian 1
+label = "exe.ps4.self"
+confidence = 96
+type = "bytes"
+hex = "4F153D1D"
+  [[rule.then]]
+  offset = 4
+  type = "bytes"
+  hex = "000101"
+
+[[rule]]
+id = "switch_nro"        # homebrew: "NRO0" after the 16-byte start
+label = "exe.switch.nro"
+confidence = 96
+offset = 0x10
+type = "string"
+value = "NRO0"
+  [[rule.then]]
+  offset = 0x14
+  type = "u32le"
+  test = "0"
+    [[rule.then.then]]
+    offset = 0x18
+    type = "u32le"
+    test = "<=$size"
+
+[[rule]]
+id = "switch_nso"
+label = "exe.switch.nso"
+confidence = 95
+type = "string"
+value = "NSO0"
+  [[rule.then]]
+  offset = 4
+  type = "u32le"
+  test = "0"
+
+[[rule]]
+id = "3dsx"              # 3DS homebrew: header size 0x20 or 0x2C
+label = "exe.3ds.3dsx"
+confidence = 96
+type = "string"
+value = "3DSX"
+  [[rule.then]]
+  offset = 4
+  type = "u16le"
+  test = "0x20|0x2C"
+
+[[rule]]
+id = "wuhb"              # Wii U homebrew bundle
+label = "exe.wiiu.wuhb"
+confidence = 95
+type = "string"
+value = "WUHB"
+  [[rule.then]]          # RomFS-style header: header size 0x50 (big-endian)
+  offset = 4
+  type = "u32be"
+  test = "0x50"
+  optional = true
