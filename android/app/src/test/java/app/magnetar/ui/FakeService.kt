@@ -4,6 +4,7 @@ import app.magnetar.api.BreakdownRequest
 import app.magnetar.api.BreakdownSet
 import app.magnetar.api.CrawlMap
 import app.magnetar.api.CrawlSources
+import app.magnetar.api.FleetStats
 import app.magnetar.api.FacetSet
 import app.magnetar.api.Graph
 import app.magnetar.api.StatsHealth
@@ -67,6 +68,9 @@ open class FakeService : MagnetarService {
     var sourcesAnswer: () -> CrawlSources = { CrawlSources() }
     var sourcesError: Exception? = null
     var sourcesCalls = 0
+    var fleetAnswer: () -> FleetStats = { FleetStats() }
+    var fleetError: Exception? = null
+    var fleetCalls = 0
     var mapAnswer: (String, String) -> CrawlMap = { l, w -> CrawlMap(layer = l, window = w, available = true) }
     var mapError: Exception? = null
     var mapDelayMs = 0L
@@ -168,6 +172,12 @@ open class FakeService : MagnetarService {
         sourcesCalls++
         sourcesError?.let { throw it }
         return sourcesAnswer()
+    }
+
+    override suspend fun fleetStats(): FleetStats {
+        fleetCalls++
+        fleetError?.let { throw it }
+        return fleetAnswer()
     }
 
     override suspend fun crawlMap(layer: String, window: String): CrawlMap {

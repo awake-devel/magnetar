@@ -30,6 +30,9 @@ interface MagnetarService {
     /** Feature `crawl_sources`. */
     suspend fun crawlSources(): CrawlSources
 
+    /** Feature `workers`: crawl workers and the header-probe backfill queue (D118). */
+    suspend fun fleetStats(): FleetStats
+
     /** Feature `crawl_map`: [layer] `dht` | `nostr`, [window] `day` | `all`. */
     suspend fun crawlMap(layer: String, window: String): CrawlMap
 }
