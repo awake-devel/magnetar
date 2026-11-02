@@ -125,6 +125,12 @@ pub struct Config {
     /// Start the librqbit download engine with `serve`.
     #[arg(long, env = "MAGNETAR_DOWNLOADS", default_value_t = true, action = clap::ArgAction::Set)]
     pub downloads: bool,
+    /// Crawl Nostr relays with `serve` (D118): the relay crawl, its indexer metadata (kinds
+    /// 0/3/10000/10002) and NIP-66 relay discovery. Off: no relay is contacted; the API, phone
+    /// sync, seed checks, enrichment, trust scoring, the saved-search notifier and the worker
+    /// endpoints keep running.
+    #[arg(long, env = "MAGNETAR_NOSTR_CRAWL", default_value_t = true, action = clap::ArgAction::Set)]
+    pub nostr_crawl: bool,
     /// Pause between crawl passes; 0 = continuous (back to back, see `crawl_interval`).
     #[arg(long, env = "MAGNETAR_CRAWL_INTERVAL_SECS", default_value_t = 900)]
     pub crawl_interval_secs: u64,
@@ -234,6 +240,11 @@ pub struct Config {
     /// Native DHT crawler (docs/DHT.md): off, polite or aggressive.
     #[arg(long, env = "MAGNETAR_DHT", value_enum, default_value = "off")]
     pub dht: DhtMode,
+    /// Worker: find new torrents in the DHT (D118): BEP 51 sampling and the triage of hashes
+    /// heard in incoming `get_peers` / `announce_peer`. Off: the worker's DHT node only looks
+    /// peers up (probe backfill); nothing new is sampled or triaged. Ignored by `serve` / `dht`.
+    #[arg(long, env = "MAGNETAR_DHT_DISCOVER", default_value_t = true, action = clap::ArgAction::Set)]
+    pub dht_discover: bool,
     /// First UDP port; virtual node i listens on PORT + i (aggressive; polite is ephemeral).
     #[arg(long, env = "MAGNETAR_DHT_PORT", default_value_t = 6891, value_parser = clap::value_parser!(u16).range(1..=65504))]
     pub dht_port: u16,
@@ -380,6 +391,11 @@ pub struct Config {
     /// Worker: piece bytes one probe may download, bytes.
     #[arg(long, env = "MAGNETAR_PROBE_MAX_BYTES", default_value_t = 8 * 1024 * 1024, value_parser = clap::value_parser!(u64).range(65_536..=67_108_864))]
     pub probe_max_bytes: u64,
+    /// Worker: probe torrents indexed before probes existed (D118): lease them from the server,
+    /// look their peers up in the DHT, fetch the info dict again and probe it. Needs
+    /// `MAGNETAR_PROBE=true` and `MAGNETAR_DHT`; paced by the probe settings.
+    #[arg(long, env = "MAGNETAR_PROBE_BACKFILL", default_value_t = false, action = clap::ArgAction::Set)]
+    pub probe_backfill: bool,
 }
 
 impl Config {
@@ -536,6 +552,29 @@ mod tests {
             args.push("serve");
             assert!(Cli::try_parse_from(args).is_err(), "{bad:?}");
         }
+    }
+
+    /// D118: the Nostr crawl and DHT discovery are on by default, backfill off; each can be
+    /// switched.
+    #[test]
+    fn crawl_switches() {
+        let d = Cli::try_parse_from(["magnetar-server", "worker"])
+            .unwrap()
+            .config;
+        assert!(d.nostr_crawl && d.dht_discover && !d.probe_backfill);
+        let off = Cli::try_parse_from([
+            "magnetar-server",
+            "--nostr-crawl",
+            "false",
+            "--dht-discover",
+            "false",
+            "--probe-backfill",
+            "true",
+            "worker",
+        ])
+        .unwrap()
+        .config;
+        assert!(!off.nostr_crawl && !off.dht_discover && off.probe_backfill);
     }
 
     /// D117: header probes are off by default, upload too, and the settings are bounded.

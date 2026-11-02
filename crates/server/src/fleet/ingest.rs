@@ -14,6 +14,13 @@
 //! blocks only the sighted hash (origin `worker`, never stops Nostr ingest); its claimed hybrid
 //! SHA-1 is dropped.
 //!
+//! D118: a hash leased to the worker for probe backfill (`probe_backfill`, its lease not
+//! answered yet) counts as held too. Its dict is stored like a triaged one, but also when the
+//! infohash is known from Nostr (the backfill's point: Nostr-only torrents get their DHT row);
+//! an existing DHT row is never rewritten. Its status reports and block reports only close or
+//! postpone the lease ([`crate::probe_backfill::record`]): they never touch `dht_seen` and a
+//! worker's block report does not block a hash it was leased for probing.
+//!
 //! D117: a dict item may carry the worker's header probe. It is checked and stored
 //! ([`crate::probes::store`]) after the dict is persisted, only for the row the server stored
 //! under the dict's v1 hash; a refused probe (`probe_rejected`) never costs its dict.
@@ -137,6 +144,8 @@ type BlockReport = ([u8; 20], i16);
 /// One upload item for a hash the worker holds, decoded.
 struct Parsed {
     h: [u8; 20],
+    /// Held through a probe-backfill lease (D118), not a triage.
+    backfill: bool,
     via: Via,
     peers: usize,
     kind: Kind,
@@ -255,6 +264,15 @@ pub async fn dht_results(
         .filter_map(|it| parse_hash(&it.sighted))
         .collect();
     let mine = held(pool, &name, &sighted).await.map_err(store_err)?;
+    // D118: or leased to it for probe backfill.
+    let others: Vec<[u8; 20]> = sighted
+        .iter()
+        .filter(|h| !mine.contains(*h))
+        .copied()
+        .collect();
+    let leased = crate::probe_backfill::held(pool, &name, &others)
+        .await
+        .map_err(store_err)?;
 
     // Decode first (base64, status codes); dicts are verified together off the async threads.
     let mut items: Vec<Parsed> = Vec::new();
@@ -265,7 +283,8 @@ pub async fn dht_results(
             ack.rejected += 1;
             continue;
         };
-        if !mine.contains(&h) || reported.contains(&h) {
+        let backfill = !mine.contains(&h) && leased.contains(&h);
+        if !(mine.contains(&h) || backfill) || reported.contains(&h) {
             ack.ignored += 1;
             continue;
         }
@@ -317,6 +336,7 @@ pub async fn dht_results(
         let probe = probe.filter(|_| matches!(kind, Kind::Dict(_)));
         items.push(Parsed {
             h,
+            backfill,
             via,
             peers,
             kind,
@@ -352,8 +372,27 @@ pub async fn dht_results(
     }
     verdicts.resize_with(items.len(), || None);
 
+    // D118: Nostr-only backfill hashes moderated since they were leased (checked again here).
+    let bf_hashes: Vec<String> = items
+        .iter()
+        .filter(|p| p.backfill && matches!(p.kind, Kind::Dict(_)))
+        .map(|p| hex::encode(p.h))
+        .collect();
+    let hidden = if bf_hashes.is_empty() {
+        HashSet::new()
+    } else {
+        let min = crate::probe_backfill::min_trust(pool)
+            .await
+            .map_err(store_err)?;
+        crate::probe_backfill::moderated(pool, &bf_hashes, min)
+            .await
+            .map_err(store_err)?
+    };
     // The first valid item per hash wins; later ones are ignored.
     let mut results: Vec<FetchResult> = Vec::new();
+    // D118: verified dicts of backfill leases, and the answer for each lease.
+    let mut bf_results: Vec<FetchResult> = Vec::new();
+    let mut answers: Vec<(String, crate::probe_backfill::Answer)> = Vec::new();
     let mut blocked: Vec<BlockReport> = Vec::new();
     let mut done: HashSet<[u8; 20]> = HashSet::new();
     // D117: probes of verified dicts, keyed by the hash the row is stored under (v1).
@@ -361,6 +400,72 @@ pub async fn dht_results(
     for (p, verdict) in items.into_iter().zip(verdicts) {
         if done.contains(&p.h) {
             ack.ignored += 1;
+            continue;
+        }
+        if p.backfill {
+            use crate::probe_backfill::Answer;
+            let answer = match (p.kind, verdict) {
+                // Moderated since the lease (D118): no DHT row, no probe.
+                (Kind::Dict(_), Some(Ok(Outcome::Ok(_)))) if hidden.contains(&hex::encode(p.h)) => {
+                    if p.probe.is_some() {
+                        ack.probe_rejected += 1;
+                    }
+                    ack.applied += 1;
+                    Answer::Moderated
+                }
+                (Kind::Dict(_), Some(Ok(Outcome::Ok(f)))) => {
+                    if let Some(report) = p.probe {
+                        probes.push(crate::probes::Upload {
+                            infohash: hex::encode(f.v1),
+                            report,
+                        });
+                    }
+                    bf_results.push(FetchResult {
+                        sighted: p.h,
+                        via: Via::GetPeers,
+                        peers_seen: p.peers,
+                        result: Ok(Outcome::Ok(f)),
+                    });
+                    Answer::Dict
+                }
+                (Kind::Dict(_), Some(Ok(o))) => {
+                    if p.probe.is_some() {
+                        ack.probe_rejected += 1;
+                    }
+                    ack.applied += 1;
+                    Answer::Close(outcome_code(&Ok(o)))
+                }
+                (Kind::Dict(_), Some(Err(e))) => {
+                    if p.probe.is_some() {
+                        ack.probe_rejected += 1;
+                    }
+                    ack.rejected += 1;
+                    tracing::warn!(
+                        worker = %name,
+                        infohash = %hex::encode(p.h),
+                        "worker backfill upload refused: {e:?}"
+                    );
+                    continue;
+                }
+                (Kind::Dict(_), None) => unreachable!("every dict is verified"),
+                // Its own blocklist stopped it: closed here, never blocked on its word.
+                (Kind::Block(_), _) => {
+                    ack.applied += 1;
+                    Answer::Close("worker_blocked".into())
+                }
+                (Kind::Report(r), _) => {
+                    ack.applied += 1;
+                    match &r {
+                        // A failure, or an oversize report from a worker whose limit is below
+                        // the server's (`oversize` false, as on a new find): another worker
+                        // with more room gets it on a later lease.
+                        Err(f) if !f.oversize => Answer::Retry(f.code().into()),
+                        _ => Answer::Close(outcome_code(&r)),
+                    }
+                }
+            };
+            done.insert(p.h);
+            answers.push((hex::encode(p.h), answer));
             continue;
         }
         let result = match (p.kind, verdict) {
@@ -408,6 +513,7 @@ pub async fn dht_results(
     }
     let verified = results
         .iter()
+        .chain(&bf_results)
         .filter(|r| matches!(r.result, Ok(Outcome::Ok(_))))
         .count() as u64;
 
@@ -435,12 +541,43 @@ pub async fn dht_results(
         ack.not_new += o.not_new as u32;
         ack.blocked += o.blocked as u32;
     }
+    // D118: backfill dicts, stored also when the infohash is known from Nostr (an existing
+    // DHT row is `not_new`, never rewritten). A new row is not a discovery: counted in
+    // `backfill_stored` only (not `stored`, the worker's `stored_total` or the DHT series).
+    for chunk in bf_results.chunks(persist::BATCH_MAX) {
+        let o =
+            persist::persist_backfill_batch(pool, chunk, fleet.screen.as_deref(), now, Some(&name))
+                .await
+                .map_err(store_err)?;
+        ack.backfill_stored += o.stored as u32;
+        ack.not_new += o.not_new as u32;
+        ack.blocked += o.blocked as u32;
+    }
     // After the rows exist: only for torrents the server stored and classified itself.
+    let probe_hashes: Vec<String> = probes.iter().map(|u| u.infohash.clone()).collect();
     let po = crate::probes::store(pool, &name, probes, now)
         .await
         .map_err(store_err)?;
     ack.probe_stored += po.stored;
     ack.probe_rejected += po.rejected;
+    // D118: close the backfill leases answered here, then drop the backfill rows of
+    // torrents probed on a new find.
+    let rec = crate::probe_backfill::record(pool, &name, &answers, now)
+        .await
+        .map_err(store_err)?;
+    fleet.note_backfill(
+        &name,
+        u64::from(rec.probed),
+        u64::from(rec.retried + rec.closed),
+    );
+    let answered: HashSet<&str> = answers.iter().map(|(h, _)| h.as_str()).collect();
+    let others: Vec<String> = probe_hashes
+        .into_iter()
+        .filter(|h| !answered.contains(h.as_str()))
+        .collect();
+    crate::probe_backfill::forget_probed(pool, &others)
+        .await
+        .map_err(store_err)?;
     let rejected = u64::from(ack.rejected);
     fleet.with(&name, |e| {
         e.metadata += verified;
@@ -450,6 +587,17 @@ pub async fn dht_results(
         e.rejected += rejected;
     });
     Ok(Json(ack))
+}
+
+/// The code a status (or a verified but unstorable dict) is recorded under.
+fn outcome_code(r: &Result<Outcome, FetchFailure>) -> String {
+    match r {
+        Ok(Outcome::Ok(_)) => "ok".into(),
+        Ok(Outcome::Private) => "private".into(),
+        Ok(Outcome::V2Only) => "v2_only".into(),
+        Ok(Outcome::Invalid(e)) => e.code().into(),
+        Err(f) => f.code().into(),
+    }
 }
 
 fn store_err(e: sqlx::Error) -> ApiError {

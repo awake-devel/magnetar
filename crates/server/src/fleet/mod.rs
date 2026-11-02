@@ -246,7 +246,24 @@ struct Entry {
     /// New hashes its triage was refused by the hourly cap, and when that was last logged.
     triage_capped: u64,
     capped_logged_at: i64,
+    /// Probe backfill (D118): hashes leased, answered with a probe stored, answered without.
+    backfill_leased: u64,
+    backfill_probed: u64,
+    backfill_unprobed: u64,
 }
+
+/// The probe-backfill queue's fill passes (D118) and cached counts.
+#[derive(Debug, Default)]
+struct Backfill {
+    filling: bool,
+    filled_at: Option<i64>,
+    /// When the running or last pass started.
+    started_at: Option<i64>,
+    stats: Option<magnetar_core::api::ProbeBackfillStats>,
+}
+
+/// Backfill counts in `/api/v1/stats` are recomputed at most this often.
+const BACKFILL_STATS_SECS: i64 = 60;
 
 /// What the fleet endpoints share: tokens, limits, and what each worker did.
 pub struct Fleet {
@@ -263,6 +280,8 @@ pub struct Fleet {
     /// Non-upload requests being read and processed ([`SMALL_CONCURRENCY`]), and per worker.
     small: Arc<tokio::sync::Semaphore>,
     worker_small: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    /// Probe backfill (D118): fill passes and cached counts.
+    backfill: Arc<Mutex<Backfill>>,
 }
 
 /// Held while one worker request is read and processed ([`Fleet::upload_permit`],
@@ -302,7 +321,103 @@ impl Fleet {
             worker_uploads: Mutex::default(),
             small: Arc::new(tokio::sync::Semaphore::new(SMALL_CONCURRENCY)),
             worker_small: Mutex::default(),
+            backfill: Arc::default(),
         }
+    }
+
+    /// Start a fill pass of the probe-backfill queue in the background when none ran in the
+    /// last [`crate::probe_backfill::FILL_EVERY_SECS`] (D118). Called by a backfill lease, so a
+    /// server whose workers never ask for one never fills the queue. Returns whether a pass
+    /// started.
+    pub fn backfill_fill(&self, pool: &sqlx::PgPool, now: i64) -> bool {
+        {
+            let mut b = self.backfill.lock().unwrap();
+            if b.filling
+                || b.started_at
+                    .is_some_and(|t| now - t < crate::probe_backfill::FILL_EVERY_SECS)
+            {
+                return false;
+            }
+            b.filling = true;
+            b.started_at = Some(now);
+        }
+        let (pool, state) = (pool.clone(), self.backfill.clone());
+        tokio::spawn(async move {
+            let t = std::time::Instant::now();
+            let r = crate::probe_backfill::fill_pass(&pool).await;
+            let mut b = state.lock().unwrap();
+            b.filling = false;
+            match r {
+                Ok(n) => {
+                    b.filled_at = Some(magnetar_core::now());
+                    b.stats = None;
+                    tracing::info!(
+                        queued = n,
+                        "probe backfill: queue filled in {} ms",
+                        t.elapsed().as_millis()
+                    );
+                }
+                Err(e) => {
+                    // Tried again by the next lease after a short pause.
+                    b.started_at =
+                        Some(magnetar_core::now() - crate::probe_backfill::FILL_EVERY_SECS + 300);
+                    tracing::warn!(
+                        "probe backfill: fill: {}",
+                        crate::dht::persist::error_class(&e)
+                    );
+                }
+            }
+        });
+        true
+    }
+
+    /// The probe-backfill queue's counts (cached [`BACKFILL_STATS_SECS`]); None without workers.
+    pub async fn backfill_stats(
+        &self,
+        pool: &sqlx::PgPool,
+        now: i64,
+    ) -> Option<magnetar_core::api::ProbeBackfillStats> {
+        if !self.enabled() {
+            return None;
+        }
+        let cached = {
+            let b = self.backfill.lock().unwrap();
+            b.stats
+                .clone()
+                .filter(|s| now - s.at < BACKFILL_STATS_SECS)
+                .map(|mut s| {
+                    s.filling = b.filling;
+                    s.filled_at = b.filled_at;
+                    s
+                })
+        };
+        if cached.is_some() {
+            return cached;
+        }
+        match crate::probe_backfill::stats(pool, now).await {
+            Ok(mut s) => {
+                let mut b = self.backfill.lock().unwrap();
+                s.filling = b.filling;
+                s.filled_at = b.filled_at;
+                b.stats = Some(s.clone());
+                Some(s)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "stats: probe backfill: {}",
+                    crate::dht::persist::error_class(&e)
+                );
+                None
+            }
+        }
+    }
+
+    /// Count a backfill upload's outcome for `worker` (D118).
+    pub(crate) fn note_backfill(&self, worker: &str, probed: u64, unprobed: u64) {
+        self.with(worker, |e| {
+            e.backfill_probed += probed;
+            e.backfill_unprobed += unprobed;
+        });
     }
 
     /// A slot for one non-upload request of `worker` ([`SMALL_CONCURRENCY_PER_WORKER`],
@@ -462,6 +577,9 @@ impl Fleet {
                     s.stored_total = e.stored;
                     s.blocked_total = e.blocked;
                     s.rejected_total = e.rejected;
+                    s.backfill_leased_total = e.backfill_leased;
+                    s.backfill_probed_total = e.backfill_probed;
+                    s.backfill_unprobed_total = e.backfill_unprobed;
                     if let Some(h) = &e.heartbeat {
                         s.uptime_secs = Some(h.uptime_secs);
                         s.rss_mb = h.rss_mb;
@@ -630,6 +748,14 @@ pub fn routes() -> Router<AppState> {
             post(ingest::triage).layer(DefaultBodyLimit::max(TRIAGE_BODY_LIMIT)),
         )
         .route(DHT_RESULTS, post(ingest::dht_results))
+        .route(
+            PROBE_LEASE,
+            post(probe_lease).layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
+        )
+        .route(
+            PROBE_RELEASE,
+            post(probe_release).layer(DefaultBodyLimit::max(TRIAGE_BODY_LIMIT)),
+        )
 }
 
 type ApiResult<T> = Result<T, ApiError>;
@@ -783,6 +909,69 @@ async fn release(
         .take(MAX_RESULTS.max(st.fleet.config().max_lease))
         .collect();
     let n = liveness::release(st.store.pool(), &name, &ihs, magnetar_core::now()).await?;
+    Ok(Json(Ack {
+        accepted: n as u32,
+        ignored: (r.infohashes.len() as u64).saturating_sub(n) as u32,
+    }))
+}
+
+/// `probe/lease` (D118): up to `max` indexed torrents for this worker's backfill probes, for
+/// the fleet's lease length. The first lease (and one every
+/// [`crate::probe_backfill::FILL_EVERY_SECS`]) starts a fill pass of the queue in the
+/// background; until it has queued rows, leases come back empty.
+async fn probe_lease(
+    State(st): State<AppState>,
+    Extension(WorkerName(name)): Extension<WorkerName>,
+    body: Result<Json<LeaseRequest>, axum::extract::rejection::JsonRejection>,
+) -> ApiResult<Json<ProbeLease>> {
+    let r = json(body)?;
+    let c = st.fleet.config();
+    let now = magnetar_core::now();
+    let pool = st.store.pool();
+    st.fleet.backfill_fill(pool, now);
+    let max = (r.max as usize).clamp(1, crate::probe_backfill::LEASE_MAX);
+    let l = crate::probe_backfill::lease(pool, &name, now, max, c.lease_secs)
+        .await
+        .map_err(|e| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "store",
+                crate::dht::persist::error_class(&e),
+            )
+        })?;
+    let n = l.items.len() as u64;
+    st.fleet.with(&name, |e| e.backfill_leased += n);
+    let filling = st.fleet.backfill.lock().unwrap().filling;
+    Ok(Json(ProbeLease {
+        expires_at: now + c.lease_secs.max(1),
+        infohashes: l.items,
+        filling,
+    }))
+}
+
+/// `probe/release` (D118): leased hashes the worker gives back unworked.
+async fn probe_release(
+    State(st): State<AppState>,
+    Extension(WorkerName(name)): Extension<WorkerName>,
+    body: Result<Json<Release>, axum::extract::rejection::JsonRejection>,
+) -> ApiResult<Json<Ack>> {
+    let r = json(body)?;
+    let ihs: Vec<String> = r
+        .infohashes
+        .iter()
+        .map(|h| h.to_ascii_lowercase())
+        .filter(|h| valid_infohash(h))
+        .take(MAX_RESULTS)
+        .collect();
+    let n = crate::probe_backfill::release(st.store.pool(), &name, &ihs, magnetar_core::now())
+        .await
+        .map_err(|e| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "store",
+                crate::dht::persist::error_class(&e),
+            )
+        })?;
     Ok(Json(Ack {
         accepted: n as u32,
         ignored: (r.infohashes.len() as u64).saturating_sub(n) as u32,
@@ -986,6 +1175,18 @@ mod tests {
         };
         assert_eq!(worker_post(addr, TRIAGE, T1, big("triage")).await.0, 413);
         assert_eq!(worker_post(addr, RELEASE, T1, big("release")).await.0, 413);
+        // D118: the backfill routes are small routes too.
+        assert_eq!(
+            worker_post(addr, PROBE_RELEASE, T1, big("release")).await.0,
+            413
+        );
+        let lease_pad = format!(r#"{{"max":1,"x":"{}"}}"#, "x".repeat(SMALL_BODY_LIMIT + 1));
+        assert_eq!(
+            worker_post(addr, PROBE_LEASE, T1, lease_pad.into_bytes())
+                .await
+                .0,
+            413
+        );
 
         // w1 fills its small slots: its next triage is refused at once, w2's is not.
         let mut held = Vec::new();
@@ -998,6 +1199,8 @@ mod tests {
         assert_eq!(ra, Some(SMALL_RETRY_AFTER_SECS.to_string()));
         let (code, _) = worker_post(addr, HEARTBEAT, T1, b"{}".to_vec()).await;
         assert_eq!(code, 503, "every non-upload route counts");
+        let (code, _) = worker_post(addr, PROBE_LEASE, T1, br#"{"max":1}"#.to_vec()).await;
+        assert_eq!(code, 503, "the backfill lease too");
         let (code, _) = worker_post(addr, HEARTBEAT, T2, b"{}".to_vec()).await;
         assert_eq!(code, 204, "another worker is not held back");
         drop(held);

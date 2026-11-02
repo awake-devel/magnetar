@@ -48,6 +48,9 @@ services:
       MAGNETAR_DB_POOL: ${MAGNETAR_DB_POOL:-10}
       MAGNETAR_ROOT_NPUB:
       MAGNETAR_SEED_RELAYS:
+      # false = no Nostr relay crawl, indexer metadata or NIP-66 discovery (D118); API, sync,
+      # seed checks, enrichment, notifications and worker endpoints keep running.
+      MAGNETAR_NOSTR_CRAWL:
       MAGNETAR_CRAWL_INTERVAL_SECS:
       MAGNETAR_CRAWL_MAX_RELAYS:
       MAGNETAR_CRAWL_EXPLORE_RELAYS:
@@ -101,6 +104,8 @@ services:
       # settings: docker/compose.worker.yml.
       MAGNETAR_PROBE: "false"
       MAGNETAR_PROBE_UPLOAD: "false"
+      # MAGNETAR_PROBE_BACKFILL and MAGNETAR_DHT_DISCOVER (D118) are worker settings too; the
+      # server side of the backfill (probe/lease) needs nothing but MAGNETAR_WORKER_TOKENS.
       # Crawl map (docs/CRAWLMAP.md): DB-IP Lite databases downloaded into state/geoip.
       MAGNETAR_GEOIP:
       MAGNETAR_GEOIP_DIR:

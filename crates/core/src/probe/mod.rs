@@ -358,6 +358,31 @@ impl Prober {
         Some(ProbeSlot { _permit: permit })
     }
 
+    /// A slot, waiting for a free one and for the probe's turn of the per-minute pace (D118:
+    /// backfill probes, whose torrents were leased for probing, wait instead of being skipped).
+    /// Turns are handed out in call order, never two within one interval; nothing is counted
+    /// as skipped. The caller bounds the wait (`tokio::time::timeout`); a waiter that gives up
+    /// after it took its turn leaves that turn unused.
+    pub async fn slot(&self) -> ProbeSlot {
+        let permit = self
+            .inner
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the probe semaphore is never closed");
+        let interval = Duration::from_secs_f64(60.0 / f64::from(self.inner.cfg.per_min.max(1)));
+        let at = {
+            let mut next = self.inner.next_at.lock().unwrap();
+            let now = Instant::now();
+            let at = next.map_or(now, |t| t.max(now));
+            *next = Some(at + interval);
+            at
+        };
+        tokio::time::sleep_until(at).await;
+        ProbeSlot { _permit: permit }
+    }
+
     /// Run one probe (at most [`ProbeConfig::session`] plus a few seconds of grace).
     pub async fn probe(&self, slot: ProbeSlot, job: ProbeJob) -> ProbeResult {
         let c = &self.inner.c;
@@ -481,6 +506,47 @@ mod tests {
             let s = p.stats();
             assert!(s.skipped.iter().any(|(k, n)| k == "busy" && *n == 1));
             assert!(s.skipped.iter().any(|(k, n)| k == "rate" && *n >= 1));
+        });
+    }
+
+    /// D118: the waiting slot keeps the pace (turns one interval apart, in order), waits for a
+    /// free slot, and counts nothing as skipped.
+    #[test]
+    fn waiting_slot_keeps_the_pace() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let f = Fetcher::new(crate::metainfo::FetchConfig::default());
+            // 600 a minute: turns 100 ms apart.
+            let p = Prober::new(
+                ProbeConfig {
+                    per_min: 600,
+                    parallel: 2,
+                    ..ProbeConfig::default()
+                },
+                f,
+            );
+            let t0 = Instant::now();
+            let a = p.slot().await;
+            let b = p.slot().await;
+            assert!(
+                t0.elapsed() >= Duration::from_millis(95),
+                "second turn one interval later"
+            );
+            // Both slots taken: the third waits for one to come back, then for its turn.
+            let p2 = p.clone();
+            let third = tokio::spawn(async move { p2.slot().await });
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            assert!(!third.is_finished(), "no free slot");
+            drop(a);
+            let _c = tokio::time::timeout(Duration::from_secs(5), third)
+                .await
+                .expect("a freed slot is taken")
+                .unwrap();
+            drop(b);
+            assert!(p.stats().skipped.is_empty(), "waiting is not skipping");
         });
     }
 }

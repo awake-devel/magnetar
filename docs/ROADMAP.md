@@ -32,8 +32,8 @@ the detail API. Left:
   watchdog, measuring unchoke share, bytes and packets per probe, verified share and peer
   reactions; then the Pi. That is how the production switch (user decision: on) is
   recommended to happen, docs/PROBES.md §8;
-- backfill probes for rows stored before C and Nostr-only rows (leases, peers from the
-  seed-check walks), probe facets in the search index and filters (`tags`), a VPN check;
+- probe facets in the search index and filters (`tags`), a VPN check (the backfill of rows
+  stored before C and of Nostr-only rows is built: D118, docs/PROBES.md §10);
 - (D) games enrichment keyed by the ids `sniff` reads (GameTDB files after GameTDB answers
   about automated downloads; Wikidata).
 

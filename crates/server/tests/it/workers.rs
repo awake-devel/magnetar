@@ -399,6 +399,8 @@ pub(crate) fn opts(
         pacer: None,
         health_targets: Vec::new(),
         probe: None,
+        discover: true,
+        backfill: false,
     }
 }
 

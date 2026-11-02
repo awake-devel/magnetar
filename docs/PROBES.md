@@ -27,7 +27,8 @@ and shows it in the detail API (`TorrentDetail.probe`, docs/API.md).
 - Not while a brake is on (router health probe, answered-share brake, pressure brake) or the
   governor reports memory / conntrack pressure; not on dicts over 2 MiB; not without a free
   slot (`MAGNETAR_PROBE_PARALLEL`) and a turn of the per-minute pace (`MAGNETAR_PROBE_PER_MIN`,
-  no burst). A torrent that misses its chance is not probed later (no backfill yet, §9).
+  no burst). A torrent that misses its chance is queued for the backfill (§10) at the
+  server's next fill pass, when a worker runs it.
   Every skip is counted by reason in the heartbeat (`skipped`).
 - At worker start with probes on, a warning says that probes connect to peers from this
   machine's address and download file data. There is no VPN detection.
@@ -237,9 +238,22 @@ MAGNETAR_PROBE_PER_MIN=12
 MAGNETAR_PROBE_PARALLEL=4
 ```
 
+For the backfill of past finds with no new crawling (user, 2026-11-02: "disable dht and nostr
+crawl tho, so it can read every past finds"; §10), add to both workers' files
+
+```sh
+MAGNETAR_PROBE_BACKFILL=true
+MAGNETAR_DHT_DISCOVER=false
+```
+
+and to the main server's `.env` `MAGNETAR_NOSTR_CRAWL=false` (then rebuild and restart it from
+the checkout: `sudo docker compose build && sudo docker compose up -d`; the published image may
+lag `main`). Not switched on either, for the same reasons; the server side needs no other
+setting.
+
 What to watch: `workers[].dht.probe` in `GET /api/v1/stats` (started, ok / partial / choked /
-no_pieces / failed, skipped by reason, bytes in, uploaded, verified files, surprises), and the
-router health brakes.
+no_pieces / failed, skipped by reason, bytes in, uploaded, verified files, surprises),
+`probe_backfill` and `workers[].dht.backfill` (§10), and the router health brakes.
 
 ## 9. Not done / UNVERIFIED
 
@@ -247,12 +261,99 @@ router health brakes.
   how often real clients unchoke a peer that has nothing (`HAVE_NONE`), anti-leech bans,
   whether clients accept `HAVE_NONE` before the extended handshake, whether the Fast bit changes
   metadata success, real bytes and packets per probe on eee and the Pi, Pi SHA-1 speed.
-- No backfill: only torrents a worker fetches after the switch are probed; rows stored before,
-  Nostr-only rows and torrents that missed a turn are not. Planned: `probe/lease` and
-  `probe/results` routes with peers from the seed-check DHT walks.
 - No search filters on probe results (tags, facets in the search index), no app screen: the
   Android `TorrentDetail` has no `probe` field yet, its JSON decoder drops the key
   (`ignoreUnknownKeys`).
 - v2-only piece checks (BEP 52 Merkle proofs) are not built: hybrid torrents are checked with
   their v1 piece hashes.
 - uTP peers are not reached (TCP only, as the metadata fetcher).
+
+## 10. Backfill (D118)
+
+Probes only follow fresh metadata fetches, so torrents indexed before them (~1.35 M DHT rows)
+and Nostr-only torrents (~470 k, never fetched from the DHT) had none. The backfill probes
+them. The server stores no info dict for them that a probe could use (the DHT rows keep only
+the display file list), so the worker fetches the dict again from the swarm; the fetcher
+verifies it against the infohash, so it cannot be made up.
+
+**Setting** (worker): `MAGNETAR_PROBE_BACKFILL=true`, with `MAGNETAR_PROBE=true` and
+`MAGNETAR_DHT`. To read only past finds, turn discovery off on the worker
+(`MAGNETAR_DHT_DISCOVER=false`: no BEP 51 sampler, nothing it hears is triaged; the node only
+looks peers up) and, if wanted, the Nostr crawl on the server (`MAGNETAR_NOSTR_CRAWL=false`:
+no relay is contacted; phone sync, seed checks, enrichment, notifications and the worker
+endpoints keep running). `polite` is the quieter DHT mode then: a read-only node that answers
+nobody.
+
+**Queue** (server, table `probe_backfill`, migration `20261106000000`). Filled in the background
+by a keyset walk over `torrent_infohashes` (5 000 per step, ~180 ms each on 1.8 M seeded rows,
+about a minute a pass), started by the first `probe/lease` and again at most every 6 h (to
+queue torrents indexed since). Skipped at fill time: torrents with a probe, blocked hashes,
+category `porn` on any row, and Nostr-only torrents that no default search shows (every event
+from a blocked publisher, or below the trust threshold and not from a trusted publisher): a
+DHT row would bring them back as DHT torrents, since a DHT row passes every trust threshold
+(D51) and a publisher block only hides that publisher's events. They are queued by a later
+pass once shown (block lifted, threshold lowered in Settings). Checked again at lease time: a
+probe stored meanwhile deletes the row, and so does a torrent no longer shown; blocked, gone,
+or adult on any of its rows (DHT or Nostr, the worker's `Classification::adult` rule: category
+`porn` or the adult signal on its name and paths) closes it. A lease whose rows were all
+closed or dropped reads the next due rows (up to 8 rounds), so a run of them does not send the
+worker idle. Order (value first, fixed when queued): known seeders (or DHT peers) in power-of-two tiers,
+most first; then torrents never seed-checked; known dead last; newest (`born`) first within a
+tier. One ordering key (`due_at`, as the seed-check schedule, D45): negative for never-tried
+rows, the lease end while leased, the retry time after an attempt, NULL when closed. The lease
+reads the partial index `probe_backfill (due_at)` in order with `FOR UPDATE SKIP LOCKED` (0.35
+ms for 256 rows on 1.8 M rows, then primary-key lookups in `probe_attrs`, `blocked_infohashes`,
+`dht_torrents`, `torrents`), so two workers never share a hash. Lease length: the fleet's
+`MAGNETAR_WORKER_LEASE_SECS`; an unanswered lease is due again at its end; `probe/release`
+gives unworked ones back (never-tried rows in their first place).
+
+**Worker.** A feeder leases while fewer than half of 2 × `MAGNETAR_PROBE_PARALLEL` leased
+torrents are in the worker (none under a brake or memory / conntrack pressure), and queues
+them for peer collection like triaged hashes: the crawler's DHT lookup (`collect_peers`, the
+shared D109 pace), the metadata fetcher (TCP pace, brake, address policy D112, identity D115),
+the worker's blocklist and adult check, then the probe gates. A backfill dict waits up to 30 s
+for a probe slot and turn (`Prober::slot`, paced like the others, no burst) instead of being
+skipped. Results go up on `dht/results` (`via: get_peers`); hashes still in the worker at a
+stop are released.
+
+**Server.** On `dht/results`, a hash leased to that worker (and not answered yet) counts as
+held, as a triaged one does (D113). Its verified dict goes through the server crawler's writer
+(classify, screen, store) with the "known from Nostr" check off: a Nostr-only torrent gets its
+DHT row (`origin: both`, `supplied_by` = the worker), an existing DHT row is `not_new` and
+never rewritten (`ON CONFLICT DO NOTHING`). The new row's `first_seen` is the oldest Nostr
+event's `created_at` (not the upload time), so `since`, date sorts and the saved-search poll
+do not see an old torrent as new. It is not a discovery: it is counted in the ack's
+`backfill_stored` and the `probe_backfill_dht_rows` series, not in `stored`, the worker's
+`stored_total`, `dht_torrents_added` or `dht_stored_<via>` (the writer marks its transaction,
+`magnetar.origin = 'backfill'`, for the insert triggers). A dict for a torrent hidden since its
+lease (publisher blocked meanwhile) is not stored and its row leaves the queue. The probe is checked and stored as any other (§6),
+against the server's own file list; the detail maps its indexes into the list it shows (the
+Nostr list on `origin: both`). Then the lease is consumed (`worker` cleared, so a second answer
+is ignored):
+
+| Answer | Queue row |
+|---|---|
+| dict + probe stored | deleted |
+| dict without a stored probe (skipped, choked, nothing found, refused) | retried (`no_probe`) |
+| `failed` (`no_peers`, `connect`, `timeout`, …), or `oversize` from a worker whose `MAGNETAR_DHT_METADATA_MAX` is below the server's | retried with that code (a worker with room gets it later) |
+| `private`, `v2_only`, `invalid`, `oversize` (worker limit ≥ the server's), worker `blocked` | closed with that outcome |
+| dict for a torrent no default search shows any more | deleted (not stored) |
+
+Retries come after 6 h, 3 days and 14 days; the 4th unsuccessful attempt closes the row. A
+worker's block report closes the lease and never blocks the hash (the server never saw the
+dict); a dict the server's own screen blocks is blocked as usual. Backfill statuses never
+touch `dht_seen`. To try closed rows again:
+`UPDATE probe_backfill SET due_at = rank, attempts = 0 WHERE due_at IS NULL AND last_outcome = 'no_peers'`.
+
+**Progress.** `GET /api/v1/stats` → `probe_backfill {waiting, leased, retrying, remaining,
+closed [[outcome, n]], probed, filling, filled_at, at}` (one scan of the narrow queue table,
+~230 ms on 1.8 M rows, recomputed at most once a minute), `workers[].backfill_*_total`, and the
+worker's heartbeat `workers[].dht.backfill {leased, released, outstanding, no_peers, failed,
+fetched, probed, unprobed, lease_errors}` and `workers[].dht.discover`.
+
+**UNVERIFIED** on real swarms: how many past finds still have reachable peers (old DHT finds
+and Nostr releases may have none: those cost one DHT lookup each, then the backoff), the
+probes per hour eee and the Pi reach, and their line load. The traffic per torrent is the shape
+of a new find (one lookup, metadata TCP attempts, one probe), paced by the same settings; the
+D109 router rules apply unchanged (CLAUDE.md "Network safety": not run here without the
+watchdog). Tests: loopback fake seeders on a fake DHT only (`probe_backfill_pg`).

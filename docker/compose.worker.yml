@@ -38,6 +38,9 @@ services:
       MAGNETAR_WORKER_RSS_MAX_MB: ${MAGNETAR_WORKER_RSS_MAX_MB:-0}
       MAGNETAR_WORKER_UPLOAD_BUFFER_MB: ${MAGNETAR_WORKER_UPLOAD_BUFFER_MB:-16}
       MAGNETAR_DHT: ${MAGNETAR_DHT:-aggressive}
+      # false = no new finds (no sampling, no triage): the DHT node only looks peers up for
+      # the probe backfill (D118).
+      MAGNETAR_DHT_DISCOVER: ${MAGNETAR_DHT_DISCOVER:-true}
       # Container ports follow MAGNETAR_DHT_PORT and MAGNETAR_DHT_NODES: change them together
       # with the `ports:` mapping below.
       MAGNETAR_DHT_PORT: "6891"
@@ -61,6 +64,9 @@ services:
       MAGNETAR_PROBE_PARALLEL: ${MAGNETAR_PROBE_PARALLEL:-32}
       MAGNETAR_PROBE_PEERS: ${MAGNETAR_PROBE_PEERS:-2}
       MAGNETAR_PROBE_MAX_BYTES: ${MAGNETAR_PROBE_MAX_BYTES:-8388608}
+      # Probe torrents indexed before probes (DHT and Nostr-only rows), leased from the
+      # server (D118, docs/PROBES.md §10). Needs MAGNETAR_PROBE=true.
+      MAGNETAR_PROBE_BACKFILL: ${MAGNETAR_PROBE_BACKFILL:-false}
       # Crawl map (docs/CRAWLMAP.md): on | country | off; databases in the worker state dir.
       MAGNETAR_GEOIP: ${MAGNETAR_GEOIP:-on}
       # Our own addresses, never contacted (D112); the crawler's vote adds the WAN IPv4 itself.

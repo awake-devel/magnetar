@@ -96,6 +96,11 @@ Worker wire additions for header probes (D117, docs/PROBES.md), all optional (wo
 1): `DhtResult.probe` (`ProbeReport {v, status, bytes_in, uploaded, peers, files: [ProbeFile]}`,
 only with a `metadata` item), `DhtAck.probe_stored` / `probe_rejected`, and
 `WorkerDhtState.probe` (`WorkerProbeState` counters) in the heartbeat and `workers[].dht`.
+Probe backfill (D118, docs/PROBES.md §10), all optional too: the routes `probe/lease` and
+`probe/release`, `DhtAck.backfill_stored` (new DHT rows from backfill dicts, not in `stored`),
+`WorkerDhtState.discover` and `.backfill` (`WorkerBackfillState`),
+`WorkerStats.backfill_*_total`, and `StatsResponse.probe_backfill` (`ProbeBackfillStats`: the
+server's queue, absent without workers).
 
 ## Header probes (D117)
 

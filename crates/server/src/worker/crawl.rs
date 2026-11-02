@@ -18,15 +18,24 @@
 //! [`magnetar_core::probe::Prober`] task that reads the few blocks sniff needs; its report
 //! travels with the dict ([`DhtResult::probe`]). A probe never delays the dict for more than
 //! its session cap, and a stop sends the dict without it.
+//!
+//! D118: with `MAGNETAR_DHT_DISCOVER=false` the engine runs no sampler and nothing it hears is
+//! triaged: the node only serves peer lookups. With `MAGNETAR_PROBE_BACKFILL=true` a feeder
+//! leases already indexed torrents from the server (`probe/lease`, at most twice
+//! `MAGNETAR_PROBE_PARALLEL` in the worker at once) and queues them like triaged hashes: the
+//! same peer collection, fetcher (pace, brake, address policy, identity), screen and probe
+//! gates. A backfill dict waits up to [`BACKFILL_SLOT_WAIT`] for a probe slot and turn instead
+//! of being skipped; it goes up with its probe on `dht/results`, where the lease makes it held.
+//! Hashes still in the worker at a stop go back (`probe/release`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use magnetar_core::api::{WorkerDhtState, WorkerProbeState};
+use magnetar_core::api::{WorkerBackfillState, WorkerDhtState, WorkerProbeState};
 use magnetar_core::dht::{Dht, EngineConfig, EngineStats, Mode, Sighting, Via, collect_peers};
 use magnetar_core::metainfo::{FetchConfig, FetchStats, Fetcher, Handoff, InfoFile, Outcome};
 use magnetar_core::model::TorrentFile;
@@ -61,6 +70,98 @@ const CONTROL_EVERY: Duration = Duration::from_millis(500);
 const QUEUE_HIGH: usize = 10_000;
 /// Brake length while the governor reports pressure (renewed while it lasts).
 const PRESSURE_BRAKE: Duration = Duration::from_secs(30);
+/// A backfill dict waits this long at most for a probe slot and turn (D118), then goes up
+/// without a probe (its lease is retried later by the server).
+pub const BACKFILL_SLOT_WAIT: Duration = Duration::from_secs(30);
+/// Backfill feeder: pause after an empty lease, a failed one, an old server (404), and while
+/// a brake or pressure is on or enough leased hashes are in the worker.
+const BACKFILL_IDLE: Duration = Duration::from_secs(60);
+const BACKFILL_RETRY: Duration = Duration::from_secs(30);
+const BACKFILL_OLD_SERVER: Duration = Duration::from_secs(600);
+const BACKFILL_TICK: Duration = Duration::from_secs(2);
+
+/// Probe backfill on this worker (D118): the leased hashes in it and its counters.
+struct Backfill {
+    /// Leased hashes queued, being collected, fetched or probed, and when their lease ends.
+    out: Mutex<HashMap<[u8; 20], Instant>>,
+    /// At most this many in the worker at once.
+    cap: usize,
+    leased: AtomicU64,
+    released: AtomicU64,
+    no_peers: AtomicU64,
+    failed: AtomicU64,
+    fetched: AtomicU64,
+    probed: AtomicU64,
+    unprobed: AtomicU64,
+    lease_errors: AtomicU64,
+}
+
+impl Backfill {
+    fn new(cap: usize) -> Self {
+        Self {
+            out: Mutex::default(),
+            cap: cap.max(1),
+            leased: AtomicU64::new(0),
+            released: AtomicU64::new(0),
+            no_peers: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            fetched: AtomicU64::new(0),
+            probed: AtomicU64::new(0),
+            unprobed: AtomicU64::new(0),
+            lease_errors: AtomicU64::new(0),
+        }
+    }
+
+    fn has(&self, h: &[u8; 20]) -> bool {
+        self.out.lock().unwrap().contains_key(h)
+    }
+
+    fn state(&self) -> WorkerBackfillState {
+        WorkerBackfillState {
+            leased: get(&self.leased),
+            released: get(&self.released),
+            outstanding: self.out.lock().unwrap().len() as u64,
+            no_peers: get(&self.no_peers),
+            failed: get(&self.failed),
+            fetched: get(&self.fetched),
+            probed: get(&self.probed),
+            unprobed: get(&self.unprobed),
+            lease_errors: get(&self.lease_errors),
+        }
+    }
+
+    /// A leased hash leaves the worker with this result (counted by outcome).
+    fn done(&self, item: &DhtResult) {
+        let Some(h) = parse_hash(&item.sighted) else {
+            return;
+        };
+        if self.out.lock().unwrap().remove(&h).is_none() {
+            return;
+        }
+        match &item.outcome {
+            DhtOutcome::Metadata { .. } => {
+                add(&self.fetched, 1);
+                add(
+                    if item.probe.is_some() {
+                        &self.probed
+                    } else {
+                        &self.unprobed
+                    },
+                    1,
+                );
+            }
+            DhtOutcome::Failed { code } if code == "no_peers" => add(&self.no_peers, 1),
+            _ => add(&self.failed, 1),
+        }
+    }
+
+    /// A leased hash leaves the worker with nothing to upload (no blocklist loaded).
+    fn drop_hash(&self, h: &[u8; 20]) {
+        if self.out.lock().unwrap().remove(h).is_some() {
+            add(&self.failed, 1);
+        }
+    }
+}
 
 #[derive(Default)]
 struct Counters {
@@ -140,6 +241,9 @@ pub struct CrawlReport {
     pub engine: EngineStats,
     /// Header probes (D117), when on.
     pub probe: Option<WorkerProbeState>,
+    /// D118: whether it looked for new torrents, and the probe backfill when on.
+    pub discover: bool,
+    pub backfill: Option<WorkerBackfillState>,
 }
 
 struct Pending {
@@ -176,6 +280,10 @@ pub struct Crawl {
     max_results: usize,
     /// Header probes (D117): Some only on a worker with `MAGNETAR_PROBE=true`.
     prober: Option<Prober>,
+    /// `MAGNETAR_DHT_DISCOVER` (D118): sample and triage what the node hears.
+    discover: bool,
+    /// Probe backfill (D118): Some with `MAGNETAR_PROBE_BACKFILL=true` (and probes on).
+    backfill: Option<Backfill>,
 }
 
 fn probe_state(p: &Prober) -> WorkerProbeState {
@@ -233,7 +341,7 @@ impl Crawl {
             },
             brake_active: e.brake_active,
             health_brakes: self.health.lock().unwrap().brakes,
-            sampling_paused: dht.sample_share() <= 0.0,
+            sampling_paused: !self.discover || dht.sample_share() <= 0.0,
             routing_nodes: e.routing.iter().sum::<usize>() as u64,
             pool: e.pool.size as u64,
             queue: self.queue.lock().unwrap().len() as u64,
@@ -242,6 +350,8 @@ impl Crawl {
             upload_backlog: get(&self.c.upload_backlog),
             external_ip_known: e.external_ip_known,
             probe: self.prober.as_ref().map(probe_state),
+            discover: Some(self.discover),
+            backfill: self.backfill.as_ref().map(Backfill::state),
         };
         *s = Snap {
             at: Some(now),
@@ -291,7 +401,12 @@ async fn triage_loop(
                     if let Some(g) = &p.opts.geo {
                         g.dht_node(s.from, magnetar_core::now());
                     }
-                    if batch.len() >= TRIAGE_BACKLOG_MAX {
+                    if !p.discover {
+                        // D118: no new finds; an announce may still help a queued backfill hash.
+                        if let (Via::Announce, Some(peer)) = (s.via, s.peer) {
+                            let _ = p.queue.lock().unwrap().attach_announce(s.info_hash, peer, Instant::now());
+                        }
+                    } else if batch.len() >= TRIAGE_BACKLOG_MAX {
                         add(&p.c.triage_dropped, 1);
                     } else if seen.check_and_insert(&s.info_hash, Instant::now()) {
                         add(&p.c.unique, 1);
@@ -448,6 +563,9 @@ async fn collector(
                 _permit: None,
                 bytes: 64,
             };
+            if let Some(b) = &p.backfill {
+                b.done(&r.item);
+            }
             if out.send(r).await.is_err() {
                 return;
             }
@@ -563,15 +681,23 @@ fn probe_peers(h: &Handoff, found: &[SocketAddrV4]) -> Vec<SocketAddrV4> {
 /// share or pressure brake on the fetcher), no memory / conntrack pressure, then a slot under
 /// `MAGNETAR_PROBE_PARALLEL` and the `MAGNETAR_PROBE_PER_MIN` pace. Each refusal is counted.
 fn probe_slot(p: &Crawl, prober: &Prober) -> Option<probe::ProbeSlot> {
-    if p.fetcher.braked() || p.fetcher.brake_level() > 0 {
-        prober.skip(Skip::Brake);
-        return None;
-    }
-    if p.governor.pressure() || p.governor.conntrack_full() {
-        prober.skip(Skip::Pressure);
+    if !probe_allowed(p, prober) {
         return None;
     }
     prober.try_slot()
+}
+
+/// The brake and pressure gates of [`probe_slot`], each refusal counted.
+fn probe_allowed(p: &Crawl, prober: &Prober) -> bool {
+    if p.fetcher.braked() || p.fetcher.brake_level() > 0 {
+        prober.skip(Skip::Brake);
+        return false;
+    }
+    if p.governor.pressure() || p.governor.conntrack_full() {
+        prober.skip(Skip::Pressure);
+        return false;
+    }
+    true
 }
 
 fn cpu<R>(f: impl FnOnce() -> R) -> R {
@@ -616,7 +742,12 @@ async fn fetch_worker(
                 };
                 match cpu(|| outcome_item(&p, &job, o)) {
                     Some(s) => (s.outcome, s.seed),
-                    None => continue,
+                    None => {
+                        if let Some(b) = &p.backfill {
+                            b.drop_hash(&job.info_hash);
+                        }
+                        continue;
+                    }
                 }
             }
             Err(f) if f.oversize => (DhtOutcome::Oversize, None),
@@ -660,6 +791,48 @@ async fn fetch_worker(
             _permit: Some(permit),
             bytes,
         };
+        // D118: a leased backfill hash waits for its probe's slot and turn (bounded) instead
+        // of being skipped; the brake and pressure gates still apply.
+        let backfill = p.backfill.as_ref().is_some_and(|b| b.has(&job.info_hash));
+        if backfill {
+            let waiting = probe_input.and_then(|(seed, h)| {
+                let prober = p.prober.clone()?;
+                probe_allowed(&p, &prober).then_some((prober, seed, h))
+            });
+            let (p2, out, mut stop) = (p.clone(), out.clone(), stop.clone());
+            tokio::spawn(async move {
+                let mut pending = pending;
+                if let Some((prober, seed, h)) = waiting {
+                    let pj = ProbeJob {
+                        info_hash: job.info_hash,
+                        raw: seed.raw,
+                        files: seed.files,
+                        peers: probe_peers(&h, &job.peers),
+                        conn: Some(h.conn),
+                    };
+                    tokio::select! {
+                        r = async {
+                            let slot = tokio::time::timeout(BACKFILL_SLOT_WAIT, prober.slot()).await.ok()?;
+                            Some(prober.probe(slot, pj).await)
+                        } => match r {
+                            Some(r) => {
+                                if let Some(rep) = crate::probes::report_of(&r) {
+                                    pending.bytes += serde_json::to_vec(&rep).map_or(0, |b| b.len());
+                                    pending.item.probe = Some(rep);
+                                }
+                            }
+                            None => prober.skip(Skip::Busy),
+                        },
+                        _ = stop_requested(&mut stop) => {}
+                    }
+                }
+                if let Some(b) = &p2.backfill {
+                    b.done(&pending.item);
+                }
+                let _ = out.send(pending).await;
+            });
+            continue;
+        }
         let probe = probe_input.and_then(|(seed, h)| {
             let prober = p.prober.clone()?;
             let slot = probe_slot(&p, &prober)?;
@@ -843,7 +1016,7 @@ async fn control(p: Arc<Crawl>, dht: Dht, mut stop: watch::Receiver<bool>) {
             add(&p.c.paused_ms, CONTROL_EVERY.as_millis() as u64);
         }
         let share = if paused { 0.0 } else { 1.0 };
-        if dht.sample_share() != share {
+        if p.discover && dht.sample_share() != share {
             dht.set_sample_share(share);
         }
         if pressure || p.governor.conntrack_full() {
@@ -872,6 +1045,117 @@ pub struct CrawlSetup {
     pub max_results: usize,
     /// Header probes (D117): None = off (the default; never on the main server).
     pub probe: Option<ProbeConfig>,
+    /// `MAGNETAR_DHT_DISCOVER` (D118): false = no sampler, no triage.
+    pub discover: bool,
+    /// `MAGNETAR_PROBE_BACKFILL` (D118): lease indexed torrents and probe them (needs `probe`).
+    pub backfill: bool,
+    /// The server's lease length (hello), for the feeder's view of when a lease ends.
+    pub lease_secs: u64,
+}
+
+/// Lease backfill hashes while fewer than half of [`Backfill::cap`] are in the worker, and
+/// queue them for peer collection like triaged hashes (D118). No lease under a brake or
+/// memory / conntrack pressure. A hash whose lease ended while it was still queued (an
+/// overflowing queue) is forgotten here; the server hands it out again.
+async fn backfill_feeder(p: Arc<Crawl>, abort: Abort, mut stop: watch::Receiver<bool>) {
+    let Some(b) = &p.backfill else { return };
+    loop {
+        let now = Instant::now();
+        b.out.lock().unwrap().retain(|_, until| *until > now);
+        let outstanding = b.out.lock().unwrap().len();
+        let busy = outstanding * 2 > b.cap
+            || p.fetcher.braked()
+            || p.fetcher.brake_level() > 0
+            || p.governor.pressure()
+            || p.governor.conntrack_full();
+        let pause = if busy {
+            BACKFILL_TICK
+        } else {
+            let want = (b.cap - outstanding) as u32;
+            match p
+                .client
+                .post::<_, ProbeLease>(PROBE_LEASE, &LeaseRequest { max: want })
+                .await
+            {
+                Ok(l) => {
+                    let ttl = (l.expires_at - magnetar_core::now()).max(1) as u64;
+                    let until = Instant::now() + Duration::from_secs(ttl);
+                    let mut n = 0u64;
+                    for h in l.infohashes.iter().filter_map(|h| parse_hash(h)) {
+                        if b.out.lock().unwrap().insert(h, until).is_some() {
+                            continue;
+                        }
+                        n += 1;
+                        p.enqueue(FetchItem {
+                            info_hash: h,
+                            via: Via::GetPeers,
+                            source: None,
+                            peer: None,
+                            retry: false,
+                            queued_at: Instant::now(),
+                        });
+                    }
+                    add(&b.leased, n);
+                    match (n, l.filling) {
+                        (0, true) => BACKFILL_TICK,
+                        (0, false) => BACKFILL_IDLE,
+                        _ => Duration::ZERO,
+                    }
+                }
+                Err(e) if e.is_fatal() => {
+                    abort.fatal(&e);
+                    return;
+                }
+                Err(e) if !e.is_retryable() => {
+                    add(&b.lease_errors, 1);
+                    tracing::warn!(
+                        "worker: probe backfill lease refused ({e}): the server may be older \
+                         than this worker; trying again in {} s",
+                        BACKFILL_OLD_SERVER.as_secs()
+                    );
+                    BACKFILL_OLD_SERVER
+                }
+                Err(e) => {
+                    if get(&b.lease_errors).is_multiple_of(20) {
+                        tracing::warn!("worker: probe backfill lease: {e}");
+                    }
+                    add(&b.lease_errors, 1);
+                    BACKFILL_RETRY
+                }
+            }
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(pause.max(Duration::from_millis(50))) => {}
+            _ = stop_requested(&mut stop) => return,
+        }
+    }
+}
+
+/// Give back the leased hashes still in the worker at a stop (D118).
+async fn backfill_release(p: &Crawl) {
+    let Some(b) = &p.backfill else { return };
+    let left: Vec<String> = b
+        .out
+        .lock()
+        .unwrap()
+        .drain()
+        .map(|(h, _)| hex::encode(h))
+        .collect();
+    if left.is_empty() {
+        return;
+    }
+    let n = left.len() as u64;
+    let r = tokio::time::timeout(
+        Duration::from_secs(10),
+        p.client
+            .post::<_, Ack>(PROBE_RELEASE, &Release { infohashes: left }),
+    )
+    .await;
+    match r {
+        Ok(Ok(_)) => add(&b.released, n),
+        Ok(Err(e)) => tracing::warn!("worker: probe backfill release: {e} (the leases expire)"),
+        Err(_) => tracing::warn!("worker: probe backfill release timed out (the leases expire)"),
+    }
 }
 
 /// Start the crawler; it runs until `stop` and returns its report.
@@ -890,6 +1174,8 @@ pub async fn start(
     cfg.pool_cap = opts.pool_cap;
     cfg.lookup_timeout = opts.lookup_timeout;
     cfg.pacer = opts.pacer.clone();
+    // D118: no new finds: no BEP 51 sampler at all.
+    cfg.sample &= setup.discover;
     let (identity, nodes) = state::load(&setup.state_dir, &opts.ports);
     cfg.identity = identity;
     cfg.known_nodes = nodes;
@@ -953,6 +1239,24 @@ pub async fn start(
         );
         Prober::new(cfg, fetcher.clone())
     });
+    // At most twice the parallel probes in the worker at once, within half the queue.
+    let backfill = match (&prober, setup.backfill) {
+        (Some(pr), true) => {
+            let cap = (pr.config().parallel * 2)
+                .clamp(4, crate::probe_backfill::LEASE_MAX)
+                .min((opts.queue_cap / 2).max(1));
+            tracing::info!(
+                "worker probe backfill on (D118): up to {cap} leased torrents at once{}",
+                if setup.discover {
+                    ""
+                } else {
+                    ", DHT discovery off"
+                }
+            );
+            Some(Backfill::new(cap))
+        }
+        _ => None,
+    };
     let units = u32::try_from((setup.upload_buffer / 1024).max(64)).unwrap_or(u32::MAX >> 4);
     let own_hub = opts.health.is_none();
     let hub = opts
@@ -975,6 +1279,8 @@ pub async fn start(
         max_results: setup.max_results.clamp(1, crate::fleet::MAX_RESULTS),
         opts,
         prober,
+        discover: setup.discover,
+        backfill,
     });
     let started = Instant::now();
     let state_dir = setup.state_dir;
@@ -1025,6 +1331,9 @@ pub async fn start(
             ));
         }
         tasks.spawn(control(p.clone(), dht.clone(), int_rx.clone()));
+        if p.backfill.is_some() {
+            tasks.spawn(backfill_feeder(p.clone(), abort.clone(), int_rx.clone()));
+        }
         let ports = p.opts.ports.clone();
         {
             let (dht, dir, ports, mut stop) = (
@@ -1066,6 +1375,7 @@ pub async fn start(
         let _ = tokio::time::timeout(Duration::from_secs(5), triage).await;
         // Every result sender is gone: the uploader sends what is left and ends.
         let _ = tokio::time::timeout(Duration::from_secs(20), up).await;
+        backfill_release(&p).await;
         if let Some(m) = mapper {
             let _ = tokio::time::timeout(Duration::from_secs(3), m).await;
         }
@@ -1121,6 +1431,8 @@ fn report(p: &Crawl, dht: &Dht, started: Instant) -> CrawlReport {
         health: p.health.lock().unwrap().clone(),
         engine: e,
         probe: p.prober.as_ref().map(probe_state),
+        discover: p.discover,
+        backfill: p.backfill.as_ref().map(Backfill::state),
     }
 }
 

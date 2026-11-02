@@ -287,6 +287,7 @@ async fn server() -> api_support::FakeHttp {
                     ..Default::default()
                 }),
                 workers: Vec::new(),
+                probe_backfill: None,
             }),
             ("GET", "/api/v1/relays") => j(&vec![relay_info()]),
             ("PUT", "/api/v1/relays") => {

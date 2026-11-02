@@ -22,8 +22,8 @@ token. Decisions: ARCHITECTURE.md D96–D100.
 ```
 
 What a worker does **not** do: Nostr relay crawling (the relay crawler keeps its cursors
-and relay state in Postgres and one crawler already covers the ~30 relays; D99), header
-probes (do not exist yet), downloads, search.
+and relay state in Postgres and one crawler already covers the ~30 relays; D99), downloads,
+search. Header probes (D117) and their backfill (D118) run on workers only, when switched on.
 
 ## 1. How it works
 
@@ -63,6 +63,8 @@ any change an older peer could misread.
 | `/api/v1/worker/liveness/release` | `{infohashes}` → `{accepted, ignored}` | unchecked leases given back at stop |
 | `/api/v1/worker/dht/triage` | `{items:[{h, via}]}` (≤ 2000, ≤ 1 MiB) → `{fetch:[h], blocked, known, capped}` | `capped`: new hashes over the worker's hourly cap (D113) |
 | `/api/v1/worker/dht/results` | `{items:[DhtResult]}` (≤ 1000, ≤ 32 MiB) → `{stored, not_new, blocked, rejected, applied, ignored}` | |
+| `/api/v1/worker/probe/lease` | `{max}` (≤ 256, ≤ 64 KiB) → `ProbeLease {expires_at, infohashes, filling}` | probe backfill (D118, item 9) |
+| `/api/v1/worker/probe/release` | `{infohashes}` (≤ 1 MiB) → `{accepted, ignored}` | unworked backfill leases given back at stop |
 
 Hello, heartbeat and lease bodies are limited to 64 KiB, triage and release bodies to 1 MiB
 (413 above; the 32 MiB limit is for the two result uploads, D113). A worker sends at most 2000
@@ -165,6 +167,21 @@ apply to it), from its own line: trackers see another IP, so the per-tracker rat
    stored itself, did not classify adult (category `porn` or the adult signal, the worker's
    own gate) and did not block; a refused probe never costs its
    dict (`DhtAck.probe_stored` / `probe_rejected`). The server never probes.
+9. **Probe backfill (D118, docs/PROBES.md §10; `MAGNETAR_PROBE_BACKFILL`, off by default,
+   needs `MAGNETAR_PROBE`).** The worker leases indexed torrents (`probe/lease`: DHT rows and
+   Nostr-only rows, never probed, not blocked, not adult, most known seeders first) and queues
+   them like triaged hashes: same peer lookup, fetcher, screen and probe gates; a backfill
+   dict waits up to 30 s for its probe turn instead of being skipped. It uploads on
+   `dht/results`, where **a hash leased to that worker and not answered yet counts as held**
+   (the D113 rule, extended): its verified dict is stored also when the infohash is known from
+   Nostr (that torrent gets its DHT row, `supplied_by` = the worker), an existing DHT row is
+   `not_new` and never rewritten, the probe is stored as in item 8, and the lease is consumed:
+   a stored probe deletes the queue row, anything else (no peers, a failed fetch, no probe) is
+   retried after 6 h, 3 days, 14 days and closed after the 4th attempt; private / v2-only /
+   invalid / oversize dicts and worker block reports close it (a worker's block report never
+   blocks a leased hash). Backfill statuses never touch `dht_seen`. With
+   `MAGNETAR_DHT_DISCOVER=false` the worker samples nothing and triages nothing: its DHT node
+   only looks peers up for the backfill.
 
 ### What a worker keeps (D100)
 
@@ -211,9 +228,14 @@ leases_held, liveness_results_total, liveness_results_per_min, triaged_total, qu
 metadata_total, metadata_per_min, stored_total, blocked_total, rejected_total, rss_mb,
 mem_available_mb, pressure` and `dht {mode, nodes, ports, qps, answered_share, brake_active,
 health_brakes, sampling_paused, routing_nodes, pool, queue, unique_per_min, metadata_per_min,
-upload_backlog, external_ip_known, probe}` (`probe`: header-probe counters when on, D117:
-`upload, started, ok, partial, choked, no_pieces, failed, skipped [[reason, n]], bytes_in,
-uploaded, files, verified_files, surprises`). Rates are counted by the server from what it accepted
+upload_backlog, external_ip_known, probe, discover, backfill}` (`probe`: header-probe counters
+when on, D117: `upload, started, ok, partial, choked, no_pieces, failed, skipped [[reason, n]],
+bytes_in, uploaded, files, verified_files, surprises`; `discover`: `MAGNETAR_DHT_DISCOVER`;
+`backfill`, D118: `leased, released, outstanding, no_peers, failed, fetched, probed, unprobed,
+lease_errors`), plus `backfill_leased_total, backfill_probed_total, backfill_unprobed_total`
+counted by the server. The queue itself is `probe_backfill {waiting, leased, retrying,
+remaining, closed [[outcome, n]], probed, filling, filled_at, at}` at the top level of the
+stats (recomputed at most once a minute). Rates are counted by the server from what it accepted
 (10-minute window); memory and DHT come from the last heartbeat. The app is unchanged: the
 field has a default, older apps ignore it.
 
@@ -445,8 +467,9 @@ health probe are the safeguards.
 
 - Nostr relay crawling on workers (D99), UPnP by default. Header probes (D117) are built but
   not yet run on eee or the Pi: their rates, unchoke share and peer reactions are
-  **UNVERIFIED** (docs/PROBES.md §9). Probes only follow a worker's own fetches: rows stored
-  before them and Nostr-only rows are not probed (backfill leases are not built).
+  **UNVERIFIED** (docs/PROBES.md §9). The probe backfill (D118) is built and tested on
+  loopback fake peers only: its share of reachable swarms, probes per hour and line load on
+  eee and the Pi are **UNVERIFIED** (docs/PROBES.md §10).
 - Hashes leased to a worker that dies come back through the server's DHT retry loop only when
   the server's own DHT crawler runs; otherwise they wait until sighted again, by another worker
   at least 1 h after the lease's end (D113), or by the same worker at once.

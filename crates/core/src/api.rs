@@ -134,6 +134,32 @@ pub struct StatsResponse {
     /// empty when the server has none (or is older).
     #[serde(default)]
     pub workers: Vec<WorkerStats>,
+    /// Header-probe backfill progress (D118); None when the server has no workers (or is
+    /// older). Computed at most once a minute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_backfill: Option<ProbeBackfillStats>,
+}
+
+/// The server's header-probe backfill queue (D118, docs/PROBES.md §10).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProbeBackfillStats {
+    /// Never tried yet, leased to a worker now, waiting for a retry (backoff).
+    pub waiting: u64,
+    pub leased: u64,
+    pub retrying: u64,
+    /// `waiting + leased + retrying`: what is left to try.
+    pub remaining: u64,
+    /// Closed for good, by outcome (`adult`, `blocked`, `gone`, `private`, `no_peers` after the
+    /// last attempt, ...).
+    pub closed: Vec<(String, u64)>,
+    /// Torrents with a stored probe (backfill or new finds).
+    pub probed: u64,
+    /// The queue is being filled now; unix time the last fill pass ended.
+    pub filling: bool,
+    pub filled_at: Option<i64>,
+    /// Unix time these counts were taken.
+    pub at: i64,
 }
 
 /// One crawl worker as the server sees it (D99). Rates are over the last ~10 minutes and are
@@ -167,6 +193,11 @@ pub struct WorkerStats {
     pub blocked_total: u64,
     /// Uploads the server refused (hash mismatch, too large, malformed).
     pub rejected_total: u64,
+    /// Probe backfill (D118): hashes leased to it, of those with a probe stored, and answered
+    /// without one (no peers, failed fetch, probe that did not land), since the server started.
+    pub backfill_leased_total: u64,
+    pub backfill_probed_total: u64,
+    pub backfill_unprobed_total: u64,
     pub rss_mb: Option<f64>,
     pub mem_available_mb: Option<f64>,
     /// Slowed down for memory or connection-tracking pressure.
@@ -200,6 +231,34 @@ pub struct WorkerDhtState {
     /// Header probes (D117), when the worker runs them. Older workers send none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probe: Option<WorkerProbeState>,
+    /// `MAGNETAR_DHT_DISCOVER` (D118): false = no new finds (no sampling, no triage), the DHT
+    /// node only serves peer lookups. None from older workers (they always discover).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discover: Option<bool>,
+    /// Header-probe backfill (D118, `MAGNETAR_PROBE_BACKFILL`), when on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backfill: Option<WorkerBackfillState>,
+}
+
+/// A worker's probe-backfill counters since it started (D118): leased hashes and what became of
+/// them on the worker. Counts only.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WorkerBackfillState {
+    /// Hashes leased, and given back unworked (stop).
+    pub leased: u64,
+    pub released: u64,
+    /// Leased hashes in the worker now (queued, looking for peers, fetching or probing).
+    pub outstanding: u64,
+    /// No peer found in the DHT, fetch failed, dict fetched (verified).
+    pub no_peers: u64,
+    pub failed: u64,
+    pub fetched: u64,
+    /// Dicts sent with a probe report, and without one (probe skipped, choked, nothing found).
+    pub probed: u64,
+    pub unprobed: u64,
+    /// Lease requests that failed (network, server).
+    pub lease_errors: u64,
 }
 
 /// A worker's header-probe counters since it started (D117). Counts only: never an address,

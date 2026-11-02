@@ -60,6 +60,11 @@ pub struct WorkerOptions {
     /// Header probes (D117, `MAGNETAR_PROBE`): None = off. They follow the crawler's
     /// metadata fetches, so they need `MAGNETAR_DHT` too.
     pub probe: Option<magnetar_core::probe::ProbeConfig>,
+    /// `MAGNETAR_DHT_DISCOVER` (D118): false = no sampling and no triage of what the node
+    /// hears; the DHT only looks peers up for the backfill.
+    pub discover: bool,
+    /// `MAGNETAR_PROBE_BACKFILL` (D118): lease indexed torrents and probe them. Needs `probe`.
+    pub backfill: bool,
 }
 
 /// The header-probe settings of a worker (D117): None unless `MAGNETAR_PROBE=true`.
@@ -126,6 +131,19 @@ impl WorkerOptions {
             );
         }
         let probe = probe.filter(|_| dht.is_some());
+        if cfg.probe_backfill && probe.is_none() {
+            tracing::warn!(
+                "worker: MAGNETAR_PROBE_BACKFILL=true needs MAGNETAR_PROBE=true and MAGNETAR_DHT; \
+                 no backfill"
+            );
+        }
+        let backfill = cfg.probe_backfill && probe.is_some();
+        if !cfg.dht_discover && dht.is_some() && !backfill {
+            tracing::warn!(
+                "worker: MAGNETAR_DHT_DISCOVER=false without probe backfill: the DHT crawler \
+                 finds nothing (seed checks still run)"
+            );
+        }
         Ok(Self {
             server,
             token,
@@ -153,6 +171,8 @@ impl WorkerOptions {
             pacer,
             health_targets: crate::dht::health::parse_targets(&cfg.dht_probe),
             probe,
+            discover: cfg.dht_discover,
+            backfill,
         })
     }
 }
@@ -331,13 +351,23 @@ pub async fn run(
         .into());
     }
     tracing::info!(
-        "worker {} connected to {} (magnetar-server {}, worker API {}): seed checks {}, DHT {}",
+        "worker {} connected to {} (magnetar-server {}, worker API {}): seed checks {}, DHT {}{}{}",
         welcome.name,
         client.base(),
         welcome.server_version,
         welcome.worker_api,
         if opts.liveness.is_some() { "on" } else { "off" },
-        hello.dht.as_deref().unwrap_or("off")
+        hello.dht.as_deref().unwrap_or("off"),
+        if opts.dht.is_some() && !opts.discover {
+            " (discovery off)"
+        } else {
+            ""
+        },
+        if opts.backfill && opts.dht.is_some() {
+            ", probe backfill on"
+        } else {
+            ""
+        }
     );
 
     // The shared DHT pace (D109).
@@ -421,6 +451,9 @@ pub async fn run(
                 upload_buffer: opts.upload_buffer,
                 max_results: welcome.max_results as usize,
                 probe: opts.probe.clone(),
+                discover: opts.discover,
+                backfill: opts.backfill && opts.probe.is_some(),
+                lease_secs: welcome.lease_secs,
             };
             match crawl::start(
                 setup,

@@ -24,6 +24,10 @@ pub const LIVENESS_RESULTS: &str = "/api/v1/worker/liveness/results";
 pub const RELEASE: &str = "/api/v1/worker/liveness/release";
 pub const TRIAGE: &str = "/api/v1/worker/dht/triage";
 pub const DHT_RESULTS: &str = "/api/v1/worker/dht/results";
+/// Header-probe backfill (D118): lease indexed torrents to probe, give back unworked ones. The
+/// dicts and probes travel on [`DHT_RESULTS`]. Absent from older servers (404).
+pub const PROBE_LEASE: &str = "/api/v1/worker/probe/lease";
+pub const PROBE_RELEASE: &str = "/api/v1/worker/probe/release";
 
 /// Sent once at start (and again after the server restarted).
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -95,6 +99,19 @@ pub struct LeaseItem {
 pub struct Lease {
     pub expires_at: i64,
     pub items: Vec<LeaseItem>,
+}
+
+/// Indexed torrents reserved for this worker's backfill probes until `expires_at` (D118): it
+/// looks each up in the DHT, fetches its dict, probes it and uploads both on [`DHT_RESULTS`]
+/// (where a hash leased here counts as held, D113). Unanswered at expiry, they are due again;
+/// unworked ones go back with [`PROBE_RELEASE`] (a [`Release`] body).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProbeLease {
+    pub expires_at: i64,
+    pub infohashes: Vec<String>,
+    /// The server is filling its backfill queue now: an empty lease is worth asking again soon.
+    pub filling: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -278,6 +295,10 @@ pub struct DhtAck {
     /// a non-metadata item). A refused probe never costs its dict. Absent from older servers.
     #[serde(skip_serializing_if = "is_zero")]
     pub probe_stored: u32,
+    /// D118: new `dht_torrents` rows from probe-backfill dicts (Nostr-only torrents); not in
+    /// `stored`, which counts discoveries. Absent from older servers.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub backfill_stored: u32,
     #[serde(skip_serializing_if = "is_zero")]
     pub probe_rejected: u32,
 }

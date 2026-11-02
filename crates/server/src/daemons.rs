@@ -219,6 +219,41 @@ pub async fn crawler_loop(
     }
 }
 
+/// Which Nostr-side loops `serve` starts (D118).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NostrLoops {
+    /// The relay crawl (with its indexer metadata and the saved-search notifier).
+    pub crawl: bool,
+    /// NIP-66 relay discovery (relays for the crawl).
+    pub discovery: bool,
+    /// The saved-search notifier without the crawl ([`notify_loop`]).
+    pub notify_alone: bool,
+}
+
+pub fn nostr_loops(cfg: &Config) -> NostrLoops {
+    NostrLoops {
+        crawl: cfg.nostr_crawl,
+        discovery: cfg.nostr_crawl && cfg.nip66,
+        notify_alone: !cfg.nostr_crawl,
+    }
+}
+
+/// The saved-search notifier on its own (D118), for a server whose Nostr crawl is off
+/// (`MAGNETAR_NOSTR_CRAWL=false`): torrents still arrive from phone sync and crawl workers.
+/// Same cadence as in [`crawler_loop`]: one poll every [`NOTIFY_EVERY`], the first one after it.
+pub async fn notify_loop(
+    store: Arc<PgStore>,
+    cfg: Arc<Config>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        if stopped_after(NOTIFY_EVERY, &mut shutdown).await {
+            return;
+        }
+        notify_saved_searches(&store, &cfg).await;
+    }
+}
+
 /// Recompute when the graph version moves, else every 6 h.
 pub async fn trust_loop(store: Arc<PgStore>, mut shutdown: watch::Receiver<bool>) {
     let mut last_version: Option<i64> = None;
@@ -274,6 +309,34 @@ mod tests {
         assert_eq!(pause_after(None, &tried(0)), CONTINUOUS_IDLE_PAUSE);
         assert_eq!(pause_after(None, &failed), CONTINUOUS_IDLE_PAUSE);
         assert!(CONTINUOUS_PAUSE >= Duration::from_secs(10));
+    }
+
+    /// D118: `MAGNETAR_NOSTR_CRAWL=false` starts no relay loop, but the notifier still runs.
+    #[test]
+    fn nostr_crawl_switch() {
+        use clap::Parser;
+        let on = crate::config::Cli::try_parse_from(["magnetar-server", "serve"])
+            .unwrap()
+            .config;
+        let l = nostr_loops(&on);
+        assert!(l.crawl && !l.notify_alone);
+        assert_eq!(l.discovery, on.nip66);
+        let off = crate::config::Cli::try_parse_from([
+            "magnetar-server",
+            "--nostr-crawl",
+            "false",
+            "serve",
+        ])
+        .unwrap()
+        .config;
+        assert_eq!(
+            nostr_loops(&off),
+            NostrLoops {
+                crawl: false,
+                discovery: false,
+                notify_alone: true
+            }
+        );
     }
 
     #[test]

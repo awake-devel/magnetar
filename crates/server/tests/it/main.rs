@@ -21,6 +21,7 @@ mod enrich_pg;
 mod filters;
 mod liveness_pg;
 mod notices;
+mod probe_backfill_pg;
 mod probe_pg;
 mod search_bench;
 mod search_index;

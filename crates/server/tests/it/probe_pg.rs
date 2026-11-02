@@ -28,7 +28,7 @@ use crate::workers::{W1, count, http, meta, opts, spawn, triage_one, tweak, uplo
 /// `info()`'s single display file.
 const SIZE: u64 = 1_500_000_000;
 
-fn mkv_file(i: u32, size: u64) -> ProbeFile {
+pub(crate) fn mkv_file(i: u32, size: u64) -> ProbeFile {
     ProbeFile {
         i,
         size,
@@ -52,7 +52,7 @@ fn mkv_file(i: u32, size: u64) -> ProbeFile {
     }
 }
 
-fn report(files: Vec<ProbeFile>) -> ProbeReport {
+pub(crate) fn report(files: Vec<ProbeFile>) -> ProbeReport {
     ProbeReport {
         v: magnetar_core::probe::PROBE_VERSION,
         status: "ok".into(),
@@ -63,14 +63,14 @@ fn report(files: Vec<ProbeFile>) -> ProbeReport {
     }
 }
 
-fn with_probe(sighted: [u8; 20], raw: &[u8], r: ProbeReport) -> DhtResult {
+pub(crate) fn with_probe(sighted: [u8; 20], raw: &[u8], r: ProbeReport) -> DhtResult {
     DhtResult {
         probe: Some(r),
         ..meta(sighted, raw)
     }
 }
 
-async fn detail(base: &str, ih: &str) -> J {
+pub(crate) async fn detail(base: &str, ih: &str) -> J {
     http()
         .get(format!("{base}/api/v1/torrents/{ih}"))
         .bearer_auth(TOKEN)
@@ -278,7 +278,7 @@ fn ebml(id: &[u8], data: &[u8]) -> Vec<u8> {
 }
 
 /// A Matroska header (HEVC + E-AC-3) then filler: sniff's `video.mkv` at 97.
-fn mkv(size: usize) -> Vec<u8> {
+pub(crate) fn mkv(size: usize) -> Vec<u8> {
     let mut head = ebml(&[0x42, 0x86], &[1]);
     head.extend(ebml(&[0x42, 0x82], b"matroska"));
     let mut out = ebml(&[0x1A, 0x45, 0xDF, 0xA3], &head);
@@ -450,7 +450,7 @@ async fn worker_probes_only_what_it_may() {
 }
 
 /// A DHT row as the crawler stores it, files given (display order).
-async fn dht_row(
+pub(crate) async fn dht_row(
     s: &magnetar_server::store::PgStore,
     ih: &str,
     title: &str,
