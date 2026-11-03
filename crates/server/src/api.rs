@@ -62,6 +62,9 @@ pub struct AppState {
     pub fleet: Arc<crate::fleet::Fleet>,
     /// Crawl map counters and geo database (D101–D105).
     pub crawlmap: Arc<crate::crawlmap::CrawlMap>,
+    /// The web UI and its sessions (D132, D133); None when `MAGNETAR_WEB_UI=false` (and in
+    /// `AppState::new`): no web routes, cookies ignored.
+    pub web: Option<Arc<crate::web::WebState>>,
 }
 
 impl AppState {
@@ -80,7 +83,13 @@ impl AppState {
             dht: None,
             fleet: Arc::default(),
             crawlmap: Arc::default(),
+            web: None,
         }
+    }
+
+    pub fn with_web(mut self, w: Option<Arc<crate::web::WebState>>) -> Self {
+        self.web = w;
+        self
     }
 
     pub fn with_crawlmap(mut self, c: Arc<crate::crawlmap::CrawlMap>) -> Self {
@@ -218,15 +227,60 @@ async fn auth(State(st): State<AppState>, req: Request, next: Next) -> Response 
         && req.uri().path() == "/relay"
         && query_token(req.uri().query()).is_some_and(|t| ct_eq(t.as_bytes(), st.token.as_bytes()));
     if header_ok || query_ok {
-        next.run(req).await
-    } else {
-        ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "missing or bad bearer token",
-        )
-        .into_response()
+        return next.run(req).await;
     }
+    // The web UI's session cookie (D133): only without an Authorization header, only on the
+    // `/api/v1/` routes it may reach, and with a CSRF token for anything that changes state.
+    if let Some(web) = &st.web
+        && !req.headers().contains_key(header::AUTHORIZATION)
+        && crate::web_auth::cookie_allowed(req.uri().path())
+    {
+        match crate::web_auth::lookup(&st, web, req.headers()).await {
+            Ok(Some(s)) => {
+                if !crate::web_auth::safe_method(req.method())
+                    && !crate::web_auth::csrf_ok(req.headers(), &s)
+                {
+                    return crate::web_auth::forbidden_csrf().into_response();
+                }
+                return next.run(req).await;
+            }
+            Ok(None) => {}
+            Err(e) => return e.into_response(),
+        }
+    }
+    ApiError::new(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        "missing or bad bearer token",
+    )
+    .into_response()
+}
+
+/// Headers of every API and `/health` answer (D134), whether the web UI is on or not:
+/// `nosniff`, `no-referrer`, and `Cache-Control: no-store` unless the handler chose a cache rule
+/// (posters, web assets). Web responses set their own full set first (`web::set_web_headers`).
+async fn security_headers(req: Request, next: Next) -> Response {
+    let mut r = next.run(req).await;
+    let h = r.headers_mut();
+    if !h.contains_key(header::X_CONTENT_TYPE_OPTIONS) {
+        h.insert(
+            header::X_CONTENT_TYPE_OPTIONS,
+            header::HeaderValue::from_static("nosniff"),
+        );
+    }
+    if !h.contains_key(header::REFERRER_POLICY) {
+        h.insert(
+            header::REFERRER_POLICY,
+            header::HeaderValue::from_static("no-referrer"),
+        );
+    }
+    if !h.contains_key(header::CACHE_CONTROL) {
+        h.insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-store"),
+        );
+    }
+    r
 }
 
 pub fn router(state: AppState) -> Router {
@@ -301,13 +355,25 @@ pub fn router(state: AppState) -> Router {
         ))
         .layer(DefaultBodyLimit::max(crate::fleet::BODY_LIMIT))
         .layer(RequestBodyLimitLayer::new(crate::fleet::BODY_LIMIT));
-    Router::new()
+    let mut app = Router::new()
         .route("/health", get(health))
         .merge(protected)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(RequestBodyLimitLayer::new(BODY_LIMIT))
-        .merge(workers)
-        .fallback(|| async { ApiError::not_found("no such route") })
+        .merge(workers);
+    // The web UI (D132) and its sign-in routes (D133), outside the bearer middleware; the
+    // sign-in body has its own 1 KiB limit.
+    if state.web.is_some() {
+        app = app.merge(crate::web::routes()).merge(
+            crate::web_auth::routes()
+                .layer(DefaultBodyLimit::max(crate::web_auth::LOGIN_BODY_LIMIT))
+                .layer(RequestBodyLimitLayer::new(
+                    crate::web_auth::LOGIN_BODY_LIMIT,
+                )),
+        );
+    }
+    app.fallback(crate::web::fallback)
+        .layer(middleware::from_fn(security_headers))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             REQUEST_TIMEOUT,

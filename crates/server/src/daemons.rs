@@ -73,17 +73,23 @@ pub async fn crawl_config(store: &PgStore, cfg: &Config, budget: Duration) -> Cr
 
 /// ntfy target: settings first, env as fallback. None if no topic.
 pub async fn ntfy_config(store: &PgStore, cfg: &Config) -> Option<NtfyConfig> {
+    let topic = ntfy_topic(store, cfg.ntfy_topic.as_deref()).await?;
     let url = setting_string(store.get_setting(keys::NTFY_URL).await.ok().flatten())
         .or_else(|| cfg.ntfy_url.clone())
         .unwrap_or_else(|| "https://ntfy.sh".into());
-    let topic = setting_string(store.get_setting(keys::NTFY_TOPIC).await.ok().flatten())
-        .or_else(|| cfg.ntfy_topic.clone())
-        .filter(|t| !t.trim().is_empty())?;
     Some(NtfyConfig {
         base_url: url,
         topic,
         token: None,
     })
+}
+
+/// The ntfy topic alerts go to: the `ntfy.topic` setting, else `MAGNETAR_NTFY_TOPIC`; None
+/// when neither is set (nothing is sent). The web UI says which (D135).
+pub async fn ntfy_topic(store: &PgStore, env_topic: Option<&str>) -> Option<String> {
+    setting_string(store.get_setting(keys::NTFY_TOPIC).await.ok().flatten())
+        .or_else(|| env_topic.map(str::to_string))
+        .filter(|t| !t.trim().is_empty())
 }
 
 /// Saved-search notifier: one ntfy message per search with new hits (D25).

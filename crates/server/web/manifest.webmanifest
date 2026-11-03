@@ -1,0 +1,17 @@
+{
+  "name": "Magnetar",
+  "short_name": "Magnetar",
+  "description": "The web client of your Magnetar torrent index.",
+  "start_url": "/",
+  "scope": "/",
+  "id": "/",
+  "display": "standalone",
+  "background_color": "#141413",
+  "theme_color": "#1c5cab",
+  "icons": [
+    { "src": "/_app/__V__/icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "/_app/__V__/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/_app/__V__/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/_app/__V__/icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

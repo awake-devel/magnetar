@@ -26,6 +26,10 @@ pub mod server;
 pub mod stats;
 pub mod store;
 pub mod tmdb;
+pub mod web;
+pub mod web_auth;
+#[allow(dead_code)]
+mod web_build;
 pub mod worker;
 
 pub use api::{AppState, router};
