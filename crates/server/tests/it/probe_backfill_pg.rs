@@ -13,7 +13,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 
 use magnetar_core::dht::Dht;
-use magnetar_core::probe::ProbeConfig;
+use magnetar_core::probe::{PROBE_VERSION, ProbeConfig};
 use magnetar_server::fleet::proto::*;
 use magnetar_server::probe_backfill::{self as bf, Answer};
 use magnetar_server::store::PgStore;
@@ -113,16 +113,83 @@ async fn queue_row(
     .unwrap()
 }
 
+/// A probe of the current [`PROBE_VERSION`] stored for `h`.
 async fn probed(s: &PgStore, h: &str) {
+    probed_v(s, h, PROBE_VERSION).await;
+}
+
+async fn probed_v(s: &PgStore, h: &str, v: u16) {
     sqlx::query(
         "INSERT INTO probe_attrs (infohash, probe_version, probed_at, status, files_probed,
-             files_verified, bytes_in) VALUES ($1, 1, $2, 'ok', 1, 1, 1000)",
+             files_verified, bytes_in) VALUES ($1, $3, $2, 'ok', 1, 1, 1000)
+         ON CONFLICT (infohash) DO UPDATE SET probe_version = EXCLUDED.probe_version",
     )
     .bind(h)
     .bind(NOW)
+    .bind(i16::try_from(v).unwrap())
     .execute(s.pool())
     .await
     .unwrap();
+}
+
+/// D127: a torrent probed before the current probe version (no track kinds) is queued again,
+/// after every never-tried torrent and before the retries; it stays queued while only the old
+/// probe exists (a failed re-probe is retried, not taken as probed) and leaves the queue once
+/// a current probe is stored. A torrent probed at the current version is never queued.
+#[tokio::test]
+async fn old_probe_versions_are_probed_again_after_never_tried() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    let now = magnetar_core::now();
+    let (fresh, old, current, retry) = (ih(0x11), ih(0x12), ih(0x13), ih(0x14));
+    for (h, t) in [
+        (&fresh, "Fresh.Film"),
+        (&old, "Old.Probe.Film"),
+        (&current, "Current.Film"),
+        (&retry, "Retry.Film"),
+    ] {
+        dht_row(s, h, t, "video", &[("f.mkv", 10)]).await;
+        seeders(s, h, Some(4)).await;
+    }
+    probed_v(s, &old, 1).await;
+    probed(s, &current).await;
+    assert_eq!(bf::fill_pass(s.pool()).await.unwrap(), 3);
+    assert!(
+        queue_row(s, &current).await.is_none(),
+        "current version is not queued"
+    );
+    let (rank, due, ..) = queue_row(s, &old).await.unwrap();
+    assert_eq!((rank, due), (bf::REPROBE_RANK, Some(bf::REPROBE_RANK)));
+    assert!(queue_row(s, &fresh).await.unwrap().1.unwrap() < 0);
+    // retry: tried once already, due again now (a unix time).
+    sqlx::query("UPDATE probe_backfill SET attempts = 1, due_at = $2 WHERE infohash = $1")
+        .bind(&retry)
+        .bind(now - 10)
+        .execute(s.pool())
+        .await
+        .unwrap();
+    // Order: never tried, then the re-probe, then the retry.
+    let l = bf::lease(s.pool(), "w1", now, 3, 900).await.unwrap();
+    assert_eq!(l.items, vec![fresh.clone(), old.clone(), retry.clone()]);
+    assert_eq!(l.probed, 0, "the old probe does not end the lease");
+    // A dict without a new probe: the old probe does not count, the row is retried.
+    let r = bf::record(s.pool(), "w1", &[(old.clone(), Answer::Dict)], now)
+        .await
+        .unwrap();
+    assert_eq!(r.probed, 0);
+    let (_, due, attempts, outcome, _) = queue_row(s, &old).await.unwrap();
+    assert_eq!(attempts, 1);
+    assert!(due.unwrap() > now);
+    assert_eq!(outcome.as_deref(), Some(bf::outcome::NO_PROBE));
+    // The current probe arrives (stored from a new find): the row leaves the queue.
+    probed(s, &old).await;
+    assert_eq!(
+        bf::forget_probed(s.pool(), std::slice::from_ref(&old))
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(queue_row(s, &old).await.is_none());
 }
 
 /// The queue: who is in it, in which order, what a lease closes, exclusivity and release.

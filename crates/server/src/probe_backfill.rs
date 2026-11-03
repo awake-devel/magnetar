@@ -21,6 +21,7 @@
 use std::collections::HashSet;
 
 use magnetar_core::api::ProbeBackfillStats;
+use magnetar_core::probe::PROBE_VERSION;
 use sqlx::PgPool;
 
 /// Most hashes per lease request.
@@ -34,6 +35,12 @@ pub const FILL_EVERY_SECS: i64 = 6 * 3600;
 /// 6 h, 3 days, 14 days; the row is closed after [`MAX_ATTEMPTS`].
 pub const BACKOFF_SECS: [i64; 3] = [6 * 3600, 3 * 86400, 14 * 86400];
 pub const MAX_ATTEMPTS: i16 = 4;
+/// Queue rank (`rank` and first `due_at`) of a torrent whose stored probe is older than
+/// [`PROBE_VERSION`] (D127): positive, so after every never-tried row (negative) and before
+/// the retries (unix times).
+pub const REPROBE_RANK: i64 = 1;
+/// [`PROBE_VERSION`] as the `probe_attrs.probe_version` column type.
+const PROBE_VERSION_I16: i16 = PROBE_VERSION as i16;
 /// One seeders tier in the rank: `born` (a unix time) stays below it.
 pub const TIER: i64 = 10_000_000_000;
 /// Hourly counter (stats_series) of the `dht_torrents` rows a backfill dict added for a
@@ -64,7 +71,8 @@ const RANK_SQL: &str = "-(
      END)::bigint * 10000000000
     + least(greatest(coalesce(s.born, 0), 0), 9999999999)) - 1";
 
-/// Queue the next [`FILL_CHUNK`] infohashes after `after` (`""` to start) that have no probe,
+/// Queue the next [`FILL_CHUNK`] infohashes after `after` (`""` to start) that have no probe
+/// (or one older than [`PROBE_VERSION`], ranked [`REPROBE_RANK`], D127),
 /// are not blocked and that a default search shows (a DHT row, or a visible Nostr event:
 /// [`moderated`]). Adult torrents are queued too (D119). Returns the last infohash read
 /// (None at the end of the table) and how many rows were queued. Rows already queued (or
@@ -76,11 +84,14 @@ pub async fn fill_chunk(pool: &PgPool, after: &str) -> sqlx::Result<(Option<Stri
              ORDER BY infohash LIMIT $2
          ), ins AS (
              INSERT INTO probe_backfill (infohash, rank, due_at)
-             SELECT c.infohash, {RANK_SQL}, {RANK_SQL}
+             SELECT c.infohash, r.rank, r.rank
              FROM chunk c
              LEFT JOIN liveness l ON l.infohash = c.infohash
              LEFT JOIN liveness_schedule s ON s.infohash = c.infohash
-             WHERE NOT EXISTS (SELECT 1 FROM probe_attrs p WHERE p.infohash = c.infohash)
+             LEFT JOIN probe_attrs p ON p.infohash = c.infohash
+             CROSS JOIN LATERAL (SELECT CASE WHEN p.infohash IS NULL THEN {RANK_SQL}
+                                             ELSE {REPROBE_RANK} END AS rank) r
+             WHERE (p.infohash IS NULL OR p.probe_version < {PROBE_VERSION})
                AND NOT EXISTS (SELECT 1 FROM blocked_infohashes b WHERE b.infohash = c.infohash)
                AND {visible}
              ORDER BY c.infohash
@@ -189,13 +200,15 @@ async fn lease_round(
     if hashes.is_empty() {
         return Ok(0);
     }
-    let has_probe: HashSet<String> =
-        sqlx::query_scalar("SELECT infohash FROM probe_attrs WHERE infohash = ANY($1)")
-            .bind(&hashes)
-            .fetch_all(&mut **tx)
-            .await?
-            .into_iter()
-            .collect();
+    let has_probe: HashSet<String> = sqlx::query_scalar(
+        "SELECT infohash FROM probe_attrs WHERE infohash = ANY($1) AND probe_version >= $2",
+    )
+    .bind(&hashes)
+    .bind(PROBE_VERSION_I16)
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .collect();
     let blocked: HashSet<String> =
         sqlx::query_scalar("SELECT infohash FROM blocked_infohashes WHERE infohash = ANY($1)")
             .bind(&hashes)
@@ -434,11 +447,13 @@ pub async fn record(
         .collect();
     let probed: Vec<String> = sqlx::query_scalar(
         "DELETE FROM probe_backfill b WHERE b.infohash = ANY($1) AND b.worker = $2
-             AND EXISTS (SELECT 1 FROM probe_attrs p WHERE p.infohash = b.infohash)
+             AND EXISTS (SELECT 1 FROM probe_attrs p WHERE p.infohash = b.infohash
+                         AND p.probe_version >= $3)
          RETURNING b.infohash",
     )
     .bind(&dicts)
     .bind(worker)
+    .bind(PROBE_VERSION_I16)
     .fetch_all(&mut *tx)
     .await?;
     r.probed = probed.len() as u32;
@@ -528,9 +543,11 @@ pub async fn forget_probed(pool: &PgPool, infohashes: &[String]) -> sqlx::Result
     }
     Ok(sqlx::query(
         "DELETE FROM probe_backfill b WHERE b.infohash = ANY($1)
-             AND EXISTS (SELECT 1 FROM probe_attrs p WHERE p.infohash = b.infohash)",
+             AND EXISTS (SELECT 1 FROM probe_attrs p WHERE p.infohash = b.infohash
+                         AND p.probe_version >= $2)",
     )
     .bind(infohashes)
+    .bind(PROBE_VERSION_I16)
     .execute(pool)
     .await?
     .rows_affected())
