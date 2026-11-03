@@ -23,7 +23,9 @@ use tantivy::{TantivyDocument, Term};
 /// 3: `adult` (D52): canonical category `porn` or a DHT row classified `porn`.
 /// 4: DHT documents (D51): stored `origin`, facet `origin` (`nostr` / `dht`), DHT titles and
 /// file names searchable, `eligible_trust` lifted to `TRUSTED` when a DHT row exists.
-pub const SCHEMA_VERSION: u32 = 4;
+/// 5: header-probe facets (D122): `probe_language probe_subtitles probe_resolution probe_codec
+/// probe_hdr probe_audio` from `probe_attrs.tags`.
+pub const SCHEMA_VERSION: u32 = 5;
 pub const TOKENIZER: &str = "magnetar";
 /// Descriptions are indexed up to this many characters (lower weight, mostly boilerplate).
 pub const DESCRIPTION_CHARS: i32 = 2000;
@@ -136,6 +138,32 @@ pub const FACETS: &[FacetDef] = &[
         name: "origin",
         values: |d| d.origin.sources().into_iter().map(str::to_string).collect(),
     },
+    // Header probes (D122): what the files hold, from `probe_attrs.tags`
+    // (`probes::facet_values`); empty for a torrent never probed.
+    FacetDef {
+        name: "probe_language",
+        values: |d| crate::probes::facet_values("probe_language", &d.probe_tags),
+    },
+    FacetDef {
+        name: "probe_subtitles",
+        values: |d| crate::probes::facet_values("probe_subtitles", &d.probe_tags),
+    },
+    FacetDef {
+        name: "probe_resolution",
+        values: |d| crate::probes::facet_values("probe_resolution", &d.probe_tags),
+    },
+    FacetDef {
+        name: "probe_codec",
+        values: |d| crate::probes::facet_values("probe_codec", &d.probe_tags),
+    },
+    FacetDef {
+        name: "probe_hdr",
+        values: |d| crate::probes::facet_values("probe_hdr", &d.probe_tags),
+    },
+    FacetDef {
+        name: "probe_audio",
+        values: |d| crate::probes::facet_values("probe_audio", &d.probe_tags),
+    },
 ];
 
 fn attr_list(d: &IndexDoc, f: fn(&ReleaseAttrs) -> &Vec<String>) -> Vec<String> {
@@ -215,6 +243,8 @@ pub struct IndexDoc {
     /// Nostr events, a DHT row, or both (D51). A DHT-only document has no event, publisher or
     /// trust (`event_id`, `pubkey` empty).
     pub origin: Origin,
+    /// `probe_attrs.tags` (D117, D122): `r:2160p`, `a:fre`, …; empty when never probed.
+    pub probe_tags: Vec<String>,
 }
 
 impl IndexDoc {

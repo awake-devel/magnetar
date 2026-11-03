@@ -153,6 +153,7 @@ fn push_hits_cte(qb: &mut QueryBuilder<Postgres>, q: &SearchQuery, min_trust: u8
         crate::enrich::push_media_filter(qb, m);
     }
     push_attr_filters(qb, q);
+    push_probe_filters(qb, q);
     if let Some(tsq) = &tsq {
         qb.push(" AND (t.search_tsv @@ to_tsquery('simple', ")
             .push_bind(tsq.clone())
@@ -242,6 +243,32 @@ fn push_attr_filters(qb: &mut QueryBuilder<Postgres>, q: &SearchQuery) {
         .push(" AND ")
         .push_bind(q.max_year.unwrap_or(i32::MAX));
     }
+}
+
+/// The header-probe filters of D122 on row `t`, on the same stored `probe_attrs.tags` the
+/// index reads (`probes::facet_values`): any value within a field (`p.tags && …`), AND across
+/// fields; `probe_hdr` `any` = some `h:` tag.
+fn push_probe_filters(qb: &mut QueryBuilder<Postgres>, q: &SearchQuery) {
+    let filters = crate::probes::search_filters(q);
+    if filters.is_empty() {
+        return;
+    }
+    qb.push(" AND EXISTS (SELECT 1 FROM probe_attrs p WHERE p.infohash = t.infohash");
+    for (name, values) in filters {
+        let prefixes = crate::probes::tag_prefixes(name);
+        let any_hdr = name == "probe_hdr" && values.iter().any(|v| v == "any");
+        let tags: Vec<String> = values
+            .iter()
+            .filter(|v| !(name == "probe_hdr" && *v == "any"))
+            .flat_map(|v| prefixes.iter().map(move |p| format!("{p}{v}")))
+            .collect();
+        qb.push(" AND (p.tags && ").push_bind(tags);
+        if any_hdr {
+            qb.push(" OR EXISTS (SELECT 1 FROM unnest(p.tags) x WHERE x LIKE 'h:%')");
+        }
+        qb.push(")");
+    }
+    qb.push(")");
 }
 
 /// `WHERE ...` on `hits` (liveness filters).
@@ -351,6 +378,20 @@ pub async fn explain_hits(
     min_trust: u8,
 ) -> magnetar_core::error::Result<Vec<String>> {
     let mut qb = hits_query_with("EXPLAIN ", q, now, min_trust);
+    qb.build_query_scalar()
+        .fetch_all(conn)
+        .await
+        .map_err(crate::store::db)
+}
+
+/// `EXPLAIN (ANALYZE, BUFFERS)` of the fallback's page query: runs it (benchmarks, D122).
+pub async fn explain_hits_analyze(
+    conn: &mut sqlx::PgConnection,
+    q: &SearchQuery,
+    now: i64,
+    min_trust: u8,
+) -> magnetar_core::error::Result<Vec<String>> {
+    let mut qb = hits_query_with("EXPLAIN (ANALYZE, BUFFERS) ", q, now, min_trust);
     qb.build_query_scalar()
         .fetch_all(conn)
         .await

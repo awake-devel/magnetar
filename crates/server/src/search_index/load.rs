@@ -130,6 +130,14 @@ pub async fn load_docs(pool: &PgPool, infohashes: &[String]) -> Result<Vec<Index
     .fetch_all(pool)
     .await
     .map_err(db)?;
+    // Header probes (D122): only DHT rows have one (`probe_attrs` references `dht_torrents`).
+    let probes: Vec<(String, Vec<String>)> =
+        sqlx::query_as("SELECT infohash, tags FROM probe_attrs WHERE infohash = ANY($1)")
+            .bind(infohashes)
+            .fetch_all(pool)
+            .await
+            .map_err(db)?;
+    let mut probes: HashMap<String, Vec<String>> = probes.into_iter().collect();
     let mut dht: HashMap<String, DhtRow> =
         dht.into_iter().map(|d| (d.infohash.clone(), d)).collect();
     let mut attrs: HashMap<String, ReleaseAttrs> =
@@ -194,6 +202,7 @@ pub async fn load_docs(pool: &PgPool, infohashes: &[String]) -> Result<Vec<Index
             attrs: attrs.remove(&r.infohash),
             dht_adult: false,
             origin: Origin::Nostr,
+            probe_tags: probes.remove(&r.infohash).unwrap_or_default(),
             infohash: r.infohash,
         });
     }
@@ -242,6 +251,7 @@ pub async fn load_docs(pool: &PgPool, infohashes: &[String]) -> Result<Vec<Index
             attrs: attrs.remove(&row.infohash),
             dht_adult: category == Category::Porn,
             origin: Origin::Dht,
+            probe_tags: probes.remove(&row.infohash).unwrap_or_default(),
             infohash: row.infohash,
         });
     }

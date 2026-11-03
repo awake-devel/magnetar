@@ -35,7 +35,9 @@ lowest id (D6). Fields:
   year in the name), and since `SCHEMA_VERSION` 2 the release attributes of `torrent_attrs`
   (D44, docs/FILTERS.md): `f_language`, `f_subtitles`, `f_resolution`, `f_source`, `f_codec`,
   `f_hdr`, `f_audio`, `f_channels`, `f_edition`, `f_format`, `f_group`; plus fast `year` and the
-  stored `attrs` JSON returned in every hit;
+  stored `attrs` JSON returned in every hit; since `SCHEMA_VERSION` 5 (D122) the header-probe
+  facets `f_probe_language`, `f_probe_subtitles`, `f_probe_resolution`, `f_probe_codec`,
+  `f_probe_hdr`, `f_probe_audio` from `probe_attrs.tags` (docs/FILTERS.md "Probe filters");
 - since `SCHEMA_VERSION` 3 (D52, D70), fast `adult` (1 when the canonical category is `porn` or
   a `dht_torrents` row of the infohash is classified `porn`). The version bump rebuilds the
   index once after the upgrade (35 s on the production copy for version 2).
@@ -102,7 +104,8 @@ lowest id (D6). Fields:
   estimate) > 0; unknown or 0 → left out). Without it the newest-first list is flooded by
   fresh, never-checked DHT torrents ("peers unknown"); the seed checker reaches new torrents
   first (D45), so a live one appears within minutes. Any sort and any other filter keep the
-  rule (the list's membership does not change with the sort). Unchanged: Nostr results and
+  rule (the list's membership does not change with the sort), except a header-probe filter
+  (D122): it turns the rule off, since probed torrents are DHT finds whose peers sent pieces. Unchanged: Nostr results and
   torrents known from both sources, every text search, `media:`/`imdb:` tokens (title pages),
   and the explicit **DHT** chip (`origin=dht`), which lists every DHT result. The browse sheet's
   facet counts follow the list; Stats breakdowns (`/api/v1/stats/breakdown`) do not (they

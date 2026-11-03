@@ -30,7 +30,19 @@ val FACET_TITLES = mapOf(
     "audio" to "Audio",
     "genre" to "Genre",
     "media_kind" to "Type",
+    "probe_language" to "Audio track",
+    "probe_subtitles" to "Subtitle track",
+    "probe_resolution" to "Picture",
+    "probe_codec" to "Video track",
+    "probe_hdr" to "HDR (probed)",
+    "probe_audio" to "Audio format",
 )
+
+/**
+ * Header-probe facets (D122): what a crawl worker read from the files, not the name. Shown
+ * under their own heading when the server lists `probe_filters`; only probed torrents match.
+ */
+val PROBE_FACET_FIELDS = listOf("probe_language", "probe_subtitles", "probe_resolution", "probe_codec", "probe_hdr", "probe_audio")
 
 /** Category codes in the order of the sheet (`magnetar_core::model::Category`). */
 val CATEGORIES = listOf("video", "audio", "application", "game", "porn", "anime", "book", "picture", "other")
@@ -63,6 +75,13 @@ data class SearchFilters(
     val maxYear: Int? = null,
     /** Result sources (D51): "nostr", "dht"; empty = both. */
     val origins: Set<String> = emptySet(),
+    /** Header-probe filters (D122), values of the `probe_*` facets. */
+    val probeLanguages: Set<String> = emptySet(),
+    val probeSubtitles: Set<String> = emptySet(),
+    val probeResolutions: Set<String> = emptySet(),
+    val probeCodecs: Set<String> = emptySet(),
+    val probeHdr: Set<String> = emptySet(),
+    val probeAudio: Set<String> = emptySet(),
 ) {
     val activeCount: Int
         get() = listOf(
@@ -71,7 +90,13 @@ data class SearchFilters(
             languages.isNotEmpty(), subtitles.isNotEmpty(), resolutions.isNotEmpty(), sources.isNotEmpty(),
             codecs.isNotEmpty(), hdr.isNotEmpty(), audio.isNotEmpty(), genres.isNotEmpty(), kinds.isNotEmpty(),
             minRating != null, minYear != null || maxYear != null, origins.isNotEmpty(),
+            probeLanguages.isNotEmpty(), probeSubtitles.isNotEmpty(), probeResolutions.isNotEmpty(),
+            probeCodecs.isNotEmpty(), probeHdr.isNotEmpty(), probeAudio.isNotEmpty(),
         ).count { it }
+
+    /** Any header-probe filter set (D122). */
+    val hasProbeFilters: Boolean
+        get() = PROBE_FACET_FIELDS.any { selected(it).isNotEmpty() }
 
     /** Selected values of facet [field] (also `category` and `origin`). */
     fun selected(field: String): Set<String> = when (field) {
@@ -86,6 +111,12 @@ data class SearchFilters(
         "genre" -> genres
         "media_kind" -> kinds
         "origin" -> origins
+        "probe_language" -> probeLanguages
+        "probe_subtitles" -> probeSubtitles
+        "probe_resolution" -> probeResolutions
+        "probe_codec" -> probeCodecs
+        "probe_hdr" -> probeHdr
+        "probe_audio" -> probeAudio
         else -> emptySet()
     }
 
@@ -104,13 +135,20 @@ data class SearchFilters(
             "genre" -> copy(genres = genres.flip())
             "media_kind" -> copy(kinds = kinds.flip())
             "origin" -> copy(origins = origins.flip())
+            "probe_language" -> copy(probeLanguages = probeLanguages.flip())
+            "probe_subtitles" -> copy(probeSubtitles = probeSubtitles.flip())
+            "probe_resolution" -> copy(probeResolutions = probeResolutions.flip())
+            "probe_codec" -> copy(probeCodecs = probeCodecs.flip())
+            "probe_hdr" -> copy(probeHdr = probeHdr.flip())
+            "probe_audio" -> copy(probeAudio = probeAudio.flip())
             else -> this
         }
     }
 
     /**
      * Only what the server can apply: a field it would ignore must not be sent, or it answers
-     * unfiltered (docs/APP.md §4). Release/media filters need `filters`, Source chips `origin`.
+     * unfiltered (docs/APP.md §4). Release/media filters need `filters`, Source chips `origin`,
+     * probe filters `probe_filters`.
      */
     fun supportedBy(features: Set<String>): SearchFilters {
         var f = this
@@ -122,6 +160,12 @@ data class SearchFilters(
             )
         }
         if (Features.ORIGIN !in features) f = f.copy(origins = emptySet())
+        if (Features.PROBE_FILTERS !in features) {
+            f = f.copy(
+                probeLanguages = emptySet(), probeSubtitles = emptySet(), probeResolutions = emptySet(),
+                probeCodecs = emptySet(), probeHdr = emptySet(), probeAudio = emptySet(),
+            )
+        }
         return f
     }
 }
@@ -168,6 +212,12 @@ fun buildQuery(
     minYear = filters.minYear,
     maxYear = filters.maxYear,
     origins = filters.origins.sorted(),
+    probeLanguages = filters.probeLanguages.sorted(),
+    probeSubtitles = filters.probeSubtitles.sorted(),
+    probeResolutions = filters.probeResolutions.sorted(),
+    probeVideoCodecs = filters.probeCodecs.sorted(),
+    probeHdr = filters.probeHdr.sorted(),
+    probeAudio = filters.probeAudio.sorted(),
 )
 
 /** Inverse of [buildQuery], for running a saved search; `since` snaps to the nearest preset. */
@@ -195,6 +245,12 @@ fun filtersOf(q: SearchQuery, nowSec: Long = System.currentTimeMillis() / 1000) 
     minYear = q.minYear,
     maxYear = q.maxYear,
     origins = q.origins.toSet(),
+    probeLanguages = q.probeLanguages.toSet(),
+    probeSubtitles = q.probeSubtitles.toSet(),
+    probeResolutions = q.probeResolutions.toSet(),
+    probeCodecs = q.probeVideoCodecs.toSet(),
+    probeHdr = q.probeHdr.toSet(),
+    probeAudio = q.probeAudio.toSet(),
 )
 
 /** One chip of the filter sheet: value, label, count (null = no counts). */

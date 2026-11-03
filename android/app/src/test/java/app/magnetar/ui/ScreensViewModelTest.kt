@@ -171,5 +171,10 @@ class ScreensViewModelTest {
         val q = SearchQuery(text = "dune", categories = listOf("video"), resolutions = listOf("2160p"), minRating = 7f, minYear = 2020, origins = listOf("dht"))
         assertEquals(describe(q), "\"dune\" · Video · DHT · 2160p (4K) · ★ ≥ 7.0 · ≥ 2020")
         assertEquals(describe(SearchQuery()), "any text")
+        // D122 review: a search filtered only by what the probes read is not "any text" alone.
+        assertEquals(
+            describe(SearchQuery(probeHdr = listOf("any"), probeAudio = listOf("atmos"), probeLanguages = listOf("fre"))),
+            "any text · files: French, Any HDR, Atmos",
+        )
     }
 }

@@ -18,6 +18,10 @@ const MAX_BODY: u64 = 1 << 20;
 const MAX_CHILDREN: usize = 1024;
 const VIDEO_SAMPLE: u64 = 64 * 1024;
 const AUDIO_SAMPLE: u64 = 32 * 1024;
+/// Tail searched for `moov` when the top-level chain cannot be followed (D120). A `moov` is
+/// found when it starts inside it: short videos (35 KB for 21 s of iPhone HEVC, 128 KB for 3 min
+/// of 4K), not a feature's 3–11 MB tables. The usual case, a right `mdat` size, needs no tail.
+const TAIL_SCAN: u64 = 1 << 20;
 
 #[derive(Clone, Copy, Debug)]
 struct Bx {
@@ -51,6 +55,26 @@ fn header(src: &Src, off: u64, lim: u64) -> Option<Bx> {
         return None;
     }
     Some(Bx { ty, body, end })
+}
+
+/// The `moov` that starts in the last [`TAIL_SCAN`] bytes: the last `moov` type whose box ends
+/// at EOF or before a valid box, with a valid first child. Asks for the tail when unknown.
+fn tail_moov(src: &Src, size: u64) -> Option<Bx> {
+    let start = size.saturating_sub(TAIL_SCAN);
+    let d = src.get(start, size - start)?;
+    for i in memchr::memmem::rfind_iter(d, b"moov") {
+        let Some(at) = (i as u64).checked_sub(4).map(|i| start + i) else {
+            continue;
+        };
+        let Some(b) = header(src, at, size) else {
+            continue;
+        };
+        let next_ok = b.end == size || header(src, b.end, size).is_some();
+        if &b.ty == b"moov" && b.len() >= 8 && next_ok && header(src, b.body, b.end).is_some() {
+            return Some(b);
+        }
+    }
+    None
 }
 
 /// Child box headers of `[from, end)`; stops at the first unknown or invalid header.
@@ -124,10 +148,16 @@ pub(crate) fn probe(src: &Src) -> Option<Parsed> {
     let mut off = 0u64;
     let mut moov: Option<Bx> = None;
     let mut after_moov = None;
+    let mut broken = false;
+    let mut saw_mdat = false;
     for _ in 0..1024 {
         let Some(b) = header(src, off, size) else {
+            // Known bytes that are no box header, or a box past EOF, after a valid `mdat`: a
+            // wrong `mdat` size (a truncated file already fails at the `mdat` itself).
+            broken = off.saturating_add(8) <= size && src.peek(off, 8).is_some();
             break;
         };
+        saw_mdat |= &b.ty == b"mdat";
         match &b.ty {
             b"ftyp" => {
                 if let Some(d) = src.get(b.body, 4) {
@@ -149,6 +179,16 @@ pub(crate) fn probe(src: &Src) -> Option<Parsed> {
             break;
         }
         off = b.end;
+    }
+    if moov.is_none() && broken && saw_mdat {
+        moov = tail_moov(src, size);
+        after_moov = moov.map(|m| m.end);
+        if moov.is_none() && !src.wants_more() {
+            src.note(format!(
+                "mp4: box chain broken at {off}; no moov in the last {} KiB",
+                TAIL_SCAN / 1024
+            ));
+        }
     }
     let Some(moov) = moov else {
         if !src.wants_more() {
@@ -223,17 +263,20 @@ pub(crate) fn probe(src: &Src) -> Option<Parsed> {
     if d > 0 && timescale > 0 {
         out.duration = Some(d as f64 / timescale as f64);
     }
-    if out.fragmented {
-        fragments(src, after_moov.unwrap_or(moov.end), &mut traks, &trex);
-        if frag_dur.filter(|d| *d > 0).is_none()
-            && let Some(dur) = mfra_duration(src, &traks, &trex)
-        {
-            out.duration = Some(dur);
+    // Fragments, the `mfra` and first samples refine tracks already named: second rank (D120).
+    src.detail(|| {
+        if out.fragmented {
+            fragments(src, after_moov.unwrap_or(moov.end), &mut traks, &trex);
+            if frag_dur.filter(|d| *d > 0).is_none()
+                && let Some(dur) = mfra_duration(src, &traks, &trex)
+            {
+                out.duration = Some(dur);
+            }
         }
-    }
-    for t in &mut traks {
-        first_sample(src, t);
-    }
+        for t in &mut traks {
+            first_sample(src, t);
+        }
+    });
     out.tracks = traks.into_iter().map(|t| t.tk).collect();
     Some(out)
 }
@@ -334,48 +377,76 @@ fn mdia(src: &Src, b: &Bx, t: &mut Trak) {
 }
 
 fn stbl(src: &Src, b: &Bx, t: &mut Trak) {
-    for x in children(src, b.body, b.end) {
-        match &x.ty {
-            b"stsd" => {
-                if let Some(d) = body(src, &x, MAX_BODY) {
-                    stsd(d, t);
-                }
+    // Up to `stsd` (codec; the first child in practice) the walk is first rank; the hops over
+    // the big tables to `stsz` / `stco` (frame rate, first sample) are details (D120).
+    let mut off = b.body;
+    let mut seen_stsd = false;
+    for _ in 0..MAX_CHILDREN {
+        if off.saturating_add(8) > b.end {
+            break;
+        }
+        let x = if seen_stsd {
+            src.detail(|| header(src, off, b.end))
+        } else {
+            header(src, off, b.end)
+        };
+        let Some(x) = x else {
+            break;
+        };
+        off = x.end;
+        if &x.ty == b"stsd" {
+            seen_stsd = true;
+            if let Some(d) = body(src, &x, MAX_BODY) {
+                stsd(d, t);
             }
-            b"stsz" => {
-                if let Some(d) = src.get(x.body, 16.min(x.len())) {
-                    let mut c = Cur::new(d);
-                    let _ = c.skip(4);
-                    let fixed = c.u32().unwrap_or(0);
-                    t.samples = c.u32().map_or(0, u64::from);
-                    t.first_size = if fixed != 0 {
-                        Some(u64::from(fixed))
+            // The tables only give a video frame rate and the first sample: an audio or
+            // subtitle track whose first frame adds nothing never pays the hops over them.
+            if t.tk.kind != Kind::Video && !t.tk.wants_audio_frame() {
+                break;
+            }
+        } else {
+            src.detail(|| table(src, &x, t));
+        }
+    }
+}
+
+/// The heads of `stsz` / `stz2` / `stco` / `co64`: sample count, first sample size and offset.
+fn table(src: &Src, x: &Bx, t: &mut Trak) {
+    match &x.ty {
+        b"stsz" => {
+            if let Some(d) = src.get(x.body, 16.min(x.len())) {
+                let mut c = Cur::new(d);
+                let _ = c.skip(4);
+                let fixed = c.u32().unwrap_or(0);
+                t.samples = c.u32().map_or(0, u64::from);
+                t.first_size = if fixed != 0 {
+                    Some(u64::from(fixed))
+                } else {
+                    c.u32().map(u64::from)
+                };
+            }
+        }
+        b"stz2" => {
+            if let Some(d) = src.get(x.body, 12.min(x.len())) {
+                let mut c = Cur::new(d);
+                let _ = c.skip(8);
+                t.samples = c.u32().map_or(0, u64::from);
+            }
+        }
+        b"stco" | b"co64" => {
+            if let Some(d) = src.get(x.body, 16.min(x.len())) {
+                let mut c = Cur::new(d);
+                let _ = c.skip(4);
+                if c.u32().unwrap_or(0) > 0 {
+                    t.first_off = if &x.ty == b"co64" {
+                        c.u64()
                     } else {
                         c.u32().map(u64::from)
                     };
                 }
             }
-            b"stz2" => {
-                if let Some(d) = src.get(x.body, 12.min(x.len())) {
-                    let mut c = Cur::new(d);
-                    let _ = c.skip(8);
-                    t.samples = c.u32().map_or(0, u64::from);
-                }
-            }
-            b"stco" | b"co64" => {
-                if let Some(d) = src.get(x.body, 16.min(x.len())) {
-                    let mut c = Cur::new(d);
-                    let _ = c.skip(4);
-                    if c.u32().unwrap_or(0) > 0 {
-                        t.first_off = if &x.ty == b"co64" {
-                            c.u64()
-                        } else {
-                            c.u32().map(u64::from)
-                        };
-                    }
-                }
-            }
-            _ => {}
         }
+        _ => {}
     }
 }
 

@@ -58,6 +58,10 @@ pub mod features {
     /// `GET /api/v1/stats/map` (D103): counts by country and network. Listed even when the geo
     /// database is off; `CrawlMap.available` says whether counting runs.
     pub const CRAWL_MAP: &str = "crawl_map";
+    /// The header-probe filters of `SearchQuery` (`probe_languages`, `probe_subtitles`,
+    /// `probe_resolutions`, `probe_video_codecs`, `probe_hdr`, `probe_audio`) and the
+    /// `probe_*` facets (D122). Facets still 503 while the search index builds.
+    pub const PROBE_FILTERS: &str = "probe_filters";
     pub const ALL: &[&str] = &[
         FILTERS,
         FACET_SET,
@@ -71,6 +75,7 @@ pub mod features {
         BROWSE_CHECKED_DHT,
         CRAWL_SOURCES,
         CRAWL_MAP,
+        PROBE_FILTERS,
     ];
 }
 

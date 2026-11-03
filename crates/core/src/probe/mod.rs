@@ -113,7 +113,9 @@ impl Default for ProbeConfig {
             caps: sniff::Caps {
                 head: plan::HEAD,
                 tail: 0,
-                rounds: 6,
+                // MP4 asks its track skeleton before the sample tables (D120): a long film with
+                // four tracks takes 9 rounds (sniff::video::recommended_caps has 10).
+                rounds: 10,
                 max_bytes: 4 * 1024 * 1024,
                 max_range: 4 * 1024 * 1024,
                 max_ranges: 16,

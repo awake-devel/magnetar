@@ -34,9 +34,9 @@ use tantivy::DocSet;
 use tantivy::SegmentMeta;
 use tantivy::index::SegmentId;
 use tantivy::merge_policy::{LogMergePolicy, MergeCandidate, MergePolicy};
-use tantivy::query::{EnableScoring, Query};
+use tantivy::query::{BooleanQuery, ConstScoreQuery, EnableScoring, Occur, Query, TermSetQuery};
 use tantivy::schema::{Field, Value};
-use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
+use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 use tokio::sync::watch;
 
 use self::collect::{AttrFilter, FacetCounts, FacetField, FacetTally, Filter, SortBy, TopFiltered};
@@ -462,10 +462,44 @@ impl SearchIndex {
         )
     }
 
+    /// The text query intersected with one term set per keyword filter (D122), each scoring 0
+    /// so relevance is unchanged: the posting lists of the wanted values drive the match, so a
+    /// rare filter visits its few documents instead of every match of the text (a browse visits
+    /// the whole index). The collector still tests every filter on the fast columns; the term
+    /// sets hold the same values (both come from the same `add_text`), so the hits and totals
+    /// are those of the collector alone. Not for facet counts: a document failing one filter
+    /// still counts for that filter's facet.
+    fn filtered_query(
+        &self,
+        searcher: &tantivy::Searcher,
+        words: &[String],
+        filter: &Filter,
+    ) -> Box<dyn Query> {
+        let base = self.query(searcher, words);
+        if filter.attrs.is_empty() {
+            return base;
+        }
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![(Occur::Must, base)];
+        for a in &filter.attrs {
+            let Ok(field) = self.fields.schema.get_field(&a.field) else {
+                continue;
+            };
+            let terms = a.values.iter().map(|v| Term::from_field_text(field, v));
+            clauses.push((
+                Occur::Must,
+                Box::new(ConstScoreQuery::new(
+                    Box::new(TermSetQuery::new(terms)),
+                    0.0,
+                )),
+            ));
+        }
+        Box::new(BooleanQuery::new(clauses))
+    }
+
     /// Run one query. Blocking (CPU-bound: call through `spawn_blocking`).
     pub fn search(&self, q: &IndexQuery) -> Result<IndexResult> {
         let searcher = self.reader.searcher();
-        let query = self.query(&searcher, &q.words);
+        let query = self.filtered_query(&searcher, &q.words, &q.filter);
         let collector = TopFiltered {
             filter: q.filter.clone(),
             sort: q.sort,
@@ -723,6 +757,9 @@ pub fn index_query(
             attrs: q
                 .attr_filters()
                 .into_iter()
+                // Header-probe filters (D122): the same any-of keyword filters, so their
+                // facets count disjunctively too.
+                .chain(crate::probes::search_filters(q))
                 .chain(
                     // The source chip (D51) is one more any-of keyword filter, so the `origin`
                     // facet is counted disjunctively like the D44 ones.

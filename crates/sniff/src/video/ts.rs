@@ -102,6 +102,27 @@ fn section(pl: &[u8]) -> Option<&[u8]> {
     s.get(..(3 + len).saturating_sub(4).min(s.len()))
 }
 
+/// A table section (`table_id` first) once all of it is there, without its CRC; `None` while
+/// it continues in later packets. Sections are at most 1024 bytes (ISO 13818-1 PSI).
+fn whole_section(s: &[u8]) -> Option<&[u8]> {
+    let len = (usize::from(s.get(1)? & 0xf) << 8) | usize::from(*s.get(2)?);
+    let total = (3 + len).min(1024);
+    s.get(..total.saturating_sub(4).max(3))
+        .filter(|_| s.len() >= total)
+}
+
+/// Parse the PMT section in `buf` once it is whole, then empty `buf`: `Some(true)` for a PMT
+/// (`table_id` 2), `Some(false)` for another table, `None` while it continues.
+fn take_section(buf: &mut Vec<u8>, es: &mut Vec<Es>) -> Option<bool> {
+    let s = whole_section(buf)?;
+    let is_pmt = s.first() == Some(&2);
+    if is_pmt {
+        pmt(s, es);
+    }
+    buf.clear();
+    Some(is_pmt)
+}
+
 fn stream(st: u8) -> (Kind, &'static str) {
     match st {
         0x01 => (Kind::Video, "mpeg1video"),
@@ -297,6 +318,9 @@ pub(crate) fn probe(src: &Src, caps: &Caps) -> Option<Parsed> {
     let mut pmt_pid: Option<u16> = None;
     let mut es: Vec<Es> = Vec::new();
     let mut have_pmt = false;
+    let mut pmt_buf: Vec<u8> = Vec::new();
+    let mut pmt_cc: Option<u8> = None;
+    let mut pmt_stalled = false;
     let mut all_done = false;
     for pkt in head.chunks_exact(ps) {
         let Some((pid, pusi, pl)) = pkt.get(pre..).and_then(payload) else {
@@ -318,10 +342,45 @@ pub(crate) fn probe(src: &Src, caps: &Caps) -> Option<Parsed> {
             }
             continue;
         }
-        if Some(pid) == pmt_pid && pusi && !have_pmt {
-            if let Some(s) = section(pl) {
-                pmt(s, &mut es);
-                have_pmt = s.first() == Some(&2);
+        if Some(pid) == pmt_pid && !have_pmt {
+            // A PMT longer than one packet (many audio and subtitle streams, each with its
+            // descriptors) continues in the next packets of its PID (D120).
+            if pl.is_empty() {
+                continue;
+            }
+            let cc = pkt.get(pre + 3).map_or(0, |b| b & 0xf);
+            if pmt_cc == Some(cc) {
+                // A duplicate packet (ISO 13818-1 allows one): its bytes are already in.
+                continue;
+            }
+            let next = pmt_cc.map(|c| (c + 1) & 0xf) == Some(cc);
+            pmt_cc = Some(cc);
+            if pusi {
+                let ptr = usize::from(pl.first().copied().unwrap_or(0));
+                // The bytes before the pointer end the section in progress (packed PSI).
+                if !pmt_buf.is_empty() && !pmt_stalled && next {
+                    pmt_buf.extend_from_slice(pl.get(1..(1 + ptr).min(pl.len())).unwrap_or(&[]));
+                    if let Some(is_pmt) = take_section(&mut pmt_buf, &mut es) {
+                        have_pmt = is_pmt;
+                        if have_pmt {
+                            continue;
+                        }
+                    }
+                }
+                pmt_buf.clear();
+                pmt_stalled = false;
+                pmt_buf.extend_from_slice(pl.get(1 + ptr..).unwrap_or(&[]));
+            } else if !pmt_buf.is_empty() && !pmt_stalled {
+                if next {
+                    pmt_buf.extend_from_slice(pl);
+                } else {
+                    // A lost packet: the section cannot be completed; keep its first part for
+                    // the fallback below until the next one starts.
+                    pmt_stalled = true;
+                }
+            }
+            if !pmt_stalled && let Some(is_pmt) = take_section(&mut pmt_buf, &mut es) {
+                have_pmt = is_pmt;
             }
             continue;
         }
@@ -346,6 +405,17 @@ pub(crate) fn probe(src: &Src, caps: &Caps) -> Option<Parsed> {
             all_done = true;
             break;
         }
+    }
+    // A PMT whose continuation is not in the known head: the streams of its first part.
+    if !have_pmt
+        && pmt_buf.len() >= 12
+        && let (Some(&l1), Some(&l2)) = (pmt_buf.get(1), pmt_buf.get(2))
+    {
+        let len = (usize::from(l1 & 0xf) << 8) | usize::from(l2);
+        let s = pmt_buf.get(..(3 + len).min(pmt_buf.len())).unwrap_or(&[]);
+        pmt(s, &mut es);
+        have_pmt = s.first() == Some(&2);
+        src.note("ts: PMT cut short");
     }
     if !have_pmt {
         src.note("ts: no PMT in the known head");

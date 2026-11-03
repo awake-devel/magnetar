@@ -5,6 +5,10 @@
 //! sends whole blocks anyway, and the neighbouring bytes are usually the next thing a walker
 //! wants). The walker then stops the chain that needed it and carries on with independent
 //! chains, so one pass can ask for several ranges at once.
+//!
+//! Reads made inside [`Src::detail`] are second rank: while any first-rank range is wanted,
+//! [`Src::take`] returns only those, so a budget that pays for whole pieces (D120) goes to
+//! what names the tracks (codec, language) before what refines them (frame rate, first frames).
 
 use std::cell::{Cell, RefCell};
 
@@ -16,6 +20,9 @@ pub(crate) const BLOCK: u64 = 16 * 1024;
 pub(crate) struct Src<'a> {
     f: &'a SparseFile,
     need: RefCell<Vec<Range>>,
+    /// Wanted by reads inside [`Src::detail`]; asked only when `need` is empty.
+    later: RefCell<Vec<Range>>,
+    in_detail: Cell<bool>,
     notes: RefCell<Vec<String>>,
     max_range: u64,
     /// Some read touched bytes inserted with [`SparseFile::insert_unverified`].
@@ -27,6 +34,8 @@ impl<'a> Src<'a> {
         Src {
             f,
             need: RefCell::new(Vec::new()),
+            later: RefCell::new(Vec::new()),
+            in_detail: Cell::new(false),
             notes: RefCell::new(Vec::new()),
             max_range: max_range.max(BLOCK),
             unverified: Cell::new(false),
@@ -103,8 +112,13 @@ impl<'a> Src<'a> {
         let start = off - off % BLOCK;
         let end = off.saturating_add(len);
         let end = end.saturating_add((BLOCK - end % BLOCK) % BLOCK).min(size);
+        let list = if self.in_detail.get() {
+            &self.later
+        } else {
+            &self.need
+        };
         for m in self.f.missing(Range::new(start, end.saturating_sub(start))) {
-            let mut need = self.need.borrow_mut();
+            let mut need = list.borrow_mut();
             if need.len() < 64 && !need.contains(&m) {
                 need.push(m);
             }
@@ -119,12 +133,25 @@ impl<'a> Src<'a> {
         }
     }
 
-    pub fn wants_more(&self) -> bool {
-        !self.need.borrow().is_empty()
+    /// Runs `f` with its misses recorded as second rank: details (sample tables, first
+    /// samples, fragments) that refine tracks the first-rank reads already named.
+    pub fn detail<T>(&self, f: impl FnOnce() -> T) -> T {
+        let was = self.in_detail.replace(true);
+        let out = f();
+        self.in_detail.set(was);
+        out
     }
 
+    pub fn wants_more(&self) -> bool {
+        !self.need.borrow().is_empty() || !self.later.borrow().is_empty()
+    }
+
+    /// The wanted ranges (first rank only while any is wanted, else the details) and notes.
     pub fn take(self) -> (Vec<Range>, Vec<String>) {
         let mut need = self.need.into_inner();
+        if need.is_empty() {
+            need = self.later.into_inner();
+        }
         need.sort();
         need.dedup();
         (need, self.notes.into_inner())

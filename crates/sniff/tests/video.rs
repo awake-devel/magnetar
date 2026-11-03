@@ -596,3 +596,283 @@ fn large_moov_is_walked_not_fetched_whole() {
         r.bytes_fetched
     );
 }
+
+// ------------------------------------------------------------------ MP4 `moov` at the end (D120)
+
+/// One `trak` with `mdhd` language `lang` (packed), `hdlr`, a `stsd` holding `entry`, then an
+/// `stsz` and an `stco` of `table` bytes each (one sample per 2000 ticks: 24 fps for video).
+fn trak_d120(id: u32, handler: &[u8; 4], lang: u16, entry: Vec<u8>, table: usize) -> Vec<u8> {
+    let mut tkhd = vec![0u8; 8];
+    tkhd.extend_from_slice(&id.to_be_bytes());
+    tkhd.extend_from_slice(&[0u8; 68]);
+    let n = (table / 4).saturating_sub(3) as u32;
+    let mut mdhd = vec![0u8; 8];
+    mdhd.extend_from_slice(&48_000u32.to_be_bytes());
+    mdhd.extend_from_slice(&(n * 2000).to_be_bytes());
+    mdhd.extend_from_slice(&lang.to_be_bytes());
+    mdhd.extend_from_slice(&[0, 0]);
+    let hdlr = full(
+        b"hdlr",
+        0,
+        0,
+        &[&[0u8; 4][..], handler, &[0u8; 13][..]].concat(),
+    );
+    let stsd = full(b"stsd", 0, 0, &[&1u32.to_be_bytes()[..], &entry].concat());
+    let mut stsz = vec![0u8; 4];
+    stsz.extend_from_slice(&n.to_be_bytes());
+    stsz.resize(table, 0);
+    let mut stco = n.to_be_bytes().to_vec();
+    stco.resize(table, 0);
+    let stbl = bx(
+        b"stbl",
+        &[stsd, full(b"stsz", 0, 0, &stsz), full(b"stco", 0, 0, &stco)].concat(),
+    );
+    let mdia = bx(
+        b"mdia",
+        &[full(b"mdhd", 0, 0, &mdhd), hdlr, bx(b"minf", &stbl)].concat(),
+    );
+    bx(b"trak", &[full(b"tkhd", 0, 1, &tkhd), mdia].concat())
+}
+
+fn avc1() -> Vec<u8> {
+    let mut e = vec![0u8; 6];
+    e.extend_from_slice(&1u16.to_be_bytes());
+    e.extend_from_slice(&[0u8; 16]);
+    e.extend_from_slice(&1280u16.to_be_bytes());
+    e.extend_from_slice(&720u16.to_be_bytes());
+    e.resize(78, 0);
+    bx(b"avc1", &e)
+}
+
+fn mp4a() -> Vec<u8> {
+    let mut e = vec![0u8; 6];
+    e.extend_from_slice(&1u16.to_be_bytes());
+    e.extend_from_slice(&[0u8; 8]);
+    e.extend_from_slice(&2u16.to_be_bytes());
+    e.extend_from_slice(&16u16.to_be_bytes());
+    e.extend_from_slice(&[0u8; 4]);
+    e.extend_from_slice(&(48_000u32 << 16).to_be_bytes());
+    bx(b"mp4a", &e)
+}
+
+const FRE: u16 = (6 << 10) | (18 << 5) | 5; // packed "fre"
+const SPA: u16 = (19 << 10) | (16 << 5) | 1; // packed "spa"
+
+/// ftyp, a 1 MiB `mdat`, then `moov`: H.264 with 400 KiB tables, two AAC tracks with 300 KiB;
+/// with the offset of each `trak`.
+fn mp4_long_moov() -> (Vec<u8>, Vec<usize>) {
+    let ftyp = bx(b"ftyp", b"isom\0\0\x02\0isomavc1mp41");
+    let mdat = bx(b"mdat", &vec![0u8; 1 << 20]);
+    let mut mvhd = vec![0u8; 8];
+    mvhd.extend_from_slice(&1000u32.to_be_bytes());
+    mvhd.extend_from_slice(&10_000u32.to_be_bytes());
+    mvhd.extend_from_slice(&[0u8; 80]);
+    let mvhd = full(b"mvhd", 0, 0, &mvhd);
+    let traks = [
+        trak_d120(1, b"vide", 0x55c4, avc1(), 400 << 10),
+        trak_d120(2, b"soun", FRE, mp4a(), 300 << 10),
+        trak_d120(3, b"soun", SPA, mp4a(), 300 << 10),
+    ];
+    let mut at = ftyp.len() + mdat.len() + 8 + mvhd.len();
+    let mut starts = Vec::new();
+    for t in &traks {
+        starts.push(at);
+        at += t.len();
+    }
+    let moov = bx(b"moov", &[mvhd, traks.concat()].concat());
+    ([ftyp, mdat, moov].concat(), starts)
+}
+
+/// D120: the hops over a track's sample tables (frame rate, first sample) wait until every
+/// track is named. With the `moov` header block known, the next pass asks for the second
+/// track's header, not also for the video `stco` head 400 KiB further (before: both at once,
+/// which with whole pieces cost a piece each). AAC tables are never hopped over (their first
+/// frame adds nothing): the whole walk is the head, the `moov` block, one block per audio
+/// track and the video `stco` head.
+#[test]
+fn mp4_track_skeleton_before_sample_tables() {
+    let (f, starts) = mp4_long_moov();
+    let block = |o: usize| (o as u64) / 16384 * 16384;
+    let d = drive(&f, 64 * 1024, 2);
+    let need: Vec<u64> = d.recon.need.iter().map(|r| r.offset).collect();
+    assert_eq!(need, vec![block(starts[2])], "need {:?}", d.recon.need);
+    let d = drive(&f, 64 * 1024, 10);
+    let i = info(&d);
+    assert!(d.recon.need.is_empty());
+    let langs: Vec<_> = i.audio.iter().map(|a| a.language.as_deref()).collect();
+    assert_eq!(langs, vec![Some("fre"), Some("spa")]);
+    assert_eq!(
+        i.video[0].fps,
+        Some(24.0),
+        "the video tables are still read"
+    );
+    assert_eq!(d.fetched, 64 * 1024 + 4 * 16384, "ranges {:?}", d.ranges);
+}
+
+/// D120: a muxer wrote a wrong `mdat` size, so the box chain breaks inside the media data: the
+/// `moov` is looked for in the last 1 MiB (before: "no moov box", no tracks).
+#[test]
+fn mp4_moov_found_in_the_tail_when_the_mdat_size_is_wrong() {
+    let mut f = mp4_audio(b"ec-3", &dec3(Some(true)), EAC3_PLAIN, 3 << 20, ENG);
+    let ftyp = u32::from_be_bytes(f[..4].try_into().unwrap()) as usize;
+    assert_eq!(&f[ftyp + 4..ftyp + 8], b"mdat");
+    f[ftyp..ftyp + 4].copy_from_slice(&4096u32.to_be_bytes());
+    // Media data that is no box header where the wrong size points.
+    f[ftyp + 4096..ftyp + 4104].copy_from_slice(&[0xff; 8]);
+    let d = drive(&f, 64 * 1024, 4);
+    let i = info(&d);
+    assert_eq!(i.audio.len(), 1, "notes {:?}", i.notes);
+    assert_eq!(i.audio[0].language.as_deref(), Some("eng"));
+    assert!(d.fetched <= 64 * 1024 + (1 << 20) + 16384, "{}", d.fetched);
+    // A file cut short (its `mdat` runs past the end) has no `moov` anywhere: no tail read.
+    let mut cut = mp4_audio(b"ec-3", &dec3(Some(true)), EAC3_PLAIN, 3 << 20, ENG);
+    cut.truncate(2 << 20);
+    let d = drive(&cut, 64 * 1024, 4);
+    assert_eq!(d.fetched, 64 * 1024);
+    assert!(info(&d).audio.is_empty());
+}
+
+/// D120 coverage: a 64-bit `mdat` (`size` 1, `largesize`) of 5 GiB puts the `moov` past
+/// 4 GiB; its offset comes from the head alone, one block, no tail scan.
+#[test]
+fn mp4_largesize_mdat_puts_moov_past_4_gib() {
+    let f = mp4_audio(b"ec-3", &dec3(Some(true)), EAC3_PLAIN, 0, ENG);
+    let ftyp = u32::from_be_bytes(f[..4].try_into().unwrap()) as usize;
+    let mdat_len = u32::from_be_bytes(f[ftyp..ftyp + 4].try_into().unwrap()) as usize;
+    let moov = &f[ftyp + mdat_len..];
+    let big: u64 = 5 << 30;
+    let moov_at = ftyp as u64 + big;
+    let total = moov_at + moov.len() as u64;
+    let mut head = f[..ftyp].to_vec();
+    head.extend_from_slice(&1u32.to_be_bytes());
+    head.extend_from_slice(b"mdat");
+    head.extend_from_slice(&big.to_be_bytes());
+    head.resize(64 * 1024, 0);
+    let mut file = SparseFile::new(total);
+    file.insert(0, head);
+    let caps = sniff::video::recommended_caps();
+    let r = sniff::video::analyze(&file, &caps);
+    assert_eq!(r.need.len(), 1, "{:?}", r.need);
+    let want = r.need[0];
+    assert!(want.offset <= moov_at && want.offset + want.len >= moov_at + 16);
+    assert!(want.len <= 32 * 1024);
+    file.insert(moov_at, moov.to_vec());
+    let r = sniff::video::analyze(&file, &caps);
+    let i = r.info.expect("info");
+    assert_eq!(i.audio[0].language.as_deref(), Some("eng"));
+}
+
+// ------------------------------------------------------------------ TS PMT (D120)
+
+/// D120: a PMT with 40 audio streams (each with an ISO 639 descriptor) spans three packets;
+/// every stream and language is read (before: 16, the streams of the first packet).
+#[test]
+fn ts_pmt_over_several_packets() {
+    let mut cc = 0u8;
+    let mut f = ts_packets(0, &pat(0x100), &mut cc);
+    let codes: [&[u8; 3]; 4] = [b"fre", b"eng", b"spa", b"ger"];
+    let streams: Vec<(u8, u16, Vec<u8>)> = (0..40u16)
+        .map(|i| {
+            let l = codes[usize::from(i) % 4];
+            (0x0f, 0x101 + i, vec![0x0a, 4, l[0], l[1], l[2], 0])
+        })
+        .collect();
+    let table = pmt(&streams);
+    assert!(table.len() > 2 * 184);
+    f.extend(ts_packets(0x100, &table, &mut cc));
+    for _ in 0..50 {
+        f.extend(ts_packets(0x1fff, &[0xff; 184], &mut cc));
+    }
+    let d = drive(&f, 64 * 1024, 2);
+    let i = info(&d);
+    assert_eq!(i.audio.len(), 40);
+    assert!(i.audio.iter().all(|a| a.language.is_some()));
+    assert_eq!(audio(i, 0x101 + 39).language.as_deref(), Some("ger"));
+}
+
+/// 40 audio streams, each with an ISO 639 descriptor: a PMT of more than two packets.
+fn big_pmt() -> Vec<u8> {
+    let codes: [&[u8; 3]; 4] = [b"fre", b"eng", b"spa", b"ger"];
+    let streams: Vec<(u8, u16, Vec<u8>)> = (0..40u16)
+        .map(|i| {
+            let l = codes[usize::from(i) % 4];
+            (0x0f, 0x101 + i, vec![0x0a, 4, l[0], l[1], l[2], 0])
+        })
+        .collect();
+    pmt(&streams)
+}
+
+fn assert_40_languages(i: &VideoInfo) {
+    let codes = ["fre", "eng", "spa", "ger"];
+    assert_eq!(i.audio.len(), 40, "{:?}", i.audio);
+    for n in 0..40u64 {
+        let a = audio(i, 0x101 + n);
+        assert_eq!(a.language.as_deref(), Some(codes[n as usize % 4]), "{a:?}");
+    }
+}
+
+/// D120 review: packed PSI. Each repetition of the PMT starts in the packet where the previous
+/// one ends (PUSI with a non-zero pointer: the bytes before it end the section in progress),
+/// and the head stops inside the last one. Before, every PUSI dropped those tail bytes, no
+/// section was ever whole and only the first packet's streams were read ("PMT cut short").
+#[test]
+fn ts_pmt_packed_back_to_back() {
+    let sct = big_pmt()[1..].to_vec(); // without psi()'s pointer field
+    let mut stream = Vec::new();
+    let mut starts = Vec::new();
+    for _ in 0..3 {
+        starts.push(stream.len());
+        stream.extend_from_slice(&sct);
+    }
+    stream.truncate(starts[2] + 200);
+    let mut cc = 0u8;
+    let mut f = ts_packets(0, &pat(0x100), &mut cc);
+    let mut pos = 0;
+    while pos < stream.len() {
+        let start = starts.iter().copied().find(|&s| s >= pos && s < pos + 183);
+        assert!(start.is_some() || !starts.contains(&(pos + 183)));
+        let mut p = vec![
+            0x47,
+            0x01 | if start.is_some() { 0x40 } else { 0 },
+            0x00,
+            0x10 | (cc & 0xf),
+        ];
+        let take = if let Some(s) = start {
+            p.push((s - pos) as u8);
+            183
+        } else {
+            184
+        };
+        p.extend_from_slice(&stream[pos..(pos + take).min(stream.len())]);
+        p.resize(188, 0xff);
+        f.extend(p);
+        cc = cc.wrapping_add(1);
+        pos += take;
+    }
+    // The first repetition must end inside a PUSI packet for this to test anything.
+    assert_ne!((starts[1] + 1) % 184, 0);
+    for _ in 0..50 {
+        f.extend(ts_packets(0x1fff, &[0xff; 184], &mut cc));
+    }
+    let d = drive(&f, 64 * 1024, 2);
+    assert_40_languages(info(&d));
+}
+
+/// D120 review: a duplicated PMT packet (same continuity counter, allowed once by ISO 13818-1)
+/// is not appended twice. Before, its bytes went into the section a second time and the
+/// streams after it were read from the wrong offsets.
+#[test]
+fn ts_pmt_duplicate_packet_is_skipped() {
+    let mut cc = 0u8;
+    let mut f = ts_packets(0, &pat(0x100), &mut cc);
+    let pm = ts_packets(0x100, &big_pmt(), &mut cc);
+    assert!(pm.len() >= 3 * 188);
+    f.extend_from_slice(&pm[..2 * 188]);
+    f.extend_from_slice(&pm[188..2 * 188]); // the second packet again
+    f.extend_from_slice(&pm[2 * 188..]);
+    for _ in 0..50 {
+        f.extend(ts_packets(0x1fff, &[0xff; 184], &mut cc));
+    }
+    let d = drive(&f, 64 * 1024, 2);
+    assert_40_languages(info(&d));
+}

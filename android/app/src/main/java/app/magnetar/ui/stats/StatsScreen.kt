@@ -371,6 +371,7 @@ private fun Status(state: StatsUiState, colors: ChartColors) {
                             Features.STATS to "charts", Features.GRAPHS to "graphs", Features.SAVED_SEARCH_POLL to "saved-search alerts",
                             Features.FILTERS to "release filters", Features.ORIGIN to "Nostr / DHT source",
                             Features.CRAWL_SOURCES to "discovery sources", Features.CRAWL_MAP to "crawl map",
+                            Features.PROBE_FILTERS to "probe filters",
                         ).filter { !health.has(it.first) }.map { it.second }
                         if (missing.isNotEmpty()) Line("Needs a newer server for", missing.joinToString(", "))
                     }

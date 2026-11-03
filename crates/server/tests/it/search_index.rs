@@ -878,6 +878,11 @@ const WORDS: &[&str] = &[
 
 /// Deterministic pseudo-random documents shaped like real releases.
 fn synthetic_docs(n: u64) -> Vec<IndexDoc> {
+    synthetic_doc_iter(n).collect()
+}
+
+/// `synthetic_docs`, generated lazily (scale benchmarks keep only a chunk in memory).
+pub(crate) fn synthetic_doc_iter(n: u64) -> impl Iterator<Item = IndexDoc> {
     let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut next = move || {
         x ^= x << 13;
@@ -885,49 +890,48 @@ fn synthetic_docs(n: u64) -> Vec<IndexDoc> {
         x ^= x << 17;
         x
     };
-    (0..n)
-        .map(|i| {
-            let words = 3 + next() % 6;
-            let title: Vec<&str> = (0..words)
-                .map(|_| WORDS[(next() % WORDS.len() as u64) as usize])
-                .collect();
-            let title = format!("{}.{}", title.join("."), 1990 + next() % 36);
-            let cat = Category::ALL[(next() % 9) as usize];
-            let seeded = next() % 3;
-            let trust = [0, 0, 0, 25, 25, 5][(next() % 6) as usize];
-            IndexDoc {
-                infohash: format!("{i:040x}"),
-                event_id: format!("{i:064x}"),
-                pubkey: format!("{:064x}", next() % 300),
-                publishers: vec![format!("{:064x}", next() % 300)],
-                publisher_trust: vec![trust],
-                titles: vec![title.clone()],
-                files_text: format!("{title}/{title}.mkv sample.txt"),
-                description: "Encoded by somebody. Enjoy and seed!".into(),
-                category: cat,
-                category_path: vec![],
-                created_at: NOW - (next() % 100_000_000) as i64,
-                total_size: (next() % 10 != 0).then(|| next() % (50 << 30)),
-                file_count: (next() % 40) as u32,
-                trust: trust as u8,
-                pow_bits: 0,
-                source_url: None,
-                seeders: (seeded > 0).then(|| (next() % 500) as u32),
-                leechers: (seeded > 0).then(|| (next() % 50) as u32),
-                best_peers: (seeded > 0).then(|| (next() % 500) as u32),
-                expires_at: (seeded > 0).then_some(NOW + 3600),
-                media: None,
-                attrs: Some(magnetar_core::release::parse_release(&title, &[], cat)),
-                dht_adult: false,
-                // About one in five documents is known from the DHT as well (D51).
-                origin: match next() % 10 {
-                    0 => Origin::Dht,
-                    1 => Origin::Both,
-                    _ => Origin::Nostr,
-                },
-            }
-        })
-        .collect()
+    (0..n).map(move |i| {
+        let words = 3 + next() % 6;
+        let title: Vec<&str> = (0..words)
+            .map(|_| WORDS[(next() % WORDS.len() as u64) as usize])
+            .collect();
+        let title = format!("{}.{}", title.join("."), 1990 + next() % 36);
+        let cat = Category::ALL[(next() % 9) as usize];
+        let seeded = next() % 3;
+        let trust = [0, 0, 0, 25, 25, 5][(next() % 6) as usize];
+        IndexDoc {
+            infohash: format!("{i:040x}"),
+            event_id: format!("{i:064x}"),
+            pubkey: format!("{:064x}", next() % 300),
+            publishers: vec![format!("{:064x}", next() % 300)],
+            publisher_trust: vec![trust],
+            titles: vec![title.clone()],
+            files_text: format!("{title}/{title}.mkv sample.txt"),
+            description: "Encoded by somebody. Enjoy and seed!".into(),
+            category: cat,
+            category_path: vec![],
+            created_at: NOW - (next() % 100_000_000) as i64,
+            total_size: (next() % 10 != 0).then(|| next() % (50 << 30)),
+            file_count: (next() % 40) as u32,
+            trust: trust as u8,
+            pow_bits: 0,
+            source_url: None,
+            seeders: (seeded > 0).then(|| (next() % 500) as u32),
+            leechers: (seeded > 0).then(|| (next() % 50) as u32),
+            best_peers: (seeded > 0).then(|| (next() % 500) as u32),
+            expires_at: (seeded > 0).then_some(NOW + 3600),
+            media: None,
+            attrs: Some(magnetar_core::release::parse_release(&title, &[], cat)),
+            dht_adult: false,
+            // About one in five documents is known from the DHT as well (D51).
+            origin: match next() % 10 {
+                0 => Origin::Dht,
+                1 => Origin::Both,
+                _ => Origin::Nostr,
+            },
+            probe_tags: Vec::new(),
+        }
+    })
 }
 
 #[test]

@@ -286,6 +286,10 @@ fn video_of(v: &sniff::VideoInfo) -> Option<ProbeVideo> {
         .video
         .iter()
         .filter_map(|t| {
+            // The profile only with the flag it describes (D121).
+            let dv = t
+                .dolby_vision
+                .filter(|_| t.hdr.contains(&sniff::video::HdrFormat::DolbyVision));
             Some(ProbeVideoTrack {
                 codec: token(&t.codec)?,
                 profile: t.profile.as_deref().and_then(|p| clean(p, MAX_TEXT)),
@@ -297,6 +301,10 @@ fn video_of(v: &sniff::VideoInfo) -> Option<ProbeVideo> {
                     .map(|f| ((f * 1000.0).round() as u32).clamp(1, MAX_FPS_MILLI)),
                 bit_depth: t.bit_depth.filter(|b| (1..=MAX_BIT_DEPTH).contains(b)),
                 hdr: t.hdr.iter().filter_map(enum_text).collect(),
+                dv_profile: dv.map(|d| d.profile).filter(|p| *p <= MAX_DV_PROFILE),
+                dv_compat: dv
+                    .and_then(|d| d.compatibility)
+                    .filter(|c| *c <= MAX_DV_COMPAT),
             })
         })
         .take(MAX_VIDEO_TRACKS)
@@ -448,6 +456,9 @@ pub const MAX_DIMENSION: u32 = 65_535;
 /// Frames per second × 1000 (1000 fps).
 pub const MAX_FPS_MILLI: u32 = 1_000_000;
 pub const MAX_BIT_DEPTH: u8 = 32;
+/// Dolby Vision profiles run 0–10 and 20 (MV-HEVC); compatibility ids are 4 bits (D121).
+pub const MAX_DV_PROFILE: u8 = 20;
+pub const MAX_DV_COMPAT: u8 = 15;
 pub const MAX_CHANNELS: u8 = 64;
 /// 30 days.
 pub const MAX_DURATION_MS: u64 = 30 * 24 * 3600 * 1000;
@@ -494,6 +505,10 @@ fn check_video(v: &ProbeVideo) -> Result<(), &'static str> {
             || !in_range(t.height, 1, MAX_DIMENSION)
             || !in_range(t.fps_milli, 1, MAX_FPS_MILLI)
             || !in_range(t.bit_depth, 1, MAX_BIT_DEPTH)
+            || !in_range(t.dv_profile, 0, MAX_DV_PROFILE)
+            || !in_range(t.dv_compat, 0, MAX_DV_COMPAT)
+            || ((t.dv_profile.is_some() || t.dv_compat.is_some())
+                && !t.hdr.iter().any(|h| h == "dolby_vision"))
         {
             return Err("video_track");
         }
@@ -589,9 +604,12 @@ fn push_unique(v: &mut Vec<String>, s: &str) {
     }
 }
 
-/// Resolution class of a picture height.
-pub fn resolution(height: u32) -> &'static str {
-    match height {
+/// Resolution class of a picture: its height, or the 16:9 height of its width when that is
+/// larger (D122: a 2.39:1 UHD film is 3840×1606 and must class as `2160p`, a 1920×800 one as
+/// `1080p`; release names count the width the same way).
+pub fn resolution(width: Option<u32>, height: u32) -> &'static str {
+    let by_width = width.map_or(0, |w| u32::try_from(u64::from(w) * 9 / 16).unwrap_or(0));
+    match height.max(by_width) {
         h if h >= 2000 => "2160p",
         h if h >= 1000 => "1080p",
         h if h >= 700 => "720p",
@@ -599,6 +617,58 @@ pub fn resolution(height: u32) -> &'static str {
         h if h >= 470 => "480p",
         _ => "sd",
     }
+}
+
+/// The header-probe search filters of `q` (D122) as (facet name, values), the language codes
+/// normalised as stored (ISO 639-2/B: `fr`, `fra`, `FRE` → `fre`). A code that names no
+/// language is kept as typed, so it matches nothing instead of dropping the filter.
+pub fn search_filters(q: &magnetar_core::query::SearchQuery) -> Vec<(&'static str, Vec<String>)> {
+    let mut out = q.probe_filters();
+    for (name, values) in out.iter_mut() {
+        if matches!(*name, "probe_language" | "probe_subtitles") {
+            let mut norm: Vec<String> = Vec::with_capacity(values.len());
+            for v in values.iter() {
+                let n = normalize_lang(v).unwrap_or_else(|| v.clone());
+                if !norm.contains(&n) {
+                    norm.push(n);
+                }
+            }
+            *values = norm;
+        }
+    }
+    out
+}
+
+/// The `probe_attrs.tags` prefixes a header-probe facet (D122) reads; none for another name.
+pub fn tag_prefixes(name: &str) -> &'static [&'static str] {
+    match name {
+        "probe_language" => &["a:"],
+        "probe_subtitles" => &["s:"],
+        "probe_resolution" => &["r:"],
+        "probe_codec" => &["v:"],
+        "probe_hdr" => &["h:"],
+        "probe_audio" => &["ac:", "x:"],
+        _ => &[],
+    }
+}
+
+/// Search facet values (D122) of the stored `probe_attrs.tags` for facet `name`: the tag
+/// suffixes of its prefixes, plus `any` on `probe_hdr` when the picture has an HDR format.
+pub fn facet_values(name: &str, tags: &[String]) -> Vec<String> {
+    let prefixes = tag_prefixes(name);
+    let mut out: Vec<String> = Vec::new();
+    for t in tags {
+        if let Some(v) = prefixes.iter().find_map(|p| t.strip_prefix(p))
+            && !v.is_empty()
+            && !out.iter().any(|x| x == v)
+        {
+            out.push(v.to_string());
+        }
+    }
+    if name == "probe_hdr" && !out.is_empty() {
+        out.push("any".to_string());
+    }
+    out
 }
 
 pub fn summary(r: &ProbeReport) -> Summary {
@@ -634,7 +704,7 @@ pub fn summary(r: &ProbeReport) -> Summary {
             push_unique(&mut s.tags, &format!("v:{}", t.codec));
             if let Some(h) = t.height {
                 s.height = i32::try_from(h).ok();
-                push_unique(&mut s.tags, &format!("r:{}", resolution(h)));
+                push_unique(&mut s.tags, &format!("r:{}", resolution(t.width, h)));
             }
             s.bit_depth = t.bit_depth.map(i16::from);
             for h in &t.hdr {
@@ -1297,6 +1367,95 @@ mod tests {
         }
     }
 
+    /// D122: the class follows the width too (scope films), as release names count it.
+    #[test]
+    fn resolution_class_counts_the_width() {
+        assert_eq!(resolution(Some(3840), 1606), "2160p", "2.39:1 UHD");
+        assert_eq!(resolution(Some(3840), 2160), "2160p");
+        assert_eq!(
+            resolution(Some(7680), 3200),
+            "2160p",
+            "8K is in the top class"
+        );
+        assert_eq!(resolution(Some(1920), 800), "1080p");
+        assert_eq!(resolution(Some(1440), 1080), "1080p", "4:3 HD");
+        assert_eq!(resolution(Some(1280), 536), "720p");
+        assert_eq!(resolution(Some(720), 576), "576p");
+        assert_eq!(resolution(Some(720), 480), "480p");
+        assert_eq!(
+            resolution(None, 1606),
+            "1080p",
+            "no width: the height alone"
+        );
+        assert_eq!(resolution(Some(640), 272), "sd");
+        assert_eq!(resolution(Some(u32::MAX), 1), "2160p");
+        // Through the summary that writes the stored tag (was `r:1080p`).
+        let mut scope = file(0, 5000, "video.mkv");
+        scope.video = Some(ProbeVideo {
+            container: "matroska".into(),
+            video: vec![ProbeVideoTrack {
+                codec: "hevc".into(),
+                width: Some(3840),
+                height: Some(1606),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let s = summary(&report(vec![scope]));
+        assert!(s.tags.iter().any(|t| t == "r:2160p"), "{:?}", s.tags);
+        assert_eq!(s.height, Some(1606), "the stored height stays the real one");
+    }
+
+    #[test]
+    fn search_facets_and_filters_from_tags() {
+        let tags: Vec<String> = [
+            "k:video",
+            "v:hevc",
+            "r:2160p",
+            "h:dolby_vision",
+            "h:hdr10",
+            "ac:truehd",
+            "a:fre",
+            "a:eng",
+            "x:atmos",
+            "s:eng",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(facet_values("probe_language", &tags), vec!["fre", "eng"]);
+        assert_eq!(facet_values("probe_subtitles", &tags), vec!["eng"]);
+        assert_eq!(facet_values("probe_resolution", &tags), vec!["2160p"]);
+        assert_eq!(facet_values("probe_codec", &tags), vec!["hevc"]);
+        assert_eq!(
+            facet_values("probe_hdr", &tags),
+            vec!["dolby_vision", "hdr10", "any"]
+        );
+        assert_eq!(facet_values("probe_audio", &tags), vec!["truehd", "atmos"]);
+        assert!(
+            facet_values("probe_hdr", &tags[..2]).is_empty(),
+            "SDR: no any"
+        );
+        assert!(facet_values("nope", &tags).is_empty());
+        let q = magnetar_core::query::SearchQuery {
+            probe_languages: vec!["fr".into(), "FRA".into(), "eng".into(), "xx".into()],
+            probe_subtitles: vec!["en-US".into()],
+            probe_hdr: vec!["Any".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            search_filters(&q),
+            vec![
+                (
+                    "probe_language",
+                    vec!["fre".into(), "eng".into(), "xx".into()]
+                ),
+                ("probe_subtitles", vec!["eng".into()]),
+                ("probe_hdr", vec!["any".into()]),
+            ]
+        );
+    }
+
     #[test]
     fn worker_reports_keep_only_storable_detections() {
         use magnetar_core::probe::FileResult;
@@ -1341,6 +1500,69 @@ mod tests {
         assert_eq!(validate(&w, &stored(&[10])), Ok(()));
         r.status = ProbeStatus::Choked;
         assert!(report_of(&r).is_none());
+    }
+
+    /// D121: the Dolby Vision profile and base-layer id travel with the `dolby_vision` flag,
+    /// so the app can show "Dolby Vision 8.1"; never alone, never out of range.
+    #[test]
+    fn dolby_vision_profile_is_kept_with_its_flag() {
+        use sniff::video::{DolbyVision, HdrFormat, VideoTrack};
+        let dv = DolbyVision {
+            profile: 8,
+            level: 6,
+            compatibility: Some(1),
+            rpu: true,
+            enhancement_layer: false,
+            base_layer: true,
+        };
+        let info = |hdr: Vec<HdrFormat>| sniff::VideoInfo {
+            container: "mkv".into(),
+            video: vec![VideoTrack {
+                codec: "hevc".into(),
+                hdr,
+                dolby_vision: Some(dv),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let v = video_of(&info(vec![HdrFormat::DolbyVision, HdrFormat::Hdr10])).unwrap();
+        assert_eq!(v.video[0].dv_profile, Some(8));
+        assert_eq!(v.video[0].dv_compat, Some(1));
+        assert_eq!(check_video(&v), Ok(()));
+        let plain = video_of(&info(vec![HdrFormat::Hdr10])).unwrap();
+        assert_eq!(
+            (plain.video[0].dv_profile, plain.video[0].dv_compat),
+            (None, None),
+            "a configuration record without the flag is not reported"
+        );
+        let track = |t: ProbeVideoTrack| ProbeVideo {
+            container: "matroska".into(),
+            video: vec![t],
+            ..Default::default()
+        };
+        let dv_track = ProbeVideoTrack {
+            codec: "hevc".into(),
+            hdr: vec!["dolby_vision".into()],
+            dv_profile: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(check_video(&track(dv_track.clone())), Ok(()));
+        for bad in [
+            ProbeVideoTrack {
+                hdr: vec!["hdr10".into()],
+                ..dv_track.clone()
+            },
+            ProbeVideoTrack {
+                dv_profile: Some(21),
+                ..dv_track.clone()
+            },
+            ProbeVideoTrack {
+                dv_compat: Some(16),
+                ..dv_track.clone()
+            },
+        ] {
+            assert_eq!(check_video(&track(bad)), Err("video_track"));
+        }
     }
 
     /// D117: the main server never probes. A prober is built in one place only, the worker's
