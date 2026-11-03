@@ -363,14 +363,21 @@ nobody.
 **Queue** (server, table `probe_backfill`, migration `20261106000000`). Filled in the background
 by a keyset walk over `torrent_infohashes` (5 000 per step, ~180 ms each on 1.8 M seeded rows,
 about a minute a pass), started by the first `probe/lease` and again at most every 6 h (to
-queue torrents indexed since). Skipped at fill time: torrents with a probe, blocked hashes,
+queue torrents indexed since). Skipped at fill time: torrents with a probe of the current
+probe version, blocked hashes,
 and Nostr-only torrents that no default search shows (every event
 from a blocked publisher, or below the trust threshold and not from a trusted publisher): a
 DHT row would bring them back as DHT torrents, since a DHT row passes every trust threshold
 (D51) and a publisher block only hides that publisher's events. They are queued by a later
 pass once shown (block lifted, threshold lowered in Settings). Checked again at lease time: a
 probe stored meanwhile deletes the row, and so does a torrent no longer shown; blocked or gone
-closes it. Adult torrents (category `porn` or the adult signal) are queued and leased like any
+closes it. **Re-probes (D127):** a torrent whose stored probe is older than `PROBE_VERSION`
+(version 1, before track kinds, D123) is queued again with rank and first `due_at` 1: after
+every never-tried row (negative) and before the retries (unix times). Its old probe stays
+shown until a newer one replaces it (§8 store rule); a re-probe that gets no probe is retried
+like any attempt, and the row is closed after the last one with the old probe kept. Probes
+are "probed" for the queue only at the current version (fill, lease, `dht/results`, a new
+find's probe). Adult torrents (category `porn` or the adult signal) are queued and leased like any
 other since D119; migration `20261107000000` reopened the rows earlier closed as `adult` or
 `private` (due again in their never-tried place), and the first fill pass after an upgrade
 queues the `porn` torrents earlier fills skipped. A lease whose rows were all
