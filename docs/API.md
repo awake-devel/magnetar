@@ -29,7 +29,8 @@ enums in `snake_case`). Checked for the app rebuild in 2026-10 (D77).
 | Adult switch (off by default) | `adult=1` / `"include_adult": true` on every search, facet, breakdown, releases and saved-search poll | Adult torrents are hidden, never deleted (D52, D70). Selecting category `porn` also shows them. |
 | Empty-query browse | same | D76: no text and no source filter → DHT-only torrents only once a seed check found peers. Text searches, `origin=dht` and any `probe_*` filter (D122) list every DHT result. |
 | Result row | `TorrentSummary` | `title, category, total_size, file_count, created_at, seeders, leechers, dead, best_peers` (max of tracker seeders and DHT peer estimate; show this when `seeders` is null), `trust, publisher_count, origin (nostr/dht/both), media_title, media_year, media_kind, media_id, media_rating, attrs` (resolution, languages, …), `matched_file`. |
-| Filter sheet counts | `POST /api/v1/facets` (`{query, fields, size}`) or `GET /api/v1/facets?field=…` | Disjunctive counts (docs/FILTERS.md); 503 while the index builds. |
+| Filter sheet counts | `POST /api/v1/facets` (`{query, fields, size, sizes}`) or `GET /api/v1/facets?field=…` | Disjunctive counts (docs/FILTERS.md); 503 while the index builds. `sizes` (D137) overrides `size` per field. |
+| File-kind names | `GET /api/v1/probe/file-kinds` | D137: groups and labels with names and extensions, static per server version (below). |
 | Detail | `GET /api/v1/torrents/{infohash}` | `TorrentDetail`: summary, `magnet` (ready to hand to a torrent app), files, description, events, comments, trackers, `trust` (score + factors), `media` (`MediaInfo` incl. `poster`), `dht` (`DhtInfo` for DHT rows), `probe` (`ProbeInfo`, header-probe results, absent when never probed; see below). 404 unknown. |
 | Seed check now | `POST /api/v1/torrents/{infohash}/liveness` | `Liveness {seeders, leechers, dht_peers_est, source, checked_at, expires_at, …}`. Works for DHT-only torrents since D77 (was 404). Rate-limited since D113: a repeat within a minute returns the stored result, more than 20 a minute server-wide → `429` with `Retry-After`. |
 | Seed history chart | `GET /api/v1/torrents/{infohash}/liveness-history?days=N` | ≤ 90 days, oldest first. |
@@ -172,6 +173,36 @@ Track-kind filters (D125, `features` lists `probe_kinds`): `SearchQuery` `probe_
 + SDH = a French SDH track) and their facets are counted that way; docs/FILTERS.md "Track
 kinds". A server without `probe_kinds` ignores the fields and answers unfiltered: send them
 only to a server that lists it.
+
+File kinds (D137–D139, `features` lists `probe_file_kinds`): `SearchQuery.probe_file_kinds`
+(query string `probe_file_kind`, comma list or repeated; at most 400 distinct values, else 400
+`invalid`), the facet `probe_file_kind` (groups and labels of every probed file in one facet),
+`FacetsRequest.sizes` (per-field size, `{"probe_file_kind": 400}`, capped at 512 for that
+field and 200 for the others; `GET /api/v1/facets?field=probe_file_kind&size=400` uses the
+same cap), the Stats breakdowns `file_group` / `file_kind` with `BreakdownRequest.file_group`
+(docs/STATS.md), and the catalogue of names:
+
+`GET /api/v1/probe/file-kinds` (bearer token or web session cookie, 401 without) →
+`FileKindCatalogue`: every group of sniff's registry in display order, each with every label
+in registry order (`misc.*` included), `name` = the label's description. The answer is the same
+for the life of a server version: cache it keyed by `/health` `version`.
+
+```json
+{"groups":[
+  {"id":"video","name":"Video","labels":[
+    {"id":"video.mkv","name":"Matroska video","extensions":["mkv","mk3d"]},
+    {"id":"video.webm","name":"WebM video","extensions":["webm","mkv"]}]},
+  {"id":"exe","name":"Executables","labels":[
+    {"id":"exe.pe","name":"Windows PE executable",
+     "extensions":["exe","dll","sys","scr","ocx","cpl","efi"]},
+    {"id":"exe.pe.dotnet","name":".NET assembly","extensions":["exe","dll"]}]}
+]}
+```
+
+(Shortened: every group and label is listed.) A group value (`video`) matches any of its labels, a label value only itself (`exe.pe` is not
+`exe.pe.dotnet`); every probed file counts, verified or not (docs/FILTERS.md "File kind"). A
+server without `probe_file_kinds` ignores the field and answers unfiltered: send it, the facet,
+`sizes`, `file_group` and the catalogue call only to a server that lists it.
 
 ## Track corrections (D128–D130)
 

@@ -295,6 +295,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/torrents/{infohash}/probe/corrections/{id}",
             delete(probe_correction_delete),
         )
+        .route("/api/v1/probe/file-kinds", get(file_kinds))
         .route("/api/v1/media/{id}/poster", get(media_poster))
         .route(
             "/api/v1/torrents/{infohash}/liveness",
@@ -525,6 +526,8 @@ pub fn parse_search_query(raw: Option<&str>) -> ApiResult<SearchQuery> {
             "probe_sub_kind" => push_list(&mut q.probe_sub_kinds, &v),
             "probe_audio_kind" => push_list(&mut q.probe_audio_kinds, &v),
             "probe_sub_format" => push_list(&mut q.probe_sub_formats, &v),
+            // D137 file kinds (groups and labels).
+            "probe_file_kind" => push_list(&mut q.probe_file_kinds, &v),
             // D51 source chip (`source` already means the release source, D44).
             "origin" => {
                 push_list(&mut q.origins, &v);
@@ -643,7 +646,7 @@ async fn facet_set(
         n => n as usize,
     };
     st.store
-        .facet_set(&r.query, &r.fields, size, magnetar_core::now())
+        .facet_set_sized(&r.query, &r.fields, size, &r.sizes, magnetar_core::now())
         .await?
         .map(Json)
         .ok_or_else(index_unavailable)
@@ -751,6 +754,12 @@ async fn probe_corrections(
         .await
         .map_err(probe_fix_error)?;
     probe_answer(&st, &ih, now).await
+}
+
+/// `GET /api/v1/probe/file-kinds` (D137): the label catalogue of the file-kind filter, static
+/// for the life of the server version.
+async fn file_kinds() -> Json<&'static magnetar_core::api::FileKindCatalogue> {
+    Json(crate::probes::file_kind_catalogue())
 }
 
 /// `DELETE /api/v1/torrents/{infohash}/probe/corrections/{id}` (D130): undo one correction.
@@ -1003,6 +1012,7 @@ async fn breakdown_get(
         match k.as_ref() {
             "field" => push_list(&mut r.fields, &v),
             "top" => r.top = parse_num(&k, &v)?,
+            "file_group" => r.file_group = Some(v.into_owned()),
             _ => {}
         }
     }

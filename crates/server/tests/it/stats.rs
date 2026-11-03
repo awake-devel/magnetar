@@ -134,6 +134,7 @@ async fn breakdowns_cross_filter() {
         query: q(),
         fields: vec!["resolution".into(), "category".into(), "language".into()],
         top: 2,
+        ..Default::default()
     };
     // No index yet: nothing to count with.
     assert!(
@@ -181,6 +182,7 @@ async fn breakdowns_cross_filter() {
         },
         fields: vec!["category".into(), "resolution".into(), "year".into()],
         top: 10,
+        ..Default::default()
     };
     let set = stats::breakdown(s, &svc, &video, NOW)
         .await
@@ -464,6 +466,7 @@ async fn api() {
         query: q(),
         fields: vec!["language".into()],
         top: 5,
+        ..Default::default()
     };
     match api.stats_breakdown(&r).await {
         Err(magnetar_core::Error::Server { status: 503, .. }) => {}
@@ -564,4 +567,216 @@ async fn api() {
             .status(),
         401
     );
+}
+
+/// A DHT row with the probe tags `summary_of(files)` gives (D137), or none.
+async fn fk_row(s: &PgStore, n: u64, labels: &[&str]) {
+    sqlx::query(
+        "INSERT INTO dht_torrents (infohash, title, file_count, total_size, category,
+             metadata_size, first_seen, fetched_at, discovered_via, classifier_version)
+         VALUES ($1, $2, 1, 1000, 'video', 100, $3, $3, 'sample', 1)",
+    )
+    .bind(ih(n))
+    .bind(format!("fkstat {n}"))
+    .bind(NOW - n as i64)
+    .execute(s.pool())
+    .await
+    .unwrap();
+    if labels.is_empty() {
+        return;
+    }
+    let files: Vec<ProbeFile> = labels
+        .iter()
+        .enumerate()
+        .map(|(i, l)| ProbeFile {
+            i: i as u32,
+            size: 1000 - i as u64,
+            label: l.to_string(),
+            confidence: 97,
+            verified: i == 0,
+            ..Default::default()
+        })
+        .collect();
+    let tags = magnetar_server::probes::summary_of(&files).tags;
+    sqlx::query(
+        "INSERT INTO probe_attrs (infohash, probe_version, probed_at, status, files_probed,
+             files_verified, bytes_in, tags) VALUES ($1, 2, $2, 'ok', 1, 1, 1000, $3)",
+    )
+    .bind(ih(n))
+    .bind(NOW)
+    .bind(tags)
+    .execute(s.pool())
+    .await
+    .unwrap();
+}
+
+/// D139: the file-kind breakdowns: groups, labels, the drill-down to one group, `missing` in
+/// both modes, cross-filtering (own filter left out, the others filtered by it), the
+/// `file_group` cache key, and 400 on a bad `file_group`.
+#[tokio::test]
+async fn file_kind_breakdowns() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    fk_row(s, 51, &["video.mkv", "subtitle.srt"]).await;
+    fk_row(s, 52, &["video.mp4"]).await;
+    fk_row(s, 53, &["archive.zip", "exe.pe"]).await;
+    fk_row(s, 54, &["doc.epub", "exe.pe.dotnet"]).await;
+    fk_row(s, 55, &[]).await;
+    let _ix = index_for(s).await;
+    let svc = StatsService::default();
+    let base = BreakdownRequest {
+        query: SearchQuery {
+            text: "fkstat".into(),
+            ..q()
+        },
+        fields: vec!["file_group".into(), "file_kind".into(), "origin".into()],
+        top: 50,
+        ..Default::default()
+    };
+    let sorted = |b: &Breakdown| -> Vec<(String, u64)> {
+        let mut v: Vec<(String, u64)> = b
+            .counts
+            .iter()
+            .map(|c| (c.value.clone(), c.count))
+            .collect();
+        v.sort();
+        v
+    };
+    let pairs = |v: &[(&str, u64)]| -> Vec<(String, u64)> {
+        let mut v: Vec<(String, u64)> = v.iter().map(|(a, n)| (a.to_string(), *n)).collect();
+        v.sort();
+        v
+    };
+    let set = stats::breakdown(s, &svc, &base, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(set.total, 5);
+    let names: Vec<&str> = set.breakdowns.iter().map(|b| b.field.as_str()).collect();
+    assert_eq!(names, ["file_group", "file_kind", "origin"]);
+    let g = &set.breakdowns[0];
+    assert_eq!(
+        sorted(g),
+        pairs(&[
+            ("archive", 1),
+            ("doc", 1),
+            ("exe", 2),
+            ("subtitle", 1),
+            ("video", 2)
+        ])
+    );
+    assert_eq!((g.total, g.missing), (5, 1), "55 was never probed");
+    let k = &set.breakdowns[1];
+    assert_eq!(
+        sorted(k),
+        pairs(&[
+            ("archive.zip", 1),
+            ("doc.epub", 1),
+            ("exe.pe", 1),
+            ("exe.pe.dotnet", 1),
+            ("subtitle.srt", 1),
+            ("video.mkv", 1),
+            ("video.mp4", 1)
+        ])
+    );
+    assert_eq!((k.total, k.missing), (5, 1));
+    // Drill-down: the labels of one group; `missing` = counted without a file of it.
+    let video = BreakdownRequest {
+        file_group: Some("video".into()),
+        ..base.clone()
+    };
+    let set = stats::breakdown(s, &svc, &video, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    let k = &set.breakdowns[1];
+    assert_eq!(sorted(k), pairs(&[("video.mkv", 1), ("video.mp4", 1)]));
+    assert_eq!((k.total, k.missing), (5, 3));
+    assert_eq!(set.breakdowns[0].counts.len(), 5, "groups unchanged");
+    // Another group on the same service: not the cached "video" answer.
+    let exe = BreakdownRequest {
+        file_group: Some("exe".into()),
+        ..base.clone()
+    };
+    let set = stats::breakdown(s, &svc, &exe, NOW).await.unwrap().unwrap();
+    let k = &set.breakdowns[1];
+    assert_eq!(sorted(k), pairs(&[("exe.pe", 1), ("exe.pe.dotnet", 1)]));
+    assert_eq!(k.missing, 3);
+    // An unknown group: nothing, every counted torrent missing.
+    let none = BreakdownRequest {
+        file_group: Some("nope".into()),
+        ..base.clone()
+    };
+    let set = stats::breakdown(s, &svc, &none, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(set.breakdowns[1].counts.is_empty());
+    assert_eq!(set.breakdowns[1].missing, 5);
+    // Cross-filter on Video: the file-kind fields keep every value (own filter left out), the
+    // other breakdowns count only the two video torrents.
+    let filtered = BreakdownRequest {
+        query: SearchQuery {
+            probe_file_kinds: vec!["video".into()],
+            ..base.query.clone()
+        },
+        ..base.clone()
+    };
+    let set = stats::breakdown(s, &svc, &filtered, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(set.total, 2);
+    assert_eq!(set.breakdowns[0].counts.len(), 5);
+    assert_eq!(set.breakdowns[0].total, 5);
+    assert_eq!(set.breakdowns[1].counts.len(), 7);
+    assert_eq!(counts(&set.breakdowns[2]), vec![("dht", 2)]);
+    // A label filter too.
+    let label = BreakdownRequest {
+        query: SearchQuery {
+            probe_file_kinds: vec!["exe.pe".into()],
+            ..base.query.clone()
+        },
+        ..base.clone()
+    };
+    let set = stats::breakdown(s, &svc, &label, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(counts(&set.breakdowns[2]), vec![("dht", 1)]);
+    // A bad group: 400 invalid, through the API too.
+    let bad = BreakdownRequest {
+        file_group: Some("Bad!".into()),
+        ..base.clone()
+    };
+    assert!(matches!(
+        stats::breakdown(s, &svc, &bad, NOW).await,
+        Err(magnetar_core::Error::Invalid(_))
+    ));
+    let api = spawn_server(s).await;
+    let http = reqwest::Client::new();
+    let resp = http
+        .get(format!(
+            "{api}/api/v1/stats/breakdown?field=file_group,file_kind&file_group=Bad!"
+        ))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let resp: BreakdownSet = http
+        .post(format!("{api}/api/v1/stats/breakdown"))
+        .bearer_auth(TOKEN)
+        .json(
+            &serde_json::json!({"query": {"text": "fkstat", "min_trust": 0},
+            "fields": ["file_group", "file_kind"], "top": 50, "file_group": "video"}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp.breakdowns[1].counts.len(), 2);
+    assert_eq!(resp.breakdowns[1].missing, 3);
 }

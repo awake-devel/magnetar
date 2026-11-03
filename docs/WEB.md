@@ -1,4 +1,4 @@
-# The web client (D132–D135)
+# The web client (D132–D136, D137–D140)
 
 A browser frontend for the server, served by the server itself at its root
 (`https://<host>:8443/` through `tailscale serve`). It is the Android app's feature set
@@ -99,6 +99,8 @@ js/prefs.js store.js     localStorage conveniences; app state (signed in, trust,
 js/format.js numfmt.js labels.js search-model.js nip19.js settings-checks.js
                          ports of the app's pure Kotlin (Format, NumberFormat, Labels,
                          SearchModel, Nip19, SettingsChecks), unit-tested with the app's values
+js/file-kinds.js         the file-kind catalogue (cached per server version) and the File kind
+                         selection rules, the app's FileKinds.kt (D137, D140)
 js/probe-format.js probe-correction.js saved-model.js chart-colors.js charts.js stats-model.js
    sources-model.js probes-model.js crawlmap-model.js worldmap.js graph-layout.js
                          ports of ProbeFormat, ProbeCorrection, SavedScreen's summary,
@@ -108,7 +110,8 @@ js/graph-worker.js       the graph layout's module Worker
 js/types.js types-stats.js  JSDoc mirrors of the API JSON
 css/screens2.css         detail, saved, stats, graph and crawl-map styles
 assets/world_110m.bin    the crawl map's world outline (byte copy of the app's asset)
-js/ui/                   shell (rail / tabs, page header), dialog, snackbar, chips, banner, slider
+js/ui/                   shell (rail / tabs, page header), dialog, snackbar, chips, banner,
+                         slider, dropdown (the filter dropdowns, D140)
 js/views/                login, search (+ search-controller, filters, results, result-row,
                          save-dialog), title, settings, not-found; detail (+ media-card,
                          swarm-card, seeder-chart, dht-card, trust-card, probe-card,
@@ -146,7 +149,8 @@ opens a new tab as usual); Back and Forward re-mount the view and restore the sc
 The Search state lives in the query string (replaced, not pushed, so Back is not filled with
 keystrokes), with the API's own GET names: `q, cat, lang, sub, res, source, codec, hdr, audio,
 genre, kind, origin, probe_lang, probe_sub, probe_res, probe_codec, probe_hdr, probe_audio,
-probe_audio_kind, probe_sub_kind, probe_sub_format` (comma lists), `min_seeders, hide_dead=1,
+probe_audio_kind, probe_sub_kind, probe_sub_format, probe_file_kind` (comma lists; a file
+kind is a group id such as `video` or a label id such as `video.mkv`), `min_seeders, hide_dead=1,
 min_trust, min_rating, min_year, max_year, sort, desc=0`, plus the web-only `date=day|week|
 month|year` and `min_size_mb` / `max_size_mb` (MiB; the API's byte `min_size` / `max_size` are
 read too). Unknown parameters are ignored and malformed ones dropped, never an error. A reload
@@ -163,6 +167,56 @@ restores the search; the Search tab returns to the current search.
   counts, "Clear all"), results, the detail pane. A detail opened directly shows the last
   search of this browser beside it.
 - No horizontal page scroll from 320 px up: untrusted strings wrap anywhere.
+
+**Filters** (`views/filters.js`, `ui/dropdown.js`, D140). Every filter group is one dropdown, one
+per row, in this order: Category, Source, Audio language, Subtitles, Resolution, Release source,
+Video codec, HDR, Audio, Genre, Type, Published (single choice); then "From the files (probed
+torrents only)" (with the kind hint when a track-kind dropdown shows): File kind, Audio track,
+Audio track kind, Subtitle track, Subtitle kind, Subtitle format, Picture, Video track, HDR
+(probed), Audio format. Rating, years, size, seeders, "Hide dead torrents" and min trust stay as
+they were. Visibility, the disabled rule (count 0 and not selected, except the adult category),
+the order that stays put while the panel is open, `supportedBy` and the pair rules are unchanged.
+
+- The collapsed trigger (`button.dd-trigger[data-dd]`, `aria-expanded`, `aria-controls`) reads
+  "{Title}: Any", "{Title}: French" or "{Title}: French, +2" (the first selected value in option
+  order, then how many more); its accessible name is the same text. A `button.dd-clear` ("Clear
+  {Title}") clears that group only. Above the dropdowns, the active filters are removable chips
+  (`.filter-active [data-active="{field}:{value}"]`, "French ×"); "Clear all" stays in the sidebar
+  head and the sheet footer, "Show N" and the debounced live counts are unchanged. File kinds
+  (D140 C3, `fileKindChips`): more than 3 labels of one group are one chip
+  (`data-active="probe_file_kind:{label},{label},…"`, "Documents and e-books except PDF document"
+  when 1–2 labels are left out, else "{Group}: {n} kinds") whose × removes them all, and the File
+  kind trigger summarises the same chips; the Stats filter row does the same. Closing the phone
+  sheet after a change focuses the rebuilt Filters button.
+- The panel (`div.dd-panel[role=group]`) is in the page flow, never a floating popover, so the
+  scrolling sheet or sidebar cannot clip it; it scrolls inside itself (`max-height: min(60vh,
+  420px)`). Options are native checkboxes (radios for Published) inside their `<label>` with the
+  value's name and its count. A search box (`input.dd-search`) shows above 12 options, and always
+  for File kind: case- and diacritics-insensitive, on the name and the value (and for file kinds
+  on the label name, id, extensions and group name).
+- One dropdown is open at a time. A multi-select stays open while values are toggled; picking a
+  Published value closes it. Keyboard: Enter, Space or ArrowDown on the trigger opens it and
+  focuses the search box or the first option; ArrowUp / ArrowDown move between them (ArrowUp
+  from the first goes back to the trigger), Home / End go to the ends, Space toggles, ArrowRight
+  / ArrowLeft expand and collapse a file-kind group, Esc closes and returns the focus to the
+  trigger (inside the sheet it does not close the sheet). Tabbing out of the dropdown, or opening
+  another, closes it. A re-render (new counts) puts the focus, the caret of the search box and
+  the panel's scroll back where they were; counts updating are not announced.
+- At 600 px and less, rows and buttons are at least 44 px tall, the search box uses a 16 px font
+  (no zoom on focus), and opening scrolls the trigger into view (`block: "nearest"`).
+- **File kind** (`probe_file_kind`, D137): what the header probes detected by content in the
+  probed files of a torrent (up to 8 targets, verified or not; a kind outside them is not seen).
+  Group rows (a checkbox with `data-group`, mixed when some of its labels are picked, and an
+  expand button `.dd-expand`) are ordered by count, then catalogue order; a group's labels show
+  when they have a count or are selected, every catalogue label when there are no counts.
+  Picking a group selects all of its labels (the URL holds the group); unchecking one label of a
+  checked group leaves the others; checking every label of a group becomes the group
+  (`toggleFileKind`). Names come from `GET /api/v1/probe/file-kinds`, read once per server
+  `version` and kept in the page cache; if it fails, a group shows as its id with a capital, a
+  label as its id. The `/facets` body then carries `sizes: {"probe_file_kind": 400}` so every
+  group and label with a count comes back. Without `probe_file_kinds` the dropdown is hidden
+  unless a saved search or the URL holds a file kind; it then shows "Needs a newer server" so it
+  can be cleared, and nothing file-kind is sent.
 
 **Page cache** (`js/pagecache.js`, IndexedDB `magnetar-pages`): the app's PageCache. Key = SHA-256
 of the endpoint and the canonical request (sorted keys, the date preset instead of the clock, the
@@ -189,7 +243,9 @@ allows the `magnetar` Trusted Types policy (§2).
 
 `/health` features gate every control, as in the app (docs/APP.md §4): `filters` (release filters,
 rating sort), `origin` (Source chips, source badge), `facet_set` (counts; without it the chips are
-the built-in lists), `probe_filters` and `probe_kinds` (probe chips, kind chips), `media_releases`
+the built-in lists), `probe_filters` and `probe_kinds` (probe dropdowns, kind dropdowns),
+`probe_file_kinds` (the File kind dropdown, the catalogue call, the facet's `sizes` entry and the
+Stats File kinds card), `media_releases`
 (title pages and media-line links), `liveness_history`, `graphs`, `saved_search_poll`, `stats`,
 `crawl_sources`, `crawl_map`, `workers`, `probe_corrections`, `adult_filter` (without it the page
 drops `porn` hits itself while the switch is off), `dht`. `supportedBy` drops a filter the server
@@ -312,6 +368,17 @@ bucket, `stats/sources`, `stats/fleet`) and shown offline with its age.
   by source, top relays, machines, and the Crawl map button (`crawl_map`). Relay hosts and machine
   names that are IP literals are replaced by "(IP address)" before anything shows or caches them
   (`sources-model.redactIpHost`, as the app).
+- **File kinds** (`probe_file_kinds`, D139): a card of group bars in one hue
+  (`.card.breakdown[data-field="file_group"]`, bars `bar-file_group-{g}`), "From N probed
+  torrents. A torrent counts once under each kind it contains." (N = total − missing, the rest
+  is "Not probed"). Each group row has "Kinds ›" (`[data-drill="{g}"]`), which opens that group's
+  labels with their catalogue names (`[data-field="file_kind"]`, bars `bar-file_kind-{label}`); it
+  opens by itself when the cross-filter names exactly one group. The card's own request is
+  `POST /stats/breakdown {query, fields: ["file_group", "file_kind"], top: 50, file_group: <open
+  group>}` (`file_kind` and `file_group` left out while no group is open), sent with the main and
+  years requests, cached and aborted the same way. A click on a bar cross-filters with the File
+  kind rules (a group, or a label); the server counts the card without its own filter, the other
+  charts with it. Chips, "Search these" and "Search for X" work as for the other bars.
 - **Graphs** (`stats-graphs.js`): "Web of trust" and "Relays and publishers", and the note on title
   and swarm graphs. Without `graphs`: "This server is older than the app and has no graphs."
 - **Status** (`stats-status.js`, `probes-card.js`): Server (state, version, "Needs a newer server
@@ -374,6 +441,23 @@ domain)".
   with every outbound activity off: no Nostr crawl or NIP-66, DHT, DHT probe, DHT seed checks,
   downloads, IMDb or anime datasets, GeoIP database, TMDB, and
   `MAGNETAR_LIVENESS_FALLBACK_TRACKERS=false` (D136); the seeded trackers are
-  `127.0.0.1:9`, so "Check now" stays on loopback. Fixtures W1–W12 are described in
-  `crates/server/examples/webcheck_seed.rs` and their infohashes are in `fixtures.json`.
+  `127.0.0.1:9`, so "Check now" stays on loopback. Fixtures W1–W17 are described in
+  `crates/server/examples/webcheck_seed.rs` and their infohashes are in `fixtures.json`. For the
+  File kind dropdown and the Stats "File kinds" card (D137–D140) the seed also probes, labels
+  only, every third bulk movie (`video.mkv`, `subtitle.srt`, and on every sixth `text.nfo`) and
+  17 of the 18 other-category torrents (audio, disc, exe, archive, console game, documents,
+  image, font), so groups and labels have counts that differ; W13–W17 hold the mixed cases
+  (text beside a disc image, an unverified cover JPEG, three document labels, an installer
+  beside an archive, a lone .NET assembly).
+- File kinds and dropdowns (D140): `test/file-kinds.test.js` (the C1 selection vectors shared
+  with the app's FileKindsTest, the summary, search matching, the catalogue and its fallback
+  names, the per-version cache), `search-model.test.js` (URL round-trip of `probe_file_kind`,
+  `supportedBy` without the feature, the facet field and `sizes`), `stats-model.test.js` (the
+  file-kind request only with the feature, the drill-down group, cross-filter toggles). There is
+  no fake DOM with events, so Esc, focus return and the keyboard are browser-checked only. The
+  dropdown browser list (FK1–FK4, FK10, the keyboard, Published) was run in headless Chromium at
+  1280 px and 390 px against the webcheck server; the file-kind UI (FK5, FK7, FK9, FK12–FK15) was
+  run against that server with `/health`, `/facets`, the catalogue and the file-kind breakdowns
+  completed by request interception, before the server side existed. **UNVERIFIED** against the
+  real D137–D139 server: the results of FK6, FK8 and FK11 (which torrents match).
 - **UNVERIFIED**: Safari and iOS, the PWA install on Windows and macOS, real phones, 200 % zoom.

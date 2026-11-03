@@ -6,6 +6,7 @@ import app.magnetar.api.CrawlMap
 import app.magnetar.api.CrawlSources
 import app.magnetar.api.FleetStats
 import app.magnetar.api.FacetSet
+import app.magnetar.api.FileKindCatalogue
 import app.magnetar.api.Graph
 import app.magnetar.api.StatsHealth
 import app.magnetar.api.TimeseriesSet
@@ -106,6 +107,15 @@ open class FakeService : MagnetarService {
     override suspend fun facets(request: FacetsRequest): FacetSet {
         facetRequests += request
         return facetAnswer(request)
+    }
+
+    /** File-kind catalogue (D137): the answer and how often it was asked. */
+    var fileKindsAnswer: () -> FileKindCatalogue = { FileKindCatalogue() }
+    var fileKindsCalls = 0
+
+    override suspend fun fileKinds(): FileKindCatalogue {
+        fileKindsCalls++
+        return fileKindsAnswer()
     }
 
     /** Delay of each detail answer (a fetch in flight while a correction is saved). */

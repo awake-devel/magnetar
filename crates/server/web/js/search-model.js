@@ -2,6 +2,7 @@
 // (docs/WEB.md "Routing and URL parameters"). Pure: filters are frozen plain objects whose list
 // fields are sorted arrays, so equal filters serialise to the same JSON and the same URL.
 
+import { FILE_KIND_FACET_SIZE, FILE_KIND_FIELD } from "./file-kinds.js";
 import { facetLabel, FILTER_OPTIONS } from "./labels.js";
 
 /** @typedef {import("./types.js").FacetCounts} FacetCounts */
@@ -55,6 +56,7 @@ export const FACET_TITLES = Object.freeze({
   probe_audio_kind: "Audio track kind",
   probe_sub_kind: "Subtitle kind",
   probe_sub_format: "Subtitle format",
+  probe_file_kind: "File kind",
 });
 
 /** Header-probe facets (D122), in the sheet's order. */
@@ -62,6 +64,9 @@ export const PROBE_FACET_FIELDS = Object.freeze([
   "probe_language", "probe_audio_kind", "probe_subtitles", "probe_sub_kind", "probe_sub_format",
   "probe_resolution", "probe_codec", "probe_hdr", "probe_audio",
 ]);
+
+/** File kinds from the probed files (D137): only with `probe_file_kinds`; first of the probe group. */
+export { FILE_KIND_FIELD };
 
 /** Track-kind facets (D125): only with `probe_kinds`. */
 export const PROBE_KIND_FIELDS = Object.freeze(["probe_audio_kind", "probe_sub_kind", "probe_sub_format"]);
@@ -119,6 +124,7 @@ export const LIST_FIELDS = Object.freeze([
   ["probeAudioKinds", "probe_audio_kind", "probe_audio_kinds", "probe_audio_kind"],
   ["probeSubKinds", "probe_sub_kind", "probe_sub_kinds", "probe_sub_kind"],
   ["probeSubFormats", "probe_sub_format", "probe_sub_formats", "probe_sub_format"],
+  ["probeFileKinds", "probe_file_kind", "probe_file_kinds", "probe_file_kind"],
 ].map((r) => Object.freeze(/** @type {[string, string, string, string]} */ (r))));
 
 /**
@@ -153,6 +159,7 @@ export const LIST_FIELDS = Object.freeze([
  * @property {readonly string[]} probeAudioKinds
  * @property {readonly string[]} probeSubKinds
  * @property {readonly string[]} probeSubFormats
+ * @property {readonly string[]} probeFileKinds file kinds: group ids and label ids (D137)
  */
 
 /** @type {SearchFilters} */
@@ -186,6 +193,7 @@ const EMPTY = {
   probeAudioKinds: [],
   probeSubKinds: [],
   probeSubFormats: [],
+  probeFileKinds: [],
 };
 
 /**
@@ -259,6 +267,7 @@ export function activeCount(f) {
     f.probeLanguages.length > 0, f.probeSubtitles.length > 0, f.probeResolutions.length > 0,
     f.probeCodecs.length > 0, f.probeHdr.length > 0, f.probeAudio.length > 0,
     f.probeAudioKinds.length > 0, f.probeSubKinds.length > 0, f.probeSubFormats.length > 0,
+    f.probeFileKinds.length > 0,
   ].filter(Boolean).length;
 }
 
@@ -267,7 +276,7 @@ export function activeCount(f) {
  * @param {SearchFilters} f
  */
 export function hasProbeFilters(f) {
-  return PROBE_FACET_FIELDS.some((field) => selected(f, field).length > 0);
+  return f.probeFileKinds.length > 0 || PROBE_FACET_FIELDS.some((field) => selected(f, field).length > 0);
 }
 
 /**
@@ -295,6 +304,7 @@ export function supportedBy(f, features) {
   if (!has("probe_filters") || !has("probe_kinds")) {
     Object.assign(o, { probeAudioKinds: [], probeSubKinds: [], probeSubFormats: [] });
   }
+  if (!has("probe_file_kinds")) o.probeFileKinds = [];
   return makeFilters(o);
 }
 
@@ -456,9 +466,10 @@ export class ChipOrder {
   /**
    * @param {string} field
    * @param {FacetChip[]} chips
+   * @param {(value: string) => string} [labelOf] the label of a value that left the counts
    * @returns {FacetChip[]}
    */
-  arrange(field, chips) {
+  arrange(field, chips, labelOf = (v) => facetLabel(field, v)) {
     if (!chips.some((c) => c.count != null)) return chips;
     let known = this.#order.get(field);
     if (known == null) {
@@ -469,7 +480,7 @@ export class ChipOrder {
     const byValue = new Map(chips.map((c) => [c.value, c]));
     const fresh = chips.filter((c) => !k.includes(c.value));
     if (fresh.length > 0) this.#order.set(field, [...k, ...fresh.map((c) => c.value)]);
-    return [...k.map((v) => byValue.get(v) ?? { value: v, label: facetLabel(field, v), count: 0 }), ...fresh];
+    return [...k.map((v) => byValue.get(v) ?? { value: v, label: labelOf(v), count: 0 }), ...fresh];
   }
 }
 
@@ -489,7 +500,37 @@ export function facetFields(features) {
         : PROBE_FACET_FIELDS.filter((f) => !PROBE_KIND_FIELDS.includes(f))),
     );
   }
+  if (features.has("probe_file_kinds")) out.push(FILE_KIND_FIELD);
   return out;
+}
+
+/** Values asked per facet field. */
+export const FACET_SIZE = 40;
+
+/**
+ * The `/facets` body: every field the server has, FACET_SIZE values each, and every file kind
+ * with a count (`sizes`, D137 A4) when the server lists them.
+ * @param {Record<string, unknown>} query
+ * @param {ReadonlySet<string>} features
+ */
+export function facetBody(query, features) {
+  /** @type {{query: Record<string, unknown>, fields: string[], size: number, sizes?: Record<string, number>}} */
+  const body = { query, fields: facetFields(features), size: FACET_SIZE };
+  if (features.has("probe_file_kinds")) body.sizes = { [FILE_KIND_FIELD]: FILE_KIND_FACET_SIZE };
+  return body;
+}
+
+/**
+ * The collapsed text of a dropdown (D140): "Any", the one value's label, or "{first in option
+ * order}, +{n-1}".
+ * @param {readonly string[]} sel
+ * @param {readonly string[]} optionOrder the option values in their shown order
+ * @param {(value: string) => string} labelOf
+ */
+export function dropdownSummary(sel, optionOrder, labelOf) {
+  if (sel.length === 0) return "Any";
+  const first = optionOrder.find((v) => sel.includes(v)) ?? [...sel].sort()[0];
+  return sel.length === 1 ? labelOf(first) : `${labelOf(first)}, +${sel.length - 1}`;
 }
 
 // ---------------------------------------------------------------------------------------------

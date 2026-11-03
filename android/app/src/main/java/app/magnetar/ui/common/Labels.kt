@@ -230,6 +230,8 @@ fun facetLabel(field: String, value: String): String {
         "probe_language", "probe_subtitles" -> iso639bLabel(value)
         // A kind a newer server knows and this app does not: readable, not a code.
         "probe_audio_kind", "probe_sub_kind", "probe_sub_format" -> value.replace('_', ' ').replaceFirstChar { it.uppercaseChar() }
+        // File kinds without the catalogue (D137): a group with a capital, a label as its id.
+        "probe_file_kind" -> if ('.' in value) value else value.replaceFirstChar { it.uppercaseChar() }
         else -> value
     }
 }

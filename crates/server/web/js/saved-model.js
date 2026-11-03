@@ -57,6 +57,7 @@ export function describe(query) {
     ["probe_subtitles", "probe_subtitles"], ["probe_sub_kind", "probe_sub_kinds"],
     ["probe_sub_format", "probe_sub_formats"], ["probe_resolution", "probe_resolutions"],
     ["probe_codec", "probe_video_codecs"], ["probe_hdr", "probe_hdr"], ["probe_audio", "probe_audio"],
+    ["probe_file_kind", "probe_file_kinds"],
   ];
   const probeParts = probes.map(([field, key]) => list(q[key]).map((v) => facetLabel(field, v)).join("/"))
     .filter((s) => s !== "");

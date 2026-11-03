@@ -679,6 +679,7 @@ async fn api_forms() {
             },
             fields: vec!["resolution".into(), "language".into()],
             size: 5,
+            ..Default::default()
         })
         .send()
         .await

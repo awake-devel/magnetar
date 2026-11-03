@@ -1,6 +1,7 @@
 // Port of android/.../ui/stats/StatsModel.kt (D47, docs/STATS.md): the activity metrics, the
 // breakdown fields and their cross-filters, and the Status tab's label → value lines. Pure.
 
+import { catalogue, fileKindName, groupOf, isGroup, labelsOfFn, toggleFileKind } from "./file-kinds.js";
 import { formatAgo, formatBytes, nowSec } from "./format.js";
 import { facetLabel } from "./labels.js";
 import { backlogEta, defaultLocale, formatNumber, formatPercent, formatRate, formatUptime } from "./numfmt.js";
@@ -81,16 +82,20 @@ export const FIELD_TITLES = Object.freeze(/** @type {Record<string, string>} */ 
   language: "Audio languages", resolution: "Resolutions", category: "Categories",
   source: "Release sources", codec: "Video codecs", hdr: "HDR", audio: "Audio formats",
   genre: "Genres", media_kind: "Movies, series, anime", subcategory: "Publisher categories",
-  year: "Years", origin: "Found via (Nostr / DHT)",
+  year: "Years", origin: "Found via (Nostr / DHT)", file_group: "File kinds", file_kind: "Kinds",
 }));
 
 /** Fields whose values are search filters (cross-filter on click); the others open a text search. */
 export const FILTERABLE = Object.freeze(new Set([
   "language", "resolution", "category", "source", "codec", "hdr", "audio", "genre", "media_kind", "year", "origin",
+  "file_group", "file_kind",
 ]));
 
 /** A torrent can count under several values of these. */
-export const MULTI_VALUED = Object.freeze(new Set(["language", "hdr", "audio", "genre", "origin"]));
+export const MULTI_VALUED = Object.freeze(new Set(["language", "hdr", "audio", "genre", "origin", "file_group", "file_kind"]));
+
+/** The two file-kind breakdowns (D139): groups, and the labels of one group. */
+export const FILE_KIND_FIELDS = Object.freeze(["file_group", "file_kind"]);
 
 /** Fixed vocabularies drawn as donuts: a value keeps its colour slot whatever its rank. */
 export const DONUT_ORDER = Object.freeze(/** @type {Record<string, readonly string[]>} */ ({
@@ -108,6 +113,7 @@ export const DONUT_ORDER = Object.freeze(/** @type {Record<string, readonly stri
 export function valueLabel(field, value) {
   if (field === "origin") return value === "nostr" ? "Nostr" : value === "dht" ? "DHT" : value;
   if (field === "subcategory" || field === "year") return value;
+  if (field === "file_group" || field === "file_kind") return fileKindName(value);
   return facetLabel(field, value);
 }
 
@@ -116,15 +122,19 @@ export function valueLabel(field, value) {
  * @param {Readonly<SearchFilters>} f
  * @param {string} field
  * @param {string} value
+ * @param {(group: string) => readonly string[]} [labelsOf] a group's labels (the catalogue's)
  * @returns {Readonly<SearchFilters>}
  */
-export function toggleStat(f, field, value) {
+export function toggleStat(f, field, value, labelsOf = labelsOfFn(catalogue(), null)) {
   if (field === "year") {
     if (!/^-?\d{1,6}$/.test(value)) return f;
     const y = Number(value);
     return f.minYear === y && f.maxYear === y
       ? makeFilters({ ...f, minYear: null, maxYear: null })
       : makeFilters({ ...f, minYear: y, maxYear: y });
+  }
+  if (field === "file_group" || field === "file_kind") {
+    return makeFilters({ ...f, probeFileKinds: toggleFileKind(f.probeFileKinds, value, labelsOf) });
   }
   if (FILTERABLE.has(field)) return toggle(f, field, value);
   return f;
@@ -138,6 +148,8 @@ export function toggleStat(f, field, value) {
  */
 export function selectedStat(f, field) {
   if (field === "year") return f.minYear != null && f.minYear === f.maxYear ? [String(f.minYear)] : [];
+  if (field === "file_group") return f.probeFileKinds.filter(isGroup);
+  if (field === "file_kind") return f.probeFileKinds.filter((v) => !isGroup(v));
   return selected(f, field);
 }
 
@@ -149,11 +161,47 @@ export function selectedStat(f, field) {
 export function statChips(f) {
   /** @type {[string, string][]} */
   const out = [];
-  for (const field of [...BREAKDOWN_FIELDS, "origin", "year"]) {
+  for (const field of [...BREAKDOWN_FIELDS, "origin", ...FILE_KIND_FIELDS, "year"]) {
     if (!FILTERABLE.has(field)) continue;
     for (const v of [...selectedStat(f, field)].sort()) out.push([field, v]);
   }
   return out;
+}
+
+/**
+ * The group whose labels the File kinds card shows: the one the user opened ("" = closed by the
+ * user), or, when they did not pick, the only group the cross-filter names.
+ * @param {Readonly<SearchFilters>} f
+ * @param {string | null} picked
+ * @returns {string | null}
+ */
+export function openFileGroup(f, picked) {
+  if (picked != null) return picked === "" ? null : picked;
+  const groups = new Set(f.probeFileKinds.map(groupOf));
+  return groups.size === 1 ? [...groups][0] : null;
+}
+
+/**
+ * The extra breakdown request of the File kinds card (D139), or null when the server has no
+ * file kinds: groups, plus the labels of `group` when one is open.
+ * @param {Record<string, unknown>} query
+ * @param {ReadonlySet<string>} features
+ * @param {string | null} group
+ */
+export function fileKindRequest(query, features, group) {
+  if (!features.has("probe_file_kinds")) return null;
+  /** @type {{query: Record<string, unknown>, fields: string[], top: number, file_group?: string}} */
+  const body = { query, fields: group ? [...FILE_KIND_FIELDS] : ["file_group"], top: 50 };
+  if (group) body.file_group = group;
+  return body;
+}
+
+/**
+ * Probed torrents of a file-kind breakdown: those counted minus those without a probe.
+ * @param {{total?: number, missing?: number} | null | undefined} b the `file_group` breakdown
+ */
+export function probedTotal(b) {
+  return Math.max(0, (b?.total ?? 0) - (b?.missing ?? 0));
 }
 
 /**
@@ -209,6 +257,7 @@ const NAMED_FEATURES = Object.freeze([
   ["stats", "charts"], ["graphs", "graphs"], ["saved_search_poll", "saved-search alerts"],
   ["filters", "release filters"], ["origin", "Nostr / DHT source"], ["crawl_sources", "discovery sources"],
   ["crawl_map", "crawl map"], ["probe_filters", "probe filters"], ["probe_kinds", "track-kind filters"],
+  ["probe_file_kinds", "file-kind filters"],
 ]);
 
 /**

@@ -92,6 +92,16 @@ dub, …) from bytes a probe already fetches (docs/PROBES.md §11). Deferred, wi
   retry, so a failed send is reported, not queued.
 - Corrections in the result list's badges (only the detail's Detected card shows them).
 
+### File kinds: what D137–D140 left out
+
+- A "verified files only" toggle for the file-kind filter: today every probed file counts,
+  verified or not (about 45 % of sampled torrents get no verified result, **UNVERIFIED** on
+  real swarms); `probe_attrs.files_verified` and each file's `verified` are stored, so a
+  second tag family (`fkv:` / `fgv:`) or a facet of its own would do it.
+- A "main file only" toggle (the largest probed file's kind, today the `k:` tag no client
+  offers as a filter).
+- Kinds of files the probe did not target: the filter sees probed files only (up to 8 targets).
+
 ### DHT engine: collapse at extreme settings
 At 8 nodes, 10,000 q/s and 8,192 lookups, both the D106 engine and the code before it sometimes
 fall to about 20 % of their query cap, with the transaction map full (`busy`). Production runs far

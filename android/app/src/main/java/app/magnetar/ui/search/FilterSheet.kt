@@ -12,9 +12,12 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Icon
+import androidx.compose.material3.InputChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
@@ -38,18 +41,18 @@ import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.unit.dp
 import app.magnetar.api.FacetCounts
 import app.magnetar.api.FacetSet
+import app.magnetar.api.FileKindCatalogue
 import app.magnetar.ui.common.NumberField
 import app.magnetar.ui.common.categoryLabel
 import app.magnetar.ui.common.formatCount
 import java.util.Locale
 import kotlin.math.roundToInt
 
-private fun chipText(label: String, count: Long?) = label + (count?.let { " (${formatCount(it)})" } ?: "")
-
 /**
- * The filter sheet (docs/APP.md §1): live disjunctive counts from the server next to every chip,
- * chips that stay where they first appeared (a value that would give nothing stays in place,
- * disabled), and Back / swipe-down apply like the Show button.
+ * The filter sheet (docs/APP.md §12, D140): one dropdown per filter group, with live
+ * disjunctive counts from the server next to every value, values that stay where they first
+ * appeared (a value that would give nothing stays in place, disabled), the active filters as
+ * removable chips at the top, and Back / swipe-down apply like the Show button.
  */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class, androidx.compose.ui.ExperimentalComposeUiApi::class)
 @Composable
@@ -60,6 +63,7 @@ fun FilterSheet(
     facets: FacetSet?,
     onDraft: (SearchFilters) -> Unit,
     onApply: (SearchFilters) -> Unit,
+    fileKinds: FileKindCatalogue? = null,
 ) {
     var f by remember { mutableStateOf(initial) }
     var minSize by remember { mutableStateOf(initial.minSizeMb?.toString() ?: "") }
@@ -67,6 +71,9 @@ fun FilterSheet(
     var minSeeders by remember { mutableStateOf(initial.minSeeders?.toString() ?: "") }
     var minYear by remember { mutableStateOf(initial.minYear?.toString() ?: "") }
     var maxYear by remember { mutableStateOf(initial.maxYear?.toString() ?: "") }
+
+    /** The one open dropdown (its field), null = all closed. */
+    var open by remember { mutableStateOf<String?>(null) }
     fun current() = f.copy(
         minSizeMb = minSize.toLongOrNull(),
         maxSizeMb = maxSize.toLongOrNull(),
@@ -78,29 +85,27 @@ fun FilterSheet(
     LaunchedEffect(f, minSize, maxSize, minSeeders, minYear, maxYear) { onDraft(current()) }
     val order = remember { ChipOrder() }
 
-    @Composable
-    fun ChipRow(field: String, chips: List<FacetChip>) {
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            for (chip in order.arrange(field, chips)) {
-                val on = chip.value in f.selected(field)
-                FilterChip(
-                    selected = on,
-                    onClick = { f = f.toggle(field, chip.value) },
-                    label = { Text(chipText(chip.label, chip.count)) },
-                    // With counts, values nothing would match stay in place but disabled. The
-                    // adult category stays enabled: while the switch is off its count is 0, and
-                    // picking it is how the server shows adult torrents (D52, docs/APP.md §6).
-                    enabled = on || chip.count != 0L || (field == "category" && chip.value == "porn"),
-                    modifier = Modifier.testTag("chip_${field}_${chip.value}"),
-                )
-            }
-        }
+    fun expandedChange(field: String): (Boolean) -> Unit = { want ->
+        if (want) open = field else if (open == field) open = null
     }
 
     @Composable
-    fun Title(text: String) {
-        Spacer(Modifier.height(8.dp))
-        Text(text, style = MaterialTheme.typography.titleSmall, modifier = Modifier.semantics { heading() })
+    fun Dropdown(field: String, chips: List<FacetChip>, title: String = FACET_TITLES[field] ?: field) {
+        FilterDropdown(
+            field = field,
+            title = title,
+            options = order.arrange(field, chips),
+            selected = f.selected(field),
+            expanded = open == field,
+            onExpandedChange = expandedChange(field),
+            onToggle = { v -> f = f.toggle(field, v) },
+            onClear = { f = f.clear(field) },
+            // With counts, values nothing would match are disabled. The adult category stays
+            // enabled: while the switch is off its count is 0, and picking it is how the server
+            // shows adult torrents (D52, docs/APP.md §6).
+            enabled = { chip -> chip.count != 0L || (field == "category" && chip.value == "porn") },
+            modifier = Modifier.padding(top = 4.dp),
+        )
     }
 
     ModalBottomSheet(
@@ -110,24 +115,27 @@ fun FilterSheet(
         modifier = Modifier.testTag("filter_sheet"),
     ) {
         Column(Modifier.semantics { testTagsAsResourceId = true }.padding(horizontal = 16.dp).verticalScroll(rememberScrollState())) {
-            Title("Categories")
+            ActiveRow(f.activeFilters(fileKinds), onRemove = { f = f.without(it) }, onClearAll = {
+                f = SearchFilters(); minSize = ""; maxSize = ""; minSeeders = ""; minYear = ""; maxYear = ""
+            }, anyActive = current().activeCount > 0)
             val categoryCounts: FacetCounts? = facets?.field("category")
-            ChipRow(
+            Dropdown(
                 "category",
                 CATEGORIES.map { c ->
                     FacetChip(c, categoryLabel(c), categoryCounts?.let { counts -> counts.counts.firstOrNull { it.value == c }?.count ?: 0L })
                 },
+                title = "Category",
             )
             // Source (D51): Nostr publishers or the server's DHT crawler; a torrent known from
             // both counts under each. Offered when the server knows sources, kept while set.
             if (state.canFilterOrigin || f.origins.isNotEmpty()) {
-                Title("Source")
                 val originCounts = facets?.field("origin")
-                ChipRow(
+                Dropdown(
                     "origin",
                     ORIGIN_CHIPS.map { (v, label) ->
                         FacetChip(v, label, originCounts?.let { counts -> counts.counts.firstOrNull { it.value == v }?.count ?: 0L })
                     },
+                    title = "Source",
                 )
             }
             for (field in FACET_FIELDS) {
@@ -136,12 +144,25 @@ fun FilterSheet(
                 if (!state.canFilterReleases && selected.isEmpty()) continue
                 val chips = facetChips(field, selected, facets?.field(field))
                 if (chips.isEmpty()) continue
-                Title(FACET_TITLES[field] ?: field)
-                ChipRow(field, chips)
+                Dropdown(field, chips)
             }
+            FilterDropdown(
+                field = "date",
+                title = "Published",
+                options = DatePreset.entries.map { FacetChip(it.name.lowercase(), it.label, null) },
+                selected = if (f.date == DatePreset.ANY) emptySet() else setOf(f.date.name.lowercase()),
+                expanded = open == "date",
+                onExpandedChange = expandedChange("date"),
+                onToggle = { v -> f = f.copy(date = DatePreset.entries.first { it.name.lowercase() == v }) },
+                onClear = { f = f.copy(date = DatePreset.ANY) },
+                single = true,
+                anyValue = DatePreset.ANY.name.lowercase(),
+                modifier = Modifier.padding(top = 4.dp),
+            )
             // Header probes (D122): read from the files by a crawl worker, so only probed
-            // torrents match. Same chips and counts as above, under their own heading.
+            // torrents match. Same dropdowns and counts as above, under their own heading.
             if (state.canFilterProbes || f.hasProbeFilters) {
+                val showFileKinds = state.canFilterFileKinds || f.probeFileKinds.isNotEmpty()
                 val probeChips = PROBE_FACET_FIELDS.mapNotNull { field ->
                     val selected = f.selected(field)
                     if (!state.canFilterProbes && selected.isEmpty()) return@mapNotNull null
@@ -149,8 +170,8 @@ fun FilterSheet(
                     if (field in PROBE_KIND_FIELDS && !state.canFilterProbeKinds && selected.isEmpty()) return@mapNotNull null
                     facetChips(field, selected, facets?.field(field)).takeIf { it.isNotEmpty() }?.let { field to it }
                 }
-                if (probeChips.isNotEmpty()) {
-                    Spacer(Modifier.height(8.dp))
+                if (probeChips.isNotEmpty() || showFileKinds) {
+                    Spacer(Modifier.height(12.dp))
                     Text(
                         "From the files (probed torrents only)",
                         style = MaterialTheme.typography.titleMedium,
@@ -159,10 +180,24 @@ fun FilterSheet(
                     if (probeChips.any { (field, _) -> field == "probe_audio_kind" || field == "probe_sub_kind" }) {
                         Text(KIND_PAIR_HINT, style = MaterialTheme.typography.bodySmall)
                     }
-                    for ((field, chips) in probeChips) {
-                        Title(FACET_TITLES[field] ?: field)
-                        ChipRow(field, chips)
+                    // File kinds (D137): every group and label sniff knows, from every probed file.
+                    if (showFileKinds) {
+                        val counts = if (state.canFilterFileKinds) facets?.field(FILE_KIND_FIELD) else null
+                        val labelsOf = fileKindLabelsOf(fileKinds, counts)
+                        FileKindDropdown(
+                            selected = f.probeFileKinds,
+                            catalogue = if (state.canFilterFileKinds) fileKinds else null,
+                            counts = counts,
+                            order = order,
+                            expanded = open == FILE_KIND_FIELD,
+                            onExpandedChange = expandedChange(FILE_KIND_FIELD),
+                            onToggle = { v -> f = f.toggleFileKind(v, labelsOf) },
+                            onClear = { f = f.clear(FILE_KIND_FIELD) },
+                            note = if (state.canFilterFileKinds) null else "Needs a newer server",
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
                     }
+                    for ((field, chips) in probeChips) Dropdown(field, chips)
                 }
             }
             if (state.canFilterReleases || f.minRating != null) {
@@ -196,12 +231,6 @@ fun FilterSheet(
                 NumberField("Min (MiB)", minSize, { minSize = it }, Modifier.weight(1f))
                 NumberField("Max (MiB)", maxSize, { maxSize = it }, Modifier.weight(1f))
             }
-            Title("Published")
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                for (p in DatePreset.entries) {
-                    FilterChip(selected = f.date == p, onClick = { f = f.copy(date = p) }, label = { Text(p.label) })
-                }
-            }
             Spacer(Modifier.height(8.dp))
             NumberField("Min seeders", minSeeders, { minSeeders = it }, Modifier.fillMaxWidth())
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -224,14 +253,50 @@ fun FilterSheet(
                 modifier = Modifier.testTag("trust_slider"),
             )
             Row(Modifier.fillMaxWidth().padding(vertical = 16.dp), horizontalArrangement = Arrangement.End) {
-                OutlinedButton(onClick = {
-                    f = SearchFilters(); minSize = ""; maxSize = ""; minSeeders = ""; minYear = ""; maxYear = ""
-                }) { Text("Clear all") }
+                OutlinedButton(
+                    onClick = { f = SearchFilters(); minSize = ""; maxSize = ""; minSeeders = ""; minYear = ""; maxYear = "" },
+                    modifier = Modifier.testTag("filter_clear_all_footer"),
+                ) { Text("Clear all") }
                 Spacer(Modifier.width(8.dp))
                 Button(onClick = { onApply(current()) }, modifier = Modifier.testTag("filters_apply")) {
                     Text(facets?.let { "Show ${formatCount(it.total)}" } ?: "Apply")
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun Title(text: String) {
+    Spacer(Modifier.height(8.dp))
+    Text(text, style = MaterialTheme.typography.titleSmall, modifier = Modifier.semantics { heading() })
+}
+
+/**
+ * The active filters at the top of the sheet: one removable chip per selected value ("French ×")
+ * in one wrapped row, and "Clear all" (D140). Nothing active: a one-line hint.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun ActiveRow(active: List<ActiveFilter>, onRemove: (ActiveFilter) -> Unit, onClearAll: () -> Unit, anyActive: Boolean) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            if (anyActive) "Active filters" else "No filters",
+            Modifier.weight(1f).semantics { heading() },
+            style = MaterialTheme.typography.titleSmall,
+        )
+        TextButton(onClick = onClearAll, enabled = anyActive, modifier = Modifier.testTag("filter_clear_all")) { Text("Clear all") }
+    }
+    if (active.isEmpty()) return
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        for (a in active) {
+            InputChip(
+                selected = true,
+                onClick = { onRemove(a) },
+                label = { Text(a.label) },
+                trailingIcon = { Icon(Icons.Filled.Close, "Remove ${a.label}") },
+                modifier = Modifier.testTag("filter_active_${a.field}_${a.value}"),
+            )
         }
     }
 }

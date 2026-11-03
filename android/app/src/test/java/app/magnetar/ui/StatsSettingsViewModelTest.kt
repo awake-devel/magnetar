@@ -4,6 +4,9 @@ import app.magnetar.api.ApiException
 import app.magnetar.api.Breakdown
 import app.magnetar.api.BreakdownSet
 import app.magnetar.api.FacetCount
+import app.magnetar.api.FileKindCatalogue
+import app.magnetar.api.FileKindGroup
+import app.magnetar.api.FileKindLabel
 import app.magnetar.api.Graph
 import app.magnetar.api.GraphEdge
 import app.magnetar.api.GraphNode
@@ -19,6 +22,8 @@ import app.magnetar.ui.graph.GraphViewModel
 import app.magnetar.ui.settings.SettingsViewModel
 import app.magnetar.ui.stats.Activity
 import app.magnetar.ui.stats.StatsViewModel
+import app.magnetar.ui.stats.statChips
+import app.magnetar.ui.stats.valueLabel
 import java.io.IOException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -108,6 +113,63 @@ class StatsSettingsViewModelTest {
         vm.clearFilters()
         advanceUntilIdle()
         assertEquals(fake.breakdownRequests.last().query.languages, emptyList<String>())
+    }
+
+    @Test
+    fun `file kinds - asked only with the feature, cross-filter with group semantics, drill-down`() = runTest {
+        main()
+        // Without `probe_file_kinds`: no file-kind request, no card data.
+        val old = statsFake()
+        val vmOld = StatsViewModel(repo(old))
+        advanceUntilIdle()
+        assertTrue(old.breakdownRequests.none { r -> r.fields.any { it.startsWith("file_") } })
+        assertNull(vmOld.state.value.fileKindSet)
+        assertFalse(vmOld.state.value.hasFileKinds)
+
+        val fake = statsFake().apply {
+            features = features + "probe_filters" + "probe_file_kinds"
+            fileKindsAnswer = {
+                FileKindCatalogue(
+                    listOf(FileKindGroup("video", "Video", listOf(FileKindLabel("video.mkv", "Matroska video"), FileKindLabel("video.mp4", "MPEG-4 video")))),
+                )
+            }
+        }
+        val vm = StatsViewModel(repo(fake))
+        advanceUntilIdle()
+        val first = fake.breakdownRequests.single { "file_group" in it.fields }
+        assertEquals(first.fields, listOf("file_group"))
+        assertEquals(first.top, 50)
+        assertNull(first.fileGroup)
+        assertTrue(fake.breakdownRequests.none { "file_group" in it.fields && "language" in it.fields }, "a request of its own")
+        assertEquals(vm.state.value.fileKindSet?.field("file_group")?.counts?.first()?.value, "file_group-a")
+        assertEquals(vm.state.value.fileKinds?.groups?.single()?.name, "Video")
+
+        // A tap on the Video bar cross-filters every chart; one group filtered opens its kinds.
+        fake.breakdownRequests.clear()
+        vm.toggle("file_group", "video")
+        advanceUntilIdle()
+        assertEquals(vm.state.value.filters.probeFileKinds, setOf("video"))
+        assertEquals(vm.state.value.fileGroup, "video")
+        val main = fake.breakdownRequests.first { "language" in it.fields }
+        assertEquals(main.query.probeFileKinds, listOf("video"))
+        val drill = fake.breakdownRequests.last { "file_group" in it.fields }
+        assertEquals(drill.fields, listOf("file_group", "file_kind"))
+        assertEquals(drill.fileGroup, "video")
+        assertEquals(vm.state.value.filters.statChips(), listOf("file_kind" to "video"))
+        assertEquals(valueLabel("file_kind", "video.mkv", vm.state.value.fileKinds), "Matroska video")
+
+        // Unticking one label of the checked group leaves the others (catalogue labels).
+        vm.toggle("file_kind", "video.mkv")
+        advanceUntilIdle()
+        assertEquals(vm.state.value.filters.probeFileKinds, setOf("video.mp4"))
+        // Long press on a label searches with it; "Kinds ›" again closes the drill-down.
+        assertEquals(vm.searchFor("file_kind", "video.mkv").probeFileKinds, listOf("video"))
+        fake.breakdownRequests.clear()
+        vm.openFileGroup("video")
+        advanceUntilIdle()
+        assertNull(vm.state.value.fileGroup)
+        assertEquals(fake.breakdownRequests.single().fields, listOf("file_group"), "opening a group counts only the card")
+        assertEquals(fake.fileKindsCalls, 1)
     }
 
     @Test

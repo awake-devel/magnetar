@@ -95,11 +95,17 @@ pub struct SearchQuery {
     pub probe_audio_kinds: Vec<String>,
     /// Subtitle format classes (D125): `text`, `image`, `cc`.
     pub probe_sub_formats: Vec<String>,
+    /// File kinds (D137): sniff content labels of any probed file of the torrent (not only
+    /// the largest one). A group id (`video`, `exe`) matches any label of the group, a label
+    /// id (`video.mkv`, `exe.pe`) only that exact label (`exe.pe` does not match
+    /// `exe.pe.dotnet`). Older servers ignore it, so clients send it only when the server lists
+    /// `api::features::PROBE_FILE_KINDS`.
+    pub probe_file_kinds: Vec<String>,
 }
 
-/// Facet names of the header-probe filters (D122, the track kinds of D125 last), in
-/// `SearchQuery::probe_filters` order.
-pub const PROBE_FACETS: [&str; 9] = [
+/// Facet names of the header-probe filters (D122, the track kinds of D125, the file kinds of
+/// D137 last), in `SearchQuery::probe_filters` order.
+pub const PROBE_FACETS: [&str; 10] = [
     "probe_language",
     "probe_subtitles",
     "probe_resolution",
@@ -109,6 +115,7 @@ pub const PROBE_FACETS: [&str; 9] = [
     "probe_sub_kind",
     "probe_audio_kind",
     "probe_sub_format",
+    "probe_file_kind",
 ];
 
 impl SearchQuery {
@@ -137,6 +144,7 @@ impl SearchQuery {
                 &self.probe_sub_kinds,
                 &self.probe_audio_kinds,
                 &self.probe_sub_formats,
+                &self.probe_file_kinds,
             ])
             .map(|(name, v)| (*name, lower(v)))
             .collect();
@@ -160,6 +168,12 @@ impl SearchQuery {
         ]
         .iter()
         .any(|v| v.iter().any(|s| !s.trim().is_empty()))
+    }
+
+    /// Needs a server with `api::features::PROBE_FILE_KINDS` (D137): an older one would
+    /// ignore `probe_file_kinds` and answer unfiltered.
+    pub fn needs_probe_file_kind_feature(&self) -> bool {
+        self.probe_file_kinds.iter().any(|s| !s.trim().is_empty())
     }
 }
 
@@ -433,5 +447,37 @@ mod tests {
             !blank.needs_probe_kind_feature(),
             "blank values are no filter"
         );
+    }
+
+    #[test]
+    fn probe_file_kinds_default_and_feature() {
+        // Older apps and saved searches send no file kinds (D137).
+        let q: SearchQuery = serde_json::from_str(r#"{"probe_hdr":["any"]}"#).unwrap();
+        assert!(q.probe_file_kinds.is_empty());
+        assert!(!q.needs_probe_file_kind_feature());
+        assert!(SearchQuery::default().browse_hides_unchecked_dht());
+        let q: SearchQuery =
+            serde_json::from_str(r#"{"probe_file_kinds":[" VIDEO ","video","","exe.pe"]}"#)
+                .unwrap();
+        assert_eq!(
+            q.probe_filters(),
+            vec![(
+                "probe_file_kind",
+                vec!["video".to_string(), "exe.pe".to_string()]
+            )]
+        );
+        assert!(q.needs_probe_file_kind_feature());
+        assert!(q.needs_probe_filter_feature());
+        assert!(!q.needs_probe_kind_feature());
+        assert!(
+            !q.browse_hides_unchecked_dht(),
+            "a file-kind filter is a probe filter (D76)"
+        );
+        let blank = SearchQuery {
+            probe_file_kinds: vec![" ".into()],
+            ..Default::default()
+        };
+        assert!(!blank.needs_probe_file_kind_feature());
+        assert_eq!(PROBE_FACETS.last(), Some(&"probe_file_kind"));
     }
 }

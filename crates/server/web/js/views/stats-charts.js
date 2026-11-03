@@ -153,12 +153,13 @@ function searchFor(field, value, label, hd) {
 /**
  * "Other: 9,120 in 41 more values · Unknown: 310,200".
  * @param {Breakdown} b
+ * @param {string} [missingLabel]
  */
-function restLine(b) {
+function restLine(b, missingLabel = "Unknown") {
   /** @type {string[]} */
   const parts = [];
   if ((b.other ?? 0) > 0) parts.push(`Other: ${formatNumber(b.other ?? 0)} in ${formatNumber(b.other_values ?? 0)} more values`);
-  if ((b.missing ?? 0) > 0) parts.push(`Unknown: ${formatNumber(b.missing ?? 0)}`);
+  if ((b.missing ?? 0) > 0) parts.push(`${missingLabel}: ${formatNumber(b.missing ?? 0)}`);
   return parts.length > 0 ? h("p", { class: "muted small", text: parts.join(" · ") }) : null;
 }
 
@@ -167,11 +168,13 @@ function restLine(b) {
  * @param {readonly string[]} selected
  * @param {ChartColors} colors
  * @param {BreakdownHandlers} hd
+ * @param {{rowExtra?: (value: string, label: string) => Node | null, missingLabel?: string}} [o]
+ *   a button after a row's bar (the File kinds drill-down), the name of `missing`
  */
-export function breakdownBars(b, selected, colors, hd) {
+export function breakdownBars(b, selected, colors, hd, o = {}) {
   const counts = b.counts ?? [];
   const max = Math.max(1, ...counts.map((c) => c.count));
-  if (counts.length === 0) return h("div", null, h("p", { class: "muted", text: "No values" }), restLine(b));
+  if (counts.length === 0) return h("div", null, h("p", { class: "muted", text: "No values" }), restLine(b, o.missingLabel));
   return h(
     "div",
     null,
@@ -199,10 +202,10 @@ export function breakdownBars(b, selected, colors, hd) {
           h("span", { class: "bar-share muted", text: formatShare(c.count, b.total ?? 0) }),
         );
         pressable(btn, () => hd.onToggle(b.field, c.value), () => hd.onSearch(b.field, c.value));
-        return h("li", { class: "bar-row" }, btn, searchFor(b.field, c.value, label, hd));
+        return h("li", { class: "bar-row" }, btn, searchFor(b.field, c.value, label, hd), o.rowExtra?.(c.value, label) ?? null);
       }),
     ),
-    restLine(b),
+    restLine(b, o.missingLabel),
   );
 }
 

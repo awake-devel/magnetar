@@ -1362,7 +1362,7 @@ fn probe_filters_at_scale_in_memory() {
         let mut facet_times = Vec::new();
         for _ in 0..3 {
             let t = Instant::now();
-            idx.facet_set(&iq, &fields, 20).unwrap().unwrap();
+            idx.facet_set(&iq, &fields, &[20]).unwrap().unwrap();
             facet_times.push(t.elapsed());
         }
         facet_times.sort();
@@ -1485,4 +1485,667 @@ async fn probe_filters_fallback_explain_at_scale() {
             eprintln!("--- EXPLAIN ANALYZE {name}\n{}", plan.join("\n"));
         }
     }
+}
+
+// ---------------------------------------------------------------- file kinds (D137, D138)
+
+/// One probed file: label, size, verified, and the picture height of a video file.
+fn fk_file(i: u32, label: &str, size: u64, verified: bool, height: Option<u32>) -> ProbeFile {
+    ProbeFile {
+        i,
+        size,
+        label: label.into(),
+        confidence: 97,
+        verified,
+        video: height.map(|h| ProbeVideo {
+            container: "matroska".into(),
+            video: vec![ProbeVideoTrack {
+                codec: "hevc".into(),
+                height: Some(h),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// A probe stored as `probes::store` writes it: the tags of `summary_of(files)` and the files.
+async fn fk_probe(s: &PgStore, n: u64, files: Vec<ProbeFile>) {
+    let summary = magnetar_server::probes::summary_of(&files);
+    let tags: Vec<&str> = summary.tags.iter().map(String::as_str).collect();
+    probe(s, n, &tags).await;
+    sqlx::query("INSERT INTO probe_files (infohash, files) VALUES ($1, $2)")
+        .bind(ih(n))
+        .bind(serde_json::to_value(&files).unwrap())
+        .execute(s.pool())
+        .await
+        .unwrap();
+}
+
+/// The D137 corpus: 21 MKV 1080p + unverified SRT; 22 MP4 2160p; 23 ZIP + NSIS installer +
+/// plain PE; 24 a .NET assembly only; 25 EPUB + PDF; 26 a DHT row never probed. 31–34 hold
+/// 16 distinct labels each ("manykinds"), for the facet sizes.
+async fn fk_corpus(s: &PgStore) {
+    for (n, title) in [
+        (21, "filekind one"),
+        (22, "filekind two"),
+        (23, "filekind three"),
+        (24, "filekind four"),
+        (25, "filekind five"),
+        (26, "filekind six never probed"),
+    ] {
+        dht_row(s, n, title, "video").await;
+    }
+    fk_probe(
+        s,
+        21,
+        vec![
+            fk_file(0, "video.mkv", 9000, true, Some(1080)),
+            fk_file(1, "subtitle.srt", 10, false, None),
+        ],
+    )
+    .await;
+    fk_probe(s, 22, vec![fk_file(0, "video.mp4", 9000, true, Some(2160))]).await;
+    fk_probe(
+        s,
+        23,
+        vec![
+            fk_file(0, "archive.zip", 9000, true, None),
+            fk_file(1, "exe.pe.nsis", 500, true, None),
+            fk_file(2, "exe.pe", 400, false, None),
+        ],
+    )
+    .await;
+    fk_probe(s, 24, vec![fk_file(0, "exe.pe.dotnet", 700, true, None)]).await;
+    fk_probe(
+        s,
+        25,
+        vec![
+            fk_file(0, "doc.epub", 700, true, None),
+            fk_file(1, "doc.pdf", 600, true, None),
+        ],
+    )
+    .await;
+    let many: Vec<&str> = sniff::label::LABELS
+        .iter()
+        .step_by(5)
+        .take(64)
+        .map(|l| l.id)
+        .collect();
+    for (k, chunk) in many.chunks(16).enumerate() {
+        let n = 31 + k as u64;
+        dht_row(s, n, &format!("manykinds {n}"), "other").await;
+        let files = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, l)| fk_file(i as u32, l, 100 + i as u64, true, None))
+            .collect();
+        fk_probe(s, n, files).await;
+    }
+}
+
+/// D137: the file-kind filter selects the same torrents on the index and on the Postgres
+/// fallback: a group matches any of its labels, a label only itself (`exe.pe` is not
+/// `exe.pe.dotnet`), every probed file counts (verified or not, largest or not), AND with the
+/// other probe filters; facet counts of both levels leave out their own filter; `sizes` lifts
+/// the per-field cap.
+#[tokio::test]
+async fn file_kinds_filter_both_paths() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    fk_corpus(s).await;
+    let ix = index_for(s).await;
+    let pg = pg_only(s);
+    let fk = |v: &[&str]| SearchQuery {
+        probe_file_kinds: v.iter().map(|s| s.to_string()).collect(),
+        ..q("filekind")
+    };
+    let cases: Vec<(&str, SearchQuery, Vec<u64>)> = vec![
+        ("none", q("filekind"), vec![21, 22, 23, 24, 25, 26]),
+        ("group exe", fk(&["exe"]), vec![23, 24]),
+        ("label exe.pe, not exe.pe.dotnet", fk(&["exe.pe"]), vec![23]),
+        ("label exe.pe.dotnet", fk(&["exe.pe.dotnet"]), vec![24]),
+        ("unverified, not largest", fk(&["subtitle"]), vec![21]),
+        ("group video", fk(&["video"]), vec![21, 22]),
+        (
+            "group and label, any of",
+            fk(&["doc.epub", "archive"]),
+            vec![23, 25],
+        ),
+        ("case and spaces", fk(&[" VIDEO.MKV "]), vec![21]),
+        ("unknown value matches nothing", fk(&["nope"]), vec![]),
+        ("a label's prefix is no group", fk(&["video.mk"]), vec![]),
+        (
+            "AND with probe_res",
+            SearchQuery {
+                probe_resolutions: vec!["2160p".into()],
+                ..fk(&["video"])
+            },
+            vec![22],
+        ),
+        (
+            "browse: a file-kind filter turns the D76 rule off",
+            SearchQuery {
+                probe_file_kinds: vec!["exe".into()],
+                // The "manykinds" rows are `other`.
+                categories: vec![Category::Video],
+                ..q("")
+            },
+            vec![23, 24],
+        ),
+    ];
+    for (name, query, want) in cases {
+        let a = s.search(&query, NOW).await.unwrap();
+        let b = pg.search(&query, NOW).await.unwrap();
+        assert_eq!(hashes(&a), set(&want), "index, {name}");
+        assert_eq!(hashes(&b), set(&want), "postgres, {name}");
+        assert_eq!(a.total, want.len() as u64, "index total, {name}");
+    }
+    // The cap: 400 distinct values at most, on both engines.
+    let too_many = SearchQuery {
+        probe_file_kinds: (0..401).map(|i| format!("x.y{i}")).collect(),
+        ..q("filekind")
+    };
+    for st in [s, &pg] {
+        let e = st.search(&too_many, NOW).await.unwrap_err();
+        assert!(e.to_string().contains("at most 400"), "{e}");
+    }
+    // Facets: its own filter left out (both levels), the other facets filtered by it.
+    let fields: Vec<String> = vec!["probe_file_kind".into(), "probe_resolution".into()];
+    let set_of = |f: &magnetar_core::api::FacetsResponse| -> BTreeSet<(String, u64)> {
+        f.counts
+            .iter()
+            .map(|c| (c.value.clone(), c.count))
+            .collect()
+    };
+    let r = s
+        .facet_set(&fk(&["exe"]), &fields, 100, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(r.total, 2);
+    let want: BTreeSet<(String, u64)> = [
+        ("video", 2),
+        ("video.mkv", 1),
+        ("video.mp4", 1),
+        ("subtitle", 1),
+        ("subtitle.srt", 1),
+        ("archive", 1),
+        ("archive.zip", 1),
+        ("exe", 2),
+        ("exe.pe", 1),
+        ("exe.pe.nsis", 1),
+        ("exe.pe.dotnet", 1),
+        ("doc", 1),
+        ("doc.epub", 1),
+        ("doc.pdf", 1),
+    ]
+    .iter()
+    .map(|(v, n)| (v.to_string(), *n))
+    .collect();
+    assert_eq!(
+        set_of(&r.facets[0]),
+        want,
+        "file kinds: own filter left out"
+    );
+    assert!(
+        r.facets[1].counts.is_empty(),
+        "resolution filtered by the file kind (no video in 23, 24)"
+    );
+    // With a label selected, the counts of every group and label stay (disjunctive).
+    let r = s
+        .facet_set(&fk(&["exe.pe"]), &fields, 100, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(set_of(&r.facets[0]), want);
+    // Sizes: one field asks for more than the shared `size`.
+    let all = q("");
+    let all = SearchQuery {
+        text: String::new(),
+        origins: vec!["dht".into()],
+        ..all
+    };
+    let distinct: BTreeSet<String> = {
+        let mut v = BTreeSet::new();
+        for l in sniff::label::LABELS.iter().step_by(5).take(64) {
+            v.insert(l.id.to_string());
+            v.insert(sniff::label::group_of(l.id).to_string());
+        }
+        for x in [
+            "video",
+            "video.mkv",
+            "video.mp4",
+            "subtitle",
+            "subtitle.srt",
+            "archive",
+            "archive.zip",
+            "exe",
+            "exe.pe",
+            "exe.pe.nsis",
+            "exe.pe.dotnet",
+            "doc",
+            "doc.epub",
+            "doc.pdf",
+        ] {
+            v.insert(x.to_string());
+        }
+        v
+    };
+    assert!(distinct.len() > 40, "{}", distinct.len());
+    let small = s.facet_set(&all, &fields, 40, NOW).await.unwrap().unwrap();
+    assert_eq!(small.facets[0].counts.len(), 40);
+    let sizes = [("probe_file_kind".to_string(), 400u32)]
+        .into_iter()
+        .collect();
+    let big = s
+        .facet_set_sized(&all, &fields, 40, &sizes, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    let got: BTreeSet<String> = big.facets[0]
+        .counts
+        .iter()
+        .map(|c| c.value.clone())
+        .collect();
+    assert_eq!(got, distinct, "every value with a count");
+    assert!(big.facets[1].counts.len() <= 40);
+    // The cap stays 200 on another field whatever `sizes` says (nothing to see with this
+    // corpus but the call succeeds), 512 on the file kinds.
+    let sizes = [
+        ("probe_file_kind".to_string(), 100_000u32),
+        ("probe_resolution".to_string(), 100_000),
+    ]
+    .into_iter()
+    .collect();
+    assert!(
+        s.facet_set_sized(&all, &fields, 40, &sizes, NOW)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(search_index::max_facet_values("probe_file_kind"), 512);
+    assert_eq!(search_index::max_facet_values("probe_resolution"), 200);
+    // The query string of GET /api/v1/search.
+    let parsed = magnetar_server::api::parse_search_query(Some(
+        "probe_file_kind=Video,archive.zip&probe_file_kind=exe.pe",
+    ))
+    .unwrap();
+    assert_eq!(
+        parsed.probe_file_kinds,
+        vec!["video", "archive.zip", "exe.pe"]
+    );
+    drop(ix);
+}
+
+/// D138: the migration gives stored rows the `fk:`/`fg:` tags `summary_of` gives new ones,
+/// replaces stale ones, leaves the other tags and rows without files alone, and a second run
+/// updates nothing.
+#[tokio::test]
+async fn file_kind_migration_matches_summary_of() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    fk_corpus(s).await;
+    // A probe row without files (never happens in production; must stay as it is).
+    dht_row(s, 40, "no files", "video").await;
+    probe(s, 40, &["k:video", "fk:keep.me"]).await;
+    let sql = include_str!("../../migrations/20261111000000_probe_file_kinds.sql");
+    // Strip the file-kind tags (rows as stored before D137); 23 gets a stale one.
+    sqlx::query(
+        "UPDATE probe_attrs SET tags = array(SELECT t FROM unnest(tags) t
+             WHERE t NOT LIKE 'fg:%' AND t NOT LIKE 'fk:%') WHERE infohash <> $1",
+    )
+    .bind(ih(40))
+    .execute(s.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE probe_attrs SET tags = tags || '{fk:old.label,fg:old}' WHERE infohash = $1",
+    )
+    .bind(ih(23))
+    .execute(s.pool())
+    .await
+    .unwrap();
+    let rows = async || -> Vec<(String, Vec<String>, String)> {
+        sqlx::query_as("SELECT infohash, tags, xmin::text FROM probe_attrs ORDER BY infohash")
+            .fetch_all(s.pool())
+            .await
+            .unwrap()
+    };
+    let before = rows().await;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql.to_string()))
+        .execute(s.pool())
+        .await
+        .unwrap();
+    let after = rows().await;
+    let files: Vec<(String, serde_json::Value)> =
+        sqlx::query_as("SELECT infohash, files FROM probe_files")
+            .fetch_all(s.pool())
+            .await
+            .unwrap();
+    let fset = |tags: &[String]| -> BTreeSet<String> {
+        tags.iter()
+            .filter(|t| t.starts_with("fk:") || t.starts_with("fg:"))
+            .cloned()
+            .collect()
+    };
+    let other = |tags: &[String]| -> BTreeSet<String> {
+        tags.iter()
+            .filter(|t| !t.starts_with("fk:") && !t.starts_with("fg:"))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(files.len(), 9);
+    for (h, f) in &files {
+        let pf: Vec<ProbeFile> = serde_json::from_value(f.clone()).unwrap();
+        let want = magnetar_server::probes::summary_of(&pf);
+        let (_, tags, _) = after.iter().find(|(x, _, _)| x == h).unwrap();
+        let (_, old, _) = before.iter().find(|(x, _, _)| x == h).unwrap();
+        assert_eq!(fset(tags), fset(&want.tags), "{h}");
+        assert!(!fset(tags).is_empty(), "{h}");
+        assert_eq!(other(tags), other(old), "other tags kept, {h}");
+        assert_eq!(other(tags), other(&want.tags), "{h}");
+    }
+    let untouched = |n: u64| {
+        let b = before.iter().find(|(x, _, _)| *x == ih(n)).unwrap();
+        let a = after.iter().find(|(x, _, _)| *x == ih(n)).unwrap();
+        a == b
+    };
+    assert!(untouched(40), "a row without files stays");
+    // Run again: nothing updated (same xmin everywhere).
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql.to_string()))
+        .execute(s.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows().await, after, "a second run updates no row");
+}
+
+/// D137: `/health` lists `probe_file_kinds`.
+#[tokio::test]
+async fn health_lists_probe_file_kinds() {
+    use magnetar_core::api::{Health, features};
+    assert!(features::ALL.contains(&features::PROBE_FILE_KINDS));
+    let Some(db) = test_db().await else { return };
+    let base = spawn_server(&db.store).await;
+    let h: Health = magnetar_core::http::client(Duration::from_secs(20))
+        .unwrap()
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(h.features.iter().any(|f| f == features::PROBE_FILE_KINDS));
+}
+
+/// D137: the catalogue needs the token, lists the 15 groups in order with every label of the
+/// registry; `GET /api/v1/facets?field=probe_file_kind&size=400` is capped per field.
+#[tokio::test]
+async fn file_kind_catalogue_shape_and_auth() {
+    use magnetar_core::api::FileKindCatalogue;
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    fk_corpus(s).await;
+    let ix = index_for(s).await;
+    let base = spawn_server(s).await;
+    let http = magnetar_core::http::client(Duration::from_secs(20)).unwrap();
+    let url = format!("{base}/api/v1/probe/file-kinds");
+    assert_eq!(http.get(&url).send().await.unwrap().status(), 401);
+    let resp = http.get(&url).bearer_auth(TOKEN).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let raw: serde_json::Value = resp.json().await.unwrap();
+    let c: FileKindCatalogue = serde_json::from_value(raw.clone()).unwrap();
+    let ids: Vec<&str> = c.groups.iter().map(|g| g.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "video", "audio", "subtitle", "image", "doc", "text", "archive", "disc", "exe",
+            "package", "game", "gamedata", "model", "font", "misc"
+        ]
+    );
+    assert_eq!(c.groups[4].name, "Documents and e-books");
+    let labels: usize = c.groups.iter().map(|g| g.labels.len()).sum();
+    assert_eq!(
+        labels,
+        sniff::label::LABELS.len(),
+        "every label, misc included"
+    );
+    let mkv = &c.groups[0].labels[0];
+    assert_eq!(
+        (mkv.id.as_str(), mkv.name.as_str()),
+        ("video.mkv", "Matroska video")
+    );
+    assert_eq!(mkv.extensions, ["mkv", "mk3d"]);
+    assert!(c.groups.iter().all(|g| {
+        g.labels
+            .iter()
+            .all(|l| l.id.starts_with(&format!("{}.", g.id)))
+    }));
+    // The exact JSON keys of the contract.
+    let g0 = &raw["groups"][0];
+    assert!(g0["id"].is_string() && g0["name"].is_string() && g0["labels"].is_array());
+    let l0 = &g0["labels"][0];
+    assert!(l0["id"].is_string() && l0["name"].is_string() && l0["extensions"].is_array());
+    // GET facets with a size above 200: the file-kind cap is 512.
+    let f: magnetar_core::api::FacetsResponse = http
+        .get(format!(
+            "{base}/api/v1/facets?field=probe_file_kind&size=400&origin=dht"
+        ))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(f.counts.len() > 40, "{}", f.counts.len());
+    // POST facets with `sizes`.
+    let body = serde_json::json!({"query": {"origins": ["dht"], "min_trust": 0},
+        "fields": ["probe_file_kind", "probe_resolution"], "size": 5,
+        "sizes": {"probe_file_kind": 400}});
+    let set: FacetSet = http
+        .post(format!("{base}/api/v1/facets"))
+        .bearer_auth(TOKEN)
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(set.facets[0].counts.len(), f.counts.len());
+    // 401 values: 400 invalid.
+    let many: Vec<String> = (0..401).map(|i| format!("x.y{i}")).collect();
+    let resp = http
+        .get(format!(
+            "{base}/api/v1/search?probe_file_kind={}",
+            many.join(",")
+        ))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let e: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(e["error"], "invalid");
+    assert!(
+        e["message"]
+            .as_str()
+            .unwrap()
+            .contains("probe_file_kind: at most 400 values")
+    );
+    drop(ix);
+}
+
+/// D138 measurement: the file-kind migration on `MAGNETAR_BENCH_ROWS` (default 150 000)
+/// probed rows of 1 to 16 files each (the 15 groups mixed), as stored before D137: time, WAL
+/// written, change-log rows; then a v7 build and the queued changes applied after it (the
+/// "re-index twice" cost), and a second run that updates nothing. Ignored; uses a throwaway
+/// schema of MAGNETAR_TEST_DATABASE_URL:
+///
+///   cargo test --release -p magnetar-server --test it file_kind_migration_at_scale -- --ignored --nocapture
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn file_kind_migration_at_scale() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    let pool = s.pool();
+    let n: i64 = std::env::var("MAGNETAR_BENCH_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(150_000);
+    let labels: Vec<&str> = sniff::label::LABELS.iter().map(|l| l.id).collect();
+    let t = Instant::now();
+    // DHT rows, probe rows without file-kind tags, and their files, in SQL.
+    sqlx::query(
+        "INSERT INTO dht_torrents (infohash, title, file_count, total_size, category,
+             metadata_size, first_seen, fetched_at, discovered_via, classifier_version)
+         SELECT lpad(to_hex(i), 40, '0'), 'bench ' || i, 1, 1000, 'video', 100, $2, $2,
+                'sample', 1
+         FROM generate_series(1, $1) i",
+    )
+    .bind(n)
+    .bind(NOW)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO probe_attrs (infohash, probe_version, probed_at, status, files_probed,
+             files_verified, bytes_in, kind, tags)
+         SELECT lpad(to_hex(i), 40, '0'), 2, $2, 'ok', 1, 1, 262144, 'video',
+                ARRAY['k:video', 'v:hevc', 'r:1080p', 'a:eng', 's:eng', 'ac:eac3']
+         FROM generate_series(1, $1) i",
+    )
+    .bind(n)
+    .bind(NOW)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO probe_files (infohash, files)
+         SELECT lpad(to_hex(i), 40, '0'),
+                (SELECT jsonb_agg(jsonb_build_object('i', j, 'size', 1000000 - j,
+                     'label', ($3::text[])[1 + ((i * 7 + j * 13) % cardinality($3::text[]))],
+                     'confidence', 97, 'verified', j % 2 = 0))
+                 FROM generate_series(0, (i % 16)::int) j)
+         FROM generate_series(1, $1) i",
+    )
+    .bind(n)
+    .bind(NOW)
+    .bind(&labels)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM search_changes")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("VACUUM ANALYZE probe_attrs")
+        .execute(pool)
+        .await
+        .ok();
+    println!("seeded {n} rows in {:.1} s", t.elapsed().as_secs_f64());
+    let files: i64 =
+        sqlx::query_scalar("SELECT sum(jsonb_array_length(files))::bigint FROM probe_files")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let sql = include_str!("../../migrations/20261111000000_probe_file_kinds.sql");
+    let lsn = async || -> String {
+        sqlx::query_scalar("SELECT pg_current_wal_lsn()::text")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    };
+    let size: i64 = sqlx::query_scalar("SELECT pg_total_relation_size('probe_attrs')")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let l0 = lsn().await;
+    let t = Instant::now();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql.to_string()))
+        .execute(pool)
+        .await
+        .unwrap();
+    let took = t.elapsed();
+    let l1 = lsn().await;
+    let wal: i64 = sqlx::query_scalar("SELECT pg_wal_lsn_diff($1::pg_lsn, $2::pg_lsn)::bigint")
+        .bind(&l1)
+        .bind(&l0)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let changes: i64 = sqlx::query_scalar("SELECT count(*) FROM search_changes")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let size2: i64 = sqlx::query_scalar("SELECT pg_total_relation_size('probe_attrs')")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let tagged: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM probe_attrs WHERE EXISTS
+             (SELECT 1 FROM unnest(tags) t WHERE t LIKE 'fk:%')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    println!(
+        "migration: {n} rows, {files} files: {:.2} s, WAL {:.1} MiB (cluster-wide, shared \
+         server), {changes} change-log rows, {tagged} rows tagged, probe_attrs {:.1} → {:.1} MiB",
+        took.as_secs_f64(),
+        wal as f64 / 1048576.0,
+        size as f64 / 1048576.0,
+        size2 as f64 / 1048576.0
+    );
+    assert_eq!(tagged, n);
+    // A second run: nothing to do.
+    let t = Instant::now();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql.to_string()))
+        .execute(pool)
+        .await
+        .unwrap();
+    let again: i64 = sqlx::query_scalar("SELECT count(*) FROM search_changes")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    println!(
+        "second run: {:.2} s, change-log rows {again} (unchanged)",
+        t.elapsed().as_secs_f64()
+    );
+    assert_eq!(again, changes);
+    // The v7 build, then the queued changes applied once more on top of it.
+    let t = Instant::now();
+    let ix = index_for(s).await;
+    let built = t.elapsed();
+    let t = Instant::now();
+    let mut applied = 0usize;
+    loop {
+        let k = search_index::apply_changes(pool, &ix.idx).await.unwrap();
+        if k == 0 {
+            break;
+        }
+        applied += k;
+    }
+    println!(
+        "index build: {:.1} s; the queued changes after it: {applied} in {:.1} s",
+        built.as_secs_f64(),
+        t.elapsed().as_secs_f64()
+    );
+    let video = SearchQuery {
+        probe_file_kinds: vec!["video".into()],
+        ..q("bench")
+    };
+    let page = s.search(&video, NOW).await.unwrap();
+    let pg = pg_only(s).search(&video, NOW).await.unwrap();
+    println!(
+        "group video: index {} hits (total {}), postgres total {}{}",
+        page.hits.len(),
+        page.total,
+        pg.total,
+        if pg.total_is_lower_bound { "+" } else { "" }
+    );
+    assert!(page.total > 0);
 }

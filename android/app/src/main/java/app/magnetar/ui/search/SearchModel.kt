@@ -2,9 +2,11 @@ package app.magnetar.ui.search
 
 import app.magnetar.api.FacetCounts
 import app.magnetar.api.Features
+import app.magnetar.api.FileKindCatalogue
 import app.magnetar.api.SearchQuery
 import app.magnetar.api.Sort
 import app.magnetar.ui.common.FILTER_OPTIONS
+import app.magnetar.ui.common.categoryLabel
 import app.magnetar.ui.common.facetLabel
 import kotlin.math.abs
 
@@ -39,6 +41,7 @@ val FACET_TITLES = mapOf(
     "probe_audio_kind" to "Audio track kind",
     "probe_sub_kind" to "Subtitle kind",
     "probe_sub_format" to "Subtitle format",
+    FILE_KIND_FIELD to FILE_KIND_TITLE,
 )
 
 /**
@@ -101,6 +104,8 @@ data class SearchFilters(
     val probeAudioKinds: Set<String> = emptySet(),
     val probeSubKinds: Set<String> = emptySet(),
     val probeSubFormats: Set<String> = emptySet(),
+    /** File kinds (D137): sniff groups or labels of any probed file, kept normalised ([normalizeFileKinds]). */
+    val probeFileKinds: Set<String> = emptySet(),
 ) {
     val activeCount: Int
         get() = listOf(
@@ -112,11 +117,12 @@ data class SearchFilters(
             probeLanguages.isNotEmpty(), probeSubtitles.isNotEmpty(), probeResolutions.isNotEmpty(),
             probeCodecs.isNotEmpty(), probeHdr.isNotEmpty(), probeAudio.isNotEmpty(),
             probeAudioKinds.isNotEmpty(), probeSubKinds.isNotEmpty(), probeSubFormats.isNotEmpty(),
+            probeFileKinds.isNotEmpty(),
         ).count { it }
 
-    /** Any header-probe filter set (D122). */
+    /** Any header-probe filter set (D122), file kinds (D137) included. */
     val hasProbeFilters: Boolean
-        get() = PROBE_FACET_FIELDS.any { selected(it).isNotEmpty() }
+        get() = PROBE_FACET_FIELDS.any { selected(it).isNotEmpty() } || probeFileKinds.isNotEmpty()
 
     /** Selected values of facet [field] (also `category` and `origin`). */
     fun selected(field: String): Set<String> = when (field) {
@@ -140,6 +146,7 @@ data class SearchFilters(
         "probe_audio_kind" -> probeAudioKinds
         "probe_sub_kind" -> probeSubKinds
         "probe_sub_format" -> probeSubFormats
+        FILE_KIND_FIELD -> probeFileKinds
         else -> emptySet()
     }
 
@@ -167,8 +174,20 @@ data class SearchFilters(
             "probe_audio_kind" -> copy(probeAudioKinds = probeAudioKinds.flip())
             "probe_sub_kind" -> copy(probeSubKinds = probeSubKinds.flip())
             "probe_sub_format" -> copy(probeSubFormats = probeSubFormats.flip())
+            // A plain flip (an active chip's ×); the dropdown uses [toggleFileKind] below.
+            FILE_KIND_FIELD -> copy(probeFileKinds = probeFileKinds.flip())
             else -> this
         }
+    }
+
+    /** File kind [value] switched with group / label checkbox semantics ([app.magnetar.ui.search.toggleFileKind]). */
+    fun toggleFileKind(value: String, labelsOf: (String) -> List<String>): SearchFilters =
+        copy(probeFileKinds = app.magnetar.ui.search.toggleFileKind(probeFileKinds, value, labelsOf).toSet())
+
+    /** [field]'s selection cleared (a dropdown's ×); `date` resets Published. */
+    fun clear(field: String): SearchFilters = when (field) {
+        "date" -> copy(date = DatePreset.ANY)
+        else -> selected(field).fold(this) { f, v -> f.toggle(field, v) }
     }
 
     /**
@@ -196,6 +215,8 @@ data class SearchFilters(
         if (Features.PROBE_FILTERS !in features || Features.PROBE_KINDS !in features) {
             f = f.copy(probeAudioKinds = emptySet(), probeSubKinds = emptySet(), probeSubFormats = emptySet())
         }
+        // D137: an older server would ignore `probe_file_kinds` and answer unfiltered.
+        if (Features.PROBE_FILE_KINDS !in features) f = f.copy(probeFileKinds = emptySet())
         return f
     }
 }
@@ -251,6 +272,7 @@ fun buildQuery(
     probeSubKinds = filters.probeSubKinds.sorted(),
     probeAudioKinds = filters.probeAudioKinds.sorted(),
     probeSubFormats = filters.probeSubFormats.sorted(),
+    probeFileKinds = filters.probeFileKinds.sorted(),
 )
 
 /** Inverse of [buildQuery], for running a saved search; `since` snaps to the nearest preset. */
@@ -287,6 +309,7 @@ fun filtersOf(q: SearchQuery, nowSec: Long = System.currentTimeMillis() / 1000) 
     probeAudioKinds = q.probeAudioKinds.toSet(),
     probeSubKinds = q.probeSubKinds.toSet(),
     probeSubFormats = q.probeSubFormats.toSet(),
+    probeFileKinds = q.probeFileKinds.toSet(),
 )
 
 /** One chip of the filter sheet: value, label, count (null = no counts). */
@@ -319,5 +342,60 @@ class ChipOrder {
         val fresh = chips.filter { it.value !in known }
         if (fresh.isNotEmpty()) order[field] = known + fresh.map { it.value }
         return known.map { v -> byValue[v] ?: FacetChip(v, facetLabel(field, v), 0L) } + fresh
+    }
+
+    /** [values] in the order they first appeared under [key], those gone included, new ones last. */
+    fun arrangeValues(key: String, values: List<String>): List<String> {
+        val known = order[key] ?: values.also { order[key] = it }
+        val fresh = values.filter { it !in known }
+        if (fresh.isNotEmpty()) order[key] = known + fresh
+        return known + fresh
+    }
+}
+
+/**
+ * One removable chip of the sheet's active-filter row: field, value, label, and the [values]
+ * it removes (several for one chip of many file kinds, D140 C3).
+ */
+data class ActiveFilter(val field: String, val value: String, val label: String, val values: List<String> = listOf(value))
+
+/**
+ * The active list filters as chips, in the sheet's order (D140): categories, sources, the
+ * release filters, Published, then the probe filters with File kind first. `date` is Published.
+ */
+fun SearchFilters.activeFilters(catalogue: FileKindCatalogue? = null): List<ActiveFilter> = buildList {
+    for (c in CATEGORIES.filter { it in categories } + categories.filter { it !in CATEGORIES }.sorted()) {
+        add(ActiveFilter("category", c, categoryLabel(c)))
+    }
+    for (o in origins.sorted()) add(ActiveFilter("origin", o, ORIGIN_CHIPS.firstOrNull { it.first == o }?.second ?: o))
+    for (field in FACET_FIELDS) for (v in selected(field).sorted()) add(ActiveFilter(field, v, facetLabel(field, v)))
+    if (date != DatePreset.ANY) add(ActiveFilter("date", date.name.lowercase(), date.label))
+    for (c in fileKindChips(probeFileKinds, fileKindLabelsOf(catalogue)) { fileKindName(catalogue, it) }) {
+        add(ActiveFilter(FILE_KIND_FIELD, c.values.joinToString(","), c.label, c.values))
+    }
+    for (field in PROBE_FACET_FIELDS) for (v in selected(field).sorted()) add(ActiveFilter(field, v, facetLabel(field, v)))
+}
+
+/** [a] removed: its value switched off, or Published back to any time. */
+fun SearchFilters.without(a: ActiveFilter): SearchFilters = when {
+    a.field == "date" -> copy(date = DatePreset.ANY)
+    a.field == FILE_KIND_FIELD -> copy(probeFileKinds = probeFileKinds - a.values.toSet())
+    a.value in selected(a.field) -> toggle(a.field, a.value)
+    else -> this
+}
+
+/**
+ * The file-kind rows kept where they first appeared while the sheet is open (as [ChipOrder]
+ * does for chips): a group or label that drops to 0 stays in place with count 0. Without counts
+ * the catalogue order is already stable.
+ */
+fun ChipOrder.arrangeFileKinds(groups: List<FileKindGroupOption>, catalogue: FileKindCatalogue?): List<FileKindGroupOption> {
+    if (groups.all { it.group.count == null }) return groups
+    val byGroup = groups.associateBy { it.group.value }
+    return arrangeValues(FILE_KIND_FIELD, groups.map { it.group.value }).map { g ->
+        val cur = byGroup[g] ?: FileKindGroupOption(FileKindOption(g, fileKindName(catalogue, g), 0L), emptyList())
+        val byLabel = cur.labels.associateBy { it.value }
+        val labels = arrangeValues("$FILE_KIND_FIELD/$g", cur.labels.map { it.value })
+        cur.copy(labels = labels.map { byLabel[it] ?: FileKindOption(it, fileKindName(catalogue, it), 0L) })
     }
 }

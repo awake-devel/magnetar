@@ -110,7 +110,8 @@ Routes: `search`, `saved`, `stats`, `settings` (tabs); `torrent/{infohash}`, `ti
 |---|---|---|
 | App start, Settings *Test connection* | `GET /health` (no auth) then `GET /api/v1/settings/trust` (checks the token) | — |
 | Search list, browse (empty box) | `POST /api/v1/search` (`SearchQuery`, `limit` 50, `offset` paging) | `filters` for the release filters; `origin` for the source chip and badge |
-| Filter sheet counts | `POST /api/v1/facets` `{query, fields, size}` (disjunctive) | `facet_set` |
+| Filter sheet counts | `POST /api/v1/facets` `{query, fields, size, sizes?}` (disjunctive; `sizes: {"probe_file_kind": 400}` only with `probe_file_kinds`) | `facet_set` |
+| File kind names (D137) | `GET /api/v1/probe/file-kinds` (groups and labels, cached per `/health` `version`) | `probe_file_kinds` |
 | Sort | `SearchQuery.sort` + `descending` (`rating` needs `filters`) | — |
 | Torrent detail | `GET /api/v1/torrents/{infohash}` (`TorrentDetail`: magnet, files, media + poster path, trust factors, DHT info, header probe (D121)) | — |
 | Track corrections (D131) | `POST /api/v1/torrents/{infohash}/probe/corrections` `{device: "android", items}`, `DELETE /api/v1/torrents/{infohash}/probe/corrections/{id}`; both answer the effective `ProbeInfo` | `probe_corrections` |
@@ -123,6 +124,7 @@ Routes: `search`, `saved`, `stats`, `settings` (tabs); `torrent/{infohash}`, `ti
 | Notifications (worker) | `GET /api/v1/saved-searches/poll?since=…[&adult=1]` | `saved_search_poll` |
 | Stats health | `GET /api/v1/stats/health` | `stats` |
 | Stats breakdowns (cross-filter) | `POST /api/v1/stats/breakdown` `{query, fields, top}` | `stats` |
+| Stats "File kinds" (D139) | `POST /api/v1/stats/breakdown` `{query, fields: ["file_group"(, "file_kind")], top: 50, file_group?}` | `probe_file_kinds` |
 | Stats activity | `GET /api/v1/stats/timeseries?metric=…&bucket=hour\|day&since=` | `stats` |
 | Web of trust / relays graphs | `GET /api/v1/graphs/wot`, `GET /api/v1/graphs/relays` | `graphs` |
 | Stats "Where discoveries come from" | `GET /api/v1/stats/sources` | `crawl_sources` |
@@ -336,6 +338,54 @@ without a word. A kind a newer server counts and the app does
 not know reads as words ("sign_language" → "Sign language");
 `SearchFilters.supportedBy` drops what the server would ignore before anything is sent.
 
+**Dropdowns (D140).** The sheet has one compact control per filter group instead of chip lists
+(`ui/search/FilterDropdown.kt`): a Material 3 `ExposedDropdownMenuBox` whose anchor is an
+`OutlinedTextField` with the title as label, the selection as value ("Any", "French", "French,
++2": the first selected value in option order, then how many more), a clear × (`dd_{field}_clear`,
+"Clear {Title}") and the arrow; its accessible name is "{Title}: {summary}". Order: Category,
+Source, Audio language, Subtitles, Resolution, Release source, Video codec, HDR, Audio, Genre,
+Type, Published (radios: a pick closes it); then the heading "From the files (probed torrents
+only)" (with the track-kind hint when a kind dropdown shows) with **File kind**, Audio track,
+Audio track kind, Subtitle track, Subtitle kind, Subtitle format, Picture, Video track, HDR
+(probed), Audio format; rating, year, size, seeders, dead and trust stay as they were. The menu
+(`ExposedDropdownMenu`, at most 360 dp tall, scrolls inside) lists `DropdownMenuItem`s with a
+leading checkbox (radio for Published), the label and the live count (read as "1 234 torrents");
+a tap toggles without closing; an outside tap or Back closes it and keeps the picks; one menu is
+open at a time. Values, counts, the disabled rule (count 0 and not selected, never the adult
+category), `ChipOrder` stability, the visibility rules and `supportedBy` are unchanged. More than
+12 values (and always File kind) make the anchor editable (`PrimaryEditable`): while open it is
+a search box that filters by label or code, case and accents ignored. At the top of the sheet,
+"Active filters" lists every selected value as a removable chip (`filter_active_{field}_{value}`,
+Published as `date`; more than 3 labels of one file-kind group are one chip,
+`filter_active_probe_file_kind_{label},{label},…`, "Documents and e-books except PDF document" or
+"{Group}: {n} kinds", whose × removes them all, and the File kind summary and the Stats filter
+row use the same chips, `fileKindChips`, D140 C3) with *Clear all* (`filter_clear_all`; the footer keeps its own next to
+*Show N*). Test tags: `dd_{field}` (the box), `dd_{field}_search` (an editable anchor),
+`opt_{field}_{value}`, `opt_probe_file_kind_group_{g}`, `opt_probe_file_kind_expand_{g}`.
+
+**File kind (D137).** What the header probes identified by content (sniff labels such as
+`video.mkv`, `exe.pe.dotnet`, in 15 groups), from every probed file of a torrent, verified or
+not: a probed torrent matches when any of its probed files is of a picked kind (files outside
+the probed ones are not seen). Offered with `probe_file_kinds` (kept while set without it, with
+"Needs a newer server", so it can be cleared; never sent then). The menu shows groups with a
+tri-state checkbox (`TriStateCheckbox`: checked = the group is picked, mixed = some of its
+labels are), their count and an expand button; labels (catalogue names, counts) show under an
+expanded group, collapsed by default. Groups are ordered by count (catalogue order without
+counts); labels show when counted or picked (every catalogue label without counts). The facet is
+asked with `sizes: {"probe_file_kind": 400}` so every counted group and label arrives. Names
+come from `GET /api/v1/probe/file-kinds`, fetched once per server version
+(`Repository.loadFileKinds`, memory then page cache); without it a group reads as its id with a
+capital, a label as its id. Selection rules (`ui/search/FileKinds.kt`, the same test vectors as
+the web client in `FileKindsTest`): picking a group drops its labels; every label of a group
+picked becomes the group; unticking one label of a picked group leaves its other labels picked;
+the selection is lowercase, deduplicated and sorted. The search box matches a label's name, id
+and extensions and the group's name; while searching, only groups with a match show, expanded.
+The Status tab's server card lists "file-kind filters" under "Needs a newer server for" on a
+server without `probe_file_kinds`. Tested on the JVM (`FileKindsTest`, `SearchModelTest`,
+`SearchViewModelTest`, `MagnetarApiTest`, `StatsSettingsViewModelTest`); the dropdowns, the
+editable anchor with the soft keyboard, TalkBack and the File kinds card are **UNVERIFIED** on
+a device (`uitest/uitest.py` was moved to the dropdown tags but not run).
+
 **Detail** (`ui/detail`): media card (2:3 poster, facts, genres, overview, IMDb, *All releases*;
 asked once more after 4 s when the poster or overview is still missing, D42), attributes line,
 *Open magnet* / *Copy magnet*, swarm card (*Check now* = `POST …/liveness`, then the history is
@@ -458,6 +508,16 @@ bundled `fake_server.py`; `--production URL` adds read-only flows and the timing
   time (`GET /stats/timeseries`), days or hours, the DHT metrics (`dht_torrents_added`,
   `dht_hashes_seen`, `dht_fetch_ok`, `dht_fetch_fail`, `dht_blocked` as a count) when the server
   runs the crawler.
+  **File kinds** (D139, with `probe_file_kinds`; tag `breakdown_file_group`): one more
+  `POST /stats/breakdown {query, fields: ["file_group"], top: 50}` in a flow of its own (cached
+  like the others, a newer request cancels it), bars per group (`bar_file_group_{g}`, catalogue
+  names) and the line "From N probed torrents. A torrent counts once under each kind it
+  contains." (N = total − missing). The arrow on a group (`file_group_open_{g}`) adds
+  `file_kind` with `file_group: g` and shows its labels under the card (`bar_file_kind_{label}`);
+  it opens by itself when exactly one group is cross-filtered, and only this card is counted
+  again. A tap cross-filters through `probe_file_kinds` with the dropdown's group / label rules
+  (the card itself is counted without it, every other chart with it); long press and *Search
+  these* carry it to Search, where the File kind dropdown shows the same selection.
 - *Graphs*: web of trust and relays cards; the title-releases graph opens from the title page's
   top bar and the swarm graph from the detail's swarm card (both need `graphs`). Graph screen
   (`ui/graph`): force layout off the main thread (D90), fitted to the view, pinch / drag / double

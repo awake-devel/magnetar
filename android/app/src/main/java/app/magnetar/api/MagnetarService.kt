@@ -9,6 +9,9 @@ interface MagnetarService {
     suspend fun health(): Health
     suspend fun search(query: SearchQuery): SearchPage
     suspend fun facets(request: FacetsRequest): FacetSet
+
+    /** Feature `probe_file_kinds` (D137): the file-kind catalogue (groups and labels). */
+    suspend fun fileKinds(): FileKindCatalogue
     suspend fun detail(infohash: String): TorrentDetail
     suspend fun checkLiveness(infohash: String): Liveness
     suspend fun livenessHistory(infohash: String, days: Int): LivenessHistory

@@ -69,6 +69,10 @@ class MagnetarApi(
     override suspend fun facets(request: FacetsRequest): FacetSet =
         post("api/v1/facets", RequestClass.SEARCH, FacetsRequest.serializer(), request, FacetSet.serializer())
 
+    /** Feature `probe_file_kinds` (D137): sniff's groups and labels, fixed per server version. */
+    override suspend fun fileKinds(): FileKindCatalogue =
+        get("api/v1/probe/file-kinds", RequestClass.DETAIL, FileKindCatalogue.serializer())
+
     override suspend fun detail(infohash: String): TorrentDetail =
         get("api/v1/torrents/${segment(infohash)}", RequestClass.DETAIL, TorrentDetail.serializer())
 

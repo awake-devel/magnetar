@@ -881,3 +881,42 @@ async fn corrections_need_the_token_and_a_probe() {
     let (status, _) = post(&base, 6, &ok, Some(TOKEN)).await;
     assert_eq!(status, 200);
 }
+
+/// D137: a correction rewrites the stored tags from `summary_of` over the effective files, so
+/// the file-kind tags stay (corrections change tracks, never labels).
+#[tokio::test]
+async fn correction_write_keeps_file_kind_tags() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    dht_row(s, 1, "Film One 2024").await;
+    assert_eq!(store(s, 1, report(2, movie())).await, (1, 0));
+    let before = tags(s, 1).await;
+    for t in ["fk:video.mkv", "fg:video"] {
+        assert!(has(&before, t), "{t}: {before:?}");
+    }
+    probe_fix::correct(
+        s.pool(),
+        &ih(1),
+        &corr(json!([{"file": 0, "track": "audio", "pos": 0, "set": ["lang"], "lang": "de"}])),
+        NOW,
+    )
+    .await
+    .unwrap();
+    let after = tags(s, 1).await;
+    assert!(has(&after, "a:ger"), "the correction applied: {after:?}");
+    let fk = |t: &[String]| -> BTreeSet<String> {
+        t.iter()
+            .filter(|x| x.starts_with("fk:") || x.starts_with("fg:"))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(fk(&after), fk(&before));
+    assert!(!fk(&after).is_empty());
+    let kinds = SearchQuery {
+        probe_file_kinds: vec!["video.mkv".into()],
+        ..q("film")
+    };
+    let pg = pg_only(s);
+    let hits = pg.search(&kinds, NOW).await.unwrap();
+    assert_eq!(hits.hits.len(), 1, "file kind after a correction");
+}

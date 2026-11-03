@@ -78,6 +78,11 @@ pub const BREAKDOWN_FIELDS: &[(&str, &str)] = &[
     ("group", "group"),
     // Nostr / DHT (D51): a torrent known from both counts once under each.
     ("origin", "origin"),
+    // File kinds of the probed files (D139): one facet holds both levels; `file_group` keeps
+    // the groups (no dot), `file_kind` the labels (limited to `file_group` when it is set). A
+    // torrent counts once under each group and each label it contains.
+    ("file_group", "probe_file_kind"),
+    ("file_kind", "probe_file_kind"),
 ];
 pub const DEFAULT_TOP: u32 = 10;
 pub const MAX_TOP: u32 = 50;
@@ -186,6 +191,49 @@ pub async fn bump(pool: &PgPool, metric: &str, n: i64) {
     }
 }
 
+/// The `file_group` request value (D139): `[a-z0-9_]{1,32}`, else 400 `invalid`.
+pub fn file_group_param(g: &Option<String>) -> Result<Option<String>> {
+    let Some(g) = g else {
+        return Ok(None);
+    };
+    let ok = (1..=32).contains(&g.len())
+        && g.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    if !ok {
+        return Err(Error::Invalid(format!(
+            "bad file_group {g:?} ([a-z0-9_], 1 to 32 characters)"
+        )));
+    }
+    Ok(Some(g.clone()))
+}
+
+/// The part of the `probe_file_kind` tally a file-kind field shows (D139): `file_group` keeps
+/// the groups; `file_kind` the labels, or with `group` G only the `G.` labels, and then
+/// `missing` is the torrents counted without a file of G (all of them for an unknown G).
+pub fn file_kind_tally(field: &str, t: &FacetTally, group: Option<&str>) -> FacetTally {
+    let keep = |v: &str| match (field, group) {
+        ("file_group", _) => !v.contains('.'),
+        (_, None) => v.contains('.'),
+        (_, Some(g)) => v.strip_prefix(g).is_some_and(|r| r.starts_with('.')),
+    };
+    let missing = match (field, group) {
+        ("file_kind", Some(g)) => t
+            .counted
+            .saturating_sub(t.values.get(g).copied().unwrap_or(0)),
+        _ => t.missing,
+    };
+    FacetTally {
+        counted: t.counted,
+        missing,
+        values: t
+            .values
+            .iter()
+            .filter(|(v, _)| keep(v))
+            .map(|(v, n)| (v.clone(), *n))
+            .collect(),
+    }
+}
+
 /// Top `top` values of one tally, the rest summed.
 pub fn to_breakdown(field: &str, t: FacetTally, top: usize) -> Breakdown {
     let mut counts = sorted_counts(t.values);
@@ -229,6 +277,8 @@ pub async fn breakdown(
     now: i64,
 ) -> Result<Option<Arc<BreakdownSet>>> {
     let fields = breakdown_fields(&r.fields)?;
+    let file_group = file_group_param(&r.file_group)?;
+    crate::probes::check_query(&r.query)?;
     let top = match r.top {
         0 => DEFAULT_TOP,
         n => n.min(MAX_TOP),
@@ -239,7 +289,7 @@ pub async fn breakdown(
     q.offset = 0;
     q.sort = Default::default();
     q.descending = true;
-    let key = serde_json::to_string(&(&q, &fields, top)).expect("json");
+    let key = serde_json::to_string(&(&q, &fields, top, &file_group)).expect("json");
     if !store.index_ready() {
         return Ok(None);
     }
@@ -253,7 +303,13 @@ pub async fn breakdown(
                 .iter()
                 .cloned()
                 .partition(|(_, facet)| !matches!(*facet, "category" | "year"));
-            let names: Vec<String> = main.iter().map(|(_, f)| f.to_string()).collect();
+            // Each facet once: `file_group` and `file_kind` share one tally (D139).
+            let mut names: Vec<String> = Vec::new();
+            for (_, f) in &main {
+                if !names.iter().any(|n| n == f) {
+                    names.push(f.to_string());
+                }
+            }
             // Only if the index went away since the check above.
             let gone = || Error::Other("search index not ready".into());
             let own_passes = own.iter().map(|(_, facet)| {
@@ -279,8 +335,23 @@ pub async fn breakdown(
             )
             .await?;
             let (total, tallies) = first;
-            let mut out: Vec<(String, FacetTally)> =
-                main.into_iter().map(|(n, _)| n).zip(tallies).collect();
+            let mut out: Vec<(String, FacetTally)> = main
+                .into_iter()
+                .map(|(n, facet)| {
+                    let t = names
+                        .iter()
+                        .position(|x| x == facet)
+                        .and_then(|i| tallies.get(i))
+                        .cloned()
+                        .unwrap_or_default();
+                    let t = if facet == "probe_file_kind" {
+                        file_kind_tally(&n, &t, file_group.as_deref())
+                    } else {
+                        t
+                    };
+                    (n, t)
+                })
+                .collect();
             out.extend(own.into_iter().map(|(n, _)| n).zip(own_tallies));
             Ok(BreakdownSet {
                 total,
@@ -710,6 +781,55 @@ mod tests {
         assert_eq!((b.other, b.other_values, b.missing, b.total), (3, 3, 2, 10));
         let few = to_breakdown("x", FacetTally::default(), 10);
         assert!(few.counts.is_empty() && few.other == 0);
+    }
+
+    #[test]
+    fn file_kind_tallies() {
+        let t = FacetTally {
+            counted: 100,
+            missing: 60,
+            values: [
+                ("video", 30),
+                ("video.mkv", 20),
+                ("video.mp4", 15),
+                ("exe", 5),
+                ("exe.pe", 4),
+                ("exe.pe.dotnet", 2),
+                ("videox.y", 1),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+        };
+        let keys = |t: &FacetTally| {
+            let mut k: Vec<(String, u64)> = t.values.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            k.sort();
+            k
+        };
+        let g = file_kind_tally("file_group", &t, Some("video"));
+        assert_eq!(keys(&g), [("exe".into(), 5), ("video".into(), 30)]);
+        assert_eq!((g.counted, g.missing), (100, 60));
+        let k = file_kind_tally("file_kind", &t, None);
+        assert_eq!(k.values.len(), 5);
+        assert_eq!(k.missing, 60);
+        let k = file_kind_tally("file_kind", &t, Some("video"));
+        assert_eq!(
+            keys(&k),
+            [("video.mkv".into(), 20), ("video.mp4".into(), 15)],
+            "videox.y is not in video"
+        );
+        assert_eq!(k.missing, 70, "counted without a video file");
+        let k = file_kind_tally("file_kind", &t, Some("nope"));
+        assert!(k.values.is_empty());
+        assert_eq!(k.missing, 100);
+        assert_eq!(file_group_param(&None).unwrap(), None);
+        assert_eq!(
+            file_group_param(&Some("game_data9".into())).unwrap(),
+            Some("game_data9".into())
+        );
+        for bad in ["", "Bad!", "Video", "a.b", &"x".repeat(33)] {
+            assert!(file_group_param(&Some(bad.into())).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

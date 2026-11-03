@@ -7,7 +7,9 @@ import app.magnetar.api.Breakdown
 import app.magnetar.api.BreakdownRequest
 import app.magnetar.api.BreakdownSet
 import app.magnetar.api.CrawlSources
+import app.magnetar.api.FacetCounts
 import app.magnetar.api.Features
+import app.magnetar.api.FileKindCatalogue
 import app.magnetar.api.FleetStats
 import app.magnetar.api.Health
 import app.magnetar.api.SearchQuery
@@ -19,6 +21,7 @@ import app.magnetar.ui.common.isOffline
 import app.magnetar.ui.common.userMessage
 import app.magnetar.ui.search.SearchFilters
 import app.magnetar.ui.search.buildQuery
+import app.magnetar.ui.search.fileKindLabelsOf
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -67,6 +70,12 @@ data class StatsUiState(
     /** Crawl workers and the header-probe backfill (feature `workers`, D118). */
     val fleet: FleetStats? = null,
     val fleetCachedAtMs: Long? = null,
+    /** The file-kind catalogue (D137) for names; null = ids. */
+    val fileKinds: FileKindCatalogue? = null,
+    /** The File kinds card's counts (D139): `file_group`, and `file_kind` of [fileGroup] when one is open. */
+    val fileKindSet: BreakdownSet? = null,
+    /** The group whose kinds are shown under the card ("Kinds ›"), null = none. */
+    val fileGroup: String? = null,
 ) {
     val features: Set<String> get() = (health?.features ?: knownFeatures).orEmpty().toSet()
     val hasStats: Boolean get() = Features.STATS in features
@@ -75,6 +84,13 @@ data class StatsUiState(
     val hasCrawlSources: Boolean get() = Features.CRAWL_SOURCES in features
     val hasCrawlMap: Boolean get() = Features.CRAWL_MAP in features
     val hasWorkers: Boolean get() = Features.WORKERS in features
+
+    /** File-kind breakdowns and cross-filters (D139). */
+    val hasFileKinds: Boolean get() = Features.PROBE_FILE_KINDS in features
+
+    /** A group's labels for the file-kind toggle: the catalogue's, else the drill-down's counts. */
+    val fileKindLabels: (String) -> List<String>
+        get() = fileKindLabelsOf(fileKinds, fileKindSet?.field("file_kind")?.let { FacetCounts("file_kind", it.total, it.counts) })
 
     /** The server sends header-probe backfill counts (D118): newer server with workers. */
     val hasProbes: Boolean get() = fleet?.probeBackfill != null
@@ -95,11 +111,14 @@ class StatsViewModel(
     /** Bumped for each breakdown load; the latest wins. */
     private val breakdownRequests = MutableStateFlow(0)
     private val seriesRequests = MutableStateFlow(0)
+    private val fileKindRequests = MutableStateFlow(0)
 
     init {
         // 0 = nothing asked yet; a collector that starts late still sees the latest request.
         viewModelScope.launch { breakdownRequests.filter { it > 0 }.collectLatest { loadBreakdowns() } }
         viewModelScope.launch { seriesRequests.filter { it > 0 }.collectLatest { loadSeries() } }
+        viewModelScope.launch { fileKindRequests.filter { it > 0 }.collectLatest { loadFileKindBreakdowns() } }
+        viewModelScope.launch { repo.fileKinds.collect { c -> _state.update { it.copy(fileKinds = c) } } }
         // Another server, token or adult switch changes every count.
         viewModelScope.launch {
             repo.settings.map { listOf(it.serverUrl, it.apiToken, it.showAdult) }.distinctUntilChanged().drop(1).collect {
@@ -127,8 +146,10 @@ class StatsViewModel(
             _state.update {
                 it.copy(health = h, knownFeatures = known, healthChecked = true, healthError = if (h == null) "Server unreachable" else null)
             }
+            if (h?.has(Features.PROBE_FILE_KINDS) == true) launch { repo.loadFileKinds() }
             if (h?.has(Features.STATS) == true || h == null) {
                 breakdownRequests.value++
+                fileKindRequests.value++
                 seriesRequests.value++
                 loadStats()
             }
@@ -223,6 +244,45 @@ class StatsViewModel(
         }
     }
 
+    /**
+     * The File kinds card (D139): one `POST /stats/breakdown` of `file_group` (plus `file_kind`
+     * of the open group), its own flow so opening a group does not count the other charts again.
+     * Cached like the others; an error leaves the card out (the main request shows the banner).
+     */
+    private suspend fun loadFileKindBreakdowns() {
+        val s = _state.value
+        if (!s.hasFileKinds) {
+            _state.update { it.copy(fileKindSet = null) }
+            return
+        }
+        val group = s.fileGroup
+        val request = BreakdownRequest(
+            query(s.filters),
+            if (group != null) listOf("file_group", "file_kind") else listOf("file_group"),
+            top = 50,
+            fileGroup = group,
+        )
+        val key = repo.keyOf(BreakdownRequest.serializer(), request)
+        val cached = repo.readCache(CACHE_BREAKDOWN, key, BreakdownSet.serializer())
+        if (cached != null) _state.update { it.copy(fileKindSet = cached.value) }
+        if (s.health == null) return
+        try {
+            val set = repo.service().breakdown(request)
+            repo.writeCache(CACHE_BREAKDOWN, key, BreakdownSet.serializer(), set)
+            _state.update { it.copy(fileKindSet = set) }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: ApiException) {
+            _state.update { it.copy(fileKindSet = if (e.isOffline) it.fileKindSet else null) }
+        }
+    }
+
+    /** "Kinds ›" on a group: show its labels under the card, or hide them (the same group again). */
+    fun openFileGroup(group: String) {
+        _state.update { it.copy(fileGroup = if (it.fileGroup == group) null else group) }
+        fileKindRequests.value++
+    }
+
     private fun loadStats() = viewModelScope.launch {
         val cached = repo.readCache(CACHE_HEALTH, "", StatsHealth.serializer())
         if (cached != null && _state.value.stats == null) {
@@ -313,14 +373,28 @@ class StatsViewModel(
     /** Tap on a bar, slice or year: cross-filter every other chart on it. */
     fun toggle(field: String, value: String) {
         if (field !in FILTERABLE) return
-        _state.update { it.copy(filters = it.filters.toggleStat(field, value)) }
+        _state.update {
+            val f = it.filters.toggleStat(field, value, it.fileKindLabels)
+            // Exactly one group cross-filtered: its kinds open by themselves.
+            val auto = if (field in FILE_KIND_STAT_FIELDS) f.autoFileGroup() else null
+            it.copy(filters = f, fileGroup = auto ?: it.fileGroup)
+        }
         breakdownRequests.value++
+        fileKindRequests.value++
+    }
+
+    /** The file kinds of one Stats chip removed (D140 C3). */
+    fun removeFileKinds(values: Collection<String>) {
+        _state.update { it.copy(filters = it.filters.copy(probeFileKinds = it.filters.probeFileKinds - values.toSet())) }
+        breakdownRequests.value++
+        fileKindRequests.value++
     }
 
     fun clearFilters() {
         if (_state.value.filters == SearchFilters()) return
         _state.update { it.copy(filters = SearchFilters()) }
         breakdownRequests.value++
+        fileKindRequests.value++
     }
 
     /**
@@ -333,7 +407,7 @@ class StatsViewModel(
         var text = ""
         if (field != null && value != null) {
             if (field in FILTERABLE) {
-                if (value !in f.selectedStat(field)) f = f.toggleStat(field, value)
+                if (value !in f.selectedStat(field)) f = f.toggleStat(field, value, _state.value.fileKindLabels)
             } else {
                 text = value
             }

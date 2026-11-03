@@ -7,6 +7,7 @@ import app.magnetar.api.Category
 import app.magnetar.api.FacetSet
 import app.magnetar.api.FacetsRequest
 import app.magnetar.api.Features
+import app.magnetar.api.FileKindCatalogue
 import app.magnetar.api.SavedSearch
 import app.magnetar.api.SearchPage
 import app.magnetar.api.SearchQuery
@@ -74,6 +75,9 @@ data class SearchUiState(
 
     /** Track-kind filters (D125) need `probe_kinds` on top of `probe_filters`. */
     val canFilterProbeKinds: Boolean get() = canFilterProbes && Features.PROBE_KINDS in features
+
+    /** File kinds (D137) need `probe_file_kinds` on top of `probe_filters`. */
+    val canFilterFileKinds: Boolean get() = canFilterProbes && Features.PROBE_FILE_KINDS in features
 }
 
 /** One search to run; [seq] makes a retry of the same query a new value. */
@@ -109,6 +113,9 @@ class SearchViewModel(
     /** Counts of the open filter sheet; null = none (no `facet_set`, index building, error). */
     val facets: StateFlow<FacetSet?> = _facets.asStateFlow()
     private val facetDraft = MutableStateFlow<SearchFilters?>(null)
+
+    /** The file-kind catalogue (D137) for names and the group / label tree; null = ids only. */
+    val fileKinds: StateFlow<FileKindCatalogue?> = repo.fileKinds
 
     private val messagesChannel = Channel<String>(Channel.BUFFERED)
     val messages: Flow<String> = messagesChannel.receiveAsFlow()
@@ -317,9 +324,14 @@ class SearchViewModel(
             if (s.canFilterReleases) addAll(FACET_FIELDS)
             // An older server would refuse (or not know) the kind facets: ask them with `probe_kinds` only.
             if (s.canFilterProbes) addAll(if (s.canFilterProbeKinds) PROBE_FACET_FIELDS else PROBE_FACET_FIELDS - PROBE_KIND_FIELDS.toSet())
+            // D137: every group and label of the file kinds, not the first 40.
+            if (s.canFilterFileKinds) add(FILE_KIND_FIELD)
         }
+        val sizes = if (s.canFilterFileKinds) mapOf(FILE_KIND_FIELD to FILE_KIND_FACET_SIZE) else emptyMap()
+        // Names and the group tree for the File kind dropdown (once per server version).
+        if (s.canFilterFileKinds) repo.loadFileKinds()
         return try {
-            repo.service().facets(FacetsRequest(q, fields, FACET_SIZE))
+            repo.service().facets(FacetsRequest(q, fields, FACET_SIZE, sizes))
         } catch (e: CancellationException) {
             throw e
         } catch (_: ApiException) {

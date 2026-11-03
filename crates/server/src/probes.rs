@@ -831,7 +831,8 @@ pub struct Summary {
     /// The search facets (D122, `facet_values`): `k:video`, `r:2160p`, `v:hevc`,
     /// `h:dolby_vision`, `a:fre`, `s:eng`, `ac:eac3`, `p:ps5`, `x:atmos`; and the track kinds
     /// (D124): `ak:commentary`, `ap:eng:commentary` (language and kind of one audio track),
-    /// `sk:sdh`, `sp:fre:sdh`, `sf:image` (subtitle format class, `sub_format`).
+    /// `sk:sdh`, `sp:fre:sdh`, `sf:image` (subtitle format class, `sub_format`); and the file
+    /// kinds of every probed file (D137): `fk:exe.pe.dotnet` (the label), `fg:exe` (its group).
     pub tags: Vec<String>,
 }
 
@@ -932,6 +933,50 @@ pub fn search_filters(q: &magnetar_core::query::SearchQuery) -> Vec<(&'static st
     out
 }
 
+/// `GET /api/v1/probe/file-kinds` (D137): every label of sniff's registry by group, groups in
+/// `sniff::label::GROUPS` order, labels in registry order (`misc.*` included). Built once.
+pub fn file_kind_catalogue() -> &'static magnetar_core::api::FileKindCatalogue {
+    use magnetar_core::api::{FileKindCatalogue, FileKindGroup, FileKindLabel};
+    static CATALOGUE: std::sync::OnceLock<FileKindCatalogue> = std::sync::OnceLock::new();
+    CATALOGUE.get_or_init(|| FileKindCatalogue {
+        groups: sniff::label::GROUPS
+            .iter()
+            .map(|g| FileKindGroup {
+                id: g.id.to_string(),
+                name: g.name.to_string(),
+                labels: sniff::label::LABELS
+                    .iter()
+                    .filter(|l| sniff::label::group_of(l.id) == g.id)
+                    .map(|l| FileKindLabel {
+                        id: l.id.to_string(),
+                        name: l.description.to_string(),
+                        extensions: l.extensions.iter().map(|e| e.to_string()).collect(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    })
+}
+
+/// Most values of the file-kind filter (D137): 348 labels and 15 groups fit.
+pub const MAX_FILE_KIND_VALUES: usize = 400;
+
+/// Refuse a query whose probe filters are out of bounds (400 `invalid`): more than
+/// [`MAX_FILE_KIND_VALUES`] distinct file kinds.
+pub fn check_query(q: &magnetar_core::query::SearchQuery) -> magnetar_core::error::Result<()> {
+    let n = q
+        .probe_filters()
+        .into_iter()
+        .find(|(n, _)| *n == "probe_file_kind")
+        .map_or(0, |(_, v)| v.len());
+    if n > MAX_FILE_KIND_VALUES {
+        return Err(magnetar_core::error::Error::Invalid(format!(
+            "probe_file_kind: at most {MAX_FILE_KIND_VALUES} values"
+        )));
+    }
+    Ok(())
+}
+
 /// The `probe_attrs.tags` prefixes a header-probe facet (D122) reads; none for another name.
 pub fn tag_prefixes(name: &str) -> &'static [&'static str] {
     match name {
@@ -947,6 +992,8 @@ pub fn tag_prefixes(name: &str) -> &'static [&'static str] {
         "probe_sub_format" => &["sf:"],
         "probe_sub_pair" => &["sp:"],
         "probe_audio_pair" => &["ap:"],
+        // D137: one facet, both levels: a group id (`fg:video`) or a label id (`fk:video.mkv`).
+        "probe_file_kind" => &["fg:", "fk:"],
         _ => &[],
     }
 }
@@ -978,6 +1025,10 @@ pub fn summary(r: &ProbeReport) -> Summary {
 /// The summary columns and tags of `files` (D117, D122, D124). Since D129 `files` are the
 /// effective files (`probe_fix::apply`): a track marked removed counts nowhere, an added track
 /// (no codec) gives no `ac:` tag and no audio codec.
+///
+/// D137: every file, verified or not, gives `fk:{label}` and `fg:{group}` (the label before its
+/// first `.`). The migration `20261111000000_probe_file_kinds.sql` applies the same rule in SQL
+/// to the stored rows (`it::probe_search::file_kind_migration_matches_summary_of`).
 pub fn summary_of(files: &[ProbeFile]) -> Summary {
     let mut s = Summary {
         files_verified: files.iter().filter(|f| f.verified).count() as i16,
@@ -987,6 +1038,13 @@ pub fn summary_of(files: &[ProbeFile]) -> Summary {
         for x in &f.flags {
             push_unique(&mut s.flags, x);
         }
+    }
+    for f in files.iter().filter(|f| !f.label.is_empty()) {
+        push_unique(&mut s.tags, &format!("fk:{}", f.label));
+        push_unique(
+            &mut s.tags,
+            &format!("fg:{}", sniff::label::group_of(&f.label)),
+        );
     }
     let Some(main) = files
         .iter()
@@ -1953,7 +2011,8 @@ mod tests {
         main.video = Some(kinds_video());
         let s = summary(&report(vec![file(0, 100, "text.plain"), main]));
         let got: std::collections::BTreeSet<&str> = s.tags.iter().map(String::as_str).collect();
-        let want: std::collections::BTreeSet<&str> = "k:video v:h264 r:1080p \
+        let want: std::collections::BTreeSet<&str> = "fk:text.plain fg:text fk:video.mkv fg:video \
+            k:video v:h264 r:1080p \
             ac:eac3 ac:ac3 ac:aac a:fre ak:commentary ap:eng:commentary ak:description \
             ap:fre:description s:eng sk:sdh sp:eng:sdh sf:image sk:forced sp:fre:forced sf:text \
             s:fre sk:cc sf:cc sk:signs sp:jpn:signs"
@@ -2324,6 +2383,109 @@ mod tests {
             !files.iter().any(|(_, src)| src.contains(fetch_probe)),
             "the fetcher's probe mode is never forced on"
         );
+    }
+
+    /// D137: every probed file gives its label and group, verified or not; `k:` stays the
+    /// main file's group.
+    #[test]
+    fn file_kind_tags_cover_every_probed_file() {
+        let mkv = file(1, 5000, "video.mkv");
+        let mut srt = file(0, 10, "subtitle.srt");
+        srt.verified = false;
+        let exe = file(2, 900, "exe.pe");
+        let s = summary(&report(vec![srt, mkv, exe]));
+        for t in [
+            "fk:video.mkv",
+            "fg:video",
+            "fk:subtitle.srt",
+            "fg:subtitle",
+            "fk:exe.pe",
+            "fg:exe",
+            "k:video",
+        ] {
+            assert!(s.tags.iter().any(|x| x == t), "{t}: {:?}", s.tags);
+        }
+        assert_eq!(s.kind.as_deref(), Some("video"));
+        assert_eq!(
+            s.tags.iter().filter(|t| t.starts_with("k:")).count(),
+            1,
+            "k: unchanged: {:?}",
+            s.tags
+        );
+        // No duplicates; a nested label's group is the part before the first dot.
+        let s = summary(&report(vec![
+            file(0, 10, "exe.pe.dotnet"),
+            file(1, 20, "exe.pe.dotnet"),
+            file(2, 30, "exe.pe"),
+        ]));
+        let fk: Vec<&str> = s
+            .tags
+            .iter()
+            .filter(|t| t.starts_with("fk:") || t.starts_with("fg:"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(fk, ["fk:exe.pe.dotnet", "fg:exe", "fk:exe.pe"]);
+    }
+
+    #[test]
+    fn file_kind_facet_values() {
+        let tags: Vec<String> = [
+            "k:video",
+            "fk:video.mkv",
+            "fg:video",
+            "fk:exe.pe.dotnet",
+            "fg:exe",
+            "r:1080p",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(tag_prefixes("probe_file_kind"), &["fg:", "fk:"]);
+        assert_eq!(
+            facet_values("probe_file_kind", &tags),
+            vec!["video.mkv", "video", "exe.pe.dotnet", "exe"]
+        );
+        assert!(facet_values("probe_file_kind", &tags[..1]).is_empty());
+    }
+
+    #[test]
+    fn file_kind_filter_normalised() {
+        use magnetar_core::query::SearchQuery;
+        let q = SearchQuery {
+            probe_file_kinds: vec![
+                " VIDEO ".into(),
+                "video".into(),
+                "".into(),
+                "Exe.PE".into(),
+                "nope.unknown".into(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            search_filters(&q),
+            vec![(
+                "probe_file_kind",
+                vec!["video".into(), "exe.pe".into(), "nope.unknown".into()]
+            )]
+        );
+        assert!(check_query(&q).is_ok());
+        let many = |n: usize| SearchQuery {
+            probe_file_kinds: (0..n).map(|i| format!("g.l{i}")).collect(),
+            ..Default::default()
+        };
+        assert!(check_query(&many(MAX_FILE_KIND_VALUES)).is_ok());
+        let e = check_query(&many(MAX_FILE_KIND_VALUES + 1)).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("probe_file_kind: at most 400 values"),
+            "{e}"
+        );
+        // Duplicates do not count towards the cap.
+        let dup = SearchQuery {
+            probe_file_kinds: vec!["video".into(); 1000],
+            ..Default::default()
+        };
+        assert!(check_query(&dup).is_ok());
     }
 
     #[test]

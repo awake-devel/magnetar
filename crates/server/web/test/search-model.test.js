@@ -8,6 +8,7 @@ import {
   EMPTY_FILTERS,
   emptySearchState,
   FACET_TITLES,
+  facetBody,
   facetChips,
   facetFields,
   filtersOf,
@@ -262,4 +263,35 @@ Deno.test("URL state round-trips and drops malformed parameters (C-SRCH-10)", ()
   assert.equal(bad.descending, true);
   // The API's byte sizes are read as MiB.
   assert.equal(stateFromParams(new URLSearchParams("min_size=1048576")).filters.minSizeMb, 1);
+});
+
+Deno.test("file kinds: URL round-trip, request key, dropped without probe_file_kinds (D137)", () => {
+  const back = stateFromParams(new URLSearchParams("probe_file_kind=video,archive.zip"));
+  assert.deepEqual(back.filters.probeFileKinds, ["archive.zip", "video"]);
+  assert.equal(stateToParams(back), "probe_file_kind=archive.zip%2Cvideo");
+  assert.deepEqual(stateFromParams(new URLSearchParams(stateToParams(back))), back);
+  const q = buildQuery("", back.filters, "relevance", true, false, { nowSec: now });
+  assert.deepEqual(q.probe_file_kinds, ["archive.zip", "video"]);
+  assert.deepEqual(filtersOf(q, now).probeFileKinds, ["archive.zip", "video"]);
+  assert.equal(activeCount(back.filters), 1);
+  assert.equal(hasProbeFilters(back.filters), true);
+  assert.deepEqual(selected(back.filters, "probe_file_kind"), ["archive.zip", "video"]);
+  // An older server never gets the field.
+  const old = supportedBy(back.filters, new Set(["filters", "probe_filters", "probe_kinds"]));
+  assert.deepEqual(old.probeFileKinds, []);
+  assert.deepEqual(supportedBy(back.filters, new Set(["probe_file_kinds"])).probeFileKinds, ["archive.zip", "video"]);
+  assert.equal(FACET_TITLES.probe_file_kind, "File kind");
+});
+
+Deno.test("file kinds: facet field and per-field size only with the feature (D137 A4)", () => {
+  const q = { text: "" };
+  const old = facetBody(q, new Set(["filters", "probe_filters"]));
+  assert.equal(old.fields.includes("probe_file_kind"), false);
+  assert.equal("sizes" in old, false);
+  assert.equal(old.size, 40);
+  const cur = facetBody(q, new Set(["filters", "probe_filters", "probe_file_kinds"]));
+  assert.equal(cur.fields[cur.fields.length - 1], "probe_file_kind");
+  assert.deepEqual(cur.sizes, { probe_file_kind: 400 });
+  assert.equal(cur.size, 40);
+  assert.ok(facetFields(new Set(["probe_file_kinds"])).includes("probe_file_kind"));
 });

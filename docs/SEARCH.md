@@ -50,6 +50,11 @@ lowest id (D6). Fields:
   the other side's facet is projected the same way on that side's values, over the documents
   passing every filter except that side's filter (`search_index::projected_facet`). That is the
   D44 disjunctive rule on single tracks: a chip's count is what picking it as well returns;
+  since `SCHEMA_VERSION` 7 (D137) the file-kind facet `f_probe_file_kind` (tags `fg:{group}`
+  and `fk:{label}` of every probed file: groups and labels in one column, so both levels are
+  disjunctive against the one file-kind filter; returned up to 512 values instead of 200,
+  `FacetsRequest.sizes`). The bump rebuilds the index at the first start: facets and breakdowns
+  answer 503 meanwhile and searches use the Postgres fallback (D138);
 - since `SCHEMA_VERSION` 3 (D52, D70), fast `adult` (1 when the canonical category is `porn` or
   a `dht_torrents` row of the infohash is classified `porn`). The version bump rebuilds the
   index once after the upgrade (35 s on the production copy for version 2).
@@ -158,10 +163,13 @@ and then sends `1000` with the flag, which the app shows as "1,000+".
 total, counts: [{value, count}] }`, most frequent first, over the results of the search
 parameters (same parsing as `/api/v1/search`). Names: `category`, `category_path`,
 `media_kind`, `genre`, `year`, and the D44 attributes `language`, `subtitles`, `resolution`,
-`source`, `codec`, `hdr`, `audio`, `channels`, `edition`, `format`, `group`. 400 for an unknown
+`source`, `codec`, `hdr`, `audio`, `channels`, `edition`, `format`, `group`, the probe facets
+(docs/FILTERS.md, `probe_file_kind` since D137). 400 for an unknown
 name, 503 `search_index_unavailable` while the index is disabled or building (older servers:
 404), so the app hides facet UI then. `POST /api/v1/facets` (D44) counts several at once over a
-JSON `SearchQuery`; every facet is counted without its own filter (docs/FILTERS.md).
+JSON `SearchQuery`; every facet is counted without its own filter (docs/FILTERS.md). `size`
+applies to every field (at most 200); `sizes` (D137) overrides it per field, and
+`probe_file_kind` may return up to 512 values.
 
 ## Stats counters
 

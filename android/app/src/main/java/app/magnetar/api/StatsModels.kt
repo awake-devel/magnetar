@@ -25,6 +25,11 @@ data class BreakdownRequest(
     val fields: List<String> = emptyList(),
     /** Values per field, server default 10, at most 50. */
     val top: Int = 10,
+    /**
+     * Drill-down of `file_kind` to one group's labels (D139, `Features.PROBE_FILE_KINDS`); left
+     * out of the body while null.
+     */
+    @SerialName("file_group") val fileGroup: String? = null,
 )
 
 /** Top values of one field; each field is counted with every filter of the query but its own. */
