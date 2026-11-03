@@ -46,7 +46,6 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.magnetar.api.Breakdown
 import app.magnetar.api.FacetCount
-import app.magnetar.api.Features
 import app.magnetar.api.StatsHealth
 import app.magnetar.ui.common.AppIcons
 import app.magnetar.ui.common.Banner
@@ -368,12 +367,7 @@ private fun Status(state: StatsUiState, colors: ChartColors) {
                     else -> {
                         Line("State", if (health.status == "ok" && health.db) "healthy" else "${health.status}, database ${if (health.db) "ok" else "down"}")
                         Line("Version", health.version.ifBlank { "?" })
-                        val missing = listOf(
-                            Features.STATS to "charts", Features.GRAPHS to "graphs", Features.SAVED_SEARCH_POLL to "saved-search alerts",
-                            Features.FILTERS to "release filters", Features.ORIGIN to "Nostr / DHT source",
-                            Features.CRAWL_SOURCES to "discovery sources", Features.CRAWL_MAP to "crawl map",
-                            Features.PROBE_FILTERS to "probe filters",
-                        ).filter { !health.has(it.first) }.map { it.second }
+                        val missing = missingFeatures(health)
                         if (missing.isNotEmpty()) Line("Needs a newer server for", missing.joinToString(", "))
                     }
                 }

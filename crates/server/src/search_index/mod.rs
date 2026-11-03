@@ -39,7 +39,9 @@ use tantivy::schema::{Field, Value};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 use tokio::sync::watch;
 
-use self::collect::{AttrFilter, FacetCounts, FacetField, FacetTally, Filter, SortBy, TopFiltered};
+use self::collect::{
+    AttrFilter, FacetCounts, FacetField, FacetTally, Filter, Project, SortBy, TopFiltered,
+};
 use self::schema::{Fields, IndexDoc, NONE, SCHEMA_VERSION, TOKENIZER, analyzer};
 use crate::daemons::stop_requested;
 
@@ -555,8 +557,18 @@ impl SearchIndex {
                 return Ok(None);
             };
             let field = self.fields.schema.get_field_name(field).to_string();
+            // D125: with a language + kind pair filter, the language and kind facets of that
+            // family are counted on the pair column, projected (one track having both).
+            if let Some(projected) = projected_facet(&q.filter, name) {
+                fields.push(projected);
+                continue;
+            }
             let filter = q.filter.attrs.iter().position(|a| a.field == field);
-            fields.push(FacetField { field, filter });
+            fields.push(FacetField {
+                field,
+                filter,
+                project: None,
+            });
         }
         let searcher = self.reader.searcher();
         let query = self.query(&searcher, &q.words);
@@ -703,6 +715,49 @@ impl SearchIndex {
             error: pr.error.clone(),
         }
     }
+}
+
+/// The language or kind facet `name` counted on its family's pair column (D125), so that each
+/// chip's count is what picking it returns, or None (counted as usual):
+/// - with a pair filter (language and kind both set), on that filter's values: the pair
+///   filter's values are every `{lang}:{kind}` asked (`probes::search_filters`), so both sides
+///   come back from them;
+/// - with only the other side set (a language filter when `name` is the kind facet, or the
+///   reverse), on that side's values, without that filter: picking a value of `name` would
+///   turn both into one pair filter (review of D125). With only the same side set, or neither,
+///   the usual count is already right.
+fn projected_facet(filter: &Filter, name: &str) -> Option<FacetField> {
+    let (lang, kind, pair) = crate::probes::PAIR_FACETS
+        .iter()
+        .find(|(l, k, _)| *l == name || *k == name)?;
+    let field = schema::facet_field_name(pair);
+    let keep_left = name == *lang;
+    if let Some(at) = filter.attrs.iter().position(|a| a.field == field) {
+        let mut other: Vec<String> = Vec::new();
+        for v in &filter.attrs[at].values {
+            if let Some((l, k)) = v.split_once(':') {
+                let side = if keep_left { k } else { l };
+                if !other.iter().any(|o| o == side) {
+                    other.push(side.to_string());
+                }
+            }
+        }
+        return Some(FacetField {
+            field,
+            filter: Some(at),
+            project: Some(Project { keep_left, other }),
+        });
+    }
+    let other_side = schema::facet_field_name(if keep_left { kind } else { lang });
+    let at = filter.attrs.iter().position(|a| a.field == other_side)?;
+    Some(FacetField {
+        field,
+        filter: Some(at),
+        project: Some(Project {
+            keep_left,
+            other: filter.attrs[at].values.clone(),
+        }),
+    })
 }
 
 /// Most frequent first, ties by value.

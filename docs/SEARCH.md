@@ -38,6 +38,18 @@ lowest id (D6). Fields:
   stored `attrs` JSON returned in every hit; since `SCHEMA_VERSION` 5 (D122) the header-probe
   facets `f_probe_language`, `f_probe_subtitles`, `f_probe_resolution`, `f_probe_codec`,
   `f_probe_hdr`, `f_probe_audio` from `probe_attrs.tags` (docs/FILTERS.md "Probe filters");
+  since `SCHEMA_VERSION` 6 (D125) the track-kind facets `f_probe_sub_kind`, `f_probe_audio_kind`,
+  `f_probe_sub_format` (tags `sk:`, `ak:`, `sf:`) and the internal pair facets
+  `f_probe_sub_pair`, `f_probe_audio_pair` (tags `sp:{lang}:{kind}`, `ap:{lang}:{kind}`: the
+  language and kind of one track). A language filter with a kind filter of the same family
+  becomes one any-of filter on the pair facet (`probes::search_filters`); facet counts are then
+  **projected** (`collect::Project`): the language facet (or the kind facet) of that family is
+  counted on the pair column, each pair value `{l}:{k}` counting as `l` when `k` is a wanted
+  kind (as `k` when `l` is a wanted language), at most once per document, over the documents
+  passing every filter except the pair filter. With only one side set (languages, or kinds),
+  the other side's facet is projected the same way on that side's values, over the documents
+  passing every filter except that side's filter (`search_index::projected_facet`). That is the
+  D44 disjunctive rule on single tracks: a chip's count is what picking it as well returns;
 - since `SCHEMA_VERSION` 3 (D52, D70), fast `adult` (1 when the canonical category is `porn` or
   a `dht_torrents` row of the infohash is classified `porn`). The version bump rebuilds the
   index once after the upgrade (35 s on the production copy for version 2).

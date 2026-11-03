@@ -10,7 +10,7 @@
 //! asked for on the first pass.
 
 use super::src::Src;
-use super::{Kind, Parsed, Tk, audio, codec, lang};
+use super::{Kind, Parsed, Tk, TrackKind, audio, codec, lang};
 use crate::types::Caps;
 
 const TAIL: u64 = 128 * 1024;
@@ -46,6 +46,9 @@ pub(crate) fn packet_size(h: &[u8]) -> Option<(usize, usize)> {
 struct Es {
     pid: u16,
     tk: Tk,
+    /// More tracks on the same PID (D123): the other entries of a DVB subtitling or teletext
+    /// descriptor, the ATSC caption services of a video PID.
+    extra: Vec<Tk>,
     buf: Vec<u8>,
     done: bool,
     first_pts: Option<u64>,
@@ -180,27 +183,130 @@ fn pmt(sct: &[u8], es: &mut Vec<Es>) {
             t.profile = Some("DTS-HD MA".into());
         }
         let mut j = 0usize;
+        // Kinds and extra tracks from the descriptors (D123), applied once the type is known.
+        let mut audio_kinds: Vec<TrackKind> = Vec::new();
+        let mut sup_lang: Option<String> = None;
+        // ATSC 0x81: (bsmod, acmod stand-in from num_channels).
+        let mut atsc_bsmod: Option<(u8, u8)> = None;
+        let mut subs: Vec<(Option<String>, bool)> = Vec::new();
+        let mut captions: Vec<Tk> = Vec::new();
         while j + 2 <= desc.len() {
             let (Some(&tag), Some(&l)) = (desc.get(j), desc.get(j + 1)) else {
                 break;
             };
             let l = usize::from(l);
             let body = desc.get(j + 2..(j + 2 + l).min(desc.len())).unwrap_or(&[]);
+            let lang3 = |b: &[u8]| lang(&String::from_utf8_lossy(b.get(..3).unwrap_or(&[])));
             match tag {
                 0x0a if body.len() >= 3 => {
-                    t.language = lang(&String::from_utf8_lossy(body.get(..3).unwrap_or(&[])))
+                    t.language = lang3(body);
+                    // ISO 639 audio_type: 1 clean effects, 2 hearing impaired, 3 visual
+                    // impaired commentary.
+                    match body.get(3) {
+                        Some(1) => audio_kinds.push(TrackKind::Music),
+                        Some(2) => audio_kinds.push(TrackKind::Dialogue),
+                        Some(3) => audio_kinds.push(TrackKind::Description),
+                        _ => {}
+                    }
                 }
                 0x59 if body.len() >= 3 => {
                     t.kind = Kind::Sub;
                     t.codec = "dvb_subtitle".into();
-                    t.language = lang(&String::from_utf8_lossy(body.get(..3).unwrap_or(&[])));
+                    // Every entry: language(3), subtitling_type, composition / ancillary page.
+                    for e in body.chunks(8).take(8) {
+                        if e.len() >= 3 {
+                            // 0x20..=0x25: for the hard of hearing.
+                            let sdh = e.get(3).is_some_and(|x| (0x20..=0x25).contains(x));
+                            subs.push((lang3(e), sdh));
+                        }
+                    }
                 }
-                0x56 => {
-                    t.kind = Kind::Sub;
-                    t.codec = "dvb_teletext".into();
+                0x56 | 0x46 => {
+                    // Entries: language(3), type(5) magazine(3), page. Type 2 is a subtitle
+                    // page, 5 a subtitle page for the hard of hearing.
+                    let before = subs.len();
+                    for e in body.as_chunks::<5>().0.iter().take(8) {
+                        match e.get(3).map(|b| b >> 3) {
+                            Some(2) => subs.push((lang3(e), false)),
+                            Some(5) => subs.push((lang3(e), true)),
+                            _ => {}
+                        }
+                    }
+                    // 0x56 is a teletext stream even without subtitle pages (one track, as
+                    // before D123). 0x46 (VBI teletext) is only a subtitle stream when it lists
+                    // a subtitle page: otherwise it stays data (review of D123).
+                    if tag == 0x56 || subs.len() > before {
+                        t.kind = Kind::Sub;
+                        t.codec = "dvb_teletext".into();
+                    }
                 }
-                0x6a => (t.kind, t.codec) = (Kind::Audio, "ac3".into()),
-                0x7a => (t.kind, t.codec) = (Kind::Audio, "eac3".into()),
+                // DVB supplementary_audio_descriptor (extension 0x06): editorial
+                // classification 1 visual impaired AD, 2 hearing impaired clean audio, 3 spoken
+                // subtitles.
+                0x7f if body.first() == Some(&0x06) => {
+                    if let Some(&f) = body.get(1) {
+                        match (f >> 2) & 0x1f {
+                            1 | 3 => audio_kinds.push(TrackKind::Description),
+                            2 => audio_kinds.push(TrackKind::Dialogue),
+                            _ => {}
+                        }
+                        if f & 1 == 1 {
+                            sup_lang = body.get(2..5).and_then(lang3);
+                        }
+                    }
+                }
+                0x6a | 0x7a => {
+                    (t.kind, t.codec) =
+                        (Kind::Audio, if tag == 0x6a { "ac3" } else { "eac3" }.into());
+                    // DVB component_type: service_type (bits 5..3), number_of_channels (2..0).
+                    if body.first().is_some_and(|f| f & 0x80 != 0)
+                        && let Some(&ct) = body.get(1)
+                    {
+                        let acmod = if ct & 7 >= 2 { 2 } else { 1 };
+                        if let Some(k) = audio::service_kind((ct >> 3) & 7, acmod) {
+                            audio_kinds.push(k);
+                        }
+                    }
+                }
+                // ATSC A/52 AC-3 audio descriptor: bsmod (3 bits) then num_channels (4 bits) in
+                // the third byte. num_channels 0 (1+1), 1 (1/0) and 8 (one channel) are
+                // acmod < 2, which makes bsmod 7 a voice-over rather than karaoke.
+                0x81 if body.len() >= 3 => {
+                    atsc_bsmod = body.get(2).map(|b| {
+                        let acmod = if matches!((b >> 1) & 0x0f, 0 | 1 | 8) {
+                            1
+                        } else {
+                            2
+                        };
+                        (b >> 5, acmod)
+                    })
+                }
+                // ATSC caption_service_descriptor on a video PID.
+                0x86 if t.kind == Kind::Video => {
+                    let n = usize::from(body.first().map_or(0, |b| b & 0x1f));
+                    for e in body
+                        .get(1..)
+                        .unwrap_or(&[])
+                        .as_chunks::<6>()
+                        .0
+                        .iter()
+                        .take(n.min(8))
+                    {
+                        let digital = e.get(3).is_some_and(|b| b & 0x80 != 0);
+                        let mut c = Tk {
+                            kind: Kind::Sub,
+                            id: u64::from(pid),
+                            codec: if digital { "eia_708" } else { "eia_608" }.into(),
+                            language: lang3(e),
+                            ..Tk::default()
+                        };
+                        c.add_kind(TrackKind::Cc);
+                        if e.get(4).is_some_and(|b| b & 0x80 != 0) {
+                            c.add_kind(TrackKind::EasyReader);
+                        }
+                        captions.push(c);
+                    }
+                }
                 0x7b => (t.kind, t.codec) = (Kind::Audio, "dts".into()),
                 0x05 if st == 0x06 => match body.get(..4) {
                     Some(b"Opus") => (t.kind, t.codec) = (Kind::Audio, "opus".into()),
@@ -218,11 +324,53 @@ fn pmt(sct: &[u8], es: &mut Vec<Es>) {
             }
             j += 2 + l;
         }
+        let mut extra = Vec::new();
+        match t.kind {
+            Kind::Audio => {
+                for k in audio_kinds {
+                    t.add_kind(k);
+                }
+                if matches!(t.codec.as_str(), "ac3" | "eac3")
+                    && let Some(k) = atsc_bsmod.and_then(|(m, acmod)| audio::service_kind(m, acmod))
+                {
+                    t.add_kind(k);
+                }
+                if t.language.is_none() {
+                    t.language = sup_lang;
+                }
+            }
+            Kind::Sub => {
+                // One track per subtitling / teletext entry, on the same PID.
+                let mut entries = subs.into_iter();
+                if let Some((l, sdh)) = entries.next() {
+                    t.language = l;
+                    if sdh {
+                        t.add_kind(TrackKind::Sdh);
+                    }
+                }
+                for (l, sdh) in entries {
+                    let mut x = Tk {
+                        kind: Kind::Sub,
+                        id: t.id,
+                        codec: t.codec.clone(),
+                        language: l,
+                        ..Tk::default()
+                    };
+                    if sdh {
+                        x.add_kind(TrackKind::Sdh);
+                    }
+                    extra.push(x);
+                }
+            }
+            Kind::Video => extra = captions,
+            Kind::Other => {}
+        }
         if !es.iter().any(|e| e.pid == pid) {
             es.push(Es {
                 pid,
                 done: t.kind == Kind::Sub || t.kind == Kind::Other,
                 tk: t,
+                extra,
                 buf: Vec::new(),
                 first_pts: None,
                 started: false,
@@ -248,7 +396,11 @@ fn try_parse(e: &mut Es, last: bool) {
             e.tried_at = n;
             let slice = match t.codec.as_str() {
                 "hevc" => codec::hevc_annexb(&e.buf, t),
-                "mpeg2video" | "mpeg1video" => codec::mpeg2_es(&e.buf, t),
+                "mpeg2video" | "mpeg1video" => {
+                    // Closed captions in the picture user data (D123).
+                    t.captions |= codec::mpeg2_captions(&e.buf);
+                    codec::mpeg2_es(&e.buf, t)
+                }
                 "h264" => {
                     let mut seen_slice = false;
                     for nal in codec::annexb(&e.buf) {
@@ -256,6 +408,8 @@ fn try_parse(e: &mut Es, last: bool) {
                             Some(7) if t.width.is_none() => {
                                 let _ = codec::h264_sps(nal, t);
                             }
+                            // SEI before the first slice: closed captions (D123).
+                            Some(6) => codec::h264_sei(nal, t),
                             Some(1 | 5) => {
                                 seen_slice = true;
                                 break;
@@ -474,6 +628,13 @@ pub(crate) fn probe(src: &Src, caps: &Caps) -> Option<Parsed> {
             }
         }
     }
-    out.tracks = es.into_iter().map(|e| e.tk).collect();
+    out.tracks = es
+        .into_iter()
+        .flat_map(|e| std::iter::once(e.tk).chain(e.extra))
+        .collect();
     Some(out)
 }
+
+#[cfg(test)]
+#[path = "ts_tests.rs"]
+mod tests;

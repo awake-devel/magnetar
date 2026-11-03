@@ -11,7 +11,7 @@
 
 use super::bits::Cur;
 use super::src::Src;
-use super::{AudioFeature, Kind, Parsed, Tk, audio, codec, lang};
+use super::{AudioFeature, Kind, Parsed, Tk, TrackKind, audio, codec, lang};
 
 /// Largest `stsd` / `moof` / `tkhd` body read.
 const MAX_BODY: u64 = 1 << 20;
@@ -137,6 +137,18 @@ struct Trak {
     nal_len: u8,
     /// `dec3` present but without the Atmos extension: the frame decides.
     complete: bool,
+    /// `hdlr` handler type.
+    handler: [u8; 4],
+    /// Track name from `udta` `name` / `tnam` (D123).
+    udta_name: Option<String>,
+    /// Track name from the `hdlr` name field (fallback, muxer boilerplate dropped).
+    hdlr_name: Option<String>,
+    /// Apple `tagc` characteristics.
+    tagc: Vec<String>,
+    /// `kind` boxes: (schemeURI, value).
+    roles: Vec<(String, String)>,
+    /// `tref/forc`: the tracks holding this track's forced subtitles.
+    forc: Vec<u32>,
 }
 
 pub(crate) fn probe(src: &Src) -> Option<Parsed> {
@@ -259,6 +271,16 @@ pub(crate) fn probe(src: &Src) -> Option<Parsed> {
             _ => {}
         }
     }
+    // `tref/forc` (D123): the referenced tracks hold the forced subtitles of the referencing one.
+    let forced: Vec<u64> = traks
+        .iter()
+        .flat_map(|t| t.forc.iter().map(|id| u64::from(*id)))
+        .collect();
+    for t in &mut traks {
+        if t.tk.kind == Kind::Sub && forced.contains(&t.tk.id) {
+            t.tk.add_kind(TrackKind::Forced);
+        }
+    }
     let d = frag_dur.filter(|d| *d > 0).unwrap_or(mvhd_dur);
     if d > 0 && timescale > 0 {
         out.duration = Some(d as f64 / timescale as f64);
@@ -310,13 +332,166 @@ fn trak(src: &Src, b: &Bx) -> Trak {
                 }
             }
             b"mdia" => mdia(src, &x, &mut t),
+            b"udta" => udta(src, &x, &mut t),
+            b"tref" => {
+                for r in children(src, x.body, x.end) {
+                    if &r.ty == b"forc"
+                        && let Some(d) = body(src, &r, 4 * 64)
+                    {
+                        t.forc
+                            .extend(d.as_chunks::<4>().0.iter().map(|c| u32::from_be_bytes(*c)));
+                    }
+                }
+            }
             _ => {}
         }
     }
     if t.tk.kind == Kind::Video && t.timescale > 0 && t.mdur > 0 && t.samples > 0 {
         t.tk.fps = Some(t.samples as f64 * t.timescale as f64 / t.mdur as f64);
     }
+    track_kinds(&mut t);
     t
+}
+
+/// Track `udta` (D123): `name` / `tnam` (the track name), Apple `tagc` characteristics and
+/// ISO `kind` roles. The box sits at the end of the `trak`, whose header the walk reads anyway.
+fn udta(src: &Src, b: &Bx, t: &mut Trak) {
+    let (mut name, mut tnam) = (None, None);
+    for x in children(src, b.body, b.end).into_iter().take(64) {
+        let Some(d) = body(src, &x, 4096) else {
+            continue;
+        };
+        match &x.ty {
+            b"name" => name = udta_text(d),
+            b"tnam" => tnam = udta_text(d),
+            b"tagc" if t.tagc.len() < 16 => {
+                let s = String::from_utf8_lossy(d)
+                    .trim_matches('\0')
+                    .trim()
+                    .to_string();
+                if !s.is_empty() {
+                    t.tagc.push(s);
+                }
+            }
+            b"kind" if t.roles.len() < 16 => {
+                let mut parts = d.get(4..).unwrap_or(&[]).split(|c| *c == 0);
+                let scheme = parts.next().map(super::text).unwrap_or_default();
+                let value = parts.next().map(super::text).unwrap_or_default();
+                if !scheme.is_empty() && !value.is_empty() {
+                    t.roles.push((scheme, value));
+                }
+            }
+            _ => {}
+        }
+    }
+    t.udta_name = name.or(tnam);
+}
+
+/// A `udta` text box: an `ilst`-style `data` atom, QuickTime international text (`u16`
+/// length, `u16` language) or the whole body as text (what ffmpeg writes for `name`).
+fn udta_text(d: &[u8]) -> Option<String> {
+    let s = if d.get(4..8) == Some(b"data") {
+        super::text(d.get(16..).unwrap_or(&[]))
+    } else {
+        let len = d
+            .get(..2)
+            .and_then(|x| x.try_into().ok())
+            .map_or(usize::MAX, |x| usize::from(u16::from_be_bytes(x)));
+        if len.checked_add(4).is_some_and(|e| e <= d.len()) {
+            super::text(d.get(4..4 + len).unwrap_or(&[]))
+        } else {
+            super::text(d)
+        }
+    };
+    Some(s).filter(|s| !s.is_empty())
+}
+
+/// `hdlr` names that are muxer boilerplate, not a track name (matched as substrings:
+/// "GPAC ISO Video Handler", "Core Media Audio", "SoundHandler", "ISO Media file produced by
+/// Google Inc.").
+const HDLR_BOILERPLATE: [&str; 16] = [
+    "iso media",
+    "handler",
+    "core media",
+    "gpac",
+    "l-smash",
+    "bento4",
+    "mainconcept",
+    "apple",
+    "media handler",
+    "isomedia",
+    "timed text",
+    "closed caption",
+    "video media",
+    "sound media",
+    "text media",
+    "subtitle media",
+];
+
+/// The `hdlr` name field (`body[24..]`): C string, or Pascal string in QuickTime files.
+fn hdlr_name(d: &[u8]) -> Option<String> {
+    let mut b = d.get(24..)?;
+    if let Some(&n) = b.first()
+        && usize::from(n) + 1 == b.len()
+    {
+        b = b.get(1..)?;
+    }
+    let s = super::text(b);
+    let low = s.to_lowercase();
+    // Also the handler type repeated as the name ("soun", Chromium's test files).
+    let boiler = HDLR_BOILERPLATE.iter().any(|h| low.contains(h))
+        || d.get(8..12)
+            .is_some_and(|h| h.eq_ignore_ascii_case(low.as_bytes()));
+    Some(s).filter(|s| !s.is_empty() && !boiler)
+}
+
+/// The track's name and its kinds from `tagc` and `kind` (D123).
+fn track_kinds(t: &mut Trak) {
+    t.tk.name = t.udta_name.take().or_else(|| t.hdlr_name.take());
+    let sub = t.tk.kind == Kind::Sub;
+    let audio = t.tk.kind == Kind::Audio;
+    let tagc = std::mem::take(&mut t.tagc);
+    for c in &tagc {
+        match c.as_str() {
+            "public.accessibility.describes-music-and-sound" if sub => {
+                t.tk.add_kind(TrackKind::Sdh);
+            }
+            "public.accessibility.describes-video" if sub || audio => {
+                t.tk.add_kind(TrackKind::Description);
+            }
+            "public.easy-to-read" if sub => t.tk.add_kind(TrackKind::EasyReader),
+            _ => {}
+        }
+    }
+    let roles = std::mem::take(&mut t.roles);
+    for (scheme, value) in &roles {
+        let k = match (scheme.as_str(), value.as_str()) {
+            ("urn:mpeg:dash:role:2011", v) => match v {
+                "caption" if sub => Some(TrackKind::Sdh),
+                "commentary" => Some(TrackKind::Commentary),
+                "description" => Some(TrackKind::Description),
+                "dub" if audio => Some(TrackKind::Dub),
+                "forced-subtitle" if sub => Some(TrackKind::Forced),
+                "enhanced-audio-intelligibility" if audio => Some(TrackKind::Dialogue),
+                "easyreader" if sub => Some(TrackKind::EasyReader),
+                "karaoke" if audio => Some(TrackKind::Karaoke),
+                "karaoke" if sub => Some(TrackKind::Signs),
+                _ => None,
+            },
+            ("about:html-kind", v) => match v {
+                "captions" if sub => Some(TrackKind::Sdh),
+                "descriptions" if sub => Some(TrackKind::Description),
+                "commentary" => Some(TrackKind::Commentary),
+                "description" | "main-desc" if audio => Some(TrackKind::Description),
+                "translation" if audio => Some(TrackKind::Dub),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(k) = k {
+            t.tk.add_kind(k);
+        }
+    }
 }
 
 fn mdia(src: &Src, b: &Bx, t: &mut Trak) {
@@ -324,14 +499,18 @@ fn mdia(src: &Src, b: &Bx, t: &mut Trak) {
     // hdlr first: the stsd layout depends on the handler.
     for m in &kids {
         if &m.ty == b"hdlr"
-            && let Some(d) = body(src, m, 12)
+            && let Some(d) = body(src, m, 24 + 256)
         {
             t.tk.kind = match d.get(8..12) {
                 Some(b"vide") => Kind::Video,
                 Some(b"soun") => Kind::Audio,
-                Some(b"subt" | b"sbtl" | b"text" | b"clcp") => Kind::Sub,
+                Some(b"subt" | b"sbtl" | b"text" | b"clcp" | b"subp") => Kind::Sub,
                 _ => Kind::Other,
             };
+            if let Some(h) = d.get(8..12).and_then(|h| h.try_into().ok()) {
+                t.handler = h;
+            }
+            t.hdlr_name = hdlr_name(d);
         }
     }
     for m in &kids {
@@ -491,8 +670,9 @@ fn sub_codec(fc: &[u8]) -> Option<&'static str> {
     Some(match fc {
         b"tx3g" | b"text" => "mov_text",
         b"wvtt" => "webvtt",
-        b"stpp" => "ttml",
+        b"stpp" | b"dfxp" => "ttml",
         b"c608" => "eia_608",
+        b"c708" => "eia_708",
         _ => return None,
     })
 }
@@ -506,6 +686,7 @@ fn stsd(d: &[u8], tr: &mut Trak) {
     let entry = d
         .get(8..(8usize.saturating_add(sz as usize)).min(d.len()))
         .unwrap_or(&[]);
+    let handler = tr.handler;
     let t = &mut tr.tk;
     let fcs = String::from_utf8_lossy(fc).to_string();
     let name = match t.kind {
@@ -515,6 +696,20 @@ fn stsd(d: &[u8], tr: &mut Trak) {
         Kind::Other => None,
     };
     t.codec = name.map_or_else(|| format!("?{fcs}"), str::to_string);
+    if t.kind == Kind::Sub {
+        if fc == b"mp4s" && &handler == b"subp" {
+            t.codec = "dvd_subtitle".into();
+        }
+        // 3GPP TS 26.245 TextSampleEntry: displayFlags after the 16-byte SampleEntry head;
+        // 0x80000000 = all samples forced (0x40000000, some samples forced, says nothing).
+        if matches!(fc, b"tx3g" | b"text")
+            && let Some(f) = entry.get(16..20).and_then(|x| x.try_into().ok())
+            && u32::from_be_bytes(f) & 0x8000_0000 != 0
+        {
+            t.add_kind(TrackKind::Forced);
+        }
+        return;
+    }
     match fc {
         b"dtsl" => t.profile = Some("DTS-HD MA".into()),
         b"dtse" => t.profile = Some("DTS Express".into()),
@@ -1042,3 +1237,7 @@ fn first_sample(src: &Src, t: &mut Trak) {
     }
     tk.frame_done = true;
 }
+
+#[cfg(test)]
+#[path = "mp4_tests.rs"]
+mod tests;

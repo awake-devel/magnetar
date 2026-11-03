@@ -2,11 +2,15 @@ package app.magnetar.ui
 
 import app.magnetar.api.FacetCount
 import app.magnetar.api.FacetCounts
+import app.magnetar.api.MagnetarApi
+import app.magnetar.api.SearchQuery
 import app.magnetar.api.Sort
 import app.magnetar.ui.common.facetLabel
 import app.magnetar.ui.search.ChipOrder
 import app.magnetar.ui.search.DatePreset
+import app.magnetar.ui.search.FACET_TITLES
 import app.magnetar.ui.search.PROBE_FACET_FIELDS
+import app.magnetar.ui.search.PROBE_KIND_FIELDS
 import app.magnetar.ui.search.SearchFilters
 import app.magnetar.ui.search.buildQuery
 import app.magnetar.ui.search.facetChips
@@ -135,5 +139,78 @@ class SearchModelTest {
         assertEquals(facetLabel("language", "fr"), "French")
         val counted = facetChips("probe_hdr", setOf("hlg"), FacetCounts("probe_hdr", 5, listOf(FacetCount("any", 5), FacetCount("hdr10", 4))))
         assertEquals(counted.map { it.value to it.count }, listOf("any" to 5L, "hdr10" to 4L, "hlg" to 0L))
+    }
+
+    @Test
+    fun `probe kind filters round-trip and are dropped without probe_kinds`() {
+        val f = SearchFilters(
+            probeSubtitles = setOf("fre"), probeSubKinds = setOf("sdh", "forced"), probeAudioKinds = setOf("description"),
+            probeSubFormats = setOf("image"), probeLanguages = setOf("fre"),
+        )
+        val q = buildQuery("", f, Sort.DATE, true, includeAdult = false, nowSec = now)
+        assertEquals(q.probeSubKinds, listOf("forced", "sdh"))
+        assertEquals(q.probeAudioKinds, listOf("description"))
+        assertEquals(q.probeSubFormats, listOf("image"))
+        assertEquals(filtersOf(q, now), f)
+        assertEquals(f.activeCount, 5)
+        assertTrue(f.hasProbeFilters)
+        assertTrue(SearchFilters(probeSubFormats = setOf("text")).hasProbeFilters)
+        // The wire names of the shared contract (D125).
+        val json = MagnetarApi.JSON.encodeToString(SearchQuery.serializer(), q)
+        assertTrue("\"probe_sub_kinds\":[\"forced\",\"sdh\"]" in json, json)
+        assertTrue("\"probe_audio_kinds\":[\"description\"]" in json, json)
+        assertTrue("\"probe_sub_formats\":[\"image\"]" in json, json)
+        // A D122 server (probe_filters, no probe_kinds) would ignore the kinds and answer
+        // unfiltered: they are not sent, the language filters still are.
+        val d122 = f.supportedBy(setOf("filters", "probe_filters"))
+        assertEquals(d122, SearchFilters(probeSubtitles = setOf("fre"), probeLanguages = setOf("fre")))
+        // Without probe_filters nothing of the probes goes, probe_kinds or not.
+        assertEquals(f.supportedBy(setOf("probe_kinds")), SearchFilters())
+        assertEquals(f.supportedBy(setOf("probe_filters", "probe_kinds")), f)
+    }
+
+    @Test
+    fun `kind chips toggle and read as names`() {
+        assertEquals(
+            PROBE_FACET_FIELDS,
+            listOf(
+                "probe_language", "probe_audio_kind", "probe_subtitles", "probe_sub_kind", "probe_sub_format",
+                "probe_resolution", "probe_codec", "probe_hdr", "probe_audio",
+            ),
+        )
+        assertTrue(PROBE_FACET_FIELDS.containsAll(PROBE_KIND_FIELDS))
+        assertEquals(FACET_TITLES["probe_audio_kind"], "Audio track kind")
+        assertEquals(FACET_TITLES["probe_sub_kind"], "Subtitle kind")
+        assertEquals(FACET_TITLES["probe_sub_format"], "Subtitle format")
+        var f = SearchFilters()
+        for (field in PROBE_KIND_FIELDS) {
+            f = f.toggle(field, "x")
+            assertEquals(f.selected(field), setOf("x"), field)
+            f = f.toggle(field, "x")
+            assertTrue(f.selected(field).isEmpty(), field)
+        }
+        assertEquals(
+            facetChips("probe_audio_kind", emptySet(), null).map { it.label },
+            listOf(
+                "Original", "Dubbed", "Voice-over", "Audio description", "Clear dialogue", "Commentary", "Music only",
+                "Karaoke", "Alternate mix",
+            ),
+        )
+        assertEquals(
+            facetChips("probe_sub_kind", emptySet(), null).map { it.value to it.label },
+            listOf(
+                "sdh" to "SDH", "cc" to "Closed captions", "forced" to "Forced", "signs" to "Signs & songs",
+                "commentary" to "Commentary", "description" to "Descriptions", "honorifics" to "Honorifics",
+                "bilingual" to "Bilingual", "easy_reader" to "Easy reader",
+            ),
+        )
+        assertEquals(
+            facetChips("probe_sub_format", emptySet(), null).map { it.value to it.label },
+            listOf("text" to "Text (SRT, ASS…)", "image" to "Image (PGS, VobSub…)", "cc" to "Closed captions (608/708)"),
+        )
+        // A kind a newer server counts and this app does not know reads as words.
+        assertEquals(facetLabel("probe_sub_kind", "sign_language"), "Sign language")
+        val counted = facetChips("probe_sub_kind", setOf("forced"), FacetCounts("probe_sub_kind", 3, listOf(FacetCount("sdh", 3))))
+        assertEquals(counted.map { it.label to it.count }, listOf("SDH" to 3L, "Forced" to 0L))
     }
 }

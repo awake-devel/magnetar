@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::*;
+use magnetar_core::api::FacetSet;
 use magnetar_core::model::*;
 use magnetar_core::query::{PROBE_FACETS, SearchPage, SearchQuery};
 use magnetar_core::store::Store;
@@ -511,6 +512,567 @@ async fn stored_rows_get_the_width_aware_class() {
     assert_eq!(tags(4).await, want(&["k:game", "p:ps5"]));
 }
 
+/// A probe stored as `probes::store` writes it: the tags of `probes::summary` over one video
+/// file whose tracks are `video` (the `ProbeVideo` JSON a worker sends).
+async fn probe_video(s: &PgStore, n: u64, video: serde_json::Value) {
+    let report = magnetar_server::fleet::proto::ProbeReport {
+        v: magnetar_core::probe::PROBE_VERSION,
+        status: "ok".into(),
+        files: vec![ProbeFile {
+            i: 0,
+            size: 1000,
+            label: "video.mkv".into(),
+            confidence: 100,
+            verified: true,
+            video: Some(serde_json::from_value(video).unwrap()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let summary = magnetar_server::probes::summary(&report);
+    let tags: Vec<&str> = summary.tags.iter().map(String::as_str).collect();
+    probe(s, n, &tags).await;
+}
+
+/// The D125 corpus: T1 English SDH (PGS) + French subtitles, French audio + an English
+/// commentary; T2 French SDH, French audio + French audio description; T3 French forced
+/// subtitles only, English audio; T4 a version-1 probe without kinds (French subtitles,
+/// English audio). Spec §4.6.
+async fn kinds_corpus(s: &PgStore) {
+    use serde_json::json;
+    for (n, title) in [
+        (11, "kinds one"),
+        (12, "kinds two"),
+        (13, "kinds three"),
+        (14, "kinds four"),
+    ] {
+        dht_row(s, n, title, "video").await;
+    }
+    let v = |audio: serde_json::Value, subs: serde_json::Value| {
+        json!({"container": "matroska",
+               "video": [{"codec": "h264", "width": 1920, "height": 1080}],
+               "audio": audio, "subs": subs})
+    };
+    probe_video(
+        s,
+        11,
+        v(
+            json!([{"codec": "eac3", "channels": 6, "lang": "fre"},
+                   {"codec": "ac3", "channels": 2, "lang": "eng", "kinds": ["commentary"],
+                    "name": "Director's Commentary"}]),
+            json!([{"codec": "hdmv_pgs_subtitle", "lang": "eng", "kinds": ["sdh"]},
+                   {"codec": "subrip", "lang": "fre"}]),
+        ),
+    )
+    .await;
+    probe_video(
+        s,
+        12,
+        v(
+            json!([{"codec": "eac3", "channels": 6, "lang": "fre"},
+                   {"codec": "aac", "channels": 2, "lang": "fre", "kinds": ["description"]}]),
+            json!([{"codec": "subrip", "lang": "fre", "kinds": ["sdh"]}]),
+        ),
+    )
+    .await;
+    probe_video(
+        s,
+        13,
+        v(
+            json!([{"codec": "aac", "channels": 2, "lang": "eng"}]),
+            json!([{"codec": "subrip", "lang": "fre", "kinds": ["forced"]}]),
+        ),
+    )
+    .await;
+    probe_video(
+        s,
+        14,
+        v(
+            json!([{"codec": "aac", "channels": 2, "lang": "eng"}]),
+            json!([{"codec": "subrip", "lang": "fre"}]),
+        ),
+    )
+    .await;
+}
+
+/// D125: the track-kind filters select the same torrents on the index and on the Postgres
+/// fallback; a language with a kind of the same family is one track having both (French +
+/// SDH finds a French SDH track, not French subtitles beside English SDH); forced subtitles
+/// and commentary audio do not count as a language (D124).
+#[tokio::test]
+async fn probe_kind_filters_match_on_index_and_postgres() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    kinds_corpus(s).await;
+    let ix = index_for(s).await;
+    let pg = pg_only(s);
+    let strs = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    let cases: Vec<(&str, SearchQuery, Vec<u64>)> = vec![
+        ("none", q("kinds"), vec![11, 12, 13, 14]),
+        (
+            "probe_sub=fre",
+            SearchQuery {
+                probe_subtitles: strs(&["fre"]),
+                ..q("kinds")
+            },
+            vec![11, 12, 14],
+        ),
+        (
+            "probe_sub_kind=sdh",
+            SearchQuery {
+                probe_sub_kinds: strs(&["sdh"]),
+                ..q("kinds")
+            },
+            vec![11, 12],
+        ),
+        (
+            "probe_sub=fre + probe_sub_kind=sdh (T1's SDH is English)",
+            SearchQuery {
+                probe_subtitles: strs(&["fre"]),
+                probe_sub_kinds: strs(&["sdh"]),
+                ..q("kinds")
+            },
+            vec![12],
+        ),
+        (
+            "probe_sub=fre + probe_sub_kind=forced",
+            SearchQuery {
+                probe_subtitles: strs(&["fr"]),
+                probe_sub_kinds: strs(&["FORCED"]),
+                ..q("kinds")
+            },
+            vec![13],
+        ),
+        (
+            "probe_sub=fre,eng + probe_sub_kind=sdh",
+            SearchQuery {
+                probe_subtitles: strs(&["fre", "eng"]),
+                probe_sub_kinds: strs(&["sdh"]),
+                ..q("kinds")
+            },
+            vec![11, 12],
+        ),
+        (
+            "probe_sub_format=image",
+            SearchQuery {
+                probe_sub_formats: strs(&["image"]),
+                ..q("kinds")
+            },
+            vec![11],
+        ),
+        (
+            "probe_lang=eng (T1's English track is a commentary)",
+            SearchQuery {
+                probe_languages: strs(&["eng"]),
+                ..q("kinds")
+            },
+            vec![13, 14],
+        ),
+        (
+            "probe_audio_kind=commentary",
+            SearchQuery {
+                probe_audio_kinds: strs(&["commentary"]),
+                ..q("kinds")
+            },
+            vec![11],
+        ),
+        (
+            "probe_lang=fre + probe_audio_kind=description",
+            SearchQuery {
+                probe_languages: strs(&["fre"]),
+                probe_audio_kinds: strs(&["description"]),
+                ..q("kinds")
+            },
+            vec![12],
+        ),
+        (
+            "probe_lang=eng + probe_audio_kind=commentary",
+            SearchQuery {
+                probe_languages: strs(&["eng"]),
+                probe_audio_kinds: strs(&["commentary"]),
+                ..q("kinds")
+            },
+            vec![11],
+        ),
+        (
+            "unknown kind matches nothing",
+            SearchQuery {
+                probe_sub_kinds: strs(&["hardsub"]),
+                ..q("kinds")
+            },
+            vec![],
+        ),
+        (
+            "browse: a kind filter turns the D76 rule off like any probe filter",
+            SearchQuery {
+                probe_sub_kinds: strs(&["sdh"]),
+                ..q("")
+            },
+            vec![11, 12],
+        ),
+    ];
+    for (name, query, want) in cases {
+        let a = s.search(&query, NOW).await.unwrap();
+        let b = pg.search(&query, NOW).await.unwrap();
+        assert_eq!(hashes(&a), set(&want), "index, {name}");
+        assert_eq!(hashes(&b), set(&want), "postgres, {name}");
+        assert_eq!(a.total, want.len() as u64, "index total, {name}");
+    }
+    // The query string of GET /api/v1/search.
+    let parsed = magnetar_server::api::parse_search_query(Some(
+        "q=kinds&probe_sub_kind=sdh&probe_audio_kind=commentary&probe_sub_format=text\
+         &probe_sub_kind=forced,cc",
+    ))
+    .unwrap();
+    assert_eq!(parsed.probe_sub_kinds, vec!["sdh", "forced", "cc"]);
+    assert_eq!(parsed.probe_audio_kinds, vec!["commentary"]);
+    assert_eq!(parsed.probe_sub_formats, vec!["text"]);
+    assert!(parsed.needs_probe_kind_feature());
+    drop(ix);
+}
+
+/// D125: with a language + kind pair filter, the language and kind facets count tracks:
+/// each value's count is what picking it as well would give (French + SDH: the kind facet
+/// counts French tracks' kinds, the language facet SDH tracks' languages).
+#[tokio::test]
+async fn probe_kind_facets_count_per_track() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    kinds_corpus(s).await;
+    let ix = index_for(s).await;
+    let fields: Vec<String> = PROBE_FACETS.iter().map(|f| f.to_string()).collect();
+    let counts = |set: &FacetSet, name: &str| -> Vec<(String, u64)> {
+        let f = set.facets.iter().find(|f| f.field == name).unwrap();
+        let mut v: Vec<(String, u64)> = f
+            .counts
+            .iter()
+            .map(|c| (c.value.clone(), c.count))
+            .collect();
+        v.sort();
+        v
+    };
+    let pairs = |v: &[(&str, u64)]| -> Vec<(String, u64)> {
+        let mut v: Vec<(String, u64)> = v.iter().map(|(a, n)| (a.to_string(), *n)).collect();
+        v.sort();
+        v
+    };
+    let query = SearchQuery {
+        probe_subtitles: vec!["fre".into()],
+        probe_sub_kinds: vec!["sdh".into()],
+        ..q("kinds")
+    };
+    let set = s
+        .facet_set(&query, &fields, 20, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(set.total, 1, "T2");
+    assert_eq!(
+        counts(&set, "probe_sub_kind"),
+        pairs(&[("sdh", 1), ("forced", 1)])
+    );
+    assert_eq!(
+        counts(&set, "probe_subtitles"),
+        pairs(&[("eng", 1), ("fre", 1)])
+    );
+    // Facets of other fields apply the pair filter.
+    assert_eq!(counts(&set, "probe_sub_format"), pairs(&[("text", 1)]));
+    assert_eq!(
+        counts(&set, "probe_audio_kind"),
+        pairs(&[("description", 1)])
+    );
+    // Picking a counted value gives that count.
+    for (subs, kinds, want) in [
+        (vec!["fre"], vec!["forced"], 1),
+        (vec!["eng"], vec!["sdh"], 1),
+        (vec!["fre"], vec!["sdh", "forced"], 2),
+        (vec!["fre", "eng"], vec!["sdh"], 2),
+    ] {
+        let q2 = SearchQuery {
+            probe_subtitles: subs.iter().map(|x| x.to_string()).collect(),
+            probe_sub_kinds: kinds.iter().map(|x| x.to_string()).collect(),
+            ..q("kinds")
+        };
+        assert_eq!(
+            s.search(&q2, NOW).await.unwrap().total,
+            want,
+            "{subs:?} {kinds:?}"
+        );
+    }
+    // The audio family the same way: English + commentary.
+    let query = SearchQuery {
+        probe_languages: vec!["eng".into()],
+        probe_audio_kinds: vec!["commentary".into()],
+        ..q("kinds")
+    };
+    let set = s
+        .facet_set(&query, &fields, 20, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(set.total, 1, "T1");
+    assert_eq!(counts(&set, "probe_language"), pairs(&[("eng", 1)]));
+    assert_eq!(
+        counts(&set, "probe_audio_kind"),
+        pairs(&[("commentary", 1)])
+    );
+    // Only one side set (review of D125): the other side's chips are counted on the pair
+    // column too, because picking one makes a pair filter. A kind alone: SDH matches T1 and
+    // T2, and the language chips say what French + SDH or English + SDH return (one each,
+    // not fre 2 from T2's French SDH plus T1's unrelated French SRT).
+    let only_kind = SearchQuery {
+        probe_sub_kinds: vec!["sdh".into()],
+        ..q("kinds")
+    };
+    let set = s
+        .facet_set(&only_kind, &fields, 20, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(set.total, 2);
+    assert_eq!(
+        counts(&set, "probe_sub_kind"),
+        pairs(&[("sdh", 2), ("forced", 1)])
+    );
+    assert_eq!(
+        counts(&set, "probe_subtitles"),
+        pairs(&[("eng", 1), ("fre", 1)])
+    );
+    // A forced kind alone: T3, whose forced French track has no `s:fre` tag (D124); the
+    // French chip is still offered, and picking it returns T3.
+    let set = s
+        .facet_set(
+            &SearchQuery {
+                probe_sub_kinds: vec!["forced".into()],
+                ..q("kinds")
+            },
+            &fields,
+            20,
+            NOW,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(set.total, 1);
+    assert_eq!(counts(&set, "probe_subtitles"), pairs(&[("fre", 1)]));
+    // A language alone: French subtitles match T1, T2 and T4; the kind chips say what
+    // French + SDH ({T2}) and French + forced ({T3}) return.
+    let only_lang = SearchQuery {
+        probe_subtitles: vec!["fre".into()],
+        ..q("kinds")
+    };
+    let set = s
+        .facet_set(&only_lang, &fields, 20, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(set.total, 3);
+    assert_eq!(
+        counts(&set, "probe_sub_kind"),
+        pairs(&[("sdh", 1), ("forced", 1)])
+    );
+    // The same language facet is counted as before, on `s:` (D122).
+    assert_eq!(
+        counts(&set, "probe_subtitles"),
+        pairs(&[("eng", 1), ("fre", 3)])
+    );
+    // Audio: English alone; the commentary chip says what English + commentary returns.
+    let set = s
+        .facet_set(
+            &SearchQuery {
+                probe_languages: vec!["eng".into()],
+                ..q("kinds")
+            },
+            &fields,
+            20,
+            NOW,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(set.total, 2, "T3, T4");
+    assert_eq!(
+        counts(&set, "probe_audio_kind"),
+        pairs(&[("commentary", 1)])
+    );
+    // Every chip above predicts the total of picking it.
+    for (subs, kinds, want) in [
+        (vec!["eng"], vec!["sdh"], 1),
+        (vec!["fre"], vec!["sdh"], 1),
+        (vec!["fre"], vec!["forced"], 1),
+    ] {
+        let q2 = SearchQuery {
+            probe_subtitles: subs.iter().map(|x| x.to_string()).collect(),
+            probe_sub_kinds: kinds.iter().map(|x| x.to_string()).collect(),
+            ..q("kinds")
+        };
+        assert_eq!(s.search(&q2, NOW).await.unwrap().total, want);
+    }
+    drop(ix);
+}
+
+/// D123–D125 end to end, from real file bytes: the ffmpeg-made MP4 fixture (two audio tracks:
+/// "Commentary" by name and a `describes-video` description; two mov_text subtitles: forced
+/// by a `kind` box and SDH by `tagc`) goes through sniff, the worker's `report_of`, the
+/// server's `store` (validation, summary, tags), the detail API JSON the app decodes, and the
+/// kind filters on the index and on the Postgres fallback.
+#[tokio::test]
+async fn track_kinds_end_to_end_from_file_bytes() {
+    use magnetar_core::probe::{FileResult, ProbeResult, ProbeStatus};
+    let bytes = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../sniff/tests/video_fixtures/ffmpeg_kinds.mp4"),
+    )
+    .unwrap();
+    let size = bytes.len() as u64;
+    let file = sniff::SparseFile::from_bytes(bytes);
+    let det = sniff::Detector::new()
+        .caps(sniff::video::recommended_caps())
+        .detect(&file);
+    let det = det.detection().expect("detected").clone();
+    let result = ProbeResult {
+        status: ProbeStatus::Ok,
+        files: vec![FileResult {
+            index: 0,
+            size,
+            detection: det,
+            verified: true,
+            agreed: 1,
+            notes: Vec::new(),
+        }],
+        bytes_in: size,
+        uploaded: 0,
+        peers_used: 1,
+        unchoked: true,
+        incomplete: false,
+        surprises: 0,
+    };
+    // The worker's side: what it uploads.
+    let report = magnetar_server::probes::report_of(&result).expect("a storable report");
+    assert_eq!(report.v, 2);
+    let v = report.files[0].video.as_ref().expect("video");
+    let audio: Vec<&[String]> = v.audio.iter().map(|a| a.kinds.as_slice()).collect();
+    let subs: Vec<&[String]> = v.subs.iter().map(|s| s.kinds.as_slice()).collect();
+    assert_eq!(audio, [&["commentary"][..], &["description"]], "{v:?}");
+    assert_eq!(subs, [&["forced"][..], &["sdh"]], "{v:?}");
+    assert_eq!(v.audio[0].name.as_deref(), Some("Commentary"));
+
+    // The server's side: validated and stored for a DHT row with that one file.
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    let h = ih(31);
+    crate::probe_pg::dht_row(s, &h, "Kinds.Fixture.2026", "video", &[("Kinds.mp4", size)]).await;
+    let o = magnetar_server::probes::store(
+        s.pool(),
+        "w1",
+        vec![magnetar_server::probes::Upload {
+            infohash: h.clone(),
+            report: report.clone(),
+        }],
+        NOW,
+    )
+    .await
+    .unwrap();
+    assert_eq!((o.stored, o.rejected), (1, 0));
+
+    // The detail JSON carries kinds and the name (the app decodes `kinds`, never shows `name`).
+    let base = spawn_server(s).await;
+    let d = crate::probe_pg::detail(&base, &h).await;
+    assert_eq!(d["probe"]["version"], 2, "{d}");
+    let jv = &d["probe"]["files"][0]["video"];
+    assert_eq!(
+        jv["audio"][0]["kinds"],
+        serde_json::json!(["commentary"]),
+        "{d}"
+    );
+    assert_eq!(jv["audio"][0]["name"], "Commentary", "{d}");
+    assert_eq!(
+        jv["audio"][1]["kinds"],
+        serde_json::json!(["description"]),
+        "{d}"
+    );
+    assert_eq!(jv["subs"][0]["kinds"], serde_json::json!(["forced"]), "{d}");
+    assert_eq!(jv["subs"][1]["kinds"], serde_json::json!(["sdh"]), "{d}");
+    assert_eq!(jv["subs"][0]["codec"], "mov_text", "{d}");
+
+    // Search: the kind and format filters find it on both paths; a kind it lacks does not.
+    let ix = index_for(s).await;
+    let pg = pg_only(s);
+    let strs = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    for (name, query, found) in [
+        (
+            "sub kind forced",
+            SearchQuery {
+                probe_sub_kinds: strs(&["forced"]),
+                ..q("")
+            },
+            true,
+        ),
+        (
+            "sub kind sdh + format text",
+            SearchQuery {
+                probe_sub_kinds: strs(&["sdh"]),
+                probe_sub_formats: strs(&["text"]),
+                ..q("")
+            },
+            true,
+        ),
+        (
+            "audio kinds",
+            SearchQuery {
+                probe_audio_kinds: strs(&["description", "commentary"]),
+                ..q("")
+            },
+            true,
+        ),
+        (
+            "sub kind cc",
+            SearchQuery {
+                probe_sub_kinds: strs(&["cc"]),
+                ..q("")
+            },
+            false,
+        ),
+        (
+            "format image",
+            SearchQuery {
+                probe_sub_formats: strs(&["image"]),
+                ..q("")
+            },
+            false,
+        ),
+    ] {
+        for (path, page) in [
+            ("index", s.search(&query, NOW).await.unwrap()),
+            ("postgres", pg.search(&query, NOW).await.unwrap()),
+        ] {
+            let hit = page.hits.iter().any(|x| x.infohash == h);
+            assert_eq!(hit, found, "{path}, {name}");
+        }
+    }
+    drop(ix);
+}
+
+/// D125: `/health` lists `probe_kinds`, so the app offers the kind chips.
+#[tokio::test]
+async fn health_lists_probe_kinds() {
+    use magnetar_core::api::{Health, features};
+    assert!(features::ALL.contains(&features::PROBE_KINDS));
+    let Some(db) = test_db().await else { return };
+    let base = spawn_server(&db.store).await;
+    let h: Health = magnetar_core::http::client(Duration::from_secs(20))
+        .unwrap()
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(h.features.iter().any(|f| f == features::PROBE_KINDS));
+    assert!(h.features.iter().any(|f| f == features::PROBE_FILTERS));
+}
+
 /// Probe tags like the D117 summary writes them, for a share of synthetic documents:
 /// roughly the production mix of containers and tracks (MKV most, MP4 and AVI with few
 /// languages), with rare values to test rare filters.
@@ -584,6 +1146,41 @@ fn probe_tags_for(i: u64, probed_per_mille: u64) -> Vec<String> {
             t.push("s:fre".into());
         }
     }
+    // Track kinds (D124) on about 30 % of probed documents: SDH and forced subtitles most,
+    // commentary and audio description less, as releases carry them.
+    if h(13) % 10 < 3 {
+        let sub = match h(14) % 10 {
+            0..=4 => "sdh",
+            5..=7 => "forced",
+            8 => "signs",
+            _ => "cc",
+        };
+        let lang = if h(15) % 4 == 0 { "fre" } else { "eng" };
+        t.push(format!("sk:{sub}"));
+        t.push(format!("sp:{lang}:{sub}"));
+        if h(16) % 3 == 0 {
+            let audio = if h(17) % 3 == 0 {
+                "description"
+            } else {
+                "commentary"
+            };
+            t.push(format!("ak:{audio}"));
+            t.push(format!("ap:eng:{audio}"));
+        }
+    }
+    // Subtitle format class of probed documents with subtitles.
+    if t.iter()
+        .any(|x| x.starts_with("s:") || x.starts_with("sk:"))
+    {
+        t.push(
+            if h(18) % 3 == 0 {
+                "sf:image"
+            } else {
+                "sf:text"
+            }
+            .into(),
+        );
+    }
     t
 }
 
@@ -651,6 +1248,29 @@ fn probe_queries() -> Vec<(&'static str, SearchQuery)> {
             },
         ),
         (
+            "browse, kind: sdh",
+            SearchQuery {
+                probe_sub_kinds: vec!["sdh".into()],
+                ..f("")
+            },
+        ),
+        (
+            "browse, pair: fre + sdh",
+            SearchQuery {
+                probe_subtitles: vec!["fre".into()],
+                probe_sub_kinds: vec!["sdh".into()],
+                ..f("")
+            },
+        ),
+        (
+            "browse, pair: eng + audio description",
+            SearchQuery {
+                probe_languages: vec!["eng".into()],
+                probe_audio_kinds: vec!["description".into()],
+                ..f("")
+            },
+        ),
+        (
             "seeders sort + atmos",
             SearchQuery {
                 probe_audio: vec!["atmos".into()],
@@ -663,7 +1283,8 @@ fn probe_queries() -> Vec<(&'static str, SearchQuery)> {
 
 /// D122 measurement, index side, at production size: synthetic documents shaped like
 /// releases (`search_index::synthetic_docs`) with probe tags on a share of them, then the
-/// probe filters from common to rare, and the app's filter-sheet facet set (17 facets). Ignored (minutes to
+/// probe filters from common to rare, and the app's filter-sheet facet set (20 facets since
+/// D125). Ignored (minutes to
 /// build); env `MAGNETAR_BENCH_DOCS` (default 1 800 000), `MAGNETAR_BENCH_PROBED` (per mille
 /// probed, default 100).
 #[test]
@@ -710,7 +1331,7 @@ fn probe_filters_at_scale_in_memory() {
         t.elapsed().as_secs_f64()
     );
     // The app's sheet refresh (SearchViewModel.facets): category, origin, the nine name
-    // facets of FACET_FIELDS, then the six probe facets: 17.
+    // facets of FACET_FIELDS, then the nine probe facets (six of D122, three of D125): 20.
     let fields: Vec<String> = [
         "category",
         "origin",
@@ -746,9 +1367,10 @@ fn probe_filters_at_scale_in_memory() {
         }
         facet_times.sort();
         eprintln!(
-            "{name:>44}: {total:>8} hits, search p50 {:>7.2} ms max {:>7.2} ms, 17 facets p50 {:>7.2} ms",
+            "{name:>44}: {total:>8} hits, search p50 {:>7.2} ms max {:>7.2} ms, {} facets p50 {:>7.2} ms",
             ms(times[3]),
             ms(times[6]),
+            fields.len(),
             ms(facet_times[1]),
         );
     }

@@ -71,6 +71,9 @@ data class SearchUiState(
     val canCountFacets: Boolean get() = Features.FACET_SET in features
     val canFilterOrigin: Boolean get() = Features.ORIGIN in features
     val canFilterProbes: Boolean get() = Features.PROBE_FILTERS in features
+
+    /** Track-kind filters (D125) need `probe_kinds` on top of `probe_filters`. */
+    val canFilterProbeKinds: Boolean get() = canFilterProbes && Features.PROBE_KINDS in features
 }
 
 /** One search to run; [seq] makes a retry of the same query a new value. */
@@ -312,7 +315,8 @@ class SearchViewModel(
             add("category")
             if (s.canFilterOrigin) add("origin")
             if (s.canFilterReleases) addAll(FACET_FIELDS)
-            if (s.canFilterProbes) addAll(PROBE_FACET_FIELDS)
+            // An older server would refuse (or not know) the kind facets: ask them with `probe_kinds` only.
+            if (s.canFilterProbes) addAll(if (s.canFilterProbeKinds) PROBE_FACET_FIELDS else PROBE_FACET_FIELDS - PROBE_KIND_FIELDS.toSet())
         }
         return try {
             repo.service().facets(FacetsRequest(q, fields, FACET_SIZE))

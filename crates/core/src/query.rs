@@ -84,16 +84,31 @@ pub struct SearchQuery {
     /// Audio codecs of the main file (`truehd`, `eac3`, `dts`, `aac`, …) and the object-audio
     /// marks `atmos`, `dts_x`.
     pub probe_audio: Vec<String>,
+    // Track-kind filters (D125): what kind of track a probe found (docs/PROBES.md "Track
+    // kinds"). Older servers ignore them, so the app offers them only when the server lists
+    // `api::features::PROBE_KINDS`. Probes older than D123 (version 1) carry no kinds.
+    /// Subtitle track kinds (D125): `sdh`, `cc`, `forced`, `signs`, `commentary`, `description`,
+    /// `honorifics`, `bilingual`, `easy_reader`. With `probe_subtitles` set, a torrent matches only
+    /// through one track having both a wanted language and a wanted kind.
+    pub probe_sub_kinds: Vec<String>,
+    /// Audio track kinds (D125), same rule with `probe_languages`.
+    pub probe_audio_kinds: Vec<String>,
+    /// Subtitle format classes (D125): `text`, `image`, `cc`.
+    pub probe_sub_formats: Vec<String>,
 }
 
-/// Facet names of the header-probe filters (D122), in `SearchQuery::probe_filters` order.
-pub const PROBE_FACETS: [&str; 6] = [
+/// Facet names of the header-probe filters (D122, the track kinds of D125 last), in
+/// `SearchQuery::probe_filters` order.
+pub const PROBE_FACETS: [&str; 9] = [
     "probe_language",
     "probe_subtitles",
     "probe_resolution",
     "probe_codec",
     "probe_hdr",
     "probe_audio",
+    "probe_sub_kind",
+    "probe_audio_kind",
+    "probe_sub_format",
 ];
 
 impl SearchQuery {
@@ -119,6 +134,9 @@ impl SearchQuery {
                 &self.probe_video_codecs,
                 &self.probe_hdr,
                 &self.probe_audio,
+                &self.probe_sub_kinds,
+                &self.probe_audio_kinds,
+                &self.probe_sub_formats,
             ])
             .map(|(name, v)| (*name, lower(v)))
             .collect();
@@ -130,6 +148,18 @@ impl SearchQuery {
     /// answer unfiltered.
     pub fn needs_probe_filter_feature(&self) -> bool {
         !self.probe_filters().is_empty()
+    }
+
+    /// Needs a server with `api::features::PROBE_KINDS` (D125): one with only
+    /// `PROBE_FILTERS` would ignore the track-kind fields and answer unfiltered.
+    pub fn needs_probe_kind_feature(&self) -> bool {
+        [
+            &self.probe_sub_kinds,
+            &self.probe_audio_kinds,
+            &self.probe_sub_formats,
+        ]
+        .iter()
+        .any(|v| v.iter().any(|s| !s.trim().is_empty()))
     }
 }
 
@@ -368,5 +398,40 @@ mod tests {
         );
         assert!(q.needs_probe_filter_feature());
         assert!(!q.has_attr_filters(), "probe filters are not D44 filters");
+    }
+
+    #[test]
+    fn probe_kind_filters_default_and_lowercase() {
+        // Older apps and saved searches send none of the D125 fields.
+        let q: SearchQuery =
+            serde_json::from_str(r#"{"probe_subtitles":["fre"],"probe_hdr":["any"]}"#).unwrap();
+        assert!(q.probe_sub_kinds.is_empty());
+        assert!(q.probe_audio_kinds.is_empty());
+        assert!(q.probe_sub_formats.is_empty());
+        assert!(q.needs_probe_filter_feature());
+        assert!(!q.needs_probe_kind_feature());
+        let q: SearchQuery = serde_json::from_str(
+            r#"{"probe_sub_kinds":[" SDH ","sdh",""],"probe_audio_kinds":["Commentary"],
+                "probe_sub_formats":["IMAGE"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            q.probe_filters(),
+            vec![
+                ("probe_sub_kind", vec!["sdh".to_string()]),
+                ("probe_audio_kind", vec!["commentary".to_string()]),
+                ("probe_sub_format", vec!["image".to_string()]),
+            ]
+        );
+        assert!(q.needs_probe_kind_feature());
+        assert!(q.needs_probe_filter_feature());
+        let blank = SearchQuery {
+            probe_sub_kinds: vec![" ".into()],
+            ..Default::default()
+        };
+        assert!(
+            !blank.needs_probe_kind_feature(),
+            "blank values are no filter"
+        );
     }
 }

@@ -177,4 +177,16 @@ class ScreensViewModelTest {
             "any text · files: French, Any HDR, Atmos",
         )
     }
+
+    @Test
+    fun `a saved query with a kind is described`() {
+        assertEquals(
+            describe(SearchQuery(probeSubtitles = listOf("fre"), probeSubKinds = listOf("sdh"))),
+            "any text · files: French, SDH",
+        )
+        assertEquals(
+            describe(SearchQuery(probeLanguages = listOf("fre"), probeAudioKinds = listOf("description"), probeSubFormats = listOf("image", "text"))),
+            "any text · files: French, Audio description, Image (PGS, VobSub…)/Text (SRT, ASS…)",
+        )
+    }
 }

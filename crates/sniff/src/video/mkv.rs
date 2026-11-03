@@ -11,7 +11,7 @@
 use std::io::Read;
 
 use super::src::{BLOCK, Src};
-use super::{Kind, Parsed, Tk, audio, codec, lang, text};
+use super::{Kind, Parsed, Tk, TrackKind, audio, codec, lang, text};
 use crate::util::us;
 
 const EBML: u32 = 0x1A45_DFA3;
@@ -396,6 +396,9 @@ fn track(b: &[u8]) -> Mt {
     let mut lang_bcp: Option<String> = None;
     let mut id = String::new();
     let mut dv: Vec<&[u8]> = Vec::new();
+    let (mut hearing_impaired, mut visual_impaired) = (false, false);
+    let (mut text_descriptions, mut commentary) = (false, false);
+    let mut original: Option<bool> = None;
     for (k, v) in kids(b) {
         match k {
             0xD7 => t.id = uint(v),
@@ -410,6 +413,12 @@ fn track(b: &[u8]) -> Mt {
             }
             0x88 => t.default = uint(v) != 0,
             0x55AA => t.forced = uint(v) != 0,
+            // Matroska v4 accessibility flags (D123): applied below, once the type is known.
+            0x55AB => hearing_impaired = uint(v) != 0,
+            0x55AC => visual_impaired = uint(v) != 0,
+            0x55AD => text_descriptions = uint(v) != 0,
+            0x55AE => original = Some(uint(v) != 0),
+            0x55AF => commentary = uint(v) != 0,
             0x86 => id = text(v),
             0x63A2 => m.private = v.get(..v.len().min(1 << 20)).unwrap_or(&[]).to_vec(),
             0x22B59C => lang_iso = Some(text(v)),
@@ -500,6 +509,39 @@ fn track(b: &[u8]) -> Mt {
     } else {
         name.to_string()
     };
+    match id.as_str() {
+        "D_WEBVTT/CAPTIONS" => t.add_kind(TrackKind::Sdh),
+        "D_WEBVTT/DESCRIPTIONS" => t.add_kind(TrackKind::Description),
+        // WebVTT metadata cues are not subtitles.
+        "D_WEBVTT/METADATA" => t.kind = Kind::Other,
+        _ => {}
+    }
+    match t.kind {
+        Kind::Sub => {
+            if hearing_impaired {
+                t.add_kind(TrackKind::Sdh);
+            }
+            if visual_impaired || text_descriptions {
+                t.add_kind(TrackKind::Description);
+            }
+            if commentary {
+                t.add_kind(TrackKind::Commentary);
+            }
+        }
+        Kind::Audio => {
+            if hearing_impaired {
+                t.add_kind(TrackKind::Dialogue);
+            }
+            if visual_impaired {
+                t.add_kind(TrackKind::Description);
+            }
+            if commentary {
+                t.add_kind(TrackKind::Commentary);
+            }
+            t.original = original;
+        }
+        _ => {}
+    }
     let cp = m.private.clone();
     match t.codec.as_str() {
         "h264" if !cp.is_empty() => {
@@ -605,7 +647,11 @@ fn codec_name(id: &str) -> &'static str {
         "A_PCM/FLOAT/IEEE" => "pcm_f32le",
         "S_TEXT/UTF8" | "S_TEXT/ASCII" => "subrip",
         "S_TEXT/ASS" | "S_TEXT/SSA" | "S_ASS" | "S_SSA" => "ass",
-        "S_TEXT/WEBVTT" | "D_WEBVTT/SUBTITLES" | "D_WEBVTT/CAPTIONS" => "webvtt",
+        "S_TEXT/WEBVTT" | "D_WEBVTT/SUBTITLES" | "D_WEBVTT/CAPTIONS" | "D_WEBVTT/DESCRIPTIONS" => {
+            "webvtt"
+        }
+        "S_ARIBSUB" => "arib_caption",
+        "S_TEXT/USF" => "usf",
         "S_HDMV/PGS" => "hdmv_pgs_subtitle",
         "S_HDMV/TEXTST" => "hdmv_text_subtitle",
         "S_VOBSUB" => "dvd_subtitle",
@@ -898,5 +944,124 @@ fn decode(m: &Mt, frame: &[u8]) -> Option<Vec<u8>> {
             Some(v)
         }
         None => Some(frame.to_vec()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::testkit::{info, mkv, sel, track, uel};
+    use super::super::{AudioTrack, SubtitleTrack, TrackKind};
+
+    fn kinds(k: &[TrackKind]) -> Vec<&'static str> {
+        k.iter().map(|k| k.as_str()).collect()
+    }
+
+    fn sub(i: &super::super::VideoInfo, id: u64) -> &SubtitleTrack {
+        i.subtitles.iter().find(|s| s.id == id).expect("subtitle")
+    }
+
+    fn audio(i: &super::super::VideoInfo, id: u64) -> &AudioTrack {
+        i.audio.iter().find(|a| a.id == id).expect("audio")
+    }
+
+    #[test]
+    fn accessibility_flags_give_kinds() {
+        let f = mkv(&[
+            track(1, 0x11, "S_TEXT/UTF8", &[uel(&[0x55, 0xAB], 1)]),
+            track(2, 2, "A_AAC", &[uel(&[0x55, 0xAB], 1)]),
+            track(3, 2, "A_AAC", &[uel(&[0x55, 0xAC], 1)]),
+            track(4, 0x11, "S_TEXT/UTF8", &[uel(&[0x55, 0xAD], 1)]),
+            track(5, 2, "A_AAC", &[uel(&[0x55, 0xAF], 1)]),
+            track(6, 0x11, "S_TEXT/UTF8", &[uel(&[0x55, 0xAF], 1)]),
+            track(7, 2, "A_AAC", &[uel(&[0x55, 0xAE], 0)]),
+            track(8, 2, "A_AAC", &[uel(&[0x55, 0xAE], 1)]),
+            track(9, 2, "A_AAC", &[]),
+            // Flags at 0 say nothing.
+            track(10, 0x11, "S_TEXT/UTF8", &[uel(&[0x55, 0xAB], 0)]),
+            // FlagTextDescriptions is ignored on audio, FlagOriginal on subtitles.
+            track(11, 2, "A_AAC", &[uel(&[0x55, 0xAD], 1)]),
+            track(12, 0x11, "S_TEXT/UTF8", &[uel(&[0x55, 0xAE], 0)]),
+        ]);
+        let i = info(&f);
+        assert_eq!(kinds(&sub(&i, 1).kinds), ["sdh"]);
+        assert_eq!(kinds(&audio(&i, 2).kinds), ["dialogue"]);
+        assert_eq!(kinds(&audio(&i, 3).kinds), ["description"]);
+        assert_eq!(kinds(&sub(&i, 4).kinds), ["description"]);
+        assert_eq!(kinds(&audio(&i, 5).kinds), ["commentary"]);
+        assert_eq!(kinds(&sub(&i, 6).kinds), ["commentary"]);
+        assert_eq!(kinds(&audio(&i, 7).kinds), ["dub"]);
+        assert_eq!(kinds(&audio(&i, 8).kinds), ["original"]);
+        assert!(audio(&i, 9).kinds.is_empty());
+        assert!(sub(&i, 10).kinds.is_empty());
+        assert!(audio(&i, 11).kinds.is_empty());
+        assert!(sub(&i, 12).kinds.is_empty());
+        // None of them came from a name.
+        assert!(i.audio.iter().all(|a| a.name_kinds.is_empty()));
+    }
+
+    #[test]
+    fn webvtt_kinds_and_new_codec_ids() {
+        let f = mkv(&[
+            track(1, 0x11, "D_WEBVTT/CAPTIONS", &[]),
+            track(2, 0x11, "D_WEBVTT/DESCRIPTIONS", &[]),
+            track(3, 0x11, "D_WEBVTT/METADATA", &[]),
+            track(4, 0x11, "S_ARIBSUB", &[]),
+            track(5, 0x11, "S_TEXT/USF", &[]),
+            track(6, 0x11, "D_WEBVTT/SUBTITLES", &[]),
+        ]);
+        let i = info(&f);
+        assert_eq!(i.subtitles.len(), 5, "{:?}", i.subtitles);
+        assert_eq!(
+            (sub(&i, 1).codec.as_str(), kinds(&sub(&i, 1).kinds)),
+            ("webvtt", vec!["sdh"])
+        );
+        assert_eq!(
+            (sub(&i, 2).codec.as_str(), kinds(&sub(&i, 2).kinds)),
+            ("webvtt", vec!["description"])
+        );
+        assert!(i.subtitles.iter().all(|s| s.id != 3));
+        assert_eq!(sub(&i, 4).codec, "arib_caption");
+        assert_eq!(sub(&i, 5).codec, "usf");
+        assert!(sub(&i, 6).kinds.is_empty());
+    }
+
+    #[test]
+    fn name_overrides_forced_flag() {
+        let name = |s: &str| sel(&[0x53, 0x6E], s);
+        let f = mkv(&[
+            track(
+                1,
+                0x11,
+                "S_TEXT/UTF8",
+                &[uel(&[0x55, 0xAA], 1), name("English (Full)")],
+            ),
+            track(
+                2,
+                0x11,
+                "S_TEXT/UTF8",
+                &[uel(&[0x55, 0xAA], 1), name("English (SDH)")],
+            ),
+            track(
+                3,
+                0x11,
+                "S_TEXT/UTF8",
+                &[uel(&[0x55, 0xAA], 0), name("Forced")],
+            ),
+            track(4, 0x11, "S_TEXT/UTF8", &[uel(&[0x55, 0xAA], 1)]),
+            track(5, 2, "A_AAC", &[name("Commentary"), uel(&[0x55, 0xAE], 0)]),
+        ]);
+        let i = info(&f);
+        // The raw flag is kept as written; the kinds say what the track is.
+        assert!(sub(&i, 1).forced);
+        assert!(sub(&i, 1).kinds.is_empty());
+        assert_eq!(kinds(&sub(&i, 2).kinds), ["sdh"]);
+        assert_eq!(kinds(&sub(&i, 2).name_kinds), ["sdh"]);
+        assert!(!sub(&i, 3).forced);
+        assert_eq!(kinds(&sub(&i, 3).kinds), ["forced"]);
+        assert_eq!(kinds(&sub(&i, 3).name_kinds), ["forced"]);
+        assert_eq!(kinds(&sub(&i, 4).kinds), ["forced"]);
+        assert!(sub(&i, 4).name_kinds.is_empty());
+        assert_eq!(kinds(&audio(&i, 5).kinds), ["commentary"]);
+        assert_eq!(audio(&i, 5).name.as_deref(), Some("Commentary"));
     }
 }

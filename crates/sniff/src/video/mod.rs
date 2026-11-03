@@ -1,7 +1,8 @@
 //! Video quality recon: container, codec, profile, resolution, frame rate, bit depth, HDR
 //! (HDR10 / HDR10+ / HLG / Dolby Vision profile), duration, bitrate, audio tracks (codec,
 //! channels, language, Atmos / JOC / TrueHD / DTS-HD / DTS:X where determinable) and subtitle
-//! tracks, from the same sparse ranges as the type detector.
+//! tracks, from the same sparse ranges as the type detector. Audio and subtitle tracks carry
+//! their kinds (SDH, forced, commentary, audio description, dub, ...: [`TrackKind`], D123).
 //!
 //! Containers: Matroska / WebM ([`mkv`]), MP4 / MOV including `moov` at the end and fragmented
 //! files ([`mp4`]), MPEG-TS / M2TS ([`ts`]) and AVI ([`avi`]). Codec records and first-frame
@@ -29,11 +30,15 @@ mod audio;
 mod avi;
 mod bits;
 mod codec;
+mod kind;
 mod mkv;
 mod mp4;
 mod src;
+#[cfg(test)]
+mod testkit;
 mod ts;
 
+pub use kind::{NameClass, NameTrack, TrackKind, classify_name};
 use src::Src;
 
 /// Result of one recon pass.
@@ -204,6 +209,12 @@ pub struct AudioTrack {
     pub language: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Resolved kinds (D123): container / bitstream flags plus the name classifier. Sorted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<TrackKind>,
+    /// The subset of `kinds` that only the name gave.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub name_kinds: Vec<TrackKind>,
     pub default: bool,
 }
 
@@ -211,13 +222,22 @@ pub struct AudioTrack {
 pub struct SubtitleTrack {
     pub id: u64,
     /// FFmpeg codec names: `subrip`, `ass`, `webvtt`, `hdmv_pgs_subtitle`, `dvd_subtitle`,
-    /// `mov_text`, `dvb_subtitle`, ...
+    /// `mov_text`, `dvb_subtitle`, `dvb_teletext`, `eia_608`, `eia_708`, `ttml`,
+    /// `arib_caption`, `usf`, `xsub`, ...
     pub codec: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Resolved kinds (D123): container / bitstream flags plus the name classifier. Sorted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<TrackKind>,
+    /// The subset of `kinds` that only the name gave.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub name_kinds: Vec<TrackKind>,
     pub default: bool,
+    /// The container's forced flag as written (Matroska FlagForced); the resolved meaning is
+    /// [`TrackKind::Forced`] in `kinds`.
     pub forced: bool,
 }
 
@@ -482,6 +502,13 @@ pub(crate) struct Tk {
     pub forced: bool,
     /// The first frame (audio or video) was parsed.
     pub frame_done: bool,
+    /// Kinds from container flags and bitstream fields, merged with the name in `finish`.
+    pub kinds: Vec<TrackKind>,
+    /// Matroska FlagOriginal: None absent, Some(false) present and 0 (dub), Some(true) original.
+    pub original: Option<bool>,
+    /// Video only: closed captions seen in the first access unit (bit 1 = CEA-608, bit 2 =
+    /// CEA-708).
+    pub captions: u8,
 }
 
 impl Tk {
@@ -516,8 +543,18 @@ impl Tk {
         }
     }
 
+    /// Adds a kind from a container flag or a bitstream field (once).
+    pub fn add_kind(&mut self, k: TrackKind) {
+        if !self.kinds.contains(&k) {
+            self.kinds.push(k);
+        }
+    }
+
     /// Merges what a first frame or configuration record says (frame values win).
     pub fn apply_audio(&mut self, a: audio::AudioInfo) {
+        if let Some(k) = a.service {
+            self.add_kind(k);
+        }
         if let Some(c) = a.codec {
             // An AC-3 frame inside a TrueHD track is the interleaved compatibility stream; inside
             // an E-AC-3 track it is the core of a Blu-ray style stream whose dependent frames were
@@ -583,8 +620,26 @@ impl Parsed {
             notes,
             ..VideoInfo::default()
         };
+        let mut captions: Vec<SubtitleTrack> = Vec::new();
         for mut t in self.tracks.into_iter().take(256) {
             t.settle_atmos();
+            if t.kind == Kind::Video && t.captions != 0 {
+                for (bit, codec) in [(1u8, "eia_608"), (2, "eia_708")] {
+                    if t.captions & bit != 0 {
+                        captions.push(SubtitleTrack {
+                            id: t.id,
+                            codec: codec.into(),
+                            kinds: vec![TrackKind::Cc],
+                            ..SubtitleTrack::default()
+                        });
+                    }
+                }
+            }
+            let (kinds, name_kinds) = match t.kind {
+                Kind::Audio => kind::resolve(&t, NameTrack::Audio),
+                Kind::Sub => kind::resolve(&t, NameTrack::Subtitle),
+                _ => (Vec::new(), Vec::new()),
+            };
             if t.kind == Kind::Audio && is_lossy(&t.codec, &t.features) {
                 t.bit_depth = None; // a container "bit depth" means nothing for lossy codecs
             }
@@ -615,6 +670,8 @@ impl Parsed {
                     dts_x: t.dts_x,
                     language: t.language,
                     name: t.name,
+                    kinds,
+                    name_kinds,
                     default: t.default,
                 }),
                 Kind::Sub => info.subtitles.push(SubtitleTrack {
@@ -622,10 +679,21 @@ impl Parsed {
                     codec: t.codec,
                     language: t.language,
                     name: t.name,
+                    kinds,
+                    name_kinds,
                     default: t.default,
                     forced: t.forced,
                 }),
                 Kind::Other => {}
+            }
+        }
+        // Captions signalled in the first video access unit (D123), unless the container
+        // already lists a track of that codec: an ATSC caption_service_descriptor on the same
+        // PID (which has languages), or an MP4 `c608` / `c708` track with its own id (review
+        // of D123: the same service would show twice).
+        for c in captions {
+            if !info.subtitles.iter().any(|s| s.codec == c.codec) {
+                info.subtitles.push(c);
             }
         }
         info
@@ -706,4 +774,47 @@ pub(crate) fn text(b: &[u8]) -> String {
         .chars()
         .take(256)
         .collect()
+}
+
+#[cfg(test)]
+mod finish_tests {
+    use super::*;
+
+    fn video(id: u64, captions: u8) -> Tk {
+        Tk {
+            kind: Kind::Video,
+            id,
+            codec: "hevc".into(),
+            captions,
+            ..Tk::default()
+        }
+    }
+
+    /// A caption service the container lists (an MP4 `c608` track, id 2) is not repeated by
+    /// the GA94 captions of the video (id 1); a codec the container lacks is added.
+    #[test]
+    fn captions_in_the_video_do_not_repeat_a_caption_track() {
+        let parsed = Parsed {
+            container: "mp4",
+            brand: None,
+            duration: None,
+            fragmented: false,
+            tracks: vec![
+                video(1, 1 | 2),
+                Tk {
+                    kind: Kind::Sub,
+                    id: 2,
+                    codec: "eia_608".into(),
+                    ..Tk::default()
+                },
+            ],
+        };
+        let info = parsed.finish(1000, Vec::new());
+        let subs: Vec<(u64, &str)> = info
+            .subtitles
+            .iter()
+            .map(|s| (s.id, s.codec.as_str()))
+            .collect();
+        assert_eq!(subs, [(2, "eia_608"), (1, "eia_708")]);
+    }
 }

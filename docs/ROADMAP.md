@@ -56,6 +56,35 @@ user's workers) runs with it on. Not switched on yet: the workers' env files are
 repository and no agent may start peer traffic (docs/PROBES.md §8). **UNVERIFIED legal reading, not legal advice**; other countries differ
 (Germany, for example, fines downloads too).
 
+### Track kinds: what D123 left out
+D123–D126 read subtitle and audio kinds (SDH, forced, signs, commentary, audio description,
+dub, …) from bytes a probe already fetches (docs/PROBES.md §11). Deferred, with why:
+- **CEA-608 / 708 for H.264 / MPEG-2 in Matroska and MP4**, and AV1 T.35: one 16 KiB block per
+  file at the first video sample. Measure the hit rate on real WEB-DL and HDTV releases first.
+- **AC-3 bsmod in Matroska**: one block per AC-3 track (the frame is not read when the header
+  gives the channels); the research expects bsmod 0 on almost all film tracks.
+- **DTS ExSS asset type**: the value table (ETSI TS 102 114 §7.4) was not verified.
+- **DVD IFO** audio and subpicture `code_extension` (forced, captions, director's comments,
+  visually impaired) and **Blu-ray clpi / mpls** languages plus the secondary-audio hint: new
+  parsers.
+- **ASS style names** ("Sign", "Song", "OP", "ED") as a signs heuristic.
+- **Torrent-name and external sidecar-file kinds** in `release.rs` / `torrent_attrs` (D44):
+  hardsub / SUBBED / HC, DUBBED, Lektor, MVO / DVO, AD / DVS, `.sdh.srt`, `.forced.srt`,
+  `Subs/N_English.srt`, the missing sidecar extensions, German DL / ML, NORDiC / SWESUB…; new
+  name facets and a `PARSER_VERSION` bump. The classifier (`sniff::video::classify_name`) is
+  pure and dependency-free, but core uses sniff only behind the `probe` feature: reusing it
+  means sharing `kind.rs` with core.
+- **Original vs dub from TMDB `original_language`**: that field is not stored today.
+- **Language variants** (pt-BR, es-419, fr-CA, zh-Hans / zh-Hant, sr-Latn) from names and
+  BCP 47.
+- **Re-probe version 1 rows for kinds**: costs peer traffic; needs the user's decision and the
+  D109 watchdog rules.
+- **Server-side re-classification of stored names** when the classifier changes.
+- **Showing track names in the app** (free text from peers needs its own decision).
+- **The rest**: MKV FlagEnabled, MP4 `txas` / `folw` / `alternate_group`, ATSC 0xCC, DVB EIT
+  component_descriptor, SCTE-27, per-sample forced (PGS, VobSub, `frcd`), SDH detected from
+  subtitle content, Ogg / ASF / FLV roles, and a sign-language video kind (DASH `sign`).
+
 ### DHT engine: collapse at extreme settings
 At 8 nodes, 10,000 q/s and 8,192 lookups, both the D106 engine and the code before it sometimes
 fall to about 20 % of their query cap, with the transaction map full (`busy`). Production runs far

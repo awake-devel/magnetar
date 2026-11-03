@@ -25,7 +25,9 @@ use tantivy::{TantivyDocument, Term};
 /// file names searchable, `eligible_trust` lifted to `TRUSTED` when a DHT row exists.
 /// 5: header-probe facets (D122): `probe_language probe_subtitles probe_resolution probe_codec
 /// probe_hdr probe_audio` from `probe_attrs.tags`.
-pub const SCHEMA_VERSION: u32 = 5;
+/// 6: probe kinds (D125): `probe_sub_kind probe_audio_kind probe_sub_format`, and the internal
+/// pair facets `probe_sub_pair probe_audio_pair`.
+pub const SCHEMA_VERSION: u32 = 6;
 pub const TOKENIZER: &str = "magnetar";
 /// Descriptions are indexed up to this many characters (lower weight, mostly boilerplate).
 pub const DESCRIPTION_CHARS: i32 = 2000;
@@ -163,6 +165,29 @@ pub const FACETS: &[FacetDef] = &[
     FacetDef {
         name: "probe_audio",
         values: |d| crate::probes::facet_values("probe_audio", &d.probe_tags),
+    },
+    // Track kinds (D125). The pair facets hold `{lang}:{kind}` of single tracks: the filter a
+    // language and a kind of the same family become (`probes::search_filters`), and what the
+    // language and kind facets are counted on then (`collect::Project`).
+    FacetDef {
+        name: "probe_sub_kind",
+        values: |d| crate::probes::facet_values("probe_sub_kind", &d.probe_tags),
+    },
+    FacetDef {
+        name: "probe_audio_kind",
+        values: |d| crate::probes::facet_values("probe_audio_kind", &d.probe_tags),
+    },
+    FacetDef {
+        name: "probe_sub_format",
+        values: |d| crate::probes::facet_values("probe_sub_format", &d.probe_tags),
+    },
+    FacetDef {
+        name: "probe_sub_pair",
+        values: |d| crate::probes::facet_values("probe_sub_pair", &d.probe_tags),
+    },
+    FacetDef {
+        name: "probe_audio_pair",
+        values: |d| crate::probes::facet_values("probe_audio_pair", &d.probe_tags),
     },
 ];
 

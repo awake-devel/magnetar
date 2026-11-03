@@ -11,6 +11,7 @@ import app.magnetar.api.TorrentSummary
 import app.magnetar.cache.PageCache
 import app.magnetar.settings.AppSettings
 import app.magnetar.ui.search.PROBE_FACET_FIELDS
+import app.magnetar.ui.search.PROBE_KIND_FIELDS
 import app.magnetar.ui.search.SEARCH_DEBOUNCE_MS
 import app.magnetar.ui.search.SearchFilters
 import app.magnetar.ui.search.SearchViewModel
@@ -178,7 +179,48 @@ class SearchViewModelTest {
         advanceUntilIdle()
         val req = fake2.facetRequests.last()
         assertEquals(req.query.probeHdr, listOf("dolby_vision"))
+        assertTrue(req.fields.containsAll(PROBE_FACET_FIELDS - PROBE_KIND_FIELDS.toSet()), req.fields.toString())
+        vm.draftFilters(null)
+        vm2.draftFilters(null)
+        advanceUntilIdle()
+    }
+
+    @Test
+    fun `kind facets are asked only with probe_kinds`() = runTest {
+        val f = SearchFilters(probeSubtitles = setOf("fre"), probeSubKinds = setOf("sdh"), probeSubFormats = setOf("image"))
+        // A D122 server: probe filters, no kinds. The kinds are neither sent nor counted.
+        val d122 = FakeService()
+        d122.features = d122.features + "probe_filters"
+        val vm = vm(d122)
+        advanceUntilIdle()
+        assertTrue(vm.state.value.canFilterProbes)
+        assertTrue(!vm.state.value.canFilterProbeKinds)
+        vm.setFilters(f)
+        advanceUntilIdle()
+        assertEquals(d122.searches.last().probeSubtitles, listOf("fre"))
+        assertEquals(d122.searches.last().probeSubKinds, emptyList<String>())
+        assertEquals(d122.searches.last().probeSubFormats, emptyList<String>())
+        vm.draftFilters(f)
+        advanceUntilIdle()
+        val old = d122.facetRequests.last()
+        assertTrue(old.fields.contains("probe_subtitles"), old.fields.toString())
+        assertTrue(old.fields.none { it in PROBE_KIND_FIELDS }, old.fields.toString())
+        assertEquals(old.query.probeSubKinds, emptyList<String>())
+
+        val kinds = FakeService()
+        kinds.features = kinds.features + "probe_filters" + "probe_kinds"
+        val vm2 = vm(kinds)
+        advanceUntilIdle()
+        assertTrue(vm2.state.value.canFilterProbeKinds)
+        vm2.setFilters(f)
+        advanceUntilIdle()
+        assertEquals(kinds.searches.last().probeSubKinds, listOf("sdh"))
+        assertEquals(kinds.searches.last().probeSubFormats, listOf("image"))
+        vm2.draftFilters(f)
+        advanceUntilIdle()
+        val req = kinds.facetRequests.last()
         assertTrue(req.fields.containsAll(PROBE_FACET_FIELDS), req.fields.toString())
+        assertEquals(req.query.probeSubKinds, listOf("sdh"))
         vm.draftFilters(null)
         vm2.draftFilters(null)
         advanceUntilIdle()

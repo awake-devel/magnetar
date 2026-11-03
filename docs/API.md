@@ -110,7 +110,7 @@ never send it; the Android app shows it as the detail's "Detected" card since D1
 
 ```json
 "probe": {
-  "version": 1, "probed_at": 1793500000, "status": "ok", "verified": true,
+  "version": 2, "probed_at": 1793500000, "status": "ok", "verified": true,
   "files": [{
     "index": 0, "path": "Movie.2024.2160p.mkv", "size": 6000000000,
     "label": "video.mkv", "description": "Matroska video", "confidence": 97, "verified": true,
@@ -118,8 +118,13 @@ never send it; the Android app shows it as the detail's "Detected" card since D1
     "video": {"container": "matroska", "duration_ms": 7200000,
               "video": [{"codec": "hevc", "width": 3840, "height": 2160, "bit_depth": 10,
                          "hdr": ["dolby_vision", "hdr10"], "dv_profile": 8, "dv_compat": 1}],
-              "audio": [{"codec": "eac3", "channels": 6, "lang": "fre", "atmos": true}],
-              "subs": [{"codec": "subrip", "lang": "eng"}]}
+              "audio": [{"codec": "eac3", "channels": 6, "lang": "fre", "atmos": true},
+                        {"codec": "ac3", "channels": 2, "lang": "eng", "kinds": ["commentary"],
+                         "name": "Director's Commentary"}],
+              "subs": [{"codec": "hdmv_pgs_subtitle", "lang": "eng", "kinds": ["sdh"],
+                        "name": "English (SDH)"},
+                       {"codec": "subrip", "lang": "fre", "kinds": ["forced"]},
+                       {"codec": "eia_608", "kinds": ["cc"]}]}
   }]
 }
 ```
@@ -138,6 +143,17 @@ never send it; the Android app shows it as the detail's "Detected" card since D1
 - `video[].dv_profile` / `dv_compat` (D121): the Dolby Vision profile and base-layer
   compatibility id (profile 8: 1 HDR10, 2 SDR, 4 HLG) from the configuration record, only with
   `dolby_vision` in `hdr`; probes stored by workers older than D121 have neither.
+- `audio[].kinds` / `subs[].kinds` (D123, `version` 2): what kind of track it is, alphabetical,
+  left out when none. Audio: `alternate`, `commentary`, `description` (audio description),
+  `dialogue` (dialogue-enhanced), `dub`, `karaoke`, `music` (music & effects, isolated score),
+  `original`, `voiceover`. Subtitles: `bilingual`, `cc`, `commentary`, `description`,
+  `easy_reader`, `forced`, `honorifics`, `sdh`, `signs`. A `cc` subtitle with codec `eia_608` /
+  `eia_708` and no language is a caption channel signalled in the video stream (one with a
+  language comes from an ATSC caption_service_descriptor or an MP4 caption track).
+  Probes of `version` 1 have none.
+- `audio[].name` / `subs[].name` (D123): the track name as the file has it (at most 64 bytes, no
+  control characters), kept so the server can re-classify later; free text from peers, so
+  clients should not show it as is (the app does not).
 - Languages are ISO 639-2/B lowercase. Every optional field is left out when unknown.
 
 Search filters on probe results (D122, `features` lists `probe_filters`): `SearchQuery`
@@ -146,6 +162,14 @@ Search filters on probe results (D122, `features` lists `probe_filters`): `Searc
 `probe_audio`) and the facets `probe_language`, `probe_subtitles`, `probe_resolution`,
 `probe_codec`, `probe_hdr` (with `any`), `probe_audio` in `POST /api/v1/facets`; values and
 rules in docs/FILTERS.md "Probe filters". All optional: older clients send none.
+
+Track-kind filters (D125, `features` lists `probe_kinds`): `SearchQuery` `probe_sub_kinds`,
+`probe_audio_kinds`, `probe_sub_formats` (query string `probe_sub_kind`, `probe_audio_kind`,
+`probe_sub_format`, comma lists or repeated) and the facets `probe_sub_kind`, `probe_audio_kind`,
+`probe_sub_format`. A language and a kind of the same family match one track having both (French
++ SDH = a French SDH track) and their facets are counted that way; docs/FILTERS.md "Track
+kinds". A server without `probe_kinds` ignores the fields and answers unfiltered: send them
+only to a server that lists it.
 
 ## Not in the API (phone-local by design)
 

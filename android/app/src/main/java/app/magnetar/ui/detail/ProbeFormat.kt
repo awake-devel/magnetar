@@ -4,6 +4,7 @@ import app.magnetar.api.ProbeAudioTrack
 import app.magnetar.api.ProbeFileInfo
 import app.magnetar.api.ProbeGame
 import app.magnetar.api.ProbeInfo
+import app.magnetar.api.ProbeSubTrack
 import app.magnetar.api.ProbeVideo
 import app.magnetar.api.ProbeVideoTrack
 import app.magnetar.api.TorrentFile
@@ -55,6 +56,8 @@ private val CODECS: Map<String, String> = mapOf(
     "mp3" to "MP3", "mp2" to "MP2", "pcm" to "PCM", "alac" to "ALAC", "wmav2" to "WMA",
     "subrip" to "SRT", "ass" to "ASS", "ssa" to "SSA", "webvtt" to "WebVTT", "mov_text" to "MP4 text",
     "hdmv_pgs_subtitle" to "PGS", "dvd_subtitle" to "VobSub", "dvb_subtitle" to "DVB", "eia_608" to "CEA-608",
+    "eia_708" to "CEA-708", "ttml" to "TTML", "arib_caption" to "ARIB", "dvb_teletext" to "Teletext",
+    "hdmv_text_subtitle" to "TextST", "xsub" to "XSUB", "kate" to "Kate", "usf" to "USF",
 )
 
 /** FFmpeg codec name → what people call it ("eac3" → "E-AC-3"). */
@@ -153,19 +156,77 @@ fun videoTrackText(t: ProbeVideoTrack): String = listOfNotNull(
     hdrNames(t).takeIf { it.isNotEmpty() }?.joinToString(", "),
 ).joinToString(" · ")
 
-/** "French · E-AC-3 5.1 · Dolby Atmos". */
-fun audioTrackText(a: ProbeAudioTrack): String = listOfNotNull(
-    a.lang?.let(::languageName),
-    codecName(a.codec) + (a.channels?.let { " " + channelsText(it) } ?: ""),
-    if (a.atmos) "Dolby Atmos" else null,
-    if (a.dtsX) "DTS:X" else null,
-).joinToString(" · ")
+/** Audio track kinds (D123) in the order they are told, with their labels. */
+val AUDIO_KIND_ORDER = listOf("original", "dub", "voiceover", "description", "dialogue", "commentary", "music", "karaoke", "alternate")
 
-/** Distinct subtitle languages in track order, "unknown" once for untagged tracks; null when none. */
-fun subtitleText(v: ProbeVideo): String? {
-    if (v.subs.isEmpty()) return null
-    val names = v.subs.map { it.lang?.let(::languageName) ?: "unknown" }.distinct()
-    return names.joinToString(", ") + if (v.subs.size > names.size) " (${v.subs.size} tracks)" else ""
+private val AUDIO_KIND_LABELS = mapOf(
+    "original" to "original", "dub" to "dub", "voiceover" to "voice-over", "description" to "audio description",
+    "dialogue" to "clear dialogue", "commentary" to "commentary", "music" to "music only", "karaoke" to "karaoke",
+    "alternate" to "alternate mix",
+)
+
+/** Subtitle track kinds (D123) in the order they are told, with their labels. */
+val SUB_KIND_ORDER = listOf("forced", "sdh", "cc", "signs", "commentary", "description", "honorifics", "bilingual", "easy_reader")
+
+private val SUB_KIND_LABELS = mapOf(
+    "forced" to "forced", "sdh" to "SDH", "cc" to "CC", "signs" to "signs & songs", "commentary" to "commentary",
+    "description" to "descriptions", "honorifics" to "honorifics", "bilingual" to "bilingual", "easy_reader" to "easy reader",
+)
+
+/** Known kinds in [order], then unknown ones as they came, with `_` read as a space. */
+private fun kindLabels(kinds: List<String>, order: List<String>, labels: Map<String, String>): List<String> {
+    val set = kinds.toSet()
+    return order.filter { it in set }.map { labels.getValue(it) } +
+        kinds.filter { it !in labels }.distinct().map { it.replace('_', ' ') }
+}
+
+/** ["description", "original"] → ["original", "audio description"]. */
+fun audioKindLabels(kinds: List<String>): List<String> = kindLabels(kinds, AUDIO_KIND_ORDER, AUDIO_KIND_LABELS)
+
+/** ["sdh", "forced"] → ["forced", "SDH"]. */
+fun subKindLabels(kinds: List<String>): List<String> = kindLabels(kinds, SUB_KIND_ORDER, SUB_KIND_LABELS)
+
+/**
+ * Subtitle format class of a codec (D125, the server's `probes::sub_format`): `text`, `image`,
+ * `cc`, or null for a codec outside the table.
+ */
+fun subFormatClass(codec: String): String? = when (codec) {
+    "subrip", "ass", "ssa", "webvtt", "mov_text", "ttml", "hdmv_text_subtitle", "dvb_teletext", "arib_caption",
+    "kate", "usf",
+    -> "text"
+    "hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub" -> "image"
+    "eia_608", "eia_708" -> "cc"
+    else -> null
+}
+
+/** "French · E-AC-3 5.1 · Dolby Atmos · audio description". The track name is never shown. */
+fun audioTrackText(a: ProbeAudioTrack): String = (
+    listOfNotNull(
+        a.lang?.let(::languageName),
+        codecName(a.codec) + (a.channels?.let { " " + channelsText(it) } ?: ""),
+        if (a.atmos) "Dolby Atmos" else null,
+        if (a.dtsX) "DTS:X" else null,
+    ) + audioKindLabels(a.kinds)
+    ).joinToString(" · ")
+
+/** "English · SDH · PGS", "unknown · CC · CEA-608". The track name is never shown. */
+fun subTrackText(s: ProbeSubTrack): String =
+    (listOf(s.lang?.let(::languageName) ?: "unknown") + subKindLabels(s.kinds) + codecName(s.codec)).joinToString(" · ")
+
+/** Most subtitle lines one file shows; the rest are counted on one more line. */
+const val MAX_SUBTITLE_LINES = 10
+
+/**
+ * One line per distinct subtitle track (D126), identical ones grouped in first-seen order:
+ * "Subtitle: French · SRT ×2". At most [MAX_SUBTITLE_LINES], then "Subtitles: N more tracks".
+ */
+fun subtitleLines(v: ProbeVideo): List<String> {
+    val groups = LinkedHashMap<String, Int>()
+    v.subs.forEach { groups.merge(subTrackText(it), 1, Int::plus) }
+    val shown = groups.entries.take(MAX_SUBTITLE_LINES)
+    val rest = v.subs.size - shown.sumOf { it.value }
+    return shown.map { (text, n) -> "Subtitle: $text" + if (n > 1) " ×$n" else "" } +
+        listOfNotNull(rest.takeIf { it > 0 }?.let { "Subtitles: $it more " + if (it == 1) "track" else "tracks" })
 }
 
 /** "Matroska · 2h 00m · 15.2 Mb/s". */
@@ -232,7 +293,7 @@ fun probeFileView(f: ProbeFileInfo, shown: List<TorrentFile>): ProbeFileView {
             containerText(v).takeIf { it.isNotEmpty() }?.let(::add)
             v.video.forEach { add("Video: " + videoTrackText(it)) }
             v.audio.forEach { add("Audio: " + audioTrackText(it)) }
-            subtitleText(v)?.let { add("Subtitles: $it") }
+            addAll(subtitleLines(v))
         }
         f.game?.let { addAll(gameLines(it)) }
         if (notes.isNotEmpty()) add(notes.joinToString(" · ").replaceFirstChar { it.uppercaseChar() })

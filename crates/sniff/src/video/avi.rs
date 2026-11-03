@@ -127,6 +127,11 @@ fn strl(body: &[u8], idx: u64) -> (Tk, Option<f64>) {
                 let _ = c.skip(4);
                 let fc = c.take(4).unwrap_or(&[]).to_ascii_uppercase();
                 super::vfw_codec(&fc, &mut t);
+                // DivX XSUB bitmap subtitles travel as a `vids` stream (D123).
+                if matches!(fc.as_slice(), b"DXSB" | b"DXSA") {
+                    (t.kind, t.codec) = (Kind::Sub, "xsub".into());
+                    (t.width, t.height, t.fps) = (None, None, None);
+                }
             }
             b"strf" if t.kind == Kind::Audio && b2.len() >= 16 => {
                 let mut c = Cur::new(b2);
@@ -229,3 +234,7 @@ fn first_video_chunk(src: &Src, mut off: u64, tracks: &mut [Tk]) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "avi_tests.rs"]
+mod tests;

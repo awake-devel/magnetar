@@ -447,6 +447,10 @@ pub fn parse_search_query(raw: Option<&str>) -> ApiResult<SearchQuery> {
             "probe_codec" => push_list(&mut q.probe_video_codecs, &v),
             "probe_hdr" => push_list(&mut q.probe_hdr, &v),
             "probe_audio" => push_list(&mut q.probe_audio, &v),
+            // D125 track kinds.
+            "probe_sub_kind" => push_list(&mut q.probe_sub_kinds, &v),
+            "probe_audio_kind" => push_list(&mut q.probe_audio_kinds, &v),
+            "probe_sub_format" => push_list(&mut q.probe_sub_formats, &v),
             // D51 source chip (`source` already means the release source, D44).
             "origin" => {
                 push_list(&mut q.origins, &v);

@@ -7,7 +7,7 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
-use sniff::video::{AudioTrack, HdrFormat, VideoTrack};
+use sniff::video::{AudioTrack, HdrFormat, TrackKind, VideoTrack};
 use sniff::{Caps, Content, Detection, Outcome, Platform, Range, detect_with};
 
 fn root() -> PathBuf {
@@ -113,6 +113,25 @@ fn hevc_in_band_sps_after_a_container_size() {
         (Some(3840), Some(2014), Some(9), Some(16), Some(9))
     );
     assert_eq!(v.hdr, vec![HdrFormat::Hdr10, HdrFormat::DolbyVision]);
+}
+
+/// Matroska test suite file 5: a second AAC track named "Commentary" (D123), its other tracks
+/// without a kind.
+#[test]
+fn matroska_commentary_track_from_its_name() {
+    let Some(d) = video("video/matroska-testsuite/test5.mkv") else {
+        return;
+    };
+    let a = audio(&d);
+    assert_eq!(a.len(), 2);
+    let c: Vec<&AudioTrack> = a.iter().filter(|t| t.codec == "aac").collect();
+    assert!(c[0].kinds.is_empty(), "{:?}", c[0]);
+    assert_eq!(c[1].name.as_deref(), Some("Commentary"));
+    assert_eq!(c[1].kinds, [TrackKind::Commentary]);
+    assert_eq!(c[1].name_kinds, [TrackKind::Commentary]);
+    let subs = &d.video.as_ref().expect("recon").subtitles;
+    assert!(subs.len() >= 8);
+    assert!(subs.iter().all(|s| s.kinds.is_empty()), "{subs:?}");
 }
 
 #[test]

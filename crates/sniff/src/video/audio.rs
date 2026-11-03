@@ -16,8 +16,8 @@
 //! delivery-kit files, Blu-ray style AC-3 core + dependent) are checked in
 //! `tests/real_samples.rs`.
 
-use super::AudioFeature;
 use super::bits::{Bits, Cur};
+use super::{AudioFeature, TrackKind};
 
 /// What a first frame (or a codec configuration record) says about an audio track.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -32,6 +32,23 @@ pub(crate) struct AudioInfo {
     pub atmos: Option<bool>,
     pub dts_x: Option<bool>,
     pub features: Vec<AudioFeature>,
+    /// AC-3 / E-AC-3 service from bsmod (+ acmod), via [`service_kind`] (D123).
+    pub service: Option<TrackKind>,
+}
+
+/// The audio service an AC-3 / E-AC-3 `bsmod` (ATSC A/52 Table 5.7; the DVB component_type
+/// and `dac3` / `dec3` carry the same 3 bits) declares. 0 main and 6 emergency say nothing;
+/// 7 is karaoke on a multichannel track and a voice-over on a mono one.
+pub(crate) fn service_kind(bsmod: u8, acmod: u8) -> Option<TrackKind> {
+    match bsmod {
+        1 => Some(TrackKind::Music),
+        2 => Some(TrackKind::Description),
+        3 | 4 => Some(TrackKind::Dialogue),
+        5 => Some(TrackKind::Commentary),
+        7 if acmod >= 2 => Some(TrackKind::Karaoke),
+        7 => Some(TrackKind::Voiceover),
+        _ => None,
+    }
 }
 
 // Channel mask bits (FFmpeg's AV_CH_* order; only used to count channels and name layouts).
@@ -136,6 +153,8 @@ struct Ac3Frame {
     chanmap: Option<u32>,
     /// `Some(flag)` when the bitstream info was parsed up to and including `addbsie`.
     ext_type_a: Option<bool>,
+    /// Bitstream mode (AC-3 always; E-AC-3 when `infomdate` is set).
+    bsmod: Option<u8>,
 }
 
 fn ac3_frame(f: &[u8]) -> Option<Ac3Frame> {
@@ -156,7 +175,8 @@ fn ac3_frame(f: &[u8]) -> Option<Ac3Frame> {
             1 => kbps * 2 * 320 / 294 + u64::from(frmsizecod & 1),
             _ => kbps * 3,
         };
-        b.skip(5 + 3)?; // bsid, bsmod
+        b.skip(5)?; // bsid
+        let bsmod = u8::try_from(b.u(3)?).ok();
         let acmod = b.u(3)?;
         if acmod & 1 == 1 && acmod != 1 {
             b.skip(2)?;
@@ -176,6 +196,7 @@ fn ac3_frame(f: &[u8]) -> Option<Ac3Frame> {
             lfe,
             kbps: Some(kbps),
             ext_type_a: Some(false),
+            bsmod,
             ..Ac3Frame::default()
         });
     }
@@ -279,8 +300,9 @@ fn eac3_tail(b: &mut Bits, fr: &mut Ac3Frame, fscod: u32, nblk: u32) -> Option<b
         }
     }
     if b.flag()? {
-        // infomdate
-        b.skip(3 + 2)?;
+        // infomdate: bsmod, copyrightb, origbs
+        fr.bsmod = u8::try_from(b.u(3)?).ok();
+        b.skip(2)?;
         if acmod == 2 {
             b.skip(4)?;
         }
@@ -375,6 +397,9 @@ pub(crate) fn ac3(buf: &[u8]) -> Option<AudioInfo> {
         sample_rate: Some(f.sample_rate),
         bitrate_kbps: if kbps > 0 { Some(kbps) } else { f.kbps },
         atmos,
+        service: f
+            .bsmod
+            .and_then(|m| service_kind(m, u8::try_from(f.acmod).unwrap_or(0))),
         ..AudioInfo::default()
     };
     if a.atmos == Some(true) {
@@ -384,11 +409,12 @@ pub(crate) fn ac3(buf: &[u8]) -> Option<AudioInfo> {
     Some(a)
 }
 
-/// MP4 `dac3` body: channels.
+/// MP4 `dac3` body: channels and the service (bsmod).
 pub(crate) fn dac3(body: &[u8]) -> Option<AudioInfo> {
     let mut b = Bits::new(body);
     let fscod = b.u(2)?;
-    b.skip(5 + 3)?;
+    b.skip(5)?;
+    let bsmod = b.u(3)?;
     let acmod = b.u(3)?;
     let lfe = b.flag()?;
     let kbps = AC3_KBPS.get(usize::try_from(b.u(5)?).ok()?).copied();
@@ -400,6 +426,7 @@ pub(crate) fn dac3(body: &[u8]) -> Option<AudioInfo> {
         sample_rate: AC3_RATES.get(usize::try_from(fscod).ok()?).copied(),
         bitrate_kbps: kbps.map(u64::from),
         atmos: Some(false),
+        service: service_kind(bsmod as u8, acmod as u8),
         ..AudioInfo::default()
     })
 }
@@ -412,10 +439,15 @@ pub(crate) fn dec3(body: &[u8]) -> Option<AudioInfo> {
     let num_ind = b.u(3)? + 1;
     let mut mask = 0;
     let mut rate = None;
+    let mut service = None;
     for i in 0..num_ind {
         let fscod = b.u(2)?;
-        b.skip(5 + 1 + 1 + 3)?; // bsid, reserved, asvc, bsmod
+        b.skip(5 + 1 + 1)?; // bsid, reserved, asvc
+        let bsmod = b.u(3)?;
         let acmod = b.u(3)?;
+        if i == 0 {
+            service = service_kind(bsmod as u8, acmod as u8);
+        }
         let lfe = b.flag()?;
         b.skip(3)?;
         let num_dep = b.u(4)?;
@@ -452,6 +484,7 @@ pub(crate) fn dec3(body: &[u8]) -> Option<AudioInfo> {
         bitrate_kbps: Some(u64::from(kbps)),
         // An absent extension does not mean "no Atmos" (older muxers omit it): first frame.
         atmos: ext.filter(|e| *e),
+        service,
         ..AudioInfo::default()
     };
     if a.atmos == Some(true) {
