@@ -11,7 +11,7 @@ Stats has three sections (docs/APP.md §13 for the rebuilt app):
 
 | Section | What it shows |
 |---|---|
-| Charts | where discoveries come from (DHT routes, relay sources, machines) with a **Crawl map** button (docs/CRAWLMAP.md); health card; breakdowns of audio languages, resolutions, categories, sources, video codecs, HDR, audio formats, genres, movies/series/anime, publisher categories, years; activity over time |
+| Charts | where discoveries come from (DHT routes, relay sources, machines) with a **Crawl map** button (docs/CRAWLMAP.md); health card; breakdowns of audio languages, resolutions, categories, sources, video codecs, HDR, audio formats, genres, movies/series/anime, publisher categories, years; file kinds of the probed torrents by group with a drill-down to labels (D139, with the `probe_file_kinds` feature); activity over time |
 | Graphs | web of trust, relays and publishers (a title's releases open from its title page, a torrent's swarm from its detail page) |
 | Status | server (version, missing features), search index, seed-check backlog, relays and crawler, DHT crawler (the phone keeps no torrent cache any more) |
 
@@ -64,14 +64,14 @@ series 1 min, health 30 s, graphs 5 min, the swarm graph 30 s since a seed check
 
 ### `GET|POST /api/v1/stats/breakdown`
 
-`POST` body `BreakdownRequest {query: SearchQuery, fields: [..], top}`; `GET` takes
+`POST` body `BreakdownRequest {query: SearchQuery, fields: [..], top, file_group}`; `GET` takes
 `field=` (repeatable or comma-separated), `top=` and the search query string of
 `/api/v1/search` (`lang=fr&res=1080p&cat=video&min_trust=0…`).
 
 Fields: `language`, `subtitles`, `resolution`, `source`, `codec`, `hdr`, `audio`, `channels`,
 `category`, `subcategory` (the publisher's `tcat` path), `genre`, `year`, `media_kind`,
-`edition`, `format`, `group`, `origin` (Nostr / DHT, D73; a torrent known from both counts
-under each). `top` default 10, max 50. Timeseries metrics also include the DHT crawler's
+`edition`, `format`, `group`, `file_group`, `file_kind` (D139, below), `origin` (Nostr / DHT,
+D73; a torrent known from both counts under each). `top` default 10, max 50. Timeseries metrics also include the DHT crawler's
 `dht_torrents_added`, `dht_hashes_seen`, `dht_fetch_ok`, `dht_fetch_fail`, `dht_blocked`
 (D74); `/api/v1/stats/health` carries `dht` (`DhtStats`) when the crawler runs.
 
@@ -88,6 +88,36 @@ HDR, audio, genres) count a torrent once per value. `other` sums the values afte
 ones, `missing` counts torrents without any value. 503 `search_index_unavailable` until the
 index is built (D43); the counts come from the index's facet collector, which also counts
 documents without a value.
+
+#### File kinds (D139, `features` lists `probe_file_kinds`)
+
+`file_group` and `file_kind` count the content labels of every probed file (docs/FILTERS.md
+"File kind"). Both come from the one `probe_file_kind` facet (served from one tally when both
+are asked for). Counts are of **torrents**, not files: a torrent counts once under each group it
+contains and once under each label, like the other multi-valued fields; file counts would be
+dominated by packs. `BreakdownRequest.file_group` (`GET` `file_group=video`, `[a-z0-9_]{1,32}`,
+else 400 `invalid`; part of the cache key) limits `file_kind` to one group's labels:
+
+| Field | `counts` values | `total` | `missing` |
+|---|---|---|---|
+| `file_group` | groups (no dot) | counted | torrents never probed |
+| `file_kind`, no `file_group` | labels (with a dot) | counted | torrents never probed |
+| `file_kind`, `file_group=G` | labels starting with `G.` | counted | counted − torrents with a file of G (an unknown G: empty `counts`, `missing` = counted) |
+
+Cross-filtering as for every field: both are counted with every filter of `query` except
+`probe_file_kinds`, and the other fields are counted with it. `top`, `other`, `other_values`
+as above (`top` up to 50).
+
+```json
+POST /api/v1/stats/breakdown
+{"query":{"probe_file_kinds":["video"],"languages":["fr"]},"fields":["file_group","file_kind"],"top":50,"file_group":"video"}
+
+{"total":1500000,"computed_at":1793000000,"breakdowns":[
+ {"field":"file_group","total":1500000,"counts":[{"value":"video","count":66012},{"value":"subtitle","count":4021}],"other":0,"other_values":0,"missing":1412539},
+ {"field":"file_kind","total":1500000,"counts":[{"value":"video.mkv","count":40110},{"value":"video.mp4","count":20022}],"other":12,"other_values":3,"missing":1433988}]}
+```
+
+(Illustrative numbers.) Probed torrents in view = `total − missing` of `file_group`.
 
 ### `GET /api/v1/stats/timeseries?metric=a,b&bucket=hour|day&since=<unix>`
 

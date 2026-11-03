@@ -131,7 +131,12 @@ export function mount(el, { params, query, ctx }) {
       return;
     }
     const n = activeCount(c.get().state.filters);
-    filterHost.replaceChildren(iconButton("filter", "Filters", openFilters, { badge: n }));
+    // The sheet's close gives focus back to the old button, then applying rebuilds it (new
+    // badge): keep the focus on the new one, not on the body.
+    const focused = filterHost.contains(document.activeElement);
+    const btn = iconButton("filter", "Filters", openFilters, { badge: n });
+    filterHost.replaceChildren(btn);
+    if (focused) btn.focus({ preventScroll: true });
   }
   const actions = h("div", { class: "search-actions" }, saveBtn, sortBtn, filterHost);
 

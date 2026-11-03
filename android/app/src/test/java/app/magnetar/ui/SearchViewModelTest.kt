@@ -5,6 +5,8 @@ import app.magnetar.api.Category
 import app.magnetar.api.FacetCount
 import app.magnetar.api.FacetCounts
 import app.magnetar.api.FacetSet
+import app.magnetar.api.FileKindCatalogue
+import app.magnetar.api.FileKindGroup
 import app.magnetar.api.SearchPage
 import app.magnetar.api.Sort
 import app.magnetar.api.TorrentSummary
@@ -221,6 +223,51 @@ class SearchViewModelTest {
         val req = kinds.facetRequests.last()
         assertTrue(req.fields.containsAll(PROBE_FACET_FIELDS), req.fields.toString())
         assertEquals(req.query.probeSubKinds, listOf("sdh"))
+        vm.draftFilters(null)
+        vm2.draftFilters(null)
+        advanceUntilIdle()
+    }
+
+    @Test
+    fun `file kinds are sent, counted with every value and named only with probe_file_kinds`() = runTest {
+        val f = SearchFilters(probeFileKinds = setOf("video", "archive.zip"), probeHdr = setOf("any"))
+        // A D125 server: probe filters, no file kinds. Neither sent nor counted, no catalogue call.
+        val old = FakeService()
+        old.features = old.features + "probe_filters" + "probe_kinds"
+        val vm = vm(old)
+        advanceUntilIdle()
+        assertFalse(vm.state.value.canFilterFileKinds)
+        vm.setFilters(f)
+        advanceUntilIdle()
+        assertEquals(old.searches.last().probeFileKinds, emptyList<String>())
+        assertEquals(old.searches.last().probeHdr, listOf("any"))
+        vm.draftFilters(f)
+        advanceUntilIdle()
+        assertTrue("probe_file_kind" !in old.facetRequests.last().fields)
+        assertEquals(old.facetRequests.last().sizes, emptyMap<String, Int>())
+        assertEquals(old.fileKindsCalls, 0)
+
+        val fresh = FakeService()
+        fresh.features = old.features + "probe_file_kinds"
+        fresh.fileKindsAnswer = { FileKindCatalogue(listOf(FileKindGroup("video", "Video"))) }
+        val vm2 = vm(fresh)
+        advanceUntilIdle()
+        assertTrue(vm2.state.value.canFilterFileKinds)
+        vm2.setFilters(f)
+        advanceUntilIdle()
+        assertEquals(fresh.searches.last().probeFileKinds, listOf("archive.zip", "video"))
+        vm2.draftFilters(f)
+        advanceUntilIdle()
+        val req = fresh.facetRequests.last()
+        assertTrue("probe_file_kind" in req.fields, req.fields.toString())
+        assertEquals(req.sizes, mapOf("probe_file_kind" to 400))
+        assertEquals(req.size, 40)
+        assertEquals(vm2.fileKinds.value?.groups?.single()?.name, "Video")
+        // Once per server version: the sheet opening again does not ask again.
+        vm2.draftFilters(null)
+        vm2.draftFilters(f.copy(probeHdr = emptySet()))
+        advanceUntilIdle()
+        assertEquals(fresh.fileKindsCalls, 1)
         vm.draftFilters(null)
         vm2.draftFilters(null)
         advanceUntilIdle()

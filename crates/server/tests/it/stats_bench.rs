@@ -139,6 +139,7 @@ async fn stats_at_scale() {
             query: q,
             fields: fields.clone(),
             top: 12,
+            ..Default::default()
         };
         let d = time(name, || async {
             let svc = StatsService::default();

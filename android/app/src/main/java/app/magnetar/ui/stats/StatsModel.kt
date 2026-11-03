@@ -13,7 +13,11 @@ import app.magnetar.ui.common.formatNumber
 import app.magnetar.ui.common.formatPercent
 import app.magnetar.ui.common.formatRate
 import app.magnetar.ui.common.formatUptime
+import app.magnetar.api.FileKindCatalogue
 import app.magnetar.ui.search.SearchFilters
+import app.magnetar.ui.search.fileKindChips
+import app.magnetar.ui.search.fileKindGroupOf
+import app.magnetar.ui.search.fileKindName
 import java.util.Locale
 
 /** What a metric's values are, for its labels. */
@@ -68,11 +72,20 @@ val FIELD_TITLES = mapOf(
     "source" to "Release sources", "codec" to "Video codecs", "hdr" to "HDR", "audio" to "Audio formats",
     "genre" to "Genres", "media_kind" to "Movies, series, anime", "subcategory" to "Publisher categories",
     "year" to "Years", "origin" to "Found via (Nostr / DHT)",
+    "file_group" to "File kinds", "file_kind" to "Kinds",
 )
+
+/**
+ * The file-kind breakdowns (D139, feature `probe_file_kinds`): `file_group` counts torrents per
+ * sniff group, `file_kind` per label (of one group with `file_group`). Both cross-filter
+ * through `probe_file_kinds` and are counted without it.
+ */
+val FILE_KIND_STAT_FIELDS = setOf("file_group", "file_kind")
 
 /** Fields whose values are search filters (cross-filter on tap); the others open a text search. */
 val FILTERABLE = setOf(
     "language", "resolution", "category", "source", "codec", "hdr", "audio", "genre", "media_kind", "year", "origin",
+    "file_group", "file_kind",
 )
 
 /** A torrent can count under several values of these. */
@@ -86,8 +99,12 @@ val DONUT_ORDER = mapOf(
     "origin" to listOf("nostr", "dht"),
 )
 
-/** The label of a chart value ("fr" → "French", "web-dl" → "WEB-DL", "dht" → "DHT"). */
-fun valueLabel(field: String, value: String): String = when (field) {
+/**
+ * The label of a chart value ("fr" → "French", "web-dl" → "WEB-DL", "dht" → "DHT"); file kinds
+ * are named from the [catalogue] (the id without it).
+ */
+fun valueLabel(field: String, value: String, catalogue: FileKindCatalogue? = null): String = when (field) {
+    in FILE_KIND_STAT_FIELDS -> fileKindName(catalogue, value)
     "origin" -> when (value) {
         "nostr" -> "Nostr"
         "dht" -> "DHT"
@@ -97,8 +114,12 @@ fun valueLabel(field: String, value: String): String = when (field) {
     else -> facetLabel(field, value)
 }
 
-/** [value] of [field] switched on or off as a cross-filter (a year is min = max = that year). */
-fun SearchFilters.toggleStat(field: String, value: String): SearchFilters = when (field) {
+/**
+ * [value] of [field] switched on or off as a cross-filter (a year is min = max = that year; a
+ * file kind with group / label semantics, [labelsOf] giving a group's labels).
+ */
+fun SearchFilters.toggleStat(field: String, value: String, labelsOf: (String) -> List<String> = { emptyList() }): SearchFilters = when (field) {
+    in FILE_KIND_STAT_FIELDS -> toggleFileKind(value, labelsOf)
     "year" -> value.toIntOrNull()?.let { y ->
         if (minYear == y && maxYear == y) copy(minYear = null, maxYear = null) else copy(minYear = y, maxYear = y)
     } ?: this
@@ -109,12 +130,43 @@ fun SearchFilters.toggleStat(field: String, value: String): SearchFilters = when
 /** Values of [field] the cross-filter selects. */
 fun SearchFilters.selectedStat(field: String): Set<String> = when (field) {
     "year" -> if (minYear != null && minYear == maxYear) setOf(minYear.toString()) else emptySet()
+    in FILE_KIND_STAT_FIELDS -> probeFileKinds
     else -> selected(field)
 }
 
 /** The active cross-filters as (field, value) chips, in chart order. */
 fun SearchFilters.statChips(): List<Pair<String, String>> =
-    (BREAKDOWN_FIELDS + "origin" + "year").filter { it in FILTERABLE }.flatMap { f -> selectedStat(f).sorted().map { f to it } }
+    (BREAKDOWN_FIELDS + "origin" + "file_kind" + "year").filter { it in FILTERABLE }.flatMap { f -> selectedStat(f).sorted().map { f to it } }
+
+/** One chip of the Stats filter row: [field] and [value] as [statChips] gives them, its [label], and the file kinds it removes. */
+data class StatChip(val field: String, val value: String, val label: String, val fileKinds: List<String> = emptyList())
+
+/**
+ * The Stats filter row's chips: [statChips], except many labels of one file-kind group, which
+ * are one chip (D140 C3, [fileKindChips]).
+ */
+fun SearchFilters.statChipItems(catalogue: FileKindCatalogue?, labelsOf: (String) -> List<String>): List<StatChip> {
+    val out = mutableListOf<StatChip>()
+    var kindsDone = false
+    for ((field, value) in statChips()) {
+        if (field !in FILE_KIND_STAT_FIELDS) {
+            out += StatChip(field, value, valueLabel(field, value, catalogue))
+            continue
+        }
+        if (kindsDone) continue
+        kindsDone = true
+        for (c in fileKindChips(probeFileKinds, labelsOf) { fileKindName(catalogue, it) }) {
+            out += StatChip(field, c.values.joinToString(","), c.label, c.values)
+        }
+    }
+    return out
+}
+
+/**
+ * The group the File kinds card drills into by itself: the one group the file-kind cross-filter
+ * is in (a group or labels of it), null for none or several.
+ */
+fun SearchFilters.autoFileGroup(): String? = probeFileKinds.map { fileKindGroupOf(it) }.toSet().singleOrNull()
 
 /**
  * Seed checks (D45) as the health card shows them: the latest result of the torrents checked at
@@ -154,6 +206,7 @@ fun missingFeatures(health: Health): List<String> =
         Features.FILTERS to "release filters", Features.ORIGIN to "Nostr / DHT source",
         Features.CRAWL_SOURCES to "discovery sources", Features.CRAWL_MAP to "crawl map",
         Features.PROBE_FILTERS to "probe filters", Features.PROBE_KINDS to "track-kind filters",
+        Features.PROBE_FILE_KINDS to "file-kind filters",
     ).filter { !health.has(it.first) }.map { it.second }
 
 /** The search index (D43) as label → value lines. */

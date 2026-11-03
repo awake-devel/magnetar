@@ -218,7 +218,9 @@ Tables (migration `20261105000000_probes.sql`):
   (`k:video`, `r:2160p`, `v:hevc`, `h:dolby_vision`, `a:fre`, `s:eng`, `ac:eac3`, `p:ps5`,
   `x:atmos`; since D124 also `ak:{kind}` / `sk:{kind}` per audio / subtitle kind, the
   same-track pairs `ap:{lang}:{kind}` / `sp:{lang}:{kind}`, and the subtitle format class
-  `sf:text` / `sf:image` / `sf:cc`). On version 2 rows `a:{lang}` leaves out audio tracks
+  `sf:text` / `sf:image` / `sf:cc`; since D137 `fk:{label}` and `fg:{group}` for **every**
+  probed file, verified or not: the file-kind filter, facet and Stats breakdown, docs/FILTERS.md
+  "File kind"). On version 2 rows `a:{lang}` leaves out audio tracks
   whose kinds include `commentary`, `music` or `karaoke`, and `s:{lang}` leaves out subtitle
   tracks whose kinds include `forced`, `signs`, `commentary` or `description`, so "French
   subtitles" means a French track to read the film with. The `audio_langs` / `sub_langs`

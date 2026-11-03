@@ -1,7 +1,7 @@
 //! Deterministic local data for the web UI check (docs/WEB.md "Local check",
 //! scripts/webcheck.sh): ~200 torrents with media, probes, track corrections, seed-check
 //! history, saved searches, activity series, relays and crawl-map counters, plus a handful of
-//! named fixtures (W1–W12) whose ids go to `--out` as JSON.
+//! named fixtures (W1–W17) whose ids go to `--out` as JSON.
 //!
 //! ```text
 //! cargo run --offline -p magnetar-server --example webcheck_seed -- \
@@ -429,6 +429,18 @@ impl Seed {
 
     fn fixture(&mut self, name: &str, v: J) {
         self.fixtures.insert(name.into(), v);
+    }
+}
+
+/// A probed file with a label only (no tracks), for the file kinds (D137).
+fn kind_file(i: u32, size: u64, label: &str, verified: bool) -> ProbeFile {
+    ProbeFile {
+        i,
+        size,
+        label: label.into(),
+        confidence: 95,
+        verified,
+        ..Default::default()
     }
 }
 
@@ -1377,6 +1389,94 @@ async fn seed(s: &mut Seed) -> anyhow::Result<()> {
     .await?;
     s.fixture("W12", json!({"infohash": w12, "title": w12_title}));
 
+    // W13–W17: file kinds of every probed file (D137). W13's text file is not the largest,
+    // W14's JPEG is unverified, W15 holds three document labels, W16 an installer beside an
+    // archive, W17 only a .NET assembly (`exe.pe` must not match it).
+    // (path, label, size, verified)
+    type KindFile = (&'static str, &'static str, u64, bool);
+    let kinds: [(&str, &str, &[KindFile]); 5] = [
+        (
+            "W13",
+            "Webcheck.Linux.Live.2025.amd64",
+            &[
+                ("webcheck-live-2025-amd64.iso", "disc.iso9660", 3 * GB, true),
+                ("SHA256SUMS", "text.checksum", 2_000, false),
+            ],
+        ),
+        (
+            "W14",
+            "Webcheck.Quartet.Studio.Album.2024.FLAC",
+            &[
+                ("01 - Opening.flac", "audio.flac", 40 * MB, true),
+                ("02 - Second Movement.flac", "audio.flac", 38 * MB, true),
+                ("cover.jpg", "image.jpeg", 2 * MB, false),
+            ],
+        ),
+        (
+            "W15",
+            "Webcheck.Reading.Bundle.2025.EPUB.PDF.CBZ",
+            &[
+                ("Webcheck Novel.epub", "doc.epub", 3 * MB, true),
+                ("Webcheck Manual.pdf", "doc.pdf", 9 * MB, true),
+                ("Webcheck Comic 01.cbz", "doc.cbz", 80 * MB, true),
+            ],
+        ),
+        (
+            "W16",
+            "Webcheck.Studio.Tools.2025.x64",
+            &[
+                (
+                    "Webcheck.Studio.Tools.2025.x64.zip",
+                    "archive.zip",
+                    900 * MB,
+                    true,
+                ),
+                ("setup.exe", "exe.pe.nsis", 120 * MB, true),
+                ("tools/webcheck-cli.exe", "exe.pe", 8 * MB, true),
+                ("redist/webcheck-runtime.msi", "package.msi", 30 * MB, true),
+            ],
+        ),
+        (
+            "W17",
+            "Webcheck.Dotnet.Utility.1.2",
+            &[("WebcheckUtility.dll", "exe.pe.dotnet", 2 * MB, true)],
+        ),
+    ];
+    for (name, title, files) in kinds {
+        let (h, _) = s
+            .nostr(Nt {
+                key: &pubs[6],
+                title: title.into(),
+                files: files
+                    .iter()
+                    .map(|(p, _, size, _)| (format!("{title}/{p}"), *size))
+                    .collect(),
+                tags: vec!["software"],
+                desc: format!("{title}: file kinds for the local web check."),
+                age: 3 * DAY,
+            })
+            .await?;
+        s.probe(
+            &h,
+            files
+                .iter()
+                .enumerate()
+                .map(|(i, (_, label, size, verified))| ProbeFile {
+                    i: i as u32,
+                    size: *size,
+                    label: (*label).into(),
+                    confidence: 95,
+                    verified: *verified,
+                    ..Default::default()
+                })
+                .collect(),
+            name,
+        )
+        .await?;
+        s.live(&h, 12, 2, None, 3 * HOUR).await?;
+        s.fixture(name, json!({"infohash": h, "title": title}));
+    }
+
     // ---- the bulk: Nostr torrents in every category ------------------------------------------
     let movies: Vec<&MediaRow> = MEDIA.iter().filter(|m| m.kind == "movie").collect();
     let res = ["720p", "1080p", "2160p"];
@@ -1425,6 +1525,19 @@ async fn seed(s: &mut Seed) -> anyhow::Result<()> {
             .position(|x| x.title == m.title)
             .expect("media");
         s.link(&h, media_ids[mi], None, None).await?;
+        // Every third movie probed (labels only, no tracks), so the File kind filter and the
+        // Stats "File kinds" card have counts that differ (D137, D139): video and subtitles,
+        // and on every sixth the .nfo as text.
+        if i % 3 == 0 {
+            let mut files = vec![
+                kind_file(0, size, "video.mkv", true),
+                kind_file(1, 80_000, "subtitle.srt", false),
+            ];
+            if i % 6 == 0 {
+                files.push(kind_file(2, 4_000, "text.nfo", false));
+            }
+            s.probe(&h, files, &format!("bulk movie {i}")).await?;
+        }
         if i % 5 != 0 {
             s.live(
                 &h,
@@ -1491,31 +1604,83 @@ async fn seed(s: &mut Seed) -> anyhow::Result<()> {
         s.live(&h, 10 + i as u32, 2, None, 5 * HOUR).await?;
         bulk += 1;
     }
-    let others: [(&str, &str, u64); 18] = [
-        ("Webcheck.Band.Live.2019.FLAC.24bit", "music", 900 * MB),
-        ("Orchestra.Webcheck.Symphonies.MP3.320", "music", 300 * MB),
+    // The last column is the probed label of `data.bin` (D137), "" = not probed.
+    let others: [(&str, &str, u64, &str); 18] = [
+        (
+            "Webcheck.Band.Live.2019.FLAC.24bit",
+            "music",
+            900 * MB,
+            "audio.flac",
+        ),
+        (
+            "Orchestra.Webcheck.Symphonies.MP3.320",
+            "music",
+            300 * MB,
+            "audio.mpeg",
+        ),
         (
             "Webcheck.Audiobook.The.Long.Road.M4B",
             "audiobook",
             400 * MB,
+            "audio.m4a",
         ),
-        ("debian-13.1.0-amd64-netinst.iso", "linux", 700 * MB),
-        ("Webcheck.Office.Suite.2025.x64", "software", 2 * GB),
-        ("fedora-workstation-42-x86_64.iso", "linux", 2 * GB),
-        ("Webcheck.Puzzle.Quest.GOG", "game", 5 * GB),
-        ("Webcheck.Kart.Switch.NSP", "game", 8 * GB),
-        ("Webcheck.Cookbook.2024.EPUB", "ebook", 20 * MB),
-        ("Webcheck.Comics.Vol.1-5.CBZ", "comic", 600 * MB),
-        ("Webcheck.Manga.Tome.01.FRENCH.CBZ", "manga", 120 * MB),
-        ("Webcheck.Wallpapers.4K.Pack", "picture", 1500 * MB),
-        ("Webcheck.Photo.Archive.2020", "image", 3 * GB),
-        ("Webcheck.Misc.Dataset.2025", "other", 10 * GB),
-        ("Webcheck.Fonts.Collection", "other", 200 * MB),
-        ("Webcheck.Podcast.Season.3", "audio", 800 * MB),
-        ("Webcheck.Retro.Games.Pack.psx", "psx", 4 * GB),
-        ("Webcheck.Lecture.Notes.PDF", "book", 50 * MB),
+        (
+            "debian-13.1.0-amd64-netinst.iso",
+            "linux",
+            700 * MB,
+            "disc.iso9660",
+        ),
+        (
+            "Webcheck.Office.Suite.2025.x64",
+            "software",
+            2 * GB,
+            "exe.pe.inno",
+        ),
+        (
+            "fedora-workstation-42-x86_64.iso",
+            "linux",
+            2 * GB,
+            "disc.iso9660",
+        ),
+        ("Webcheck.Puzzle.Quest.GOG", "game", 5 * GB, "archive.7z"),
+        (
+            "Webcheck.Kart.Switch.NSP",
+            "game",
+            8 * GB,
+            "game.switch.nsp",
+        ),
+        ("Webcheck.Cookbook.2024.EPUB", "ebook", 20 * MB, "doc.epub"),
+        ("Webcheck.Comics.Vol.1-5.CBZ", "comic", 600 * MB, "doc.cbz"),
+        (
+            "Webcheck.Manga.Tome.01.FRENCH.CBZ",
+            "manga",
+            120 * MB,
+            "doc.cbz",
+        ),
+        (
+            "Webcheck.Wallpapers.4K.Pack",
+            "picture",
+            1500 * MB,
+            "image.png",
+        ),
+        (
+            "Webcheck.Photo.Archive.2020",
+            "image",
+            3 * GB,
+            "archive.rar5",
+        ),
+        ("Webcheck.Misc.Dataset.2025", "other", 10 * GB, ""),
+        ("Webcheck.Fonts.Collection", "other", 200 * MB, "font.ttf"),
+        ("Webcheck.Podcast.Season.3", "audio", 800 * MB, "audio.mpeg"),
+        (
+            "Webcheck.Retro.Games.Pack.psx",
+            "psx",
+            4 * GB,
+            "game.ps1.bin",
+        ),
+        ("Webcheck.Lecture.Notes.PDF", "book", 50 * MB, "doc.pdf"),
     ];
-    for (i, (title, tag, size)) in others.iter().enumerate() {
+    for (i, (title, tag, size, label)) in others.iter().enumerate() {
         let (h, _) = s
             .nostr(Nt {
                 key: &pubs[6 + i % 2],
@@ -1526,6 +1691,10 @@ async fn seed(s: &mut Seed) -> anyhow::Result<()> {
                 age: (i as i64 + 2) * DAY,
             })
             .await?;
+        if !label.is_empty() {
+            s.probe(&h, vec![kind_file(0, *size, label, i % 4 != 1)], title)
+                .await?;
+        }
         if i % 3 != 2 {
             s.live(&h, (i * 11 % 50) as u32, 3, None, 7 * HOUR).await?;
         }

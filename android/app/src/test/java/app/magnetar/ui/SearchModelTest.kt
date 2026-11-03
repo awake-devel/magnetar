@@ -120,6 +120,36 @@ class SearchModelTest {
     }
 
     @Test
+    fun `file kinds round-trip, count once and are dropped without probe_file_kinds`() {
+        val f = SearchFilters(probeFileKinds = setOf("video", "archive.zip"), probeHdr = setOf("any"))
+        val q = buildQuery("", f, Sort.DATE, true, includeAdult = false, nowSec = now)
+        assertEquals(q.probeFileKinds, listOf("archive.zip", "video"))
+        assertEquals(filtersOf(q, now), f)
+        assertEquals(f.activeCount, 2)
+        assertEquals(SearchFilters(probeFileKinds = setOf("exe")).activeCount, 1)
+        assertTrue(SearchFilters(probeFileKinds = setOf("exe")).hasProbeFilters)
+        assertEquals(f.selected("probe_file_kind"), setOf("video", "archive.zip"))
+        assertEquals(FACET_TITLES["probe_file_kind"], "File kind")
+        // A D125 server would ignore them and answer unfiltered; the other probe filters stay.
+        assertEquals(f.supportedBy(setOf("probe_filters", "probe_kinds")), SearchFilters(probeHdr = setOf("any")))
+        assertEquals(f.supportedBy(setOf("probe_filters", "probe_kinds", "probe_file_kinds")), f)
+        // Facet labels without the catalogue: a group with a capital, a label as its id.
+        assertEquals(facetLabel("probe_file_kind", "video"), "Video")
+        assertEquals(facetLabel("probe_file_kind", "exe.pe.dotnet"), "exe.pe.dotnet")
+    }
+
+    @Test
+    fun `an empty file-kind list and sizes stay out of the body`() {
+        val json = MagnetarApi.JSON
+        val plain = json.encodeToString(SearchQuery.serializer(), SearchQuery(text = "x"))
+        assertTrue("probe_file_kinds" !in plain, plain)
+        val set = json.encodeToString(SearchQuery.serializer(), SearchQuery(probeFileKinds = listOf("video")))
+        assertTrue(set.contains("\"probe_file_kinds\":[\"video\"]"), set)
+        val facets = json.encodeToString(app.magnetar.api.FacetsRequest.serializer(), app.magnetar.api.FacetsRequest(fields = listOf("category")))
+        assertTrue("sizes" !in facets, facets)
+    }
+
+    @Test
     fun `probe chips toggle, list built-in values and read as names`() {
         var f = SearchFilters()
         for (field in PROBE_FACET_FIELDS) {

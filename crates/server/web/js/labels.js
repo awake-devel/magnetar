@@ -2,6 +2,7 @@
 // display labels of filter values and release attributes. Labels only: nothing here decides
 // what is shown or hidden.
 
+import { fileKindName } from "./file-kinds.js";
 import { formatAge, formatBytes, formatRating, peersText } from "./format.js";
 
 /** @typedef {import("./types.js").ReleaseAttrs} ReleaseAttrs */
@@ -263,6 +264,8 @@ export function facetLabel(field, value) {
     case "probe_sub_kind":
     case "probe_sub_format":
       return capitalize(value.replaceAll("_", " "));
+    case "probe_file_kind":
+      return fileKindName(value);
     default:
       return value;
   }

@@ -72,6 +72,11 @@ pub mod features {
     /// `pos` / `fix` on the probe tracks, `ProbeFileInfo.dht_index`, `ProbeInfo.unplaced`
     /// and `StatsResponse.probe_corrections`. Probe filters and facets count corrected values.
     pub const PROBE_CORRECTIONS: &str = "probe_corrections";
+    /// File kinds (D137–D139): `SearchQuery.probe_file_kinds`, the `probe_file_kind` facet
+    /// (groups and labels of every probed file), `FacetsRequest.sizes`,
+    /// `GET /api/v1/probe/file-kinds` (the label catalogue) and the `file_group` / `file_kind`
+    /// breakdowns with `BreakdownRequest.file_group`.
+    pub const PROBE_FILE_KINDS: &str = "probe_file_kinds";
     pub const ALL: &[&str] = &[
         FILTERS,
         FACET_SET,
@@ -88,6 +93,7 @@ pub mod features {
         PROBE_FILTERS,
         PROBE_KINDS,
         PROBE_CORRECTIONS,
+        PROBE_FILE_KINDS,
     ];
 }
 
@@ -626,6 +632,38 @@ pub struct FacetsRequest {
     pub fields: Vec<String>,
     /// Values per facet, default 20, at most 200.
     pub size: u32,
+    /// Per-field override of `size` (D137, `features::PROBE_FILE_KINDS`), for example
+    /// `{"probe_file_kind": 400}`; at most 512 for `probe_file_kind`, 200 for the others.
+    /// Older servers ignore it.
+    pub sizes: std::collections::BTreeMap<String, u32>,
+}
+
+/// `GET /api/v1/probe/file-kinds` (D137): every content label a header probe can give, by
+/// group, from sniff's registry. The same for the life of a server version (cache it keyed by
+/// `Health::version`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct FileKindCatalogue {
+    pub groups: Vec<FileKindGroup>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct FileKindGroup {
+    /// `video`, `exe`, … (a value of the `probe_file_kind` facet without a dot).
+    pub id: String,
+    pub name: String,
+    /// In registry order.
+    pub labels: Vec<FileKindLabel>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct FileKindLabel {
+    /// `video.mkv`, `exe.pe.dotnet`, …
+    pub id: String,
+    pub name: String,
+    pub extensions: Vec<String>,
 }
 
 /// Counts of several facets. Each facet's counts apply every filter of the query except its
@@ -686,6 +724,10 @@ pub struct BreakdownRequest {
     pub fields: Vec<String>,
     /// Values shown per field, default 10, at most 50; the rest is summed into `other`.
     pub top: u32,
+    /// The group the `file_kind` breakdown is limited to (D139, `video` → `video.*` labels);
+    /// `[a-z0-9_]{1,32}`. None = every label. Older servers ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_group: Option<String>,
 }
 
 /// Top values of one field and what is left.

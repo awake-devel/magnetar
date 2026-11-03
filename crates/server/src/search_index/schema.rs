@@ -27,7 +27,9 @@ use tantivy::{TantivyDocument, Term};
 /// probe_hdr probe_audio` from `probe_attrs.tags`.
 /// 6: probe kinds (D125): `probe_sub_kind probe_audio_kind probe_sub_format`, and the internal
 /// pair facets `probe_sub_pair probe_audio_pair`.
-pub const SCHEMA_VERSION: u32 = 6;
+/// 7: file kinds (D137): `probe_file_kind`, the groups (`fg:`) and labels (`fk:`) of every
+/// probed file.
+pub const SCHEMA_VERSION: u32 = 7;
 pub const TOKENIZER: &str = "magnetar";
 /// Descriptions are indexed up to this many characters (lower weight, mostly boilerplate).
 pub const DESCRIPTION_CHARS: i32 = 2000;
@@ -188,6 +190,12 @@ pub const FACETS: &[FacetDef] = &[
     FacetDef {
         name: "probe_audio_pair",
         values: |d| crate::probes::facet_values("probe_audio_pair", &d.probe_tags),
+    },
+    // File kinds (D137): groups (no dot) and labels (with a dot) in one column, so both levels
+    // are counted disjunctively against the one file-kind filter.
+    FacetDef {
+        name: "probe_file_kind",
+        values: |d| crate::probes::facet_values("probe_file_kind", &d.probe_tags),
     },
 ];
 

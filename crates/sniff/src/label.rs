@@ -2423,6 +2423,84 @@ pub static LABELS: &[LabelInfo] = &[
     ),
 ];
 
+/// One label group: the part of a label id before the first `.` (`exe` for `exe.pe.dotnet`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupInfo {
+    pub id: &'static str,
+    /// Display name (Magnetar's file-kind filter and Stats, D137).
+    pub name: &'static str,
+}
+
+/// Every label group, in display order. Each label's group is listed here
+/// (`tests::groups_cover_every_label`).
+pub static GROUPS: &[GroupInfo] = &[
+    GroupInfo {
+        id: "video",
+        name: "Video",
+    },
+    GroupInfo {
+        id: "audio",
+        name: "Audio",
+    },
+    GroupInfo {
+        id: "subtitle",
+        name: "Subtitles",
+    },
+    GroupInfo {
+        id: "image",
+        name: "Images",
+    },
+    GroupInfo {
+        id: "doc",
+        name: "Documents and e-books",
+    },
+    GroupInfo {
+        id: "text",
+        name: "Text",
+    },
+    GroupInfo {
+        id: "archive",
+        name: "Archives",
+    },
+    GroupInfo {
+        id: "disc",
+        name: "Disc and disk images",
+    },
+    GroupInfo {
+        id: "exe",
+        name: "Executables",
+    },
+    GroupInfo {
+        id: "package",
+        name: "Installers and packages",
+    },
+    GroupInfo {
+        id: "game",
+        name: "Console games",
+    },
+    GroupInfo {
+        id: "gamedata",
+        name: "Game data",
+    },
+    GroupInfo {
+        id: "model",
+        name: "3D models",
+    },
+    GroupInfo {
+        id: "font",
+        name: "Fonts",
+    },
+    GroupInfo {
+        id: "misc",
+        name: "Other",
+    },
+];
+
+/// The group of a label id (`exe` for `exe.pe.dotnet`).
+pub fn group_of(id: &str) -> &str {
+    id.split('.').next().unwrap_or(id)
+}
+
 /// Registry entry for `id`.
 pub fn info(id: &str) -> Option<&'static LabelInfo> {
     LABELS.iter().find(|l| l.id == id)
@@ -2463,5 +2541,30 @@ mod tests {
                 l.id
             );
         }
+    }
+
+    #[test]
+    fn groups_cover_every_label() {
+        for l in LABELS {
+            assert!(l.id.contains('.'), "{} has no group", l.id);
+            assert!(
+                GROUPS.iter().any(|g| g.id == group_of(l.id)),
+                "group of {} is not in GROUPS",
+                l.id
+            );
+        }
+        for g in GROUPS {
+            assert!(
+                LABELS.iter().any(|l| group_of(l.id) == g.id),
+                "group {} has no label",
+                g.id
+            );
+            assert!(!g.name.is_empty());
+        }
+        let mut ids: Vec<&str> = GROUPS.iter().map(|g| g.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), GROUPS.len(), "duplicate group");
+        assert_eq!(GROUPS.len(), 15);
     }
 }

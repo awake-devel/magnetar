@@ -335,6 +335,49 @@ class MagnetarApiTest {
     }
 
     @Test
+    fun `file kinds - catalogue path and decoding, sizes and file_group sent`() = runBlocking {
+        server.enqueue(
+            json(
+                """{"groups":[{"id":"video","name":"Video","labels":[
+                {"id":"video.mkv","name":"Matroska video","extensions":["mkv","mk3d"]},
+                {"id":"video.webm","name":"WebM video","extensions":["webm","mkv"],"new":1}]},
+                {"id":"exe","name":"Executables","labels":[{"id":"exe.pe.dotnet","name":".NET assembly","extensions":[]}]}],"v":2}""",
+            ),
+        )
+        val c = api().fileKinds()
+        assertEquals(c.groups.map { it.id }, listOf("video", "exe"))
+        assertEquals(c.groups[0].labels[0].name, "Matroska video")
+        assertEquals(c.groups[0].labels[0].extensions, listOf("mkv", "mk3d"))
+        assertEquals(c.groups[1].labels.single().id, "exe.pe.dotnet")
+        val cr = server.takeRequest()
+        assertEquals(cr.method, "GET")
+        assertEquals(cr.url.encodedPath, "/api/v1/probe/file-kinds")
+        assertEquals(cr.headers["Authorization"], "Bearer secret-token")
+
+        server.enqueue(json("""{"total":3,"facets":[{"field":"probe_file_kind","total":3,"counts":[{"value":"video","count":3},{"value":"video.mkv","count":2}]}]}"""))
+        val set = api().facets(
+            FacetsRequest(SearchQuery(probeFileKinds = listOf("video")), listOf("probe_file_kind"), 40, mapOf("probe_file_kind" to 400)),
+        )
+        assertEquals(set.field("probe_file_kind")!!.counts.map { it.value }, listOf("video", "video.mkv"))
+        val fb = server.takeRequest().body!!.utf8()
+        assertTrue(fb.contains("\"sizes\":{\"probe_file_kind\":400}"), fb)
+        assertTrue(fb.contains("\"probe_file_kinds\":[\"video\"]"), fb)
+
+        server.enqueue(json("""{"total":5,"breakdowns":[{"field":"file_group","total":5,"counts":[{"value":"video","count":3}],"missing":2}]}"""))
+        val b = api().breakdown(BreakdownRequest(SearchQuery(), listOf("file_group", "file_kind"), top = 50, fileGroup = "video"))
+        assertEquals(b.field("file_group")?.missing, 2L)
+        val bb = server.takeRequest().body!!.utf8()
+        assertTrue(bb.contains("\"file_group\":\"video\""), bb)
+        assertTrue(bb.contains("\"fields\":[\"file_group\",\"file_kind\"]"), bb)
+        // No group: the field is left out (an older server never sees it).
+        server.enqueue(json("""{"total":0,"breakdowns":[]}"""))
+        api().breakdown(BreakdownRequest(SearchQuery(), listOf("language")))
+        val nb = server.takeRequest().body!!.utf8()
+        assertFalse(nb.contains("file_group"), nb)
+        assertFalse(nb.contains("probe_file_kinds"), nb)
+    }
+
+    @Test
     fun `detail decodes the server's tuples and unknown fields`() = runBlocking {
         server.enqueue(
             json(

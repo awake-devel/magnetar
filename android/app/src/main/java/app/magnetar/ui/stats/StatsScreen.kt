@@ -9,11 +9,14 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.AssistChip
@@ -54,6 +57,7 @@ import app.magnetar.ui.common.cachedAgo
 import app.magnetar.ui.common.formatAgo
 import app.magnetar.ui.common.formatNumber
 import app.magnetar.ui.common.formatShare
+import app.magnetar.ui.search.fileKindChecked
 import app.magnetar.ui.theme.ChartColors
 import app.magnetar.ui.theme.chartColors
 
@@ -141,6 +145,10 @@ private fun Charts(state: StatsUiState, colors: ChartColors, vm: StatsViewModel,
             items(set.breakdowns.filter { it.counts.isNotEmpty() || it.missing > 0 }, key = { it.field }) { b ->
                 BreakdownCard(b, state, colors, vm, onSearch)
             }
+            // File kinds (D139): from the header probes, with a drill-down to one group's kinds.
+            state.fileKindSet?.field("file_group")?.takeIf { state.hasFileKinds && (it.counts.isNotEmpty() || it.missing > 0) }?.let { g ->
+                item(key = "file_group") { FileKindsCard(g, state, colors, vm, onSearch) }
+            }
             state.years?.takeIf { it.counts.isNotEmpty() }?.let { y -> item(key = "year") { BreakdownCard(y, state, colors, vm, onSearch) } }
         }
         item(key = "activity") { ActivityCard(state, colors, vm) }
@@ -152,20 +160,20 @@ private fun Charts(state: StatsUiState, colors: ChartColors, vm: StatsViewModel,
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun FilterRow(state: StatsUiState, vm: StatsViewModel, onSearch: () -> Unit) {
-    val chips = state.filters.statChips()
+    val chips = state.filters.statChipItems(state.fileKinds, state.fileKindLabels)
     Column(Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
         if (chips.isEmpty()) {
             Text("Tap a bar or slice to filter every chart by it; long-press to search for it.", style = MaterialTheme.typography.bodySmall)
             return@Column
         }
         FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            for ((field, value) in chips) {
+            for (c in chips) {
                 InputChip(
                     selected = true,
-                    onClick = { vm.toggle(field, value) },
-                    label = { Text(valueLabel(field, value)) },
-                    trailingIcon = { Icon(Icons.Filled.Close, "Remove ${valueLabel(field, value)}") },
-                    modifier = Modifier.testTag("stats_chip_${field}_$value"),
+                    onClick = { if (c.fileKinds.isNotEmpty()) vm.removeFileKinds(c.fileKinds) else vm.toggle(c.field, c.value) },
+                    label = { Text(c.label) },
+                    trailingIcon = { Icon(Icons.Filled.Close, "Remove ${c.label}") },
+                    modifier = Modifier.testTag("stats_chip_${c.field}_${c.value}"),
                 )
             }
         }
@@ -199,6 +207,62 @@ private fun BreakdownCard(b: Breakdown, state: StatsUiState, colors: ChartColors
                 b.field == "year" -> YearColumns(b, selected, colors, toggle, open)
                 b.field in DONUT_ORDER -> BreakdownDonut(b, selected, colors, toggle, open)
                 else -> BreakdownBars(b, selected, colors, toggle, open)
+            }
+        }
+    }
+}
+
+/**
+ * "File kinds" (D139): torrents per sniff group from the header probes, one hue; a torrent
+ * counts once under each kind it contains. "Kinds ›" on a group lists its labels below (it
+ * opens by itself when one group is cross-filtered). Tap cross-filters, long press searches.
+ */
+@Composable
+private fun FileKindsCard(b: Breakdown, state: StatsUiState, colors: ChartColors, vm: StatsViewModel, onSearch: () -> Unit) {
+    val selected = state.filters.probeFileKinds
+    val names = { v: String -> valueLabel("file_kind", v, state.fileKinds) }
+    val isOn = { v: String -> fileKindChecked(selected, v) }
+    val toggle = { field: String -> { c: FacetCount -> vm.toggle(field, c.value) } }
+    val open = { field: String -> { c: FacetCount -> vm.openSearch(field, c.value); onSearch() } }
+    OutlinedCard(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp).testTag("breakdown_file_group")) {
+        Column(Modifier.padding(12.dp)) {
+            Text(FIELD_TITLES["file_group"]!!, style = MaterialTheme.typography.titleSmall, modifier = Modifier.semantics { heading() })
+            Text(
+                "From ${formatNumber((b.total - b.missing).coerceAtLeast(0))} probed torrents. A torrent counts once under each kind it contains.",
+                style = MaterialTheme.typography.labelSmall,
+                color = colors.inkMuted,
+                modifier = Modifier.padding(bottom = 6.dp).testTag("file_kinds_probed"),
+            )
+            BreakdownBars(
+                b.copy(missing = 0),
+                selected,
+                colors,
+                toggle("file_group"),
+                open("file_group"),
+                labelOf = names,
+                isOn = isOn,
+                trailing = { c ->
+                    val shown = state.fileGroup == c.value
+                    // "Kinds ›" as an icon: a text button would leave the bar no room on a phone.
+                    IconButton(onClick = { vm.openFileGroup(c.value) }, modifier = Modifier.size(40.dp).testTag("file_group_open_${c.value}")) {
+                        Icon(
+                            if (shown) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
+                            (if (shown) "Hide the kinds of " else "Show the kinds of ") + names(c.value),
+                        )
+                    }
+                },
+            )
+            val drill = state.fileGroup?.let { g -> state.fileKindSet?.field("file_kind")?.let { g to it } }
+            if (drill != null) {
+                val (g, kinds) = drill
+                Text(
+                    "Kinds of ${names(g)}",
+                    Modifier.padding(top = 10.dp, bottom = 4.dp).semantics { heading() },
+                    style = MaterialTheme.typography.titleSmall,
+                )
+                Column(Modifier.testTag("breakdown_file_kind")) {
+                    BreakdownBars(kinds.copy(missing = 0), selected, colors, toggle("file_kind"), open("file_kind"), labelOf = names, isOn = isOn)
+                }
             }
         }
     }

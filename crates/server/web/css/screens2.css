@@ -138,6 +138,9 @@
 .search-for-spacer { flex: none; width: 48px; }
 .bar-row:hover .search-for, .bar-row:focus-within .search-for, .search-for:focus-visible { opacity: 1; }
 @media (hover: none) { .search-for { opacity: 0.6; } }
+.btn.drill { flex: none; min-height: 36px; padding: 4px 10px; font-size: 13px; white-space: nowrap; }
+.btn.drill.on { background: var(--primary-soft); color: var(--on-primary-soft); }
+.drill-down { margin-top: 10px; padding-top: 6px; border-top: 1px solid var(--border); }
 .donut-wrap { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
 .donut { flex: none; }
 .donut .slice { cursor: pointer; }

@@ -1,5 +1,7 @@
 package app.magnetar.api
 
+import kotlinx.serialization.EncodeDefault
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
@@ -46,6 +48,12 @@ object Features {
     const val WORKERS = "workers"
     /** Track corrections (D128–D131): `POST`/`DELETE …/probe/corrections`, `fix` and `unplaced` in the detail. */
     const val PROBE_CORRECTIONS = "probe_corrections"
+    /**
+     * File kinds read by the header probes (D137): the `probe_file_kinds` filter, the
+     * `probe_file_kind` facet, `FacetsRequest.sizes`, `GET /api/v1/probe/file-kinds` and the
+     * `file_group` / `file_kind` Stats breakdowns (D139).
+     */
+    const val PROBE_FILE_KINDS = "probe_file_kinds"
 }
 
 /** `{"error": "<code>", "message": "…"}` of every 4xx/5xx. */
@@ -143,6 +151,16 @@ data class SearchQuery(
     @SerialName("probe_sub_kinds") val probeSubKinds: List<String> = emptyList(),
     @SerialName("probe_audio_kinds") val probeAudioKinds: List<String> = emptyList(),
     @SerialName("probe_sub_formats") val probeSubFormats: List<String> = emptyList(),
+    /**
+     * File kinds (D137, `Features.PROBE_FILE_KINDS`): sniff groups (`video`) or labels
+     * (`exe.pe.dotnet`) of any probed file; a group matches every label in it. Left out of the
+     * body while empty, so a server without the feature never sees it and the cache keys of
+     * earlier queries do not change.
+     */
+    @OptIn(ExperimentalSerializationApi::class)
+    @EncodeDefault(EncodeDefault.Mode.NEVER)
+    @SerialName("probe_file_kinds")
+    val probeFileKinds: List<String> = emptyList(),
 ) {
     companion object {
         const val DEFAULT_LIMIT = 50
@@ -263,6 +281,34 @@ data class FacetsRequest(
     val fields: List<String> = emptyList(),
     /** Values per facet (server default 20, at most 200). */
     val size: Int = 30,
+    /**
+     * Per-field override of [size] (D137, `Features.PROBE_FILE_KINDS`), e.g.
+     * `{"probe_file_kind": 400}` (capped at 512 for that field). Left out while empty.
+     */
+    @OptIn(ExperimentalSerializationApi::class)
+    @EncodeDefault(EncodeDefault.Mode.NEVER)
+    val sizes: Map<String, Int> = emptyMap(),
+)
+
+/**
+ * `GET /api/v1/probe/file-kinds` (D137): sniff's groups and labels, in registry order. The same
+ * for the life of a server version, so it is cached per `/health` version.
+ */
+@Serializable
+data class FileKindCatalogue(val groups: List<FileKindGroup> = emptyList())
+
+@Serializable
+data class FileKindGroup(
+    val id: String = "",
+    val name: String = "",
+    val labels: List<FileKindLabel> = emptyList(),
+)
+
+@Serializable
+data class FileKindLabel(
+    val id: String = "",
+    val name: String = "",
+    val extensions: List<String> = emptyList(),
 )
 
 @Serializable

@@ -6,6 +6,7 @@
 import { ApiError, isAborted, isOffline, userMessage } from "../api.js";
 import { chartColors } from "../chart-colors.js";
 import { h, untrusted } from "../dom.js";
+import { catalogue, fileKindChips, fileKindName, labelsOfFn, loadCatalogue } from "../file-kinds.js";
 import { cachedAgo, formatAgo } from "../format.js";
 import { formatNumber, formatShare } from "../numfmt.js";
 import * as prefs from "../prefs.js";
@@ -16,8 +17,12 @@ import {
   activityOf,
   breakdownFields,
   dhtLines,
+  FILE_KIND_FIELDS,
+  fileKindRequest,
   FILTERABLE,
   offeredActivities,
+  openFileGroup,
+  probedTotal,
   seedChecks,
   selectedStat,
   statChips,
@@ -28,7 +33,7 @@ import { banner, progressBar } from "../ui/banner.js";
 import { iconButton, pageHeader } from "../ui/shell.js";
 import { runSearch } from "./search.js";
 import { sourcesCard } from "./sources-card.js";
-import { activityChart, breakdownCard, kvLines, statusBar } from "./stats-charts.js";
+import { activityChart, breakdownBars, breakdownCard, kvLines, statusBar } from "./stats-charts.js";
 import { graphsTab } from "./stats-graphs.js";
 import { seedParts, statusTab } from "./stats-status.js";
 
@@ -47,6 +52,11 @@ const TABS = /** @type {const} */ ([["charts", "Charts", "/stats"], ["graphs", "
  * @property {Readonly<import("../search-model.js").SearchFilters>} filters
  * @property {import("../types-stats.js").BreakdownSet | null} breakdowns
  * @property {import("../types-stats.js").Breakdown | null} years
+ * @property {import("../types-stats.js").Breakdown | null} fileGroups the File kinds card (D139)
+ * @property {import("../types-stats.js").Breakdown | null} fileKinds the labels of `fileKindsGroup`
+ * @property {string | null} fileKindsGroup
+ * @property {string | null} fkPicked the group the user opened ("" = closed), null = automatic
+ * @property {string | null} fkError
  * @property {boolean} loadingBreakdowns
  * @property {string | null} breakdownError
  * @property {number | null} breakdownCachedAt
@@ -98,6 +108,11 @@ export function mount(el, { ctx }) {
     filters: EMPTY_FILTERS,
     breakdowns: null,
     years: null,
+    fileGroups: null,
+    fileKinds: null,
+    fileKindsGroup: null,
+    fkPicked: null,
+    fkError: null,
     loadingBreakdowns: false,
     breakdownError: null,
     breakdownCachedAt: null,
@@ -122,6 +137,8 @@ export function mount(el, { ctx }) {
   let breakdownCall = null;
   /** @type {AbortController | null} */
   let seriesCall = null;
+  /** @type {AbortController | null} */
+  let fkCall = null;
 
   const tabBar = h("div", { class: "tabs", role: "tablist", "aria-label": "Stats" });
   const panel = h("div", { class: "stats-panel page-pad", role: "tabpanel", id: "stats-panel" });
@@ -174,6 +191,12 @@ export function mount(el, { ctx }) {
     }
     s.healthAsked = true;
     render();
+    if (has("probe_file_kinds")) {
+      const health = { has, version: () => s.version };
+      void loadCatalogue({ api: ctx.api, cache: ctx.cache, health }).then(() => {
+        if (!signal.aborted) render();
+      });
+    }
     if (has("stats") || !s.healthOk) {
       void loadBreakdowns();
       void loadSeries();
@@ -304,6 +327,7 @@ export function mount(el, { ctx }) {
     const q = queryOf(s.filters);
     const main = { query: q, fields: breakdownFields(s.features), top: 10 };
     const years = { query: q, fields: ["year"], top: 50 };
+    void loadFileKinds(q);
     s.loadingBreakdowns = true;
     s.breakdownError = null;
     const [cMain, cYears] = await Promise.all([ctx.cache.get("stats/breakdown", main), ctx.cache.get("stats/breakdown", years)]);
@@ -342,6 +366,40 @@ export function mount(el, { ctx }) {
     }
     s.loadingBreakdowns = false;
     render();
+  }
+
+  /**
+   * The File kinds card's own request (D139): groups, and the open group's labels.
+   * @param {Record<string, unknown>} q
+   */
+  function loadFileKinds(q) {
+    fkCall?.abort();
+    const group = openFileGroup(s.filters, s.fkPicked);
+    const body = fileKindRequest(q, s.features, group);
+    s.fkError = null;
+    if (!body) return void (s.fileGroups = s.fileKinds = null);
+    fkCall = new AbortController();
+    /** @param {any} set */
+    const apply = (set) => {
+      const bs = /** @type {import("../types-stats.js").Breakdown[]} */ (set?.breakdowns ?? []);
+      s.fileGroups = bs.find((b) => b.field === "file_group") ?? null;
+      s.fileKinds = bs.find((b) => b.field === "file_kind") ?? null;
+      s.fileKindsGroup = group;
+      render();
+    };
+    return cachedCall({
+      endpoint: "stats/breakdown",
+      key: body,
+      signal: fkCall.signal,
+      call: (sg) => ctx.api.post("/api/v1/stats/breakdown", body, { cls: "STATS", signal: sg }),
+      onCached: (v) => apply(v),
+      onLive: apply,
+      onError: (e) => {
+        s.fkError = userMessage(e);
+        if (!isOffline(e)) s.fileGroups = s.fileKinds = null;
+        render();
+      },
+    });
   }
 
   async function loadSeries() {
@@ -385,7 +443,7 @@ export function mount(el, { ctx }) {
    */
   function toggle(field, value) {
     if (!FILTERABLE.has(field)) return;
-    s.filters = toggleStat(s.filters, field, value);
+    s.filters = toggleStat(s.filters, field, value, labelsOf());
     void loadBreakdowns();
   }
 
@@ -400,10 +458,68 @@ export function mount(el, { ctx }) {
     let text = "";
     if (field != null && value != null) {
       if (FILTERABLE.has(field)) {
-        if (!selectedStat(f, field).includes(value)) f = toggleStat(f, field, value);
+        if (!selectedStat(f, field).includes(value)) f = toggleStat(f, field, value, labelsOf());
       } else text = value;
     }
     runSearch(ctx, buildQuery(text, f, "relevance", true, prefs.showAdult()));
+  }
+
+  /** A group's labels for the file-kind toggle: the catalogue's, else the drill-down's counts. */
+  function labelsOf() {
+    return labelsOfFn(catalogue(), s.fileKinds?.counts ?? null);
+  }
+
+  /**
+   * The File kinds card (D139): one-hue group bars, "Kinds ›" opens a group's labels.
+   * @param {import("../chart-colors.js").ChartColors} colors
+   * @param {{onToggle: (field: string, value: string) => void, onSearch: (field: string, value: string) => void}} hd
+   */
+  function fileKindsCard(colors, hd) {
+    if (!has("probe_file_kinds")) return null;
+    const b = s.fileGroups;
+    const open = openFileGroup(s.filters, s.fkPicked);
+    /** @type {Node[]} */
+    const body = [];
+    if (s.fkError != null) body.push(h("p", { class: "error-text small", text: (b ? "Offline: " : "") + s.fkError }));
+    if (b) {
+      body.push(h("p", {
+        class: "muted small",
+        text: `From ${formatNumber(probedTotal(b))} probed torrents. A torrent counts once under each kind it contains.`,
+      }));
+      body.push(breakdownBars(b, selectedStat(s.filters, "file_group"), colors, hd, {
+        missingLabel: "Not probed",
+        rowExtra: (g, label) =>
+          h("button", {
+            type: "button",
+            class: ["btn", "text", "drill", open === g && "on"],
+            "aria-expanded": String(open === g),
+            "aria-label": `Kinds of ${label}`,
+            dataset: { drill: g, fkey: `drill-${g}` },
+            "on:click": () => {
+              s.fkPicked = open === g ? "" : g;
+              void loadFileKinds(queryOf(s.filters));
+              render();
+            },
+          }, "Kinds ›"),
+      }));
+      if (open) {
+        const k = s.fileKinds && s.fileKindsGroup === open ? s.fileKinds : null;
+        body.push(h(
+          "section",
+          { class: "drill-down", dataset: { field: "file_kind" }, "aria-label": `${fileKindName(open)}: kinds` },
+          h("h4", { class: "section-title", text: `${fileKindName(open)}: kinds` }),
+          k
+            ? breakdownBars(k, selectedStat(s.filters, "file_kind"), colors, hd, { missingLabel: `Without a file of this kind` })
+            : progressBar(),
+        ));
+      }
+    } else if (s.fkError == null) body.push(progressBar());
+    return h(
+      "section",
+      { class: "card breakdown file-kinds", dataset: { field: "file_group" } },
+      h("h3", { class: "card-title", text: "File kinds" }),
+      ...body,
+    );
   }
 
   function healthCard() {
@@ -453,7 +569,27 @@ export function mount(el, { ctx }) {
   }
 
   function filterRow() {
-    const chips = statChips(s.filters);
+    // Many labels of one file-kind group are one chip (D140 C3), where the file kinds come.
+    const kindName = (/** @type {string} */ v) => fileKindName(v, catalogue());
+    /** @type {{key: string, label: string, remove: () => void}[]} */
+    const chips = [];
+    let kindsDone = false;
+    for (const [field, value] of statChips(s.filters)) {
+      if (FILE_KIND_FIELDS.includes(field)) {
+        if (kindsDone) continue;
+        kindsDone = true;
+        for (const c of fileKindChips(s.filters.probeFileKinds, labelsOf(), kindName)) {
+          chips.push({
+            key: `chip-kinds-${c.values.join(",")}`,
+            label: c.label,
+            remove: () => {
+              s.filters = makeFilters({ ...s.filters, probeFileKinds: s.filters.probeFileKinds.filter((v) => !c.values.includes(v)) });
+              void loadBreakdowns();
+            },
+          });
+        }
+      } else chips.push({ key: `chip-${field}-${value}`, label: valueLabel(field, value), remove: () => toggle(field, value) });
+    }
     if (chips.length === 0) {
       return h("p", { class: "muted small", text: "Click a bar or slice to filter every chart by it; use its search button (or long-press on touch) to search for it." });
     }
@@ -463,16 +599,15 @@ export function mount(el, { ctx }) {
       h(
         "div",
         { class: "chips", role: "group", "aria-label": "Chart filters" },
-        ...chips.map(([field, value]) => {
-          const label = valueLabel(field, value);
-          return h("button", {
+        ...chips.map(({ key, label, remove }) =>
+          h("button", {
             type: "button",
             class: "chip on",
             "aria-label": `Remove ${label}`,
-            dataset: { fkey: `chip-${field}-${value}` },
-            "on:click": () => toggle(field, value),
-          }, untrusted(label), h("span", { "aria-hidden": "true", text: " ×" }));
-        }),
+            dataset: { fkey: key },
+            "on:click": remove,
+          }, untrusted(label), h("span", { "aria-hidden": "true", text: " ×" }))
+        ),
       ),
       h(
         "div",
@@ -576,6 +711,8 @@ export function mount(el, { ctx }) {
       out.push(h("p", { class: "stats-total", text: `${formatNumber(set.total ?? 0)} torrents` + (activeCount(s.filters) > 0 ? " match" : "") }));
       const cards = (set.breakdowns ?? []).filter((b) => (b.counts ?? []).length > 0 || (b.missing ?? 0) > 0)
         .map((b) => breakdownCard(b, selectedStat(s.filters, b.field), colors, hd));
+      const fk = fileKindsCard(colors, hd);
+      if (fk) cards.push(fk);
       if (s.years && (s.years.counts ?? []).length > 0) cards.push(breakdownCard(s.years, selectedStat(s.filters, "year"), colors, hd));
       out.push(h("div", { class: "breakdowns" }, ...cards));
     }
@@ -658,6 +795,7 @@ export function mount(el, { ctx }) {
       life.abort();
       breakdownCall?.abort();
       seriesCall?.abort();
+      fkCall?.abort();
       offPrefs();
       offScheme();
     },

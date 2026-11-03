@@ -96,13 +96,19 @@ fun BreakdownBars(
     colors: ChartColors,
     onToggle: (FacetCount) -> Unit,
     onOpen: (FacetCount) -> Unit,
+    /** A value's label (file kinds are named from the catalogue). */
+    labelOf: (String) -> String = { valueLabel(b.field, it) },
+    /** Is the value's bar drawn selected (a file-kind label of a selected group is). */
+    isOn: (String) -> Boolean = { it in selected },
+    /** Something after a bar's numbers (the File kinds card's "Kinds ›"). */
+    trailing: (@Composable (FacetCount) -> Unit)? = null,
 ) {
     val max = b.counts.maxOfOrNull { it.count }?.coerceAtLeast(1) ?: 1
     Column(Modifier.fillMaxWidth()) {
         if (b.counts.isEmpty()) Text("No values", style = MaterialTheme.typography.bodySmall, color = colors.inkMuted)
         for (c in b.counts) {
-            val on = c.value in selected
-            val label = valueLabel(b.field, c.value)
+            val on = isOn(c.value)
+            val label = labelOf(c.value)
             val share = formatShare(c.count, b.total)
             Row(
                 Modifier
@@ -141,6 +147,7 @@ fun BreakdownBars(
                     fontWeight = if (on) FontWeight.Bold else null,
                 )
                 Text(share, Modifier.width(44.dp), style = MaterialTheme.typography.labelSmall, color = colors.inkMuted, textAlign = TextAlign.End)
+                trailing?.invoke(c)
             }
         }
         RestLines(b, colors)

@@ -406,6 +406,21 @@ impl PgStore {
         size: usize,
         now: i64,
     ) -> Result<Option<FacetSet>> {
+        self.facet_set_sized(q, fields, size, &Default::default(), now)
+            .await
+    }
+
+    /// `facet_set` with per-field sizes (D137, `FacetsRequest.sizes`): `sizes[field]` instead
+    /// of `size`, each capped by `search_index::max_facet_values`.
+    pub async fn facet_set_sized(
+        &self,
+        q: &SearchQuery,
+        fields: &[String],
+        size: usize,
+        sizes: &std::collections::BTreeMap<String, u32>,
+        now: i64,
+    ) -> Result<Option<FacetSet>> {
+        crate::probes::check_query(q)?;
         if let Some(bad) = fields.iter().find(|f| {
             !search_index::schema::FACETS
                 .iter()
@@ -421,6 +436,10 @@ impl PgStore {
             }
         }
         let fields = &uniq[..];
+        let sizes: Vec<usize> = fields
+            .iter()
+            .map(|f| sizes.get(f).map_or(size, |n| *n as usize))
+            .collect();
         let Some(idx) = self.ready_index() else {
             return Ok(None);
         };
@@ -428,7 +447,7 @@ impl PgStore {
             Some(t) => t,
             None => self.threshold().await?,
         };
-        search_index::facet_set(&self.pool, idx, q, fields, size, min_trust, now)
+        search_index::facet_set(&self.pool, idx, q, fields, &sizes, min_trust, now)
             .await?
             .map(Some)
             .ok_or_else(|| Error::Invalid("unknown facet".into()))
@@ -456,6 +475,7 @@ impl PgStore {
         fields: &[String],
         now: i64,
     ) -> Result<Option<(u64, Vec<search_index::collect::FacetTally>)>> {
+        crate::probes::check_query(q)?;
         let Some(idx) = self.ready_index() else {
             return Ok(None);
         };
@@ -1465,6 +1485,7 @@ impl Store for PgStore {
                 q.offset
             )));
         }
+        crate::probes::check_query(q)?;
         let min_trust = match q.min_trust {
             Some(t) => t,
             None => self.threshold().await?,

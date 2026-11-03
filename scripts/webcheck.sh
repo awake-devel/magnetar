@@ -21,9 +21,11 @@
 # WEBCHECK_NTFY=1 adds the ntfy variant (MAGNETAR_NTFY_URL=http://127.0.0.1:9, topic
 # "webcheck"): the Settings and Saved pages then say alerts go out; anything the notifier
 # would send goes to a closed loopback port.
+# WEBCHECK_PORT and WEBCHECK_DB change the port and the database (a name the seed accepts:
+# magnetar_webcheck[a-z0-9_]*), so a second checkout can run beside the first one.
 set -euo pipefail
 
-usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; }
 
 [ $# -ge 1 ] || { usage >&2; exit 2; }
 case "$1" in -h | --help) usage; exit 0 ;; esac
@@ -31,9 +33,9 @@ S=$1
 mode=${2:-both}
 root=$(cd "$(dirname "$0")/.." && pwd)
 export PATH="$HOME/.cargo/bin:$PATH"
-port=18787
+port=${WEBCHECK_PORT:-18787}
 admin=postgres://magnetar:magnetar@127.0.0.1:54329/magnetar
-db=magnetar_webcheck
+db=${WEBCHECK_DB:-magnetar_webcheck}
 bin="${CARGO_TARGET_DIR:-$root/target}/debug/magnetar-server"
 
 umask 077

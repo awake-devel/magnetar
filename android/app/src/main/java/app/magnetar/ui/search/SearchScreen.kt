@@ -74,6 +74,7 @@ fun SearchScreen(
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
     val facets by vm.facets.collectAsStateWithLifecycle()
+    val fileKinds by vm.fileKinds.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
     var showFilters by rememberSaveable { mutableStateOf(false) }
     var showSort by remember { mutableStateOf(false) }
@@ -157,6 +158,7 @@ fun SearchScreen(
             defaultTrust = threshold,
             state = state,
             facets = facets,
+            fileKinds = fileKinds,
             onDraft = vm::draftFilters,
             onApply = {
                 showFilters = false

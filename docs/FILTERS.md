@@ -291,6 +291,50 @@ change log as a re-probe, at the next pass (about a second); the Postgres fallba
 tags at once. A correction that only confirms the detection ("matches VLC") changes no tag and
 re-indexes nothing.
 
+### File kind (D137)
+
+What kind of files a torrent holds, by content: the sniff label of **every probed file**
+(docs/PROBES.md: up to 8 targets per torrent, the largest file always, plus the pack samples
+the planner picked; at most 16 stored files), not only the main payload, and verified or not.
+
+| `SearchQuery` field | query string | facet | values |
+|---|---|---|---|
+| probe_file_kinds | `probe_file_kind` (comma list or repeated) | `probe_file_kind` | a group id (`video`, `exe`, `doc`, …, 15 groups) or a label id (`video.mkv`, `exe.pe`, `exe.pe.dotnet`, …, 348 labels) |
+
+- **Group or label.** A group value matches a torrent with any file of that group (`video` =
+  any `video.*`); a label value matches only that exact label: `exe.pe` (a Windows PE
+  executable) does **not** match `exe.pe.dotnet` (a .NET assembly). Values are any-of within
+  the field and AND with every other filter; the pair rules of D125 are unchanged.
+- **Every probed file, verified or not.** An album's unverified cover JPEG makes it match
+  "Images", a disc image with a checksum file matches "Text", a game pack's NSIS installer
+  matches "Executables" and a video torrent with an exe disguised as a video (W7) matches both.
+  About 45 % of sampled torrents get no verified result (docs/PROBES.md, **UNVERIFIED** on real
+  swarms), and no other probe filter requires one, so a verified-only rule would hide about
+  half of the probed torrents. "Verified files only" and "main file only" are on the roadmap.
+- **Probed files, not all files.** A kind that is in the torrent but outside the probe's
+  targets is not seen; a torrent never probed matches no file kind (as every probe filter).
+- **One facet, both levels.** The `probe_file_kind` facet counts groups (values without a dot)
+  and labels (with a dot) together, without its own filter, so both levels stay disjunctive
+  against the file-kind filter. There are more values than the usual facet cap:
+  `FacetsRequest.sizes` (`{"probe_file_kind": 400}`) asks for more on that field alone, capped
+  at 512 (200 for every other field); `GET /api/v1/facets?field=probe_file_kind&size=400` uses
+  the same cap.
+- **Names.** `GET /api/v1/probe/file-kinds` (docs/API.md) gives every group and label with its
+  display name and usual extensions, from sniff's registry.
+- **Normalisation.** Values are trimmed, lowercased and deduplicated; an unknown value of the
+  right shape is kept, so it matches nothing. More than 400 distinct values: 400 `invalid`
+  (`probe_file_kind: at most 400 values`).
+- **Older servers.** The server lists `probe_file_kinds` in `/health` `features`; clients send
+  the field, the facet, `sizes` and the catalogue call only to a server that lists it.
+- **Browse** (D76) is off with a file-kind filter, as with any probe filter.
+
+Where it lives: the tags `fk:{label}` and `fg:{group}` (the label before its first `.`) on
+`probe_attrs.tags`, written by `probes::summary_of` for every file; rows stored before D137
+got them from `probe_files` in migration `20261111000000_probe_file_kinds.sql` (D138); the
+index facet since `SCHEMA_VERSION` 7. The Postgres fallback tests `p.tags && {fg:v, fk:v}` for
+each value. `k:` (the main file's group) is unchanged. Track corrections (D128) never change a
+file's label, so the tags survive them.
+
 ## Phone, offline and older servers
 
 | | no server / unreachable | server without `filters` (older) | server with `filters` |

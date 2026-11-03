@@ -7,9 +7,12 @@ import {
   backlogLines,
   breakdownFields,
   dhtLines,
+  fileKindRequest,
   indexLines,
   missingFeatures,
   offeredActivities,
+  openFileGroup,
+  probedTotal,
   seedChecks,
   selectedStat,
   statChips,
@@ -90,8 +93,10 @@ Deno.test("index and DHT lines", () => {
 
 Deno.test("a server without track kinds is named on the server card", () => {
   const d122 = ["stats", "graphs", "saved_search_poll", "filters", "origin", "crawl_sources", "crawl_map", "probe_filters"];
-  assert.deepEqual(missingFeatures(new Set(d122)), ["track-kind filters"]);
-  assert.deepEqual(missingFeatures(new Set([...d122, "probe_kinds"])), []);
+  assert.deepEqual(missingFeatures(new Set(d122)), ["track-kind filters", "file-kind filters"]);
+  assert.deepEqual(missingFeatures(new Set([...d122, "probe_kinds"])), ["file-kind filters"]);
+  // D137: the file kinds, named like the app's server card does.
+  assert.deepEqual(missingFeatures(new Set([...d122, "probe_kinds", "probe_file_kinds"])), []);
 });
 
 Deno.test("a saved query is described in one line", () => {
@@ -114,4 +119,38 @@ Deno.test("a saved query is described in one line", () => {
     sortByName([{ name: "dune 4K" }, { name: "All torrents" }, { name: "French SDH subtitles" }, { name: "<img src=x>" }]).map((s) => s.name),
     ["<img src=x>", "All torrents", "dune 4K", "French SDH subtitles"],
   );
+});
+
+Deno.test("file kinds: the extra request only with the feature, the drill-down group (D139)", () => {
+  const q = { text: "", probe_file_kinds: ["video"] };
+  assert.equal(fileKindRequest(q, new Set(["stats", "probe_filters"]), null), null);
+  const feats = new Set(["stats", "probe_file_kinds"]);
+  assert.deepEqual(fileKindRequest(q, feats, null), { query: q, fields: ["file_group"], top: 50 });
+  assert.deepEqual(fileKindRequest(q, feats, "doc"), { query: q, fields: ["file_group", "file_kind"], top: 50, file_group: "doc" });
+  // Opens by itself when the cross-filter names one group; the user's pick wins.
+  assert.equal(openFileGroup(makeFilters({ probeFileKinds: ["video"] }), null), "video");
+  assert.equal(openFileGroup(makeFilters({ probeFileKinds: ["doc.epub", "doc.pdf"] }), null), "doc");
+  assert.equal(openFileGroup(makeFilters({ probeFileKinds: ["doc", "video"] }), null), null);
+  assert.equal(openFileGroup(makeFilters({ probeFileKinds: ["video"] }), ""), null);
+  assert.equal(openFileGroup(makeFilters(), "exe"), "exe");
+  assert.equal(probedTotal({ total: 1500, missing: 1400 }), 100);
+  assert.equal(probedTotal(null), 0);
+});
+
+Deno.test("file kinds: bars cross-filter with the group rule, chips list them", () => {
+  const labelsOf = (/** @type {string} */ g) => (g === "doc" ? ["doc.cbz", "doc.epub", "doc.pdf"] : []);
+  let f = toggleStat(makeFilters(), "file_group", "video", labelsOf);
+  assert.deepEqual(f.probeFileKinds, ["video"]);
+  f = toggleStat(f, "file_kind", "doc.epub", labelsOf);
+  assert.deepEqual(f.probeFileKinds, ["doc.epub", "video"]);
+  assert.deepEqual(selectedStat(f, "file_group"), ["video"]);
+  assert.deepEqual(selectedStat(f, "file_kind"), ["doc.epub"]);
+  assert.deepEqual(statChips(f), [["file_group", "video"], ["file_kind", "doc.epub"]]);
+  // Every label of a group becomes the group.
+  f = toggleStat(toggleStat(f, "file_kind", "doc.pdf", labelsOf), "file_kind", "doc.cbz", labelsOf);
+  assert.deepEqual(f.probeFileKinds, ["doc", "video"]);
+  f = toggleStat(f, "file_group", "video", labelsOf);
+  assert.deepEqual(f.probeFileKinds, ["doc"]);
+  assert.equal(valueLabel("file_group", "gamedata"), "Gamedata");
+  assert.equal(valueLabel("file_kind", "doc.epub"), "doc.epub");
 });

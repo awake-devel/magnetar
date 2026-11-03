@@ -266,12 +266,17 @@ def run_fake(port):
     ok("fake: instant search (debounced)")
     flow_search_detail_title()
 
-    # Filters apply: the 1080p chip is sent as resolutions.
+    # Filters apply: 1080p picked in the Resolution dropdown (D140) is sent as resolutions.
     tap(wait("filters")[0])
-    chip = wait("chip_resolution_1080p")[0]
-    # The chip's label is a child node: the server's count is shown next to the value.
-    wait(text_re=r"^1080p \(3\)$")
-    tap(chip)
+    tap(scroll_to("dd_resolution")[0])
+    opt = wait("opt_resolution_1080p")[0]
+    # The value and the server's count are separate child nodes of the menu item.
+    wait(text_re=r"^1080p$")
+    tap(opt)
+    # The menu stays open while values are picked: Back closes it and keeps the pick.
+    wait("opt_resolution_1080p")
+    back()
+    wait(text_re=r"^1080p$")
     tap(scroll_to("filters_apply")[0])
     wait("search_box")
     time.sleep(1.0)
@@ -282,15 +287,20 @@ def run_fake(port):
 
     # Back on the sheet applies too.
     tap(wait("filters")[0])
-    tap(wait("chip_origin_dht")[0])
-    back()
+    tap(wait("dd_origin")[0])
+    tap(wait("opt_origin_dht")[0])
+    back()  # closes the menu
+    wait("filter_active_origin_dht")
+    back()  # closes the sheet, applying it
     wait("search_box")
     time.sleep(1.0)
     last = json.load(urllib.request.urlopen(base + "/_uitest/searches"))[-1]
     assert last["origins"] == ["dht"], "Back applied the Source chip"
     ok("fake: Back applies the sheet")
     tap(wait("filters")[0])
-    tap(wait("chip_origin_dht")[0])
+    tap(wait("dd_origin")[0])
+    tap(wait("opt_origin_dht")[0])
+    back()
     tap(scroll_to("filters_apply")[0])
     wait("search_box")
 
@@ -438,10 +448,12 @@ def run_production(url, queries):
     wait("result_count")
     flow_search_detail_title()
     tap(wait("filters")[0])
-    wait("chip_origin_dht", timeout=20)
-    wait(text_re=r"^DHT \(\d[\d,]*\)$", timeout=20)
+    tap(wait("dd_origin", timeout=20)[0])
+    wait("opt_origin_dht", timeout=20)
+    wait(text_re=r"^\d[\d,]*$", timeout=20)
     ok("production: filter sheet shows live counts")
-    back()
+    back()  # closes the menu
+    back()  # closes the sheet
     wait("search_box")
     # Read-only: the Stats tab (GET health/series, POST breakdown counts) and the web of trust.
     tap(wait("tab_stats")[0])

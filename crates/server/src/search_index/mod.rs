@@ -58,6 +58,18 @@ pub const BUILD_COMMIT_EVERY: u64 = 200_000;
 pub const WRITER_MEMORY: usize = 128 << 20;
 /// Facet values returned at most.
 pub const MAX_FACET_VALUES: usize = 200;
+/// Values of the `probe_file_kind` facet returned at most (D137): more than sniff's 348
+/// labels plus 15 groups, so a client can list every value with a count.
+pub const MAX_FILE_KIND_VALUES: usize = 512;
+
+/// The most values facet `name` returns.
+pub fn max_facet_values(name: &str) -> usize {
+    if name == "probe_file_kind" {
+        MAX_FILE_KIND_VALUES
+    } else {
+        MAX_FACET_VALUES
+    }
+}
 
 pub(crate) fn ix(e: impl std::fmt::Display) -> Error {
     Error::Other(format!("search index: {e}"))
@@ -579,12 +591,13 @@ impl SearchIndex {
         Ok(Some(searcher.search(&*query, &collector).map_err(ix)?))
     }
 
-    /// Value counts of facets `names` (`facet_tallies`, most frequent `size` values). Blocking.
+    /// Value counts of facets `names` (`facet_tallies`, most frequent `sizes[i]` values for
+    /// `names[i]`, at most `max_facet_values`; a missing size is the last one). Blocking.
     pub fn facet_set(
         &self,
         q: &IndexQuery,
         names: &[String],
-        size: usize,
+        sizes: &[usize],
     ) -> Result<Option<FacetSet>> {
         let Some((total, tallies)) = self.facet_tallies(q, names)? else {
             return Ok(None);
@@ -592,9 +605,11 @@ impl SearchIndex {
         let facets = names
             .iter()
             .zip(tallies)
-            .map(|(name, t)| {
+            .enumerate()
+            .map(|(i, (name, t))| {
+                let size = sizes.get(i).or(sizes.last()).copied().unwrap_or(20);
                 let mut counts = sorted_counts(t.values);
-                counts.truncate(size.clamp(1, MAX_FACET_VALUES));
+                counts.truncate(size.clamp(1, max_facet_values(name)));
                 FacetsResponse {
                     field: name.clone(),
                     total: t.counted,
@@ -613,7 +628,7 @@ impl SearchIndex {
         size: usize,
     ) -> Result<Option<FacetsResponse>> {
         Ok(self
-            .facet_set(q, &[name.to_string()], size)?
+            .facet_set(q, &[name.to_string()], &[size])?
             .and_then(|mut s| s.facets.pop()))
     }
 
@@ -926,7 +941,7 @@ pub async fn facet_set(
     idx: &Arc<SearchIndex>,
     q: &SearchQuery,
     names: &[String],
-    size: usize,
+    sizes: &[usize],
     min_trust: u8,
     now: i64,
 ) -> Result<Option<FacetSet>> {
@@ -944,7 +959,8 @@ pub async fn facet_set(
     let iq = index_query(q, &text, min_trust, media_id, now);
     let idx = idx.clone();
     let names = names.to_vec();
-    tokio::task::spawn_blocking(move || idx.facet_set(&iq, &names, size))
+    let sizes = sizes.to_vec();
+    tokio::task::spawn_blocking(move || idx.facet_set(&iq, &names, &sizes))
         .await
         .map_err(join_err)?
 }

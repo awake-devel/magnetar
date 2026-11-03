@@ -207,8 +207,13 @@ class StatsFormatTest {
             Features.STATS, Features.GRAPHS, Features.SAVED_SEARCH_POLL, Features.FILTERS, Features.ORIGIN,
             Features.CRAWL_SOURCES, Features.CRAWL_MAP, Features.PROBE_FILTERS,
         )
-        assertEquals(missingFeatures(Health(status = "ok", db = true, features = d122)), listOf("track-kind filters"))
-        assertEquals(missingFeatures(Health(status = "ok", db = true, features = d122 + Features.PROBE_KINDS)), emptyList<String>())
+        assertEquals(missingFeatures(Health(status = "ok", db = true, features = d122)), listOf("track-kind filters", "file-kind filters"))
+        // A D125 server lacks the file kinds (D137): a kept file-kind filter is not dropped without a word.
+        assertEquals(missingFeatures(Health(status = "ok", db = true, features = d122 + Features.PROBE_KINDS)), listOf("file-kind filters"))
+        assertEquals(
+            missingFeatures(Health(status = "ok", db = true, features = d122 + Features.PROBE_KINDS + Features.PROBE_FILE_KINDS)),
+            emptyList<String>(),
+        )
     }
 
     @Test

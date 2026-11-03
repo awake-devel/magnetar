@@ -1,6 +1,8 @@
 package app.magnetar.data
 
 import app.magnetar.api.ApiException
+import app.magnetar.api.Features
+import app.magnetar.api.FileKindCatalogue
 import app.magnetar.api.Health
 import app.magnetar.api.MagnetarApi
 import app.magnetar.api.MagnetarService
@@ -55,11 +57,25 @@ class Repository(
     /** Bumped when a saved search was created elsewhere (Search tab), so Saved reloads. */
     val savedSearchesChanged = MutableStateFlow(0)
 
+    private val _fileKinds = MutableStateFlow<FileKindCatalogue?>(null)
+
+    /**
+     * The file-kind catalogue (D137) of the server in Settings, null until [loadFileKinds]
+     * got it (or when the server lacks `probe_file_kinds`). Labels fall back to the ids without it.
+     */
+    val fileKinds: StateFlow<FileKindCatalogue?> = _fileKinds.asStateFlow()
+
+    /** Server URL and version [_fileKinds] belongs to. */
+    @Volatile private var fileKindsKey: Pair<String, String>? = null
+    private val fileKindsLock = Mutex()
+
     init {
         // Another server or token: forget its features and its cached pages (docs/APP.md §5).
         scope.launch {
             settings.map { it.serverUrl to it.apiToken }.distinctUntilChanged().drop(1).collect {
                 _health.value = null
+                _fileKinds.value = null
+                fileKindsKey = null
                 cache?.let { c -> withContext(io) { c.clear() } }
             }
         }
@@ -91,6 +107,32 @@ class Repository(
         }
     }
 
+    /**
+     * The file-kind catalogue, once per server version (`/health` `version`): from memory, else
+     * the page cache, else `GET /api/v1/probe/file-kinds`. Null without `probe_file_kinds`, or
+     * when nothing is cached and the call fails (the dropdown then shows the facet's ids). Never throws.
+     */
+    suspend fun loadFileKinds(): FileKindCatalogue? = fileKindsLock.withLock {
+        val h = _health.value ?: return null
+        if (!h.has(Features.PROBE_FILE_KINDS)) return null
+        val key = settings.value.serverUrl to h.version
+        if (fileKindsKey == key) _fileKinds.value?.let { return it }
+        val cached = readCache(CACHE_FILE_KINDS, h.version, FileKindCatalogue.serializer())?.value
+        val catalogue = cached ?: try {
+            service().fileKinds().also { writeCache(CACHE_FILE_KINDS, h.version, FileKindCatalogue.serializer(), it) }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: ApiException) {
+            null
+        }
+        // The server changed while the call ran: keep nothing.
+        if (catalogue != null && settings.value.serverUrl == key.first) {
+            fileKindsKey = key
+            _fileKinds.value = catalogue
+        }
+        catalogue
+    }
+
     suspend fun <T> readCache(endpoint: String, key: String, ser: KSerializer<T>): Cached<T>? {
         val c = cache ?: return null
         val server = settings.value.serverUrl
@@ -108,4 +150,9 @@ class Repository(
 
     /** Canonical cache key of a request body (encodeDefaults: the adult switch is always in it). */
     fun <T> keyOf(ser: KSerializer<T>, body: T): String = MagnetarApi.JSON.encodeToString(ser, body)
+
+    companion object {
+        /** Page-cache endpoint of the file-kind catalogue, keyed by the server version. */
+        const val CACHE_FILE_KINDS = "probe/file-kinds"
+    }
 }
