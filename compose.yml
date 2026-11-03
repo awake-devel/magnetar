@@ -26,6 +26,9 @@ services:
       timeout: 5s
       retries: 6
       start_period: 30s
+    # Docker gives containers 64 MB of /dev/shm; Postgres parallel hash joins (the search index
+    # load, D122) need more and fail with "could not resize shared memory segment".
+    shm_size: 512m
     # Optional resource limits (none by default; docs/DOCKER.md "Resource limits"):
     # cpus: "2.0"
     # mem_limit: 1g
