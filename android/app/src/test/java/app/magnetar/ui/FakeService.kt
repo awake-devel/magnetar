@@ -16,6 +16,8 @@ import app.magnetar.api.Liveness
 import app.magnetar.api.LivenessHistory
 import app.magnetar.api.MagnetarService
 import app.magnetar.api.MediaReleases
+import app.magnetar.api.ProbeCorrectionRequest
+import app.magnetar.api.ProbeInfo
 import app.magnetar.api.SavedSearch
 import app.magnetar.api.SavedSearchPoll
 import app.magnetar.api.SearchPage
@@ -76,6 +78,12 @@ open class FakeService : MagnetarService {
     var mapDelayMs = 0L
     val mapCalls = mutableListOf<Pair<String, String>>()
 
+    /** Track corrections (D130): what was sent, the answer and an error. */
+    val correctionPosts = mutableListOf<Pair<String, ProbeCorrectionRequest>>()
+    val correctionDeletes = mutableListOf<Pair<String, Long>>()
+    var correctionAnswer: () -> ProbeInfo = { ProbeInfo() }
+    var correctionError: Exception? = null
+
     var healthDelayMs = 0L
     var healthError: Exception? = null
     var healthCalls = 0
@@ -100,7 +108,13 @@ open class FakeService : MagnetarService {
         return facetAnswer(request)
     }
 
-    override suspend fun detail(infohash: String) = detailAnswer(infohash)
+    /** Delay of each detail answer (a fetch in flight while a correction is saved). */
+    var detailDelayMs = 0L
+
+    override suspend fun detail(infohash: String): TorrentDetail {
+        kotlinx.coroutines.delay(detailDelayMs)
+        return detailAnswer(infohash)
+    }
 
     override suspend fun checkLiveness(infohash: String): Liveness {
         checks++
@@ -178,6 +192,18 @@ open class FakeService : MagnetarService {
         fleetCalls++
         fleetError?.let { throw it }
         return fleetAnswer()
+    }
+
+    override suspend fun postProbeCorrections(infohash: String, request: ProbeCorrectionRequest): ProbeInfo {
+        correctionPosts += infohash to request
+        correctionError?.let { throw it }
+        return correctionAnswer()
+    }
+
+    override suspend fun deleteProbeCorrection(infohash: String, id: Long): ProbeInfo {
+        correctionDeletes += infohash to id
+        correctionError?.let { throw it }
+        return correctionAnswer()
     }
 
     override suspend fun crawlMap(layer: String, window: String): CrawlMap {

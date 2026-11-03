@@ -418,9 +418,9 @@ private fun Status(state: StatsUiState, colors: ChartColors) {
     }
 }
 
-/** "Header probes" (D117, D118), left out when the server sends no backfill counts. */
+/** "Header probes" (D117, D118, D131), left out without backfill counts or corrections. */
 private fun LazyListScope.probesItem(state: StatsUiState, colors: ChartColors) {
-    val fleet = state.fleet?.takeIf { it.probeBackfill != null } ?: return
+    val fleet = state.fleet?.takeIf { it.probeBackfill != null || hasCorrections(it.probeCorrections) } ?: return
     item(key = "probes") { StatusCard("Header probes", "status_probes") { ProbesContent(fleet, colors, state.fleetCachedAtMs) } }
 }
 

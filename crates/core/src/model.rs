@@ -498,7 +498,13 @@ pub struct ProbeInfo {
     pub status: String,
     /// Every listed result was read from hash-checked pieces.
     pub verified: bool,
+    /// Detected and added tracks are effective values: the user's track corrections (D128–D130,
+    /// docs/PROBES.md §12) applied over the detection.
     pub files: Vec<ProbeFileInfo>,
+    /// Corrections that no longer anchor to a track of the current probe (D128): kept, never
+    /// applied to another track. Older servers send none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unplaced: Vec<ProbeUnplacedFix>,
 }
 
 /// One probed file, with its path from the server's own file list.
@@ -508,6 +514,9 @@ pub struct ProbeFileInfo {
     /// Index in `TorrentDetail::files` of the same detail (the Nostr event's list when there
     /// is one, else the DHT row's).
     pub index: u32,
+    /// The file's display index in the DHT row's list (`ProbeFile::i`): what a track
+    /// correction names as `file` (D130). Servers older than D130 send none (0).
+    pub dht_index: u32,
     pub path: String,
     pub size: u64,
     /// sniff label id (`video.mkv`, `game.ps5.pkg`, `exe.pe`, ...).
@@ -635,9 +644,17 @@ pub struct ProbeAudioTrack {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub kinds: Vec<String>,
     /// The track name as the file has it, cleaned and cut to [`PROBE_MAX_TRACK_NAME`] bytes
-    /// (D123); kept to re-classify later, not shown by the app.
+    /// (D123); shown by the app since D131 (VLC shows it).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Detail only (D128): the 0-based position in the file's detected list (VLC's "Track
+    /// pos+1"); None on a track the user added. Never in a worker report or `probe_files`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pos: Option<u16>,
+    /// Detail only (D129): the user's correction applied to this track. Never in a worker
+    /// report or `probe_files`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix: Option<ProbeTrackFix>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -650,6 +667,99 @@ pub struct ProbeSubTrack {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub kinds: Vec<String>,
     /// As [`ProbeAudioTrack::name`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// As [`ProbeAudioTrack::pos`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pos: Option<u16>,
+    /// As [`ProbeAudioTrack::fix`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix: Option<ProbeTrackFix>,
+}
+
+/// The user's correction of one track (D128–D130, docs/PROBES.md §12), as the detail shows
+/// it on the effective track.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProbeTrackFix {
+    /// The correction's id (`DELETE …/probe/corrections/{id}` undoes it).
+    pub id: i64,
+    /// Which values it overrides, in the order `lang`, `kinds`, `name`; empty for a track
+    /// checked against VLC ("matches VLC") or removed.
+    pub fields: Vec<String>,
+    /// "This track doesn't exist": kept in the list, left out of every tag.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub removed: bool,
+    /// A track the probe missed, added by the user (no codec).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub added: bool,
+    /// The probe changed since the user checked this track: look again.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub review: bool,
+    /// The current detection of the track (what the overrides replace): on anchored tracks
+    /// with `fields` or `removed`, and on checks only with `review`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detected: Option<ProbeTrackDetected>,
+    /// Unix time of the last edit.
+    pub at: i64,
+    /// The device that sent it (`android`, `api`).
+    pub by: String,
+}
+
+/// What the probe detected for a corrected track.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProbeTrackDetected {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// A correction that anchors to no track of the current probe (D128): the probe changed (a
+/// re-probe lists other tracks: `changed`) or the file is no longer probed (`file`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProbeUnplacedFix {
+    pub id: i64,
+    /// `ProbeFileInfo::dht_index` of the file it was made on.
+    pub file: u32,
+    pub path: String,
+    /// `audio` or `sub`.
+    pub track: String,
+    /// The detected position it was made on; None for an added track.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pos: Option<u16>,
+    /// `changed` or `file`.
+    pub reason: String,
+    /// What the probe said of the track when the user corrected it (none for an added track).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub was: Option<ProbeUnplacedWas>,
+    pub fields: Vec<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub removed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub at: i64,
+}
+
+/// The detection an unplaced correction was made on.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProbeUnplacedWas {
+    pub codec: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channels: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
@@ -824,4 +934,65 @@ pub fn parse_pubkey(input: &str) -> Result<Hex32> {
     nostr::prelude::PublicKey::parse(input.trim())
         .map(|pk| pk.to_hex())
         .map_err(|e| Error::Invalid(format!("pubkey: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D128–D130: the correction fields are additive. A detail from an older server (none of
+    /// them) parses; a track without a correction writes none of them, so worker reports and
+    /// `probe_files` keep their exact JSON.
+    #[test]
+    fn probe_track_fix_fields_skip_when_absent() {
+        let old = r#"{"version":2,"probed_at":1,"status":"ok","verified":true,
+            "files":[{"index":0,"path":"a.mkv","size":1,"label":"video.mkv","description":"",
+            "confidence":97,"verified":true,"flags":[],"video":{"container":"matroska",
+            "audio":[{"codec":"ac3","lang":"eng"}],"subs":[{"codec":"subrip","lang":"fre"}]}}]}"#;
+        let p: ProbeInfo = serde_json::from_str(old).unwrap();
+        assert!(p.unplaced.is_empty());
+        assert_eq!(p.files[0].dht_index, 0);
+        let v = p.files[0].video.as_ref().unwrap();
+        assert_eq!((v.audio[0].pos, &v.audio[0].fix), (None, &None));
+        assert_eq!((v.subs[0].pos, &v.subs[0].fix), (None, &None));
+        // Nothing new is written for a plain track or an info without unplaced corrections.
+        let a = serde_json::to_value(&v.audio[0]).unwrap();
+        assert_eq!(a, serde_json::json!({"codec": "ac3", "lang": "eng"}));
+        let s = serde_json::to_value(&v.subs[0]).unwrap();
+        assert_eq!(s, serde_json::json!({"codec": "subrip", "lang": "fre"}));
+        let info = serde_json::to_value(&p).unwrap();
+        assert!(info.get("unplaced").is_none());
+        assert_eq!(info["files"][0]["dht_index"], 0, "dht_index is always sent");
+        // A check: `fields` and `at` / `by` always sent, the false flags and None skipped.
+        let fixed = ProbeSubTrack {
+            codec: "subrip".into(),
+            pos: Some(1),
+            fix: Some(ProbeTrackFix {
+                id: 7,
+                at: 5,
+                by: "android".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&fixed).unwrap(),
+            serde_json::json!({"codec": "subrip", "pos": 1,
+                "fix": {"id": 7, "fields": [], "at": 5, "by": "android"}})
+        );
+        let back: ProbeSubTrack =
+            serde_json::from_value(serde_json::to_value(&fixed).unwrap()).unwrap();
+        assert_eq!(back, fixed);
+        let u = ProbeUnplacedFix {
+            id: 9,
+            track: "sub".into(),
+            reason: "file".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&u).unwrap(),
+            serde_json::json!({"id": 9, "file": 0, "path": "", "track": "sub", "reason": "file",
+                "fields": [], "at": 0})
+        );
+    }
 }

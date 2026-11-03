@@ -16,6 +16,7 @@ pub mod graphs;
 pub mod liveness;
 pub mod media_lock;
 pub mod probe_backfill;
+pub mod probe_fix;
 pub mod probes;
 pub mod relay;
 pub mod search;

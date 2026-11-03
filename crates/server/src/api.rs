@@ -233,6 +233,14 @@ pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/v1/search", get(search_get).post(search_post))
         .route("/api/v1/torrents/{infohash}", get(torrent))
+        .route(
+            "/api/v1/torrents/{infohash}/probe/corrections",
+            post(probe_corrections),
+        )
+        .route(
+            "/api/v1/torrents/{infohash}/probe/corrections/{id}",
+            delete(probe_correction_delete),
+        )
         .route("/api/v1/media/{id}/poster", get(media_poster))
         .route(
             "/api/v1/torrents/{infohash}/liveness",
@@ -641,6 +649,56 @@ async fn torrent(
     Ok(Json(d))
 }
 
+fn probe_fix_error(e: crate::probe_fix::FixError) -> ApiError {
+    use crate::probe_fix::FixError;
+    match e {
+        FixError::Invalid(m) => ApiError::bad_request(m),
+        FixError::NotFound(m) => ApiError::not_found(m),
+        FixError::Db(e) => {
+            tracing::warn!("probe corrections: {e}");
+            store_error(e)
+        }
+    }
+}
+
+/// The effective probe of a torrent after a correction write: the detail's `probe`.
+async fn probe_answer(st: &AppState, ih: &str, now: i64) -> ApiResult<Json<ProbeInfo>> {
+    st.store
+        .torrent_detail(ih, now)
+        .await?
+        .and_then(|d| d.probe)
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("no probe for this torrent"))
+}
+
+/// `POST /api/v1/torrents/{infohash}/probe/corrections` (D130, docs/API.md "Track
+/// corrections"): all items or none; answers the effective `ProbeInfo`.
+async fn probe_corrections(
+    State(st): State<AppState>,
+    Path(infohash): Path<String>,
+    body: Result<Json<ProbeCorrectionRequest>, JsonRejection>,
+) -> ApiResult<Json<ProbeInfo>> {
+    let ih = infohash_param(&infohash)?;
+    let Json(req) = body?;
+    let now = magnetar_core::now();
+    crate::probe_fix::correct(st.store.pool(), &ih, &req, now)
+        .await
+        .map_err(probe_fix_error)?;
+    probe_answer(&st, &ih, now).await
+}
+
+/// `DELETE /api/v1/torrents/{infohash}/probe/corrections/{id}` (D130): undo one correction.
+async fn probe_correction_delete(
+    State(st): State<AppState>,
+    Path((infohash, id)): Path<(String, i64)>,
+) -> ApiResult<Json<ProbeInfo>> {
+    let ih = infohash_param(&infohash)?;
+    crate::probe_fix::remove(st.store.pool(), &ih, id)
+        .await
+        .map_err(probe_fix_error)?;
+    probe_answer(&st, &ih, magnetar_core::now()).await
+}
+
 /// `GET /api/v1/media/{id}/poster`: the cached TMDB poster (w342), never a redirect to TMDB.
 async fn media_poster(
     State(st): State<AppState>,
@@ -844,6 +902,15 @@ async fn stats(State(st): State<AppState>) -> ApiResult<Json<StatsResponse>> {
         .fleet
         .backfill_stats(st.store.pool(), magnetar_core::now())
         .await;
+    // D130: always Some on this server (zero counts included).
+    let probe_corrections =
+        match crate::probe_fix::stats(st.store.pool(), magnetar_core::now()).await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!("stats: probe corrections: {e}");
+                None
+            }
+        };
     Ok(Json(StatsResponse {
         store,
         crawler,
@@ -852,6 +919,7 @@ async fn stats(State(st): State<AppState>) -> ApiResult<Json<StatsResponse>> {
         dht,
         workers,
         probe_backfill,
+        probe_corrections,
     }))
 }
 

@@ -163,6 +163,7 @@ fn detail() -> TorrentDetail {
             verified: true,
             files: vec![magnetar_core::model::ProbeFileInfo {
                 index: 0,
+                dht_index: 0,
                 path: "Big.Buck.Bunny.2008.mkv".into(),
                 size: 276_000_000,
                 label: "video.mkv".into(),
@@ -182,6 +183,7 @@ fn detail() -> TorrentDetail {
                     ..Default::default()
                 }),
             }],
+            unplaced: Vec::new(),
         }),
     }
 }
@@ -288,6 +290,7 @@ async fn server() -> api_support::FakeHttp {
                 }),
                 workers: Vec::new(),
                 probe_backfill: None,
+                probe_corrections: None,
             }),
             ("GET", "/api/v1/relays") => j(&vec![relay_info()]),
             ("PUT", "/api/v1/relays") => {

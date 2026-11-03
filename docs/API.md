@@ -153,7 +153,9 @@ never send it; the Android app shows it as the detail's "Detected" card since D1
   Probes of `version` 1 have none.
 - `audio[].name` / `subs[].name` (D123): the track name as the file has it (at most 64 bytes, no
   control characters), kept so the server can re-classify later; free text from peers, so
-  clients should not show it as is (the app does not).
+  clients should clean it before showing it (the app shows it since D131, as VLC does, without
+  bidi controls).
+- `pos`, `fix`, `dht_index`, `unplaced` (D128–D130): track corrections, below.
 - Languages are ISO 639-2/B lowercase. Every optional field is left out when unknown.
 
 Search filters on probe results (D122, `features` lists `probe_filters`): `SearchQuery`
@@ -170,6 +172,129 @@ Track-kind filters (D125, `features` lists `probe_kinds`): `SearchQuery` `probe_
 + SDH = a French SDH track) and their facets are counted that way; docs/FILTERS.md "Track
 kinds". A server without `probe_kinds` ignores the fields and answers unfiltered: send them
 only to a server that lists it.
+
+## Track corrections (D128–D130)
+
+`features` lists `probe_corrections`. The user corrects, per audio and subtitle track, what VLC
+shows: the language, the kinds, the name, a track that does not exist, and a track the probe
+missed. Corrections are stored apart from the detection, survive every re-probe, and apply
+everywhere: the detail's `probe`, the stored tags, both search paths and the facet counts
+(docs/PROBES.md §12, docs/FILTERS.md). Not correctable: codec, resolution, HDR.
+
+| Route | Body | Answer |
+|---|---|---|
+| `POST /api/v1/torrents/{infohash}/probe/corrections` | `ProbeCorrectionRequest` | 200 `ProbeInfo` (the same object as `TorrentDetail.probe`, effective) |
+| `DELETE /api/v1/torrents/{infohash}/probe/corrections/{id}` | | 200 `ProbeInfo` (undo: back to the detection) |
+
+Request (all items or none, 1–96 items):
+
+```json
+{"device":"android","items":[
+  {"file":0,"track":"sub","pos":1,"set":["lang","kinds"],"lang":"fre","kinds":["forced"]},
+  {"file":0,"track":"audio","pos":0,"set":[]},
+  {"file":0,"track":"audio","pos":2,"removed":true},
+  {"file":0,"track":"sub","set":["lang","kinds","name"],"lang":"spa","kinds":["forced"],"name":"Español (forzados)"},
+  {"id":42,"file":0,"track":"sub","set":["lang"],"lang":"cat"}
+]}
+```
+
+| Field | Meaning |
+|---|---|
+| `file` | `ProbeFileInfo.dht_index` |
+| `track` | `audio` or `sub` |
+| `pos` | 0-based position in the file's detected list (`pos` of the track in the detail) |
+| `set` | Which of `lang`, `kinds`, `name` the item overrides; a field not in `set` is ignored. `"lang"` with `lang` absent, null, empty or `und` means "no language"; `"name"` with `name` absent means "no name"; `"kinds"` with `kinds` absent means none |
+| `removed` | "This track doesn't exist" (default false): a detected track only, with nothing else |
+| `id` | Edit an added track (fields not in `set` keep their values) |
+| `device` | Optional, 1–32 printable bytes, default `api` (one token for every device, so the client names itself) |
+
+- **`pos`, no `id`**: the correction of that detected track. One already anchored there is
+  updated in place (fresh snapshot of the detection, new `at`); else a new one. `set: []` (not
+  `removed`) is "matches VLC": a check, no override. A value equal to the current detection is
+  dropped from `set`, so saving an unchanged value is a check.
+- **No `pos`, no `id`**: a track the probe missed. It needs a language, a kind or a name.
+- **`id`**: an added track's language, kinds or name. A detected track's correction is changed
+  with `pos`, not `id`.
+- Languages go through the server's normalisation (`fr`, `fra`, `FRE` → `fre`, `mri` → `mao`)
+  and must then be one of the 89 ISO 639-2/B codes the app's picker offers
+  (`probe_fix::CORRECTION_LANGS`), or the track's own detected code (setting it back is a check);
+  any other code (`xyz`) is `unknown language code`; kinds are the
+  closed lists of the track type (above), no duplicates; names are trimmed, ≤ 64 bytes, no
+  control characters, empty = none.
+
+Errors: 400 `invalid` with the message prefixed `item {n}: ` (n 0-based) where it concerns one
+item: `items: 1 to 96 per request`, `track must be "audio" or "sub"`, `no probed video file
+{file}`, `no subtitle track at pos {pos} (the file has {n})`, `unknown language code "{x}"`,
+`"{k}" is not a subtitle kind` / `is not an audio kind`, `duplicate kind "{k}"`, `name is longer
+than 64 bytes`, `name has control characters`, `unknown field "{x}" in set`, `removed takes no
+other field`, `duplicate track`, `use pos to correct a detected track`, `an added track needs a
+language, a kind or a name`, `too many tracks` (32 audio / 64 subtitle tracks per file with the
+added ones), `too many corrections for this torrent` (256), `device must be 1 to 32 printable
+bytes`. 404 `not_found`: `unknown infohash`, `no probe for this torrent`, an unknown `id`
+(`no correction {id} on this torrent`). 401 without the token. A body of the wrong shape: 422
+`invalid_body`.
+
+What the detail adds (every field defaulted, absent ones left out):
+
+```json
+"probe": {
+  "version": 2, "probed_at": 1793500000, "status": "ok", "verified": true,
+  "files": [{
+    "index": 0, "dht_index": 0, "path": "Movie.mkv", "size": 6000000000, "label": "video.mkv",
+    "description": "Matroska video", "confidence": 97, "verified": true,
+    "video": {"container": "matroska",
+      "audio": [
+        {"codec":"eac3","channels":6,"lang":"fre","atmos":true,"pos":0,
+         "fix":{"id":17,"fields":[],"at":1793500100,"by":"android"}},
+        {"codec":"ac3","channels":2,"lang":"fre","kinds":["commentary"],"name":"Commentaire","pos":1,
+         "fix":{"id":18,"fields":["lang","name"],"detected":{"lang":"eng","kinds":["commentary"],"name":"Commentary"},
+                "at":1793500200,"by":"android"}},
+        {"codec":"aac","channels":2,"lang":"eng","pos":2,
+         "fix":{"id":19,"fields":[],"removed":true,"detected":{"lang":"eng"},"at":1793500300,"by":"android"}}],
+      "subs": [
+        {"codec":"subrip","lang":"fre","kinds":["forced"],"pos":0},
+        {"codec":"","lang":"spa","kinds":["forced"],"name":"Español (forzados)",
+         "fix":{"id":42,"fields":["lang","kinds","name"],"added":true,"review":true,"at":1793500400,"by":"android"}}]}
+  }],
+  "unplaced": [
+    {"id":9,"file":0,"path":"Movie.mkv","track":"sub","pos":3,"reason":"changed",
+     "was":{"codec":"hdmv_pgs_subtitle","lang":"eng","kinds":["sdh"],"name":"English SDH"},
+     "fields":["kinds"],"kinds":["cc"],"at":1793400000}]
+}
+```
+
+- `dht_index` (always sent): the file's index in the DHT row's list, what `file` names.
+- Track values are **effective**: the detection with the correction's fields replaced. `pos`
+  (always set on a detected track) is its 0-based position; the app shows "Track {pos+1}" as
+  VLC numbers them. An added track has no `pos` and an empty `codec`.
+- `fix`: `id` (for DELETE), `fields` (overridden, order `lang`, `kinds`, `name`; always sent,
+  empty for a check or a removal), `removed`, `added`, `review` (the probe changed since the
+  user checked: on an anchored track its language, kinds or name differ from the snapshot; on
+  an added track the probe lists another number of tracks of that type), `detected` (the
+  current detection of the track: on anchored tracks with `fields` or `removed`, on checks only
+  with `review`), `at` (last edit), `by` (`device`).
+- `unplaced`: corrections that anchor to no current track (`reason` `changed`: the probe now
+  lists other tracks and none matches what the user corrected; `file`: the file is no longer
+  probed). Kept, never applied to another track; `was` is the detection they were made on (none
+  for an added track); DELETE removes one.
+- **Older clients** (no `probe_corrections`) see the effective values, and also the removed
+  tracks: they stay in the arrays, marked only by `fix.removed`, which such a client ignores.
+  An older server has no routes (404): hide the edit actions without the feature.
+
+`StatsResponse.probe_corrections` (always present on a server with the feature, zero counts
+included; definitions in docs/PROBES.md §12):
+
+```json
+"probe_corrections": {
+  "tracks": 140, "checked": 92, "corrected": 41, "removed": 7, "added": 4,
+  "languages": {"checked": 120, "wrong": 6, "filled": 9},
+  "names_changed": 3,
+  "kinds": [{"track":"sub","kind":"sdh","source":"name","checked":31,"wrong":4},
+            {"track":"sub","kind":"forced","source":"flags","checked":12,"wrong":1}],
+  "missed": [{"track":"sub","kind":"forced","count":3}],
+  "at": 1793500000
+}
+```
 
 ## Not in the API (phone-local by design)
 

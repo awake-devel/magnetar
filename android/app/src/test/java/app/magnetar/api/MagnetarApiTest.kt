@@ -586,4 +586,52 @@ class MagnetarApiTest {
         assertEquals(MagnetarApi.redactIpHost("2001:db8::1"), "(IP address)")
         assertEquals(MagnetarApi.redactIpHost("wss://1.2.3.4.example.com"), "wss://1.2.3.4.example.com")
     }
+
+    @Test
+    fun `probe corrections are posted and deleted on the torrent's probe path`() = runBlocking {
+        val ih = "AB".repeat(20)
+        val answer = """{"version":2,"status":"ok","files":[{"index":0,"dht_index":3,"path":"a.mkv",
+            "video":{"audio":[{"codec":"ac3","lang":"fre","pos":0,"fix":{"id":7,"fields":["lang"],
+            "detected":{"lang":"eng"},"at":5,"by":"android"}}]}}],"unplaced":[],"future":1}"""
+        server.enqueue(json(answer))
+        val request = ProbeCorrectionRequest(
+            items = listOf(
+                ProbeCorrectionItem(file = 3, track = "audio", pos = 0, set = listOf("lang"), lang = "fre"),
+                ProbeCorrectionItem(file = 3, track = "sub", pos = 1, set = listOf("lang")),
+                ProbeCorrectionItem(id = 42, file = 3, track = "sub", set = listOf("name"), name = "Forced"),
+            ),
+        )
+        val p = api().postProbeCorrections(ih, request)
+        val post = server.takeRequest()
+        assertEquals(post.method, "POST")
+        assertEquals(post.url.encodedPath, "/api/v1/torrents/${"ab".repeat(20)}/probe/corrections")
+        assertEquals(post.headers["Authorization"], "Bearer secret-token")
+        assertEquals(
+            post.body!!.utf8(),
+            """{"device":"android","items":[""" +
+                """{"file":3,"track":"audio","pos":0,"set":["lang"],"lang":"fre","kinds":[],"removed":false},""" +
+                // "No language": the null is left out, which the server reads as none.
+                """{"file":3,"track":"sub","pos":1,"set":["lang"],"kinds":[],"removed":false},""" +
+                """{"id":42,"file":3,"track":"sub","set":["name"],"kinds":[],"name":"Forced","removed":false}]}""",
+        )
+        val f = p.files.single()
+        assertEquals(f.dhtIndex, 3)
+        assertEquals(f.video!!.audio.single().fix?.id, 7L)
+        assertEquals(f.video.audio.single().fix?.detected?.lang, "eng")
+
+        server.enqueue(json("""{"version":2,"files":[]}"""))
+        api().deleteProbeCorrection(ih, 7)
+        val del = server.takeRequest()
+        assertEquals(del.method, "DELETE")
+        assertEquals(del.url.encodedPath, "/api/v1/torrents/${"ab".repeat(20)}/probe/corrections/7")
+        assertEquals(del.headers["Authorization"], "Bearer secret-token")
+
+        // A 400 carries the server's reason; a bad infohash never leaves the phone.
+        server.enqueue(json("""{"error":"invalid","message":"item 0: duplicate track"}""", 400))
+        val e = expect<ApiException.Http> { api().postProbeCorrections(ih, request) }
+        assertEquals(e.message, "item 0: duplicate track")
+        server.takeRequest()
+        expect<ApiException.NotFound> { api().deleteProbeCorrection("nope", 1) }
+        assertEquals(server.requestCount, 3)
+    }
 }

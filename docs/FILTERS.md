@@ -277,6 +277,20 @@ written, replaced or removed re-indexes its torrent through the change log (trig
 building) tests the same tags with `EXISTS (… probe_attrs p … p.tags && …)`. Measurements in
 ARCHITECTURE.md D122.
 
+### Corrected tracks (D128–D130)
+
+Probe filters and their facet counts test the **corrected** values: when the user corrected a
+track against VLC (docs/PROBES.md §12, docs/API.md "Track corrections"), the stored tags are
+built from the effective tracks: a corrected language or kind replaces the detected one (the
+D124 language rules apply to the effective kinds), a track marked "doesn't exist" counts
+nowhere, and a track the user added counts like a detected one (its language and kinds; it has
+no codec, so it adds no `probe_audio` value). As for every probe filter, only the main payload
+(largest probed file) feeds the tags: a correction on another file (a sample, a second
+episode) shows in the detail but changes no filter. The torrent is re-indexed through the same
+change log as a re-probe, at the next pass (about a second); the Postgres fallback sees the new
+tags at once. A correction that only confirms the detection ("matches VLC") changes no tag and
+re-indexes nothing.
+
 ## Phone, offline and older servers
 
 | | no server / unreachable | server without `filters` (older) | server with `filters` |

@@ -22,6 +22,7 @@ mod filters;
 mod liveness_pg;
 mod notices;
 mod probe_backfill_pg;
+mod probe_fix_pg;
 mod probe_pg;
 mod probe_search;
 mod search_bench;

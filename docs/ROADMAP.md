@@ -80,10 +80,17 @@ dub, …) from bytes a probe already fetches (docs/PROBES.md §11). Deferred, wi
 - **Re-probe version 1 rows for kinds**: costs peer traffic; needs the user's decision and the
   D109 watchdog rules.
 - **Server-side re-classification of stored names** when the classifier changes.
-- **Showing track names in the app** (free text from peers needs its own decision).
 - **The rest**: MKV FlagEnabled, MP4 `txas` / `folw` / `alternate_group`, ATSC 0xCC, DVB EIT
   component_descriptor, SCTE-27, per-sample forced (PGS, VobSub, `frcd`), SDH detected from
   subtitle content, Ogg / ASF / FLV roles, and a sign-language video kind (DASH `sign`).
+
+### Track corrections: what D128–D131 left out
+
+- Codec, resolution and HDR corrections: the user corrects only what VLC shows per track
+  (language, kinds, name, missing or extra tracks); machines detect the rest better.
+- An offline correction queue on the phone: corrections are rare and the open sheet allows a
+  retry, so a failed send is reported, not queued.
+- Corrections in the result list's badges (only the detail's Detected card shows them).
 
 ### DHT engine: collapse at extreme settings
 At 8 nodes, 10,000 q/s and 8,192 lookups, both the D106 engine and the code before it sometimes

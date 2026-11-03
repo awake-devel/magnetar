@@ -78,6 +78,18 @@ class MagnetarApi(
         ByteArray(0).toRequestBody(null), Liveness.serializer(),
     )
 
+    /** Feature `probe_corrections` (D130): all items or none; answers the effective `ProbeInfo`. */
+    override suspend fun postProbeCorrections(infohash: String, request: ProbeCorrectionRequest): ProbeInfo = post(
+        "api/v1/torrents/${segment(infohash)}/probe/corrections", RequestClass.DETAIL,
+        ProbeCorrectionRequest.serializer(), request, ProbeInfo.serializer(),
+    )
+
+    /** Feature `probe_corrections`: undo = delete the row (back to the detection). */
+    override suspend fun deleteProbeCorrection(infohash: String, id: Long): ProbeInfo = decode(
+        ProbeInfo.serializer(),
+        execute(request("api/v1/torrents/${segment(infohash)}/probe/corrections/$id").delete().build(), RequestClass.DETAIL),
+    )
+
     /** Feature `liveness_history`; at most 90 days. */
     override suspend fun livenessHistory(infohash: String, days: Int): LivenessHistory {
         val url = url("api/v1/torrents/${segment(infohash)}/liveness-history").newBuilder()

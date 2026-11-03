@@ -177,7 +177,8 @@ and served, peers used, files: index, size, label, confidence, verified, flags, 
 `PROBE_VERSION` is **2** since D123: each audio and subtitle track may carry `kinds` (values of
 `PROBE_AUDIO_KINDS` / `PROBE_SUB_KINDS`, alphabetical, no duplicates, left out when empty) and
 `name` (the track name, cleaned, at most 64 bytes, left out when absent; stored so the server
-can re-classify later, not shown by the app). Version 1 rows have neither. When names would
+can re-classify later; shown by the app since D131, as VLC shows it). Version 1 rows have
+neither. When names would
 push a report over 64 KiB the worker drops every name first (the kinds stay). §11 has the
 taxonomy and how sniff finds the kinds.
 
@@ -221,8 +222,13 @@ Tables (migration `20261105000000_probes.sql`):
   whose kinds include `commentary`, `music` or `karaoke`, and `s:{lang}` leaves out subtitle
   tracks whose kinds include `forced`, `signs`, `commentary` or `description`, so "French
   subtitles" means a French track to read the film with. The `audio_langs` / `sub_langs`
-  columns keep every language. About 1 GB per million probes (storage report, S4).
-- `probe_files`: the per-file JSON (`[ProbeFile]`).
+  columns keep every language. Since D129 the summary columns and `tags` are built from the
+  **effective** tracks: the user's track corrections (§12) applied over the detection, so
+  filters and facets count corrected values. About 1 GB per million probes (storage report,
+  S4).
+- `probe_files`: the per-file JSON (`[ProbeFile]`), always the raw detection (never corrected
+  values).
+- `probe_corrections` (D128, §12): the user's track corrections, never written by a probe.
 
 No GIN index on `tags`: with `ORDER BY probed_at LIMIT` a tags GIN collapses to a full scan on
 rare mixes (check1 #3). Since D122 the tags are search-index facets (`probe_language`,
@@ -542,7 +548,151 @@ CEA-608 / 708 for H.264 / MPEG-2 in Matroska and MP4 (a new block per file) and 
 AC-3 bsmod in Matroska (the frame is not read when the header gives the channels); the DTS
 ExSS asset type; DVD IFO and Blu-ray clpi / mpls; ASS style names; torrent-name and sidecar
 file kinds (`.sdh.srt`, DUBBED, Lektor); original vs dub from TMDB; language variants
-(pt-BR, es-419, zh-Hant); a re-probe of version 1 rows; server-side re-classification; showing
-names in the app; MKV FlagEnabled, MP4 `txas` / `folw` / `alternate_group`, ATSC 0xCC, DVB EIT
+(pt-BR, es-419, zh-Hant); a re-probe of version 1 rows (since done, D127); server-side
+re-classification; MKV FlagEnabled, MP4 `txas` / `folw` / `alternate_group`, ATSC 0xCC, DVB EIT
 component descriptors, SCTE-27, per-sample forced flags, SDH from subtitle content, Ogg / ASF /
 FLV roles and a sign-language video kind.
+
+## 12. Corrections (D128–D131)
+
+The user checks a file in VLC and corrects, per audio and subtitle track, what the probe got
+wrong: the **language**, the **kinds** (forced, SDH, audio description, commentary, …), the
+**name**, a track that **does not exist**, and a track the probe **missed**. Codec, resolution
+and HDR are not correctable (machines detect them better). The app edits them from the detail's
+Detected card (docs/APP.md "Detail"); the API is docs/API.md "Track corrections".
+
+### Storage (`probe_corrections`, migration `20261109000000_probe_corrections.sql`)
+
+Corrections live apart from the detection: `probe_files` always holds what the worker sent, and
+**no probe ever writes a correction**, D127's re-probes included. The table references
+`dht_torrents` (cascade), not `probe_attrs`, so a probe deleted after a worker token leak
+(docs/WORKERS.md §7) and stored again gets its corrections back. One row per correction:
+
+- `(infohash, file_i, track, pos)`: `file_i` is `ProbeFile.i`, the file's index in the DHT
+  row's list (`ProbeFileInfo.dht_index` in the detail; the shown `index` is not used, since the
+  shown list changes when a Nostr event arrives); `track` is `audio` or `sub`; `pos` the 0-based
+  index in that file's stored `video.audio` / `video.subs` (the app shows "Track {pos+1}"),
+  NULL for a track the user added;
+- `removed` ("this track doesn't exist"), `set_lang` + `lang` (NULL = no language), `set_kinds`
+  + `kinds` (the closed lists of §11, sorted), `set_name` + `name`; a `set_*` flag is stored
+  only when the value differs from the detection, so an item without any is a **check**
+  ("matches VLC");
+- `detected`: a snapshot of what the detector said when the user corrected the track, e.g.
+  `{"v":2,"n":3,"codec":"ac3","channels":2,"lang":"eng","kinds":["sdh"],"name":"English SDH","src":{"sdh":"name"}}`
+  (`v` the probe version, `n` the number of tracks of that type in the file, absent values left
+  out; an added track's snapshot is `{"v":2,"n":3}`);
+- `device` (`android`, `api`: one API token for every device, so the client names itself),
+  `created_at`, `updated_at`.
+
+Undo deletes the row (back to the detection). An edit updates it in place (same id and
+`created_at`, new snapshot and `updated_at`). No history table: the detection stays in
+`probe_files` and in the snapshot. At most 256 rows per torrent and 96 items per request.
+
+### Anchoring (`probe_fix::anchor`): computed on every read
+
+Nothing is rewritten when a torrent is probed again: each read (detail, correction write, probe
+store) places every correction on the current tracks. Rows are taken newest first
+(`updated_at DESC, id DESC`) and a track claimed by one is not claimed by another, so the
+user's latest intent wins over an old correction that would match again. For a correction of a
+detected track with snapshot S in file F:
+
+1. F is gone or has no video recon: **unplaced**, reason `file`.
+2. **Same place**: the list still has `S.n` tracks, `pos` is in it, its codec is `S.codec`
+   (audio: same channels, or either unknown), and nobody claimed it. Language, kinds and name
+   may differ: the detector changed its mind, the user's VLC check still holds.
+3. **Moved**: the tracks (claimed or not) with the same codec, the same language, compatible
+   channels and, when both the snapshot and the probe are version 2, the same kinds and name (a
+   version-1 snapshot has neither: D127's v1 → v2 re-probes compare codec and language only).
+   One candidate: there. Several, the correction's own position among them: there. The pick
+   must then be unclaimed, else step 4. This is the D123 TS expansion: teletext pages become
+   tracks and shift the list. Candidates are counted before claims on purpose: when two tracks
+   match a correction, it stays unplaced even after the user checks or corrects one of them,
+   instead of landing on the other one, a track the user never touched.
+4. Otherwise **unplaced**, reason `changed`: kept, listed in `ProbeInfo.unplaced`, never applied
+   to another track. The user removes it or corrects the track again.
+
+An anchored correction gets `review` when the current detection differs from the snapshot (in
+language, kinds or name; version-1 snapshots: language only); its overrides still apply. Added
+tracks always apply, after the detected tracks of their type, oldest first; they get `review`
+when the probe now lists another number of tracks of that type (it may list the added one).
+
+### Track order and VLC
+
+The stored order is sniff's, which is the container's: Matroska TrackEntry order, MP4 `trak`
+order, MPEG-TS PMT order (D123 expands DVB subtitling and teletext entries into one track per
+entry on the same PID), AVI stream order. Captions found in the video stream (`eia_608` /
+`eia_708`, kind `cc`, no language) come after the container's subtitles. VLC lists audio and
+subtitle tracks per type in elementary-stream creation order, the same container order ("Disable"
+is not a track). Known or possible exceptions, all **UNVERIFIED** against VLC:
+
+1. VLC lists CEA-608 captions as "Closed captions 1–4", and only once it decodes them; the probe
+   stores one track per codec.
+2. VLC's handling of TS teletext and DVB subtitling as one stream per page or entry is assumed to
+   match D123's expansion.
+3. An MP4 text track used for chapters (`tref/chap`) may be listed by sniff but hidden by VLC.
+4. A track the worker dropped (a codec that is not a valid token) or beyond the caps (32 audio,
+   64 subtitles) shifts every later number.
+
+"This track doesn't exist" and "Add a track the probe missed" cover all four.
+
+### Effective tracks everywhere (`probe_fix::apply`, D129)
+
+The effective track is the detection with each `set_*` field replaced, plus `pos` and a `fix`
+(id, fields, removed, added, review, the current detection, time, device); removed tracks stay
+in the list, marked; added tracks have no codec. One function serves every reader:
+
+- the **detail** (`probes::probe_for`): effective files, `dht_index`, `unplaced` (path from the
+  shown list, else the DHT list);
+- the **probe store path** (`probes::store`, D127 re-probes included): the `probe_attrs` row is
+  locked `FOR UPDATE`, the corrections read, and the summary and tags written from
+  `summary_of(apply(report))`; `probe_files` stores the raw report. A refused weaker re-probe
+  changes nothing;
+- the **correction write**: recomputes `audio_codecs`, `audio_langs`, `sub_langs` and `tags`
+  and writes them only when they changed, which fires the D122 trigger, so the torrent is
+  re-indexed at the next change-log pass (D43). A pure confirmation writes nothing.
+
+`summary_of` skips removed tracks and gives no `ac:` tag for an added track's empty codec;
+every other rule (§6, D124 language rules on the effective kinds, main file = largest probed
+file) is unchanged, so corrections on another file show in the detail and change no tag. Both
+write paths lock `probe_attrs` before reading `probe_corrections`: no deadlock, no lost update;
+a correction needs a probe row, so it cannot race a first probe's INSERT.
+
+Worker reports never carry corrections: `pos` and `fix` are left out when None, and the server
+refuses a report track that carries either (`audio_track` / `sub_track`). The report format and
+`PROBE_VERSION` (2) are unchanged.
+
+### Detector accuracy (`StatsResponse.probe_corrections`, D130)
+
+Where each detected kind came from is computed when the correction is written and stored in
+`detected.src`: `name` when `sniff::video::classify_name` gives the kind from the stored track
+name (and language), else `flags` (Matroska / MP4 / TS flags, bitstream fields, `enm`, captions
+in the video). A kind that both a flag and the name gave counts as `name`, since the report does
+not carry sniff's split. **UNVERIFIED**: names were cut to 64 bytes by the worker, which may hide
+a kind word at the end of a long name. The language source is not split: it always comes from
+the container tag.
+
+All counts use the snapshot (what the detector said when the user checked), never the current
+detection, over every row of `probe_corrections` (one SELECT per stats request):
+
+| Count | Definition |
+|---|---|
+| `tracks` | corrections of detected tracks (`pos` set) |
+| `removed` | of those, "doesn't exist" |
+| `checked` | not removed, no field overridden ("matches VLC") |
+| `corrected` | not removed, at least one field overridden |
+| `added` | tracks the user added (`pos` NULL) |
+| `languages.checked` | not removed, the snapshot has a language |
+| `languages.wrong` | of those, the language overridden |
+| `languages.filled` | the snapshot has no language, the user set one |
+| `names_changed` | the name overridden |
+| `kinds` | not removed, snapshot version ≥ 2: per snapshot kind, `(track, kind, source)` gets `checked + 1`, and `wrong + 1` when the kinds were overridden without that kind; sorted by wrong, then checked (descending), then track, kind, source |
+| `missed` | kinds the user set that the snapshot (version ≥ 2) did not have, by `(track, kind)`, most first |
+
+So "SDH from track names: 4 of 31 wrong" is the `sub` / `sdh` / `name` entry with `checked` 31
+and `wrong` 4.
+
+### Not done (docs/ROADMAP.md)
+
+Codec, resolution and HDR corrections; an offline correction queue on the phone; corrections in
+the result list's badges. **UNVERIFIED**: the app on a device, and VLC numbering parity per
+container (above).

@@ -345,6 +345,9 @@ fn video_of(v: &sniff::VideoInfo) -> Option<ProbeVideo> {
                 dts_x: a.dts_x == Some(true) || feature(sniff::video::AudioFeature::DtsX),
                 kinds: kinds_of(&a.kinds, &PROBE_AUDIO_KINDS),
                 name: track_name(&a.name),
+                // Detail-only fields (D128): never in a report.
+                pos: None,
+                fix: None,
             })
         })
         .take(MAX_AUDIO_TRACKS)
@@ -373,6 +376,8 @@ fn video_of(v: &sniff::VideoInfo) -> Option<ProbeVideo> {
                 lang,
                 kinds,
                 name: track_name(&s.name),
+                pos: None,
+                fix: None,
             })
         })
         .take(MAX_SUB_TRACKS)
@@ -735,6 +740,9 @@ fn check_video(v: &ProbeVideo) -> Result<(), &'static str> {
             || !in_range(a.channels, 1, MAX_CHANNELS)
             || !ok_kinds(&a.kinds, &PROBE_AUDIO_KINDS)
             || !ok_opt(&a.name, PROBE_MAX_TRACK_NAME)
+            // A worker never sends the detail's correction fields (D129).
+            || a.pos.is_some()
+            || a.fix.is_some()
         {
             return Err("audio_track");
         }
@@ -744,6 +752,8 @@ fn check_video(v: &ProbeVideo) -> Result<(), &'static str> {
             || !ok_lang(&s.lang)
             || !ok_kinds(&s.kinds, &PROBE_SUB_KINDS)
             || !ok_opt(&s.name, PROBE_MAX_TRACK_NAME)
+            || s.pos.is_some()
+            || s.fix.is_some()
         {
             return Err("sub_track");
         }
@@ -960,18 +970,25 @@ pub fn facet_values(name: &str, tags: &[String]) -> Vec<String> {
     out
 }
 
+/// The summary of a report as detected (no correction applied).
 pub fn summary(r: &ProbeReport) -> Summary {
+    summary_of(&r.files)
+}
+
+/// The summary columns and tags of `files` (D117, D122, D124). Since D129 `files` are the
+/// effective files (`probe_fix::apply`): a track marked removed counts nowhere, an added track
+/// (no codec) gives no `ac:` tag and no audio codec.
+pub fn summary_of(files: &[ProbeFile]) -> Summary {
     let mut s = Summary {
-        files_verified: r.files.iter().filter(|f| f.verified).count() as i16,
+        files_verified: files.iter().filter(|f| f.verified).count() as i16,
         ..Summary::default()
     };
-    for f in &r.files {
+    for f in files {
         for x in &f.flags {
             push_unique(&mut s.flags, x);
         }
     }
-    let Some(main) = r
-        .files
+    let Some(main) = files
         .iter()
         .max_by_key(|f| (f.size, std::cmp::Reverse(f.i)))
     else {
@@ -1001,9 +1018,13 @@ pub fn summary(r: &ProbeReport) -> Summary {
                 push_unique(&mut s.tags, &format!("h:{h}"));
             }
         }
-        for a in &v.audio {
-            push_unique(&mut s.audio_codecs, &a.codec);
-            push_unique(&mut s.tags, &format!("ac:{}", a.codec));
+        let removed =
+            |f: &Option<magnetar_core::model::ProbeTrackFix>| f.as_ref().is_some_and(|f| f.removed);
+        for a in v.audio.iter().filter(|a| !removed(&a.fix)) {
+            if !a.codec.is_empty() {
+                push_unique(&mut s.audio_codecs, &a.codec);
+                push_unique(&mut s.tags, &format!("ac:{}", a.codec));
+            }
             if let Some(l) = &a.lang {
                 push_unique(&mut s.audio_langs, l);
                 // D124: a commentary, music-only or karaoke track is not audio in its language.
@@ -1028,7 +1049,7 @@ pub fn summary(r: &ProbeReport) -> Summary {
                 push_unique(&mut s.tags, "x:dts_x");
             }
         }
-        for t in &v.subs {
+        for t in v.subs.iter().filter(|t| !removed(&t.fix)) {
             if let Some(l) = &t.lang {
                 push_unique(&mut s.sub_langs, l);
                 // D124: forced, signs, commentary and description tracks are not "subtitles
@@ -1144,7 +1165,15 @@ async fn write_one(
     now: i64,
 ) -> sqlx::Result<bool> {
     let r = &u.report;
-    let s = summary(r);
+    // D129: the summary and tags carry the user's track corrections, so a re-probe (D127's
+    // included) keeps them in search. The probe row is locked before the corrections are read,
+    // as the correction write does (`probe_fix::correct`): no lost update, no deadlock.
+    sqlx::query("SELECT 1 FROM probe_attrs WHERE infohash = $1 FOR UPDATE")
+        .bind(&u.infohash)
+        .execute(&mut **tx)
+        .await?;
+    let fixes = crate::probe_fix::load(&mut **tx, &u.infohash).await?;
+    let s = summary_of(&crate::probe_fix::apply(&r.files, r.v, &fixes).0);
     let bytes_in = i32::try_from(r.bytes_in).unwrap_or(i32::MAX);
     // The guard again inside the transaction: the row may have gone since the read above.
     let written: Option<i32> = sqlx::query_scalar(
@@ -1265,14 +1294,28 @@ pub async fn probe_for(
     let Some((version, probed_at, status, probed, verified, list, title, dht)) = row else {
         return Ok(None);
     };
-    let files = list
-        .0
+    let version = u16::try_from(version).unwrap_or(0);
+    // D129: the user's track corrections over the detection.
+    let fixes = crate::probe_fix::load(pool, infohash).await?;
+    let (effective, unplaced) = crate::probe_fix::apply(&list.0, version, &fixes);
+    let path_of = |i: u32| -> String {
+        shown_index(&title, &dht.0, shown, i as usize)
+            .and_then(|at| shown.get(at))
+            .or_else(|| dht.0.get(i as usize))
+            .map_or(String::new(), |f| f.path.clone())
+    };
+    let unplaced = unplaced
+        .into_iter()
+        .map(|u| u.info(path_of(u.fix.file_i)))
+        .collect();
+    let files = effective
         .into_iter()
         .filter_map(|f| {
             let at = shown_index(&title, &dht.0, shown, f.i as usize)?;
             let stored = &shown[at];
             Some(ProbeFileInfo {
                 index: u32::try_from(at).ok()?,
+                dht_index: f.i,
                 path: stored.path.clone(),
                 size: f.size,
                 description: sniff::label::info(&f.label)
@@ -1287,11 +1330,12 @@ pub async fn probe_for(
         })
         .collect();
     Ok(Some(ProbeInfo {
-        version: u16::try_from(version).unwrap_or(0),
+        version,
         probed_at,
         status,
         verified: probed > 0 && verified == probed,
         files,
+        unplaced,
     }))
 }
 
@@ -1792,6 +1836,43 @@ mod tests {
 
     fn kinds_video() -> ProbeVideo {
         serde_json::from_str(KINDS_JSON).unwrap()
+    }
+
+    /// D129: `pos` and `fix` are the detail's fields; a worker report carrying either is
+    /// refused (a worker cannot plant a correction); a track without them writes neither.
+    #[test]
+    fn worker_reports_cannot_carry_corrections() {
+        let files = stored(&[100, 5000]);
+        let with = |v: ProbeVideo| {
+            report(vec![ProbeFile {
+                video: Some(v),
+                ..file(1, 5000, "video.mkv")
+            }])
+        };
+        assert_eq!(validate(&with(kinds_video()), &files), Ok(()));
+        let mut v = kinds_video();
+        v.audio[0].pos = Some(0);
+        assert_eq!(validate(&with(v), &files), Err("audio_track"));
+        let mut v = kinds_video();
+        v.audio[1].fix = Some(magnetar_core::model::ProbeTrackFix::default());
+        assert_eq!(validate(&with(v), &files), Err("audio_track"));
+        let mut v = kinds_video();
+        v.subs[2].pos = Some(2);
+        assert_eq!(validate(&with(v), &files), Err("sub_track"));
+        let mut v = kinds_video();
+        v.subs[0].fix = Some(magnetar_core::model::ProbeTrackFix {
+            removed: true,
+            ..Default::default()
+        });
+        assert_eq!(validate(&with(v), &files), Err("sub_track"));
+        // As a worker sends it (JSON): the fields are read, then refused.
+        let json = r#"{"container":"matroska","subs":[{"codec":"subrip","lang":"eng",
+            "fix":{"id":1,"fields":["lang"],"at":0,"by":"x"}}]}"#;
+        let v: ProbeVideo = serde_json::from_str(json).unwrap();
+        assert_eq!(validate(&with(v), &files), Err("sub_track"));
+        // A track without them writes neither (worker reports and `probe_files` unchanged).
+        let s = serde_json::to_string(&kinds_video()).unwrap();
+        assert!(!s.contains("\"pos\"") && !s.contains("\"fix\""), "{s}");
     }
 
     /// D124: kinds are whitelisted per track type, without duplicates; names are short

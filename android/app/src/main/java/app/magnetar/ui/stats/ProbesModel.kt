@@ -1,11 +1,14 @@
 package app.magnetar.ui.stats
 
 import app.magnetar.api.ProbeBackfillStats
+import app.magnetar.api.ProbeCorrectionStats
 import app.magnetar.api.WorkerStats
 import app.magnetar.api.named
 import app.magnetar.ui.common.formatAgo
 import app.magnetar.ui.common.formatNumber
 import app.magnetar.ui.common.formatPercent
+import app.magnetar.ui.detail.AUDIO_KIND_LABELS
+import app.magnetar.ui.detail.SUB_KIND_LABELS
 import java.util.Locale
 
 /*
@@ -102,4 +105,35 @@ fun workerBackfillLines(w: WorkerStats, locale: Locale = Locale.getDefault()): L
         add("Fetched / no peers / failed" to "${formatNumber(b.fetched, locale)} / ${formatNumber(b.noPeers, locale)} / ${formatNumber(b.failed, locale)}")
         if (b.leaseErrors > 0) add("Lease errors" to formatNumber(b.leaseErrors, locale))
     }
+}
+
+/** The user corrected or checked at least one track (D131): worth a "Your corrections" block. */
+fun hasCorrections(s: ProbeCorrectionStats?): Boolean = s != null && s.tracks + s.added > 0
+
+/** "SDH (subtitles)", "Audio description (audio)". */
+private fun kindTitle(track: String, kind: String): String {
+    val labels = if (track == "audio") AUDIO_KIND_LABELS else SUB_KIND_LABELS
+    val label = (labels[kind] ?: kind.replace('_', ' ')).replaceFirstChar { it.uppercaseChar() }
+    return "$label (" + (if (track == "audio") "audio" else "subtitles") + ")"
+}
+
+/**
+ * "Your corrections" (D130, D131): what the user checked against VLC, and how often each
+ * detector source was wrong ("SDH (subtitles) from track names" → "4 of 31 wrong"). At most
+ * 8 kind lines (the server sends the most wrong first) and 4 missed kinds.
+ */
+fun correctionLines(s: ProbeCorrectionStats, locale: Locale = Locale.getDefault()): List<Pair<String, String>> = buildList {
+    fun n(v: Long) = formatNumber(v, locale)
+    add("Tracks checked" to n(s.tracks))
+    add("Matched VLC" to n(s.checked))
+    add("Corrected" to n(s.corrected))
+    add("Not in the file" to n(s.removed))
+    add("Added by you" to n(s.added))
+    val l = s.languages
+    add("Languages" to "${n(l.wrong)} of ${n(l.checked)} wrong" + if (l.filled > 0) ", ${n(l.filled)} filled in" else "")
+    for (k in s.kinds.take(8)) {
+        val from = if (k.source == "name") "track names" else "file flags"
+        add("${kindTitle(k.track, k.kind)} from $from" to "${n(k.wrong)} of ${n(k.checked)} wrong")
+    }
+    for (m in s.missed.take(4)) add("${kindTitle(m.track, m.kind)} missed" to n(m.count))
 }
