@@ -405,6 +405,30 @@ class MagnetarApiTest {
     }
 
     @Test
+    fun `fleet stats read workers and the probe backfill from the stats route`() = runBlocking {
+        server.enqueue(
+            json(
+                """{"torrents":3,"crawler":{"running":false},"workers":[{"name":"192.168.1.20","connected":true,
+                "backfill_probed_total":4,"dht":{"mode":"polite","discover":false,"backfill":{"leased":9}}}],
+                "probe_backfill":{"waiting":2,"remaining":2,"closed":[["gone",1]],"probed":4,"at":5}}""",
+            ),
+        )
+        val f = api().fleetStats()
+        assertEquals(server.takeRequest().url.encodedPath, "/api/v1/stats")
+        assertEquals(f.probeBackfill?.closed?.single()?.name, "gone")
+        assertEquals(f.workers.single().backfillProbedTotal, 4L)
+        assertEquals(f.workers.single().dht?.backfill?.leased, 9L)
+        // A worker named by its address is never shown with it.
+        assertFalse(f.workers.single().name.contains("192.168"), f.workers.single().name)
+
+        // An older server: the same route without the new fields.
+        server.enqueue(json("""{"torrents":3,"crawler":{"running":false}}"""))
+        val old = api().fleetStats()
+        assertNull(old.probeBackfill)
+        assertTrue(old.workers.isEmpty())
+    }
+
+    @Test
     fun `stats endpoints`() = runBlocking {
         server.enqueue(
             json(

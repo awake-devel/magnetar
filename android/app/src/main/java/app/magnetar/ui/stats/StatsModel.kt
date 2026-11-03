@@ -19,7 +19,14 @@ import java.util.Locale
 enum class ValueUnit { COUNT, BYTES }
 
 /** One activity chart the user can pick (D47 metrics, D74 DHT metrics). */
-enum class Activity(val metric: String, val label: String, val unit: ValueUnit = ValueUnit.COUNT, val dht: Boolean = false) {
+enum class Activity(
+    val metric: String,
+    val label: String,
+    val unit: ValueUnit = ValueUnit.COUNT,
+    val dht: Boolean = false,
+    /** Only a server with the header-probe backfill (D118) knows the metric. */
+    val probes: Boolean = false,
+) {
     TOTAL("torrents_total", "Torrents over time"),
     ADDED("torrents_added", "Added"),
     PUBLISHED("torrents_published", "Published"),
@@ -34,11 +41,15 @@ enum class Activity(val metric: String, val label: String, val unit: ValueUnit =
 
     /** A count only: the illegal-content blocklist's matches are never listed (docs/DHT.md §7). */
     DHT_BLOCKED("dht_blocked", "DHT blocked (count)", dht = true),
+
+    /** DHT rows the probe backfill added for Nostr-only torrents (not discoveries, D118). */
+    PROBE_DHT_ROWS("probe_backfill_dht_rows", "Probe backfill DHT rows", probes = true),
     ;
 
     companion object {
-        /** The metrics a server with [dht] (crawler on) offers. */
-        fun offered(dht: Boolean): List<Activity> = entries.filter { !it.dht || dht }
+        /** The metrics a server with [dht] (crawler on) and [probes] (backfill counts) offers. */
+        fun offered(dht: Boolean, probes: Boolean = false): List<Activity> =
+            entries.filter { (!it.dht || dht) && (!it.probes || probes) }
     }
 }
 

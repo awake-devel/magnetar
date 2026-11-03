@@ -194,6 +194,15 @@ class MagnetarApi(
         )
     }
 
+    /**
+     * Feature `workers`: `GET /api/v1/stats`, read for its `workers` and `probe_backfill` only.
+     * A worker name that is an IP literal is redacted, as in [crawlSources].
+     */
+    override suspend fun fleetStats(): FleetStats {
+        val s = get("api/v1/stats", RequestClass.STATS, FleetStats.serializer())
+        return s.copy(workers = s.workers.map { it.copy(name = redactIpHost(it.name)) })
+    }
+
     /** Feature `crawl_map`; any other [layer] or [window] is refused before a request is made. */
     override suspend fun crawlMap(layer: String, window: String): CrawlMap {
         if (layer !in MAP_LAYERS || window !in MAP_WINDOWS) throw ApiException.NotFound("No such map")
