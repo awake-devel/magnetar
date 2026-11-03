@@ -7,7 +7,7 @@
 //! - **server**: [`validate`] checks an uploaded report against the server's own file list
 //!   and sniff's label registry (nothing a worker says is trusted beyond what is checkable,
 //!   D113), [`store`] writes it to `probe_attrs` / `probe_files` (one savepoint per row, D110)
-//!   only for a stored DHT row the server classified as not adult and did not block, and
+//!   only for a stored DHT row whose hash is not blocked (adult rows included since D119), and
 //!   [`probe_for`] reads it back for the detail API with paths from the server's file list.
 //!
 //! The server never runs a probe: [`magnetar_core::probe::Prober`] is built only by the
@@ -675,24 +675,14 @@ pub struct Upload {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct StoreOutcome {
     pub stored: u32,
-    /// Refused by [`validate`], or no storable row (none, adult, blocked), or a weaker
+    /// Refused by [`validate`], or no storable row (none, blocked), or a weaker
     /// result than the one already stored.
     pub rejected: u32,
 }
 
-/// True when the server's own classification of a DHT row is adult: category `porn` or the
-/// adult signal on its name and paths ([`magnetar_core::classify::Classification::adult`],
-/// the worker's gate before it probes).
-pub fn adult(category: &str, title: &str, files: &[TorrentFile]) -> bool {
-    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
-    category == "porn" || magnetar_core::classify::adult_signal(title, &paths)
-}
-
 /// Validate and write reports a worker uploaded with dicts the server just verified and
-/// persisted. A row is written only when the `dht_torrents` row exists, the server does not
-/// classify it adult ([`adult`]: category `porn` or the adult signal) and the hash is not
-/// blocked; a re-probe
-/// replaces the stored one only when it is of a newer probe version or verifies at least as
+/// persisted. A row is written only when the `dht_torrents` row exists and the hash is not
+/// blocked (adult rows are probed too, D119); a re-probe replaces the stored one only when it is of a newer probe version or verifies at least as
 /// many files. One savepoint per row (D110).
 pub async fn store(
     pool: &PgPool,
@@ -705,19 +695,16 @@ pub async fn store(
         return Ok(o);
     }
     let hashes: Vec<String> = items.iter().map(|u| u.infohash.clone()).collect();
-    let rows: Vec<(String, String, String, Json<Vec<TorrentFile>>)> = sqlx::query_as(
-        "SELECT d.infohash, d.category, d.title, d.files FROM dht_torrents d
-         WHERE d.infohash = ANY($1) AND d.category <> 'porn'
+    let rows: Vec<(String, Json<Vec<TorrentFile>>)> = sqlx::query_as(
+        "SELECT d.infohash, d.files FROM dht_torrents d
+         WHERE d.infohash = ANY($1)
            AND NOT EXISTS (SELECT 1 FROM blocked_infohashes b WHERE b.infohash = d.infohash)",
     )
     .bind(&hashes)
     .fetch_all(pool)
     .await?;
-    let files: std::collections::HashMap<String, Vec<TorrentFile>> = rows
-        .into_iter()
-        .filter(|(_, c, t, f)| !adult(c, t, &f.0))
-        .map(|(h, _, _, f)| (h, f.0))
-        .collect();
+    let files: std::collections::HashMap<String, Vec<TorrentFile>> =
+        rows.into_iter().map(|(h, f)| (h, f.0)).collect();
     let mut tx = pool.begin().await?;
     for u in items {
         let Some(list) = files.get(&u.infohash) else {
@@ -777,7 +764,7 @@ async fn write_one(
              height, hdr, bit_depth, duration_ms, audio_codecs, audio_langs, sub_langs, flags, tags)
          SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
                 $19, $20, $21, $22
-         WHERE EXISTS (SELECT 1 FROM dht_torrents d WHERE d.infohash = $1 AND d.category <> 'porn')
+         WHERE EXISTS (SELECT 1 FROM dht_torrents d WHERE d.infohash = $1)
            AND NOT EXISTS (SELECT 1 FROM blocked_infohashes b WHERE b.infohash = $1)
          ON CONFLICT (infohash) DO UPDATE SET
              probe_version = EXCLUDED.probe_version, probed_at = EXCLUDED.probed_at,
@@ -833,7 +820,7 @@ async fn write_one(
 }
 
 /// `probe_attrs` version, time, status, files probed / verified, `probe_files.files`, and the
-/// DHT row's category, title and files.
+/// DHT row's title and files.
 type StoredProbeRow = (
     i16,
     i64,
@@ -841,7 +828,6 @@ type StoredProbeRow = (
     i16,
     i16,
     Json<Vec<ProbeFile>>,
-    String,
     String,
     Json<Vec<TorrentFile>>,
 );
@@ -870,8 +856,7 @@ pub fn shown_index(
 /// The stored probe of `infohash` for the detail API: indexes into `shown` (the file list the
 /// detail returns as `files`, a Nostr event's or the DHT row's; entries not in it are left
 /// out), paths from `shown`, descriptions from sniff's label registry. None for a torrent
-/// never probed, or one the server now classifies as adult ([`adult`] on the DHT row; the
-/// caller checks the Nostr row it shows).
+/// never probed (or whose DHT row is gone). Adult torrents show their probe too (D119).
 pub async fn probe_for(
     pool: &PgPool,
     infohash: &str,
@@ -879,22 +864,18 @@ pub async fn probe_for(
 ) -> sqlx::Result<Option<ProbeInfo>> {
     let row: Option<StoredProbeRow> = sqlx::query_as(
         "SELECT p.probe_version, p.probed_at, p.status, p.files_probed, p.files_verified, f.files,
-                d.category, d.title, d.files
+                d.title, d.files
          FROM probe_attrs p
          JOIN probe_files f USING (infohash)
          JOIN dht_torrents d USING (infohash)
-         WHERE p.infohash = $1 AND d.category <> 'porn'",
+         WHERE p.infohash = $1",
     )
     .bind(infohash)
     .fetch_optional(pool)
     .await?;
-    let Some((version, probed_at, status, probed, verified, list, category, title, dht)) = row
-    else {
+    let Some((version, probed_at, status, probed, verified, list, title, dht)) = row else {
         return Ok(None);
     };
-    if adult(&category, &title, &dht.0) {
-        return Ok(None);
-    }
     let files = list
         .0
         .into_iter()
@@ -1120,24 +1101,6 @@ mod tests {
             ..file(1, 5000, "game.ps5.pkg")
         }]);
         assert_eq!(validate(&game, &files), Ok(()));
-    }
-
-    /// Review finding: the server stored probes for `adult_signal` rows the worker never
-    /// probes (category not `porn`, e.g. an audio majority).
-    #[test]
-    fn the_servers_adult_gate_is_the_workers() {
-        let files = vec![TorrentFile {
-            path: "01.flac".into(),
-            size: Some(40_000_000),
-        }];
-        let c = magnetar_core::classify::classify("Studio.XXX.Hits.2024", &files);
-        assert!(
-            c.adult() && c.category != magnetar_core::model::Category::Porn,
-            "{c:?}"
-        );
-        assert!(adult("audio", "Studio.XXX.Hits.2024", &files));
-        assert!(adult("porn", "Plain.Hits.2024", &files));
-        assert!(!adult("audio", "Plain.Hits.2024", &files));
     }
 
     /// Review finding: on a torrent with a Nostr and a DHT row, probe indexes pointed into the

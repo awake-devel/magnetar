@@ -217,8 +217,9 @@ pub enum DhtOutcome {
         #[serde(default)]
         rule_version: i16,
     },
-    /// Verified but not storable (BEP 27 private, pure v2, unusable dict: `code` as
-    /// `InfoError::code`).
+    /// Verified but not storable (pure v2, unusable dict: `code` as `InfoError::code`).
+    /// `Private` (BEP 27) is sent only by workers older than D119: a private dict now goes up
+    /// as `Metadata` like any other.
     Private,
     V2Only,
     Invalid {

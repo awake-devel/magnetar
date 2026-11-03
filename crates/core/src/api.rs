@@ -150,8 +150,8 @@ pub struct ProbeBackfillStats {
     pub retrying: u64,
     /// `waiting + leased + retrying`: what is left to try.
     pub remaining: u64,
-    /// Closed for good, by outcome (`adult`, `blocked`, `gone`, `private`, `no_peers` after the
-    /// last attempt, ...).
+    /// Closed for good, by outcome (`blocked`, `gone`, `worker_blocked`, `no_peers` after the
+    /// last attempt, ...; `adult` and `private` rows were reopened by D119).
     pub closed: Vec<(String, u64)>,
     /// Torrents with a stored probe (backfill or new finds).
     pub probed: u64,
@@ -274,7 +274,8 @@ pub struct WorkerProbeState {
     pub choked: u64,
     pub no_pieces: u64,
     pub failed: u64,
-    /// Probes not started, by reason (`rate`, `busy`, `adult`, `blocklist`, `brake`, ...).
+    /// Probes not started, by reason (`rate`, `busy`, `blocklist`, `brake`, ...; `adult` from
+    /// workers older than D119).
     pub skipped: Vec<(String, u64)>,
     /// Piece payload received and served.
     pub bytes_in: u64,

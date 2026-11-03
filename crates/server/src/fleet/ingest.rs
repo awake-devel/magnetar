@@ -460,6 +460,9 @@ pub async fn dht_results(
                         // the server's (`oversize` false, as on a new find): another worker
                         // with more room gets it on a later lease.
                         Err(f) if !f.oversize => Answer::Retry(f.code().into()),
+                        // D119: a worker older than D119 refuses private dicts; an updated
+                        // worker probes them, so the lease is tried again later.
+                        Ok(Outcome::Private) => Answer::Retry(outcome_code(&r)),
                         _ => Answer::Close(outcome_code(&r)),
                     }
                 }

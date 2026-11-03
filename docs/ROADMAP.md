@@ -18,7 +18,8 @@ monitors such as nostr.watch, and relay lists in popular clients' public code.
 
 ### Header probes
 Check a torrent's contents block by block from its peers: verify that it really contains what
-its file list says. Never on torrents tagged adult or matched by the blocklist. Warn when no VPN
+its file list says. Never on torrents matched by the blocklist (adult and BEP 27 private
+torrents are probed, D119). Warn when no VPN
 is active, since probing connects to peers from the server's IP (as built: probes run on the
 crawl workers only, which log this at start; no VPN detection yet). Per-machine limits for the
 crawl workers come from the router benchmarks (docs/benchmarks/).

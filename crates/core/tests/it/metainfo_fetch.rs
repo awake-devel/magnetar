@@ -427,11 +427,14 @@ async fn incoming_requests_are_rejected() {
 #[tokio::test]
 async fn private_v2_only_hybrid_and_duplicates() {
     let f = fetcher();
-    // BEP 27 private: verified but not storable.
+    // BEP 27 private: storable like any other dict since D119, the flag kept.
     let raw = info_v1("Private", 1000, true);
     let h = sha1(&raw);
     let p = peer(raw.clone(), h, Behave::Good).await;
-    assert!(matches!(f.fetch(h, &[p]).await.unwrap(), Outcome::Private));
+    match f.fetch(h, &[p]).await.unwrap() {
+        Outcome::Ok(got) => assert!(got.info.private && got.v1 == h),
+        o => panic!("{o:?}"),
+    }
 
     // Hybrid sighted under its truncated SHA-256: stored under the SHA-1, v2 kept.
     let tree = dict(vec![(
@@ -482,7 +485,7 @@ async fn private_v2_only_hybrid_and_duplicates() {
     let st = f.stats();
     assert_eq!(
         (st.private, st.v2_only, st.invalid, st.hybrid),
-        (1, 1, 1, 1)
+        (0, 1, 1, 1)
     );
 }
 

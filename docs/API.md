@@ -104,8 +104,9 @@ server's queue, absent without workers).
 
 ## Header probes (D117)
 
-`TorrentDetail.probe` (absent when the torrent was never probed or the server now classifies
-it adult; older servers never send it; the Android app does not read it yet, its decoder
+`TorrentDetail.probe` (absent when the torrent was never probed; adult and BEP 27 private
+torrents are probed too since D119, while older servers hid it on adult ones; older servers
+never send it; the Android app does not read it yet, its decoder
 ignores unknown keys):
 
 ```json

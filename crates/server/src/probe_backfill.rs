@@ -18,12 +18,10 @@
 //! newest (`born`); those with no seed check yet after every tier with seeders, those known
 //! dead last. The order is fixed when a row is queued.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use magnetar_core::api::ProbeBackfillStats;
-use magnetar_core::model::TorrentFile;
 use sqlx::PgPool;
-use sqlx::types::Json;
 
 /// Most hashes per lease request.
 pub const LEASE_MAX: usize = 256;
@@ -67,8 +65,8 @@ const RANK_SQL: &str = "-(
     + least(greatest(coalesce(s.born, 0), 0), 9999999999)) - 1";
 
 /// Queue the next [`FILL_CHUNK`] infohashes after `after` (`""` to start) that have no probe,
-/// are not blocked, are not category `porn` on any row and that a default search shows (a DHT
-/// row, or a visible Nostr event: [`moderated`]). Returns the last infohash read
+/// are not blocked and that a default search shows (a DHT row, or a visible Nostr event:
+/// [`moderated`]). Adult torrents are queued too (D119). Returns the last infohash read
 /// (None at the end of the table) and how many rows were queued. Rows already queued (or
 /// closed) are kept as they are.
 pub async fn fill_chunk(pool: &PgPool, after: &str) -> sqlx::Result<(Option<String>, u64)> {
@@ -84,10 +82,6 @@ pub async fn fill_chunk(pool: &PgPool, after: &str) -> sqlx::Result<(Option<Stri
              LEFT JOIN liveness_schedule s ON s.infohash = c.infohash
              WHERE NOT EXISTS (SELECT 1 FROM probe_attrs p WHERE p.infohash = c.infohash)
                AND NOT EXISTS (SELECT 1 FROM blocked_infohashes b WHERE b.infohash = c.infohash)
-               AND NOT EXISTS (SELECT 1 FROM dht_torrents d
-                               WHERE d.infohash = c.infohash AND d.category = 'porn')
-               AND NOT EXISTS (SELECT 1 FROM torrents t
-                               WHERE t.infohash = c.infohash AND t.category = 'porn')
                AND {visible}
              ORDER BY c.infohash
              ON CONFLICT (infohash) DO NOTHING
@@ -122,7 +116,6 @@ pub async fn fill_pass(pool: &PgPool) -> sqlx::Result<u64> {
 
 /// Why a queue row was closed, or what an attempt ended with (`last_outcome`).
 pub mod outcome {
-    pub const ADULT: &str = "adult";
     pub const BLOCKED: &str = "blocked";
     pub const GONE: &str = "gone";
     pub const NO_PROBE: &str = "no_probe";
@@ -132,20 +125,17 @@ pub mod outcome {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Leased {
     pub items: Vec<String>,
-    /// Rows found already probed (deleted) or closed (adult, blocked, gone).
+    /// Rows found already probed (deleted) or closed (blocked, gone).
     pub probed: u32,
     pub closed: u32,
     /// Rows left out of the queue because no default search shows them ([`moderated`]).
     pub moderated: u32,
 }
 
-type Row = (String, String, String, Json<Vec<TorrentFile>>);
-
 /// Lease up to `max` due rows to `worker` until `now + ttl`. Before a row is handed out it is
 /// checked again against what the server holds now: a probe stored meanwhile deletes it; a
-/// blocked hash, an infohash with no row left, or one the server classifies adult on any of
-/// its rows (DHT or Nostr: [`crate::probes::adult`], the worker's own gate) closes it; one no
-/// default search shows ([`moderated`]) leaves the queue (a later fill pass queues it again
+/// blocked hash or an infohash with no row left closes it (adult rows are leased like any
+/// other since D119); one no default search shows ([`moderated`]) leaves the queue (a later fill pass queues it again
 /// once it is shown). Rows are taken with `FOR UPDATE SKIP LOCKED`, so concurrent leases never
 /// share a hash. A batch that those checks emptied is followed by the next due rows (a few
 /// rounds), so a run of closed rows does not send the worker idle.
@@ -213,28 +203,17 @@ async fn lease_round(
             .await?
             .into_iter()
             .collect();
-    let dht: Vec<Row> = sqlx::query_as(
-        "SELECT infohash, category, title, files FROM dht_torrents WHERE infohash = ANY($1)",
+    // Still present: a DHT row or a Nostr row.
+    let present: HashSet<String> = sqlx::query_scalar(
+        "SELECT infohash FROM dht_torrents WHERE infohash = ANY($1)
+         UNION SELECT infohash FROM torrents WHERE infohash = ANY($1)",
     )
     .bind(&hashes)
     .fetch_all(&mut **tx)
-    .await?;
-    let nostr: Vec<Row> = sqlx::query_as(
-        "SELECT infohash, category, title, files FROM torrents WHERE infohash = ANY($1)",
-    )
-    .bind(&hashes)
-    .fetch_all(&mut **tx)
-    .await?;
+    .await?
+    .into_iter()
+    .collect();
     let hidden = moderated(&mut **tx, &hashes, min).await?;
-    // Present, and adult on any row.
-    let judged: HashMap<String, bool> = cpu(move || {
-        let mut m: HashMap<String, bool> = HashMap::new();
-        for (h, cat, title, files) in dht.into_iter().chain(nostr) {
-            let a = crate::probes::adult(&cat, &title, &files.0);
-            *m.entry(h).or_default() |= a;
-        }
-        m
-    });
     let mut drop = Vec::new();
     let mut close_h = Vec::new();
     let mut close_o: Vec<&str> = Vec::new();
@@ -247,12 +226,10 @@ async fn lease_round(
         }
         let why = if blocked.contains(&h) {
             Some(outcome::BLOCKED)
+        } else if !present.contains(&h) {
+            Some(outcome::GONE)
         } else {
-            match judged.get(&h) {
-                None => Some(outcome::GONE),
-                Some(true) => Some(outcome::ADULT),
-                Some(false) => None,
-            }
+            None
         };
         match why {
             Some(o) => {
@@ -407,7 +384,7 @@ pub enum Answer {
     Dict,
     /// No dict, worth another try later (no peers, connect, timeout, ...): the failure code.
     Retry(String),
-    /// No dict and never one worth probing (private, v2-only, invalid, oversize, blocked by
+    /// No dict and never one worth probing (v2-only, invalid, oversize, blocked by
     /// the worker's blocklist): closed with this outcome.
     Close(String),
     /// A dict for a torrent no default search shows any more ([`moderated`], since the
@@ -596,15 +573,6 @@ pub async fn stats(pool: &PgPool, now: i64) -> sqlx::Result<ProbeBackfillStats> 
         filled_at: None,
         at: now,
     })
-}
-
-fn cpu<R>(f: impl FnOnce() -> R) -> R {
-    match tokio::runtime::Handle::try_current() {
-        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(f)
-        }
-        _ => f(),
-    }
 }
 
 #[cfg(test)]
