@@ -64,6 +64,73 @@ pub struct SearchQuery {
     /// Empty = every source. Older servers ignore it, so the app offers the chip only when
     /// the server lists `api::features::ORIGIN`.
     pub origins: Vec<String>,
+    // Header-probe filters (D122): what a crawl worker's probe read from the files themselves
+    // (docs/PROBES.md), not the name. Only probed torrents can match. Within one field any
+    // value matches; fields combine with AND, with each other and with the D44 filters. Older
+    // servers ignore them, so the app offers them only when the server lists
+    // `api::features::PROBE_FILTERS`.
+    /// Audio track languages, ISO 639-2/B (`fre`, `eng`, `jpn`; 639-1 and 639-2/T codes are
+    /// accepted and normalised by the server: `fr`, `fra` → `fre`).
+    pub probe_languages: Vec<String>,
+    /// Subtitle track languages, as `probe_languages`.
+    pub probe_subtitles: Vec<String>,
+    /// Picture class of the main video track: `2160p` (8K included), `1080p`, `720p`, `576p`,
+    /// `480p`, `sd`. "4K and up" is `["2160p"]`, "1080p and up" `["2160p", "1080p"]`.
+    pub probe_resolutions: Vec<String>,
+    /// FFmpeg codec names of the main video track (`hevc`, `h264`, `av1`, `vp9`, …).
+    pub probe_video_codecs: Vec<String>,
+    /// `any` (any HDR format), `dolby_vision`, `hdr10`, `hdr10_plus`, `hlg`.
+    pub probe_hdr: Vec<String>,
+    /// Audio codecs of the main file (`truehd`, `eac3`, `dts`, `aac`, …) and the object-audio
+    /// marks `atmos`, `dts_x`.
+    pub probe_audio: Vec<String>,
+}
+
+/// Facet names of the header-probe filters (D122), in `SearchQuery::probe_filters` order.
+pub const PROBE_FACETS: [&str; 6] = [
+    "probe_language",
+    "probe_subtitles",
+    "probe_resolution",
+    "probe_codec",
+    "probe_hdr",
+    "probe_audio",
+];
+
+impl SearchQuery {
+    /// The header-probe filters set (D122) as (facet name, lowercase values, deduplicated).
+    /// Language codes are only lowercased here; the server normalises them to ISO 639-2/B.
+    pub fn probe_filters(&self) -> Vec<(&'static str, Vec<String>)> {
+        let lower = |v: &[String]| -> Vec<String> {
+            let mut out: Vec<String> = Vec::new();
+            for s in v {
+                let s = s.trim().to_lowercase();
+                if !s.is_empty() && !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+            out
+        };
+        let mut out: Vec<(&'static str, Vec<String>)> = PROBE_FACETS
+            .iter()
+            .zip([
+                &self.probe_languages,
+                &self.probe_subtitles,
+                &self.probe_resolutions,
+                &self.probe_video_codecs,
+                &self.probe_hdr,
+                &self.probe_audio,
+            ])
+            .map(|(name, v)| (*name, lower(v)))
+            .collect();
+        out.retain(|(_, v)| !v.is_empty());
+        out
+    }
+
+    /// Needs a server with `api::features::PROBE_FILTERS`: an older one would ignore them and
+    /// answer unfiltered.
+    pub fn needs_probe_filter_feature(&self) -> bool {
+        !self.probe_filters().is_empty()
+    }
 }
 
 impl SearchQuery {
@@ -134,9 +201,13 @@ impl SearchQuery {
     /// (seeders, or DHT peers for a torrent without trackers, > 0). Fresh unchecked DHT
     /// torrents would otherwise flood the newest-first list. Any sort; Nostr results and any
     /// torrent with a Nostr event are unaffected; a text search or an explicit source filter
-    /// (`origins` = `dht` alone) returns every DHT result.
+    /// (`origins` = `dht` alone) returns every DHT result. So does a header-probe filter
+    /// (D122): only probed torrents match it, every one of them is a DHT find whose peers sent
+    /// pieces, and most were never seed-checked, so the rule would hide nearly all of them.
     pub fn browse_hides_unchecked_dht(&self) -> bool {
-        self.text.trim().is_empty() && self.origin_filter().is_empty()
+        self.text.trim().is_empty()
+            && self.origin_filter().is_empty()
+            && self.probe_filters().is_empty()
     }
 
     /// Adult documents are left out of this query (D52).
@@ -275,5 +346,27 @@ mod tests {
             ..Default::default()
         };
         assert!(!q.hides_adult(), "selecting porn is consent");
+    }
+
+    #[test]
+    fn probe_filters_default_and_lowercase() {
+        // Older apps and saved searches send none of the D122 fields.
+        let q: SearchQuery = serde_json::from_str(r#"{"text":"x","languages":["fr"]}"#).unwrap();
+        assert!(q.probe_filters().is_empty());
+        assert!(!q.needs_probe_filter_feature());
+        let q: SearchQuery = serde_json::from_str(
+            r#"{"probe_languages":[" FRE ","fre",""],"probe_hdr":["any"],"probe_audio":["Atmos"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            q.probe_filters(),
+            vec![
+                ("probe_language", vec!["fre".to_string()]),
+                ("probe_hdr", vec!["any".to_string()]),
+                ("probe_audio", vec!["atmos".to_string()]),
+            ]
+        );
+        assert!(q.needs_probe_filter_feature());
+        assert!(!q.has_attr_filters(), "probe filters are not D44 filters");
     }
 }

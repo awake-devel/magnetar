@@ -10,6 +10,7 @@ import app.magnetar.api.Sort
 import app.magnetar.api.TorrentSummary
 import app.magnetar.cache.PageCache
 import app.magnetar.settings.AppSettings
+import app.magnetar.ui.search.PROBE_FACET_FIELDS
 import app.magnetar.ui.search.SEARCH_DEBOUNCE_MS
 import app.magnetar.ui.search.SearchFilters
 import app.magnetar.ui.search.SearchViewModel
@@ -149,6 +150,38 @@ class SearchViewModelTest {
         assertEquals(q.resolutions, emptyList<String>())
         assertEquals(q.origins, emptyList<String>())
         assertEquals(q.categories, listOf("video"))
+    }
+
+    @Test
+    fun `probe filters and facets follow the server's probe_filters feature`() = runTest {
+        val fake = FakeService()
+        val vm = vm(fake)
+        advanceUntilIdle()
+        val f = SearchFilters(probeHdr = setOf("dolby_vision"), resolutions = setOf("2160p"))
+        vm.setFilters(f)
+        advanceUntilIdle()
+        // The fake server lists `filters` but not `probe_filters`: only the name filter goes.
+        assertEquals(fake.searches.last().probeHdr, emptyList<String>())
+        assertEquals(fake.searches.last().resolutions, listOf("2160p"))
+        vm.draftFilters(f)
+        advanceUntilIdle()
+        assertTrue(fake.facetRequests.last().fields.none { it.startsWith("probe_") })
+
+        val fake2 = FakeService()
+        fake2.features = fake.features + "probe_filters"
+        val vm2 = vm(fake2)
+        advanceUntilIdle()
+        vm2.setFilters(f)
+        advanceUntilIdle()
+        assertEquals(fake2.searches.last().probeHdr, listOf("dolby_vision"))
+        vm2.draftFilters(f)
+        advanceUntilIdle()
+        val req = fake2.facetRequests.last()
+        assertEquals(req.query.probeHdr, listOf("dolby_vision"))
+        assertTrue(req.fields.containsAll(PROBE_FACET_FIELDS), req.fields.toString())
+        vm.draftFilters(null)
+        vm2.draftFilters(null)
+        advanceUntilIdle()
     }
 
     @Test

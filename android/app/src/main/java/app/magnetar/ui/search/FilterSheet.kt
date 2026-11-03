@@ -139,6 +139,27 @@ fun FilterSheet(
                 Title(FACET_TITLES[field] ?: field)
                 ChipRow(field, chips)
             }
+            // Header probes (D122): read from the files by a crawl worker, so only probed
+            // torrents match. Same chips and counts as above, under their own heading.
+            if (state.canFilterProbes || f.hasProbeFilters) {
+                val probeChips = PROBE_FACET_FIELDS.mapNotNull { field ->
+                    val selected = f.selected(field)
+                    if (!state.canFilterProbes && selected.isEmpty()) return@mapNotNull null
+                    facetChips(field, selected, facets?.field(field)).takeIf { it.isNotEmpty() }?.let { field to it }
+                }
+                if (probeChips.isNotEmpty()) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "From the files (probed torrents only)",
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.semantics { heading() },
+                    )
+                    for ((field, chips) in probeChips) {
+                        Title(FACET_TITLES[field] ?: field)
+                        ChipRow(field, chips)
+                    }
+                }
+            }
             if (state.canFilterReleases || f.minRating != null) {
                 Spacer(Modifier.height(8.dp))
                 val rating = f.minRating ?: 0f

@@ -123,6 +123,11 @@ Integration points:
   recon's track handlers also settle MP4 vs `.m4a` (no picture track), so the type check
   never fetches a whole `moov`. Audio-only containers (`.mka`, `.m4a`) and raw AC-3 / E-AC-3,
   DTS and TrueHD / MLP streams get the same recon (one audio track for a raw stream).
+  MP4 asks in two ranks (D120): first what names the tracks (each `trak` header, `mdhd`,
+  `hdlr`, `stsd`), then, once nothing of that is missing, the hops over the sample tables
+  and the first samples; an audio track whose first frame adds nothing (AAC, Opus, FLAC, …)
+  never hops over its tables. A `moov` after an `mdat` whose size is wrong is searched for in
+  the last 1 MiB. A TS PMT longer than one packet is reassembled.
 - **Console** (`src/formats/console/`): every parser is listed in `console::CHECKS`; labels and
   confidences follow the detector prototype (tuned on the corpora), `GameInfo` follows the
   console prototype. Labels produced by signature rules only (`game.toml`) get a minimal

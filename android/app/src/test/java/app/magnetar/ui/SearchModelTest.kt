@@ -3,8 +3,10 @@ package app.magnetar.ui
 import app.magnetar.api.FacetCount
 import app.magnetar.api.FacetCounts
 import app.magnetar.api.Sort
+import app.magnetar.ui.common.facetLabel
 import app.magnetar.ui.search.ChipOrder
 import app.magnetar.ui.search.DatePreset
+import app.magnetar.ui.search.PROBE_FACET_FIELDS
 import app.magnetar.ui.search.SearchFilters
 import app.magnetar.ui.search.buildQuery
 import app.magnetar.ui.search.facetChips
@@ -85,5 +87,53 @@ class SearchModelTest {
         assertEquals(second.first { it.value == "2160p" }.count, 30L)
         // Without counts nothing is reordered.
         assertNull(order.arrange("resolution", facetChips("resolution", emptySet(), null)).first().count)
+    }
+
+    @Test
+    fun `probe filters round-trip and are dropped for a server without probe_filters`() {
+        val f = SearchFilters(
+            probeLanguages = setOf("jpn", "fre"), probeSubtitles = setOf("eng"), probeResolutions = setOf("2160p"),
+            probeCodecs = setOf("hevc"), probeHdr = setOf("any"), probeAudio = setOf("atmos"), categories = setOf("video"),
+        )
+        val q = buildQuery("", f, Sort.DATE, true, includeAdult = false, nowSec = now)
+        assertEquals(q.probeLanguages, listOf("fre", "jpn"))
+        assertEquals(q.probeSubtitles, listOf("eng"))
+        assertEquals(q.probeResolutions, listOf("2160p"))
+        assertEquals(q.probeVideoCodecs, listOf("hevc"))
+        assertEquals(q.probeHdr, listOf("any"))
+        assertEquals(q.probeAudio, listOf("atmos"))
+        assertEquals(filtersOf(q, now), f)
+        assertEquals(f.activeCount, 7)
+        assertTrue(f.hasProbeFilters)
+        // A D44-era server (filters, origin) would ignore them and answer unfiltered.
+        val old = f.supportedBy(setOf("filters", "origin"))
+        assertEquals(old, SearchFilters(categories = setOf("video")))
+        assertTrue(!old.hasProbeFilters)
+        assertEquals(f.supportedBy(setOf("probe_filters")), f)
+        // The release (name) filters are independent of them.
+        val both = SearchFilters(resolutions = setOf("2160p"), probeResolutions = setOf("2160p"))
+        assertEquals(both.supportedBy(setOf("filters")), SearchFilters(resolutions = setOf("2160p")))
+    }
+
+    @Test
+    fun `probe chips toggle, list built-in values and read as names`() {
+        var f = SearchFilters()
+        for (field in PROBE_FACET_FIELDS) {
+            f = f.toggle(field, "x")
+            assertEquals(f.selected(field), setOf("x"), field)
+            f = f.toggle(field, "x")
+            assertTrue(f.selected(field).isEmpty(), field)
+            assertTrue(facetChips(field, emptySet(), null).isNotEmpty(), field)
+        }
+        assertEquals(facetLabel("probe_language", "fre"), "French")
+        assertEquals(facetLabel("probe_subtitles", "ice"), "Icelandic")
+        assertEquals(facetLabel("probe_language", "xyz"), "XYZ")
+        assertEquals(facetLabel("probe_hdr", "any"), "Any HDR")
+        assertEquals(facetLabel("probe_resolution", "2160p"), "2160p (4K and up)")
+        assertEquals(facetLabel("probe_audio", "atmos"), "Atmos")
+        // The name-parsed facet keeps its own labels.
+        assertEquals(facetLabel("language", "fr"), "French")
+        val counted = facetChips("probe_hdr", setOf("hlg"), FacetCounts("probe_hdr", 5, listOf(FacetCount("any", 5), FacetCount("hdr10", 4))))
+        assertEquals(counted.map { it.value to it.count }, listOf("any" to 5L, "hdr10" to 4L, "hlg" to 0L))
     }
 }

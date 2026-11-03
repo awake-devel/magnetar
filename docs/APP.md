@@ -10,7 +10,7 @@ settings (§7).
 
 | Tab | Content |
 |---|---|
-| **Search** | Search box with instant results (search as you type); filter sheet with live facet counts (category, languages, subtitles, resolution, source, codec, HDR, audio, genre, movie/series/anime, rating, years, **Source Nostr / DHT**), sort; result list (title, media line "Title (year) · rating", attributes, size, seeders, source badge Nostr / DHT / both); torrent detail (media card with poster, French overview, release attributes, files, swarm with **Check now** and the seeder history chart, trust, *Open magnet* / *Copy magnet*); title page grouping the releases of one movie/series |
+| **Search** | Search box with instant results (search as you type); filter sheet with live facet counts (category, languages, subtitles, resolution, source, codec, HDR, audio, genre, movie/series/anime, rating, years, **Source Nostr / DHT**, and with `probe_filters` what header probes read from the files: audio/subtitle track languages, picture class, video codec, HDR, audio format incl. Atmos, D122), sort; result list (title, media line "Title (year) · rating", attributes, size, seeders, source badge Nostr / DHT / both); torrent detail (media card with poster, French overview, release attributes, files, swarm with **Check now** and the seeder history chart, trust, *Open magnet* / *Copy magnet*); title page grouping the releases of one movie/series |
 | **Saved** | Saved searches (stored on the server), run one, edit, delete, per-search "notify"; hourly notifications through the server's stateless poll |
 | **Stats** | Health card, breakdown charts with cross-filtering, activity series, "Where discoveries come from" and the crawl map (§15), the four network graphs: web of trust, relays and publishers, title releases (from a title page), swarm (from a detail page) |
 | **Settings** | Server URL + API token + *Test connection*; trust root with **Get my key from Amber** (NIP-55 `get_public_key`) and nsec rejection; trust threshold (pushed to the server); *Show adult content*; saved-search notifications on/off; TMDB / IMDb attribution; version |
@@ -112,7 +112,7 @@ Routes: `search`, `saved`, `stats`, `settings` (tabs); `torrent/{infohash}`, `ti
 | Search list, browse (empty box) | `POST /api/v1/search` (`SearchQuery`, `limit` 50, `offset` paging) | `filters` for the release filters; `origin` for the source chip and badge |
 | Filter sheet counts | `POST /api/v1/facets` `{query, fields, size}` (disjunctive) | `facet_set` |
 | Sort | `SearchQuery.sort` + `descending` (`rating` needs `filters`) | — |
-| Torrent detail | `GET /api/v1/torrents/{infohash}` (`TorrentDetail`: magnet, files, media + poster path, trust factors, DHT info) | — |
+| Torrent detail | `GET /api/v1/torrents/{infohash}` (`TorrentDetail`: magnet, files, media + poster path, trust factors, DHT info, header probe (D121)) | — |
 | Poster | `GET /api/v1/media/{id}/poster` (bearer, ETag) | — |
 | Check now | `POST /api/v1/torrents/{infohash}/liveness` | — |
 | Seeder history chart | `GET /api/v1/torrents/{infohash}/liveness-history?days=90` | `liveness_history` |
@@ -313,19 +313,29 @@ checked against the Rust parser's output in `LabelsTest`), "matched in file: …
 source badge (trust star / DHT / both). "1,000+" when `total_is_lower_bound`.
 
 **Filter sheet.** Opening it (and every draft change, 300 ms debounce) asks
-`POST /facets {query: draft, fields: category, origin?, language…media_kind?, size: 40}`. Chip
+`POST /facets {query: draft, fields: category, origin?, language…media_kind?, probe_*?, size: 40}`. Chip
 order is fixed by the first counts seen (`ChipOrder`): a value that drops to 0 keeps its place,
 disabled; new values append. The adult category chip is never disabled (with the switch off its
 count is 0, and picking it is how the server shows those torrents). Back and swipe-down apply
-like *Show N*. Release filters need `filters`, Source chips `origin`, counts `facet_set`;
+like *Show N*. Release filters need `filters`, Source chips `origin`, counts `facet_set`, the
+header-probe chips `probe_filters` (D122: a heading "From the files (probed torrents only)"
+with audio track, subtitle track, picture, video track, HDR (probed, with *Any HDR*) and audio
+format; languages labelled from ISO 639-2/B in `Labels.kt`);
 `SearchFilters.supportedBy` drops what the server would ignore before anything is sent.
 
 **Detail** (`ui/detail`): media card (2:3 poster, facts, genres, overview, IMDb, *All releases*;
 asked once more after 4 s when the poster or overview is still missing, D42), attributes line,
 *Open magnet* / *Copy magnet*, swarm card (*Check now* = `POST …/liveness`, then the history is
 reloaded; seeders step chart drawn with Canvas from `liveness-history?days=90`, seeders =
-max(tracker, DHT estimate), unanswered points skipped), DHT card or trust card, file tree,
-trackers, tags, description, comments, other publishers. Cached for offline viewing.
+max(tracker, DHT estimate), unanswered points skipped), DHT card or trust card, *Detected*
+card (D121: `TorrentDetail.probe`, hidden when absent; one block per probed file, named from
+the shown file list by `index`: sniff description, confidence, verified / unverified, container,
+duration, bitrate, video codec and profile, resolution, fps, bit depth, HDR10 / HDR10+ / HLG /
+Dolby Vision with profile, audio tracks with language, channels, Atmos / DTS:X, subtitle
+languages, console platform, title, title / content id, region, version, warnings for
+`suspicious_executable` and `extension_mismatch`; then status, hash-check and probe age;
+ISO 639-2 names from a built-in table, `ui/detail/ProbeFormat.kt`), file tree, trackers, tags,
+description, comments, other publishers. Cached for offline viewing.
 
 **Title page** (`ui/title`): `POST /media/{id}/releases` with the Search tab's filters (no text,
 sort seeders); "N search filters apply · Show all" clears them; in-page chips for season,

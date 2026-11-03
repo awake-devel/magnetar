@@ -175,6 +175,57 @@ the app then drops `porn` hits itself). The app shows the filters a server canno
 (so they can be cleared), never offers rating sort to a server without `filters`, and falls
 back to the local cache's grouping for the title page.
 
+## Probe filters (D122)
+
+The filters above read the release **name**. Header probes (D117, docs/PROBES.md) read the
+**files**: a crawl worker fetches a few blocks of the main payload and sniff decodes its
+container. The probe filters test what that found, so only probed torrents can match them (a
+small share of the index at first: 1 924 video probes in production on 2026-11-03).
+
+| `SearchQuery` field | query string | facet | values |
+|---|---|---|---|
+| probe_languages | `probe_lang` | `probe_language` | audio track languages, ISO 639-2/B (`fre`, `eng`, `jpn`; `fr`, `fra` are accepted and normalised) |
+| probe_subtitles | `probe_sub` | `probe_subtitles` | subtitle track languages, as above |
+| probe_resolutions | `probe_res` | `probe_resolution` | `2160p` (8K included), `1080p`, `720p`, `576p`, `480p`, `sd` |
+| probe_video_codecs | `probe_codec` | `probe_codec` | FFmpeg names: `hevc`, `h264`, `av1`, `vp9`, `mpeg4`, … |
+| probe_hdr | `probe_hdr` | `probe_hdr` | `any`, `dolby_vision`, `hdr10`, `hdr10_plus`, `hlg` |
+| probe_audio | `probe_audio` | `probe_audio` | audio codecs (`truehd`, `eac3`, `dts`, `aac`, …) and `atmos`, `dts_x` |
+
+Same rules as the name filters: any value within a field, AND across fields (and with the name
+filters), disjunctive counts, `serde(default)` so older apps and saved searches send none. The
+server lists `probe_filters` in `/health` `features`; an older server would ignore the fields
+and answer unfiltered, so the app sends them (and asks for the `probe_*` facets) only to a
+server that lists it.
+
+- **"4K and up"** is `probe_resolutions: ["2160p"]` (the top class starts at 2000 lines),
+  "1080p and up" `["2160p", "1080p"]`. The class follows the main video track's height, or the
+  16:9 height of its width when larger, so a 2.39:1 UHD film (3840×1606) is `2160p` and a
+  1920×800 one `1080p`, as release names count them (rows stored before D122 were re-classed by
+  the migration from `probe_files`).
+- **`probe_hdr: ["any"]`** is any HDR format; the `probe_hdr` facet counts `any` too, so the
+  chip shows how many torrents have one.
+- **Languages are only as good as the container.** Measured on the production probes
+  (2026-11-03, before D120): audio languages on 89 % of MKV probes, 39 % of MP4, 0 % of AVI and
+  MPEG-TS / unknown containers. D120 reads every track of an MP4 whose `moov` is at the end
+  when pieces are fetched whole and reassembles a TS PMT over several packets; how far that
+  raises the MP4 and TS shares on real swarms is **UNVERIFIED**. AVI has no usable language
+  field, and many MP4 tracks are tagged `und` (docs/PROBES.md §9). A language filter therefore misses most AVI, TS and many MP4 releases; the name
+  filter (`languages`) still covers them.
+- **Empty-query browse** (D76) is off once a probe filter is set: every probed torrent is a DHT
+  find whose peers sent pieces, and most have no seed check yet, so the rule would hide nearly
+  all of them from the app's default list (no text, no source chip). Without a probe filter
+  the rule is unchanged.
+- Values come from the probe's main payload (largest probed file), as `TorrentDetail.probe`
+  shows it; they are not merged into the name filters, so "French" from the name and `fre` from
+  an audio track stay two separate choices.
+
+Where they live: the search index (`SCHEMA_VERSION` 5) has one keyword facet per field, filled
+from `probe_attrs.tags` (`a:fre`, `r:2160p`, …; `server::probes::facet_values`), and a probe
+written, replaced or removed re-indexes its torrent through the change log (triggers on
+`probe_attrs`, migration `20261108220000_probe_search.sql`). The Postgres fallback (index off or
+building) tests the same tags with `EXISTS (… probe_attrs p … p.tags && …)`. Measurements in
+ARCHITECTURE.md D122.
+
 ## Phone, offline and older servers
 
 | | no server / unreachable | server without `filters` (older) | server with `filters` |

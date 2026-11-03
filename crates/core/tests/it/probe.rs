@@ -1,7 +1,8 @@
 //! Header probes against fake peers on 127.0.0.1 (D117): blocks only on big pieces, whole
 //! verified pieces on small ones, lying peers, the surprise check, chokes with and without BEP 6,
 //! allowed-fast, `reqq`, hostile peers and the no-upload whitelist, upload mode and its caps,
-//! identity, the single hand-off connection, the byte budget, and the fetcher with probes off.
+//! identity, the single hand-off connection, the byte budget, the fetcher with probes off, and
+//! an MP4 with its `moov` at the end on whole pieces and on blocks (D120).
 //! Only the `allow_loopback` test seam differs from production; no other traffic.
 #![cfg(feature = "probe")]
 
@@ -599,4 +600,214 @@ async fn second_peer_agreement() {
     let r = probe(&t, &a, &[b.addr], cfg()).await;
     assert_eq!(label(&r), vec![("video.mkv", true)], "{r:?}");
     assert_eq!(r.files[0].notes, vec!["disagree", "surprise_verified"]);
+}
+
+// ------------------------------------------------------------------ MP4 `moov` at the end (D120)
+
+fn bx(ty: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut v = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+    v.extend_from_slice(ty);
+    v.extend_from_slice(body);
+    v
+}
+
+fn full(ty: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    bx(ty, &[&[0u8; 4][..], body].concat())
+}
+
+/// Packed ISO 639-2 code of an `mdhd`.
+fn packed(l: &str) -> u16 {
+    l.bytes().fold(0u16, |a, c| (a << 5) | u16::from(c - 0x60))
+}
+
+/// One `trak`: `tkhd`, `mdhd` (language), `hdlr`, `stsd` with `entry`, then sample tables of
+/// `table` bytes each (`stsz`, `stco`), as a muxer writes them for a long film.
+fn trak(id: u32, handler: &[u8; 4], lang: &str, entry: Vec<u8>, table: usize) -> Vec<u8> {
+    let mut tkhd = vec![0u8; 8];
+    tkhd.extend_from_slice(&id.to_be_bytes());
+    tkhd.extend_from_slice(&[0u8; 68]);
+    let mut mdhd = vec![0u8; 8];
+    mdhd.extend_from_slice(&48_000u32.to_be_bytes());
+    mdhd.extend_from_slice(&(48_000u32 * 7200).to_be_bytes());
+    mdhd.extend_from_slice(&packed(lang).to_be_bytes());
+    mdhd.extend_from_slice(&[0, 0]);
+    let hdlr = full(b"hdlr", &[&[0u8; 4][..], handler, &[0u8; 13][..]].concat());
+    let stsd = full(b"stsd", &[&1u32.to_be_bytes()[..], &entry].concat());
+    let n = (table / 4).saturating_sub(3) as u32;
+    let mut stsz = vec![0u8; 4];
+    stsz.extend_from_slice(&n.to_be_bytes());
+    stsz.resize(table, 0);
+    let mut stco = n.to_be_bytes().to_vec();
+    stco.resize(table, 0);
+    let stbl = bx(
+        b"stbl",
+        &[stsd, full(b"stsz", &stsz), full(b"stco", &stco)].concat(),
+    );
+    let minf = bx(b"minf", &stbl);
+    let mdia = bx(b"mdia", &[full(b"mdhd", &mdhd), hdlr, minf].concat());
+    bx(b"trak", &[full(b"tkhd", &tkhd), mdia].concat())
+}
+
+/// ftyp, an `mdat` of `mdat` bytes, then `moov`: an H.264 video track whose tables take
+/// `video_table` bytes each and one AAC track per language with `table` bytes each (2 h of
+/// 24 fps video: 690 KB; of 48 kHz AAC: 1.35 MB).
+fn mp4_moov_last(langs: &[&str], video_table: usize, table: usize, mdat: usize) -> Vec<u8> {
+    let ftyp = bx(b"ftyp", b"isom\0\0\x02\0isomavc1mp41");
+    let mdat = bx(b"mdat", &fill(Vec::new(), mdat));
+    let mut avc = vec![0u8; 6];
+    avc.extend_from_slice(&1u16.to_be_bytes());
+    avc.extend_from_slice(&[0u8; 16]);
+    avc.extend_from_slice(&1920u16.to_be_bytes());
+    avc.extend_from_slice(&800u16.to_be_bytes());
+    avc.resize(78, 0);
+    let mut traks = vec![trak(1, b"vide", "und", bx(b"avc1", &avc), video_table)];
+    for (i, l) in langs.iter().enumerate() {
+        let mut a = vec![0u8; 6];
+        a.extend_from_slice(&1u16.to_be_bytes());
+        a.extend_from_slice(&[0u8; 8]);
+        a.extend_from_slice(&2u16.to_be_bytes());
+        a.extend_from_slice(&16u16.to_be_bytes());
+        a.extend_from_slice(&[0u8; 4]);
+        a.extend_from_slice(&(48_000u32 << 16).to_be_bytes());
+        traks.push(trak(i as u32 + 2, b"soun", l, bx(b"mp4a", &a), table));
+    }
+    let mut mvhd = vec![0u8; 8];
+    mvhd.extend_from_slice(&1000u32.to_be_bytes());
+    mvhd.extend_from_slice(&7_200_000u32.to_be_bytes());
+    mvhd.extend_from_slice(&[0u8; 80]);
+    let moov = bx(b"moov", &[full(b"mvhd", &mvhd), traks.concat()].concat());
+    [ftyp, mdat, moov].concat()
+}
+
+fn audio_langs(r: &ProbeResult) -> Vec<Option<String>> {
+    r.files
+        .first()
+        .and_then(|f| f.detection.video.as_ref())
+        .map(|v| v.audio.iter().map(|a| a.language.clone()).collect())
+        .unwrap_or_default()
+}
+
+fn langs(l: &[&str]) -> Vec<Option<String>> {
+    l.iter().map(|s| Some(s.to_string())).collect()
+}
+
+/// D120: an MP4 whose `moov` follows a 3 MiB `mdat` (a 1.4 MiB video track, three audio
+/// tracks of 1.2 MiB), 1 MiB pieces fetched whole. Every track hop costs a piece: head, `moov`,
+/// then one per audio track, 5 MiB. Before, the 4 MiB per-file cap (also spent on the hops over
+/// the sample tables) stopped before the last audio language; the payload now has the
+/// torrent's budget and the track skeleton comes before the tables, so every language is read,
+/// verified.
+#[tokio::test]
+async fn mp4_moov_at_the_end_with_whole_pieces_reads_every_language() {
+    let data = mp4_moov_last(
+        &["eng", "fre", "spa"],
+        700 * 1024,
+        600 * 1024,
+        3 * MIB as usize,
+    );
+    let t = Torrent::new("x", vec![("Film.2024.1080p.mp4", data)], MIB);
+    let s = fs::start(t.clone(), Opts::default()).await;
+    let r = probe(&t, &s, &[], cfg()).await;
+    assert_eq!(label(&r), vec![("video.mp4", true)], "{r:?}");
+    assert_eq!(audio_langs(&r), langs(&["eng", "fre", "spa"]), "{r:?}");
+    assert_eq!(r.status, ProbeStatus::Ok, "{r:?}");
+    assert_eq!(
+        r.bytes_in,
+        5 * MIB,
+        "head, moov and one piece per audio track"
+    );
+    assert_whitelist(&s.log());
+}
+
+/// The same file with 4 MiB pieces (blocks only): the `moov` is found from the `mdat` size and
+/// walked by its headers, a few 16 KiB blocks for every language.
+#[tokio::test]
+async fn mp4_moov_at_the_end_with_blocks_costs_a_few_blocks() {
+    let data = mp4_moov_last(
+        &["eng", "fre", "spa"],
+        700 * 1024,
+        600 * 1024,
+        3 * MIB as usize,
+    );
+    let t = Torrent::new("x", vec![("Film.2024.1080p.mp4", data)], 4 * MIB);
+    let s = fs::start(t.clone(), Opts::default()).await;
+    let r = probe(&t, &s, &[], cfg()).await;
+    assert_eq!(label(&r), vec![("video.mp4", false)], "{r:?}");
+    assert_eq!(audio_langs(&r), langs(&["eng", "fre", "spa"]), "{r:?}");
+    assert_eq!(r.status, ProbeStatus::Ok, "{r:?}");
+    // The 64 KiB head, the `moov` header block (video track), the video `stco` head and one
+    // block per audio track; their tables are never hopped over (192 KiB before).
+    assert!(r.bytes_in <= 144 * KIB, "bytes {}", r.bytes_in);
+}
+
+/// D120 review: the payload's raised cap keeps the other targets' first reads. A film with six
+/// audio tracks would take the whole 8 MiB budget at 1 MiB pieces (head, `moov`, one piece per
+/// track); a 2 MiB featurette in its own pieces would then get nothing and count as missing.
+/// The payload now stops one piece short (five of six languages, incomplete) and the featurette
+/// is still read and verified.
+#[tokio::test]
+async fn mp4_payload_leaves_the_other_targets_their_first_read() {
+    let data = mp4_moov_last(
+        &["eng", "fre", "spa", "ger", "ita", "jpn"],
+        700 * 1024,
+        600 * 1024,
+        3 * MIB as usize,
+    );
+    let t = Torrent::new(
+        "x",
+        vec![
+            ("Extras/Making.Of.mkv", mkv(2 * MIB as usize)),
+            ("Film.2024.1080p.mp4", data),
+        ],
+        MIB,
+    );
+    let s = fs::start(t.clone(), Opts::default()).await;
+    let r = probe(&t, &s, &[], cfg()).await;
+    let mut got = label(&r);
+    got.sort();
+    assert_eq!(
+        got,
+        vec![("video.mkv", true), ("video.mp4", true)],
+        "both files are read: {r:?}"
+    );
+    assert!(r.bytes_in <= 8 * MIB, "bytes {}", r.bytes_in);
+    let mp4 = r.files.iter().find(|f| f.index == 1).expect("payload");
+    let n = mp4.detection.video.as_ref().map_or(0, |v| v.audio.len());
+    assert!(n >= 5, "the payload still reads most tracks: {n}");
+    assert_whitelist(&s.log());
+}
+
+/// D120 review: the surprise re-read of a second target is allowed every piece its unverified
+/// verdict read, not only the 4 MiB per-file cap. An MP4 named `.mkv` (extension mismatch) beside
+/// a film, 2 MiB pieces (blocks): its verdict read the head, the `moov` and the audio track, three
+/// pieces. With whole pieces charged at cost, a 4 MiB cap skipped the third piece and the
+/// verified re-read saw less than the verdict it confirms.
+#[tokio::test]
+async fn surprise_reread_of_a_second_target_gets_its_pieces() {
+    let clip = mp4_moov_last(&["eng"], 700 * 1024, 1200 * 1024, 3 * MIB as usize);
+    let t = Torrent::new(
+        "x",
+        vec![
+            ("Extras/Clip.mkv", clip),
+            ("Movie.2024.mkv", mkv(12 * MIB as usize)),
+        ],
+        2 * MIB,
+    );
+    let s = fs::start(t.clone(), Opts::default()).await;
+    let r = probe(&t, &s, &[], cfg()).await;
+    let clip = r.files.iter().find(|f| f.index == 0).expect("clip: {r:?}");
+    assert!(clip.detection.flags.extension_mismatch, "{r:?}");
+    assert_eq!(clip.notes, vec!["surprise_verified"], "{r:?}");
+    assert!(clip.verified, "{r:?}");
+    assert_eq!(audio_langs_of(clip), langs(&["eng"]), "{r:?}");
+    assert!(r.bytes_in <= cfg().max_bytes, "bytes {}", r.bytes_in);
+    assert_whitelist(&s.log());
+}
+
+fn audio_langs_of(f: &magnetar_core::probe::FileResult) -> Vec<Option<String>> {
+    f.detection
+        .video
+        .as_ref()
+        .map(|v| v.audio.iter().map(|a| a.language.clone()).collect())
+        .unwrap_or_default()
 }

@@ -181,6 +181,7 @@ private fun DetailBody(
         mutableStateOf(if (detail.files.size <= 30) allDirs(tree) else emptySet())
     }
     var trustOpen by remember { mutableStateOf(false) }
+    val probed = remember(detail.probe, detail.files) { probeViews(detail.probe, detail.files) }
 
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp).testTag("detail")) {
         item {
@@ -235,6 +236,9 @@ private fun DetailBody(
         if (s.origin != Origin.DHT) {
             item { TrustCard(detail.trust, threshold, trustOpen) { trustOpen = !trustOpen } }
         }
+
+        // Header probes (D121): hidden when never probed or from an older server.
+        if (detail.probe != null && probed != null) item { ProbeCard(detail.probe, probed) }
 
         item {
             SectionTitle("Infohash")

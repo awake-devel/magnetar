@@ -440,6 +440,13 @@ pub fn parse_search_query(raw: Option<&str>) -> ApiResult<SearchQuery> {
             "hdr" => push_list(&mut q.hdr, &v),
             "audio" => push_list(&mut q.audio, &v),
             "genre" => push_list(&mut q.genres, &v),
+            // D122 header-probe filters.
+            "probe_lang" => push_list(&mut q.probe_languages, &v),
+            "probe_sub" => push_list(&mut q.probe_subtitles, &v),
+            "probe_res" => push_list(&mut q.probe_resolutions, &v),
+            "probe_codec" => push_list(&mut q.probe_video_codecs, &v),
+            "probe_hdr" => push_list(&mut q.probe_hdr, &v),
+            "probe_audio" => push_list(&mut q.probe_audio, &v),
             // D51 source chip (`source` already means the release source, D44).
             "origin" => {
                 push_list(&mut q.origins, &v);

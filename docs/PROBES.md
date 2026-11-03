@@ -57,8 +57,16 @@ and shows it in the detail API (`TorrentDetail.probe`, docs/API.md).
    RAR volumes after the first and padding skipped; Blu-ray (`.mpls`, `.clpi`, `index.bdmv`
    whole plus the M2TS head) and DVD (`.IFO` whole) layouts count as one target. First read:
    64 KiB for video, 16 KiB for anything else; `sniff` asks for the rest (`NeedMore`: PS5 CNT
-   block, MP4 `moov`, ZIP central directory, …) within its caps (6 rounds, 16 ranges, 4 MiB per
-   file) and the torrent's `MAGNETAR_PROBE_MAX_BYTES`.
+   block, MP4 `moov`, ZIP central directory, …) within its caps (10 rounds, 16 ranges, 4 MiB per
+   file; a video payload, the largest file, fetched in whole pieces may use the torrent's budget
+   less the first reads of the other targets, D120) and the
+   torrent's `MAGNETAR_PROBE_MAX_BYTES`. An MP4 / MOV whose `moov` follows the `mdat` (39 % of
+   MP4 probes had audio languages in production, 2026-11-03) is found from the `mdat` size in
+   the head (32 or 64-bit), one 16 KiB block at the computed offset; when the box chain cannot
+   be followed (a wrong `mdat` size) sniff searches the last 1 MiB for it. The `moov` is walked
+   by its box headers, never fetched whole: first every track's header, `mdhd` (language),
+   `hdlr` and `stsd` (codec), then the hops over the sample tables (frame rate, first sample),
+   which audio tracks whose first frame adds nothing (AAC, Opus, FLAC, …) skip (§3 Caps).
 3. **Download** (§3), then `sniff` on each target (`Detector::analyze` / `finish`, off the async
    threads), until it needs nothing more, a cap is reached or the 45 s session ends.
 4. **Second peer.** With `MAGNETAR_PROBE_PEERS` ≥ 2, a second connection (peers that took our
@@ -85,9 +93,19 @@ and shows it in the detail API (`TorrentDetail.probe`, docs/API.md).
   `surprise_verified`; a different verified verdict wins (`surprise_changed`); no room:
   `surprise_unverified` and the result stays unverified.
 - **Caps.** Per torrent `MAGNETAR_PROBE_MAX_BYTES` (8 MiB; ~1–2 % of torrents end
-  `incomplete`), per file sniff's caps, per peer 64 requests in flight (capped by its BEP 10
-  `reqq`), 15 s unchoke wait, 10 s stall, 45 s per probe, `MAGNETAR_PROBE_PARALLEL` probes at
-  once (memory ≤ parallel × max bytes).
+  `incomplete`), per file sniff's caps (4 MiB; a video payload in whole pieces up to the torrent's budget less
+  the other targets' first-read pieces, so a long multi-track MP4 cannot starve them; the
+  surprise re-read up to the pieces its verdict read, D120),
+  per peer 64 requests in flight (capped by its BEP 10 `reqq`), 15 s unchoke wait, 10 s stall,
+  45 s per probe, `MAGNETAR_PROBE_PARALLEL` probes at once (memory ≤ parallel × max bytes).
+  With whole pieces a follow-up is charged the pieces it costs, not the bytes sniff asked for
+  (a 16-byte box header behind a 1 MiB piece costs 1 MiB), and one that does not fit what is
+  left of the file's cap is skipped; the first read always goes. Measured on the loopback fake
+  seeder (D120): a 2 h MP4 with three audio tracks and its `moov` at the end (11.2 MB of
+  tables) costs 6.7 MiB at 1 MiB pieces (all three languages; before: 4 MiB, one language),
+  4.2 MiB at 512 KiB (before: 5 MiB), 0.18 MiB with blocks (before: 0.23 MiB); single-audio
+  files with the `moov` at the end cost what they did (1.7–2.3 MiB at 1 MiB pieces,
+  0.08–0.16 MiB with blocks; iPhone, Jellyfin and remux samples).
 - **Peer protocol.** Outgoing messages are a closed type (`probe::msg::ProbeMsg`): keep-alive,
   `interested`, `not_interested`, `request`, `cancel`, `have_none`, `reject_request`, the
   extended handshake and the `ut_metadata` reject. It cannot express `unchoke`, `have`,
@@ -147,7 +165,10 @@ Why these numbers (planner cost simulation on real torrents and the check report
 
 Constants (code, `probe::ProbeConfig::default`): 15 s unchoke wait, 10 s stall, 45 s session,
 64 requests in flight, second peer after 3 s, 4 further connection attempts, 8 targets, minimum
-confidence 80, agreement slack 15, upload 4 MiB / 256 KiB/s and a 5 s linger, dicts ≤ 2 MiB.
+confidence 80, agreement slack 15, upload 4 MiB / 256 KiB/s and a 5 s linger, dicts ≤ 2 MiB,
+sniff caps per file of 10 rounds (6 before D120: an MP4 asks its track skeleton before its
+sample tables, a 2 h film with four tracks takes 9), 16 ranges and 4 MiB (a video payload in whole
+pieces: the torrent's budget less the other targets' first reads).
 
 ## 6. What is stored and shown
 
@@ -182,9 +203,12 @@ Tables (migration `20261105000000_probes.sql`):
   `x:atmos`). About 1 GB per million probes (storage report, S4).
 - `probe_files`: the per-file JSON (`[ProbeFile]`).
 
-No GIN index on `tags` and no search-index trigger yet: with `ORDER BY probed_at LIMIT` a tags
-GIN collapses to a full scan on rare mixes (check1 #3); facets go to the search index when
-filters are built. Detail API: `TorrentDetail.probe` with each file's path from the server's own
+No GIN index on `tags`: with `ORDER BY probed_at LIMIT` a tags GIN collapses to a full scan on
+rare mixes (check1 #3). Since D122 the tags are search-index facets (`probe_language`,
+`probe_subtitles`, `probe_resolution`, `probe_codec`, `probe_hdr`, `probe_audio`; filters in
+docs/FILTERS.md "Probe filters"), and `probe_attrs` writes re-index their torrent through the
+change log (migration `20261108220000_probe_search.sql`, which also re-classed `r:` from the
+width: a 3840×1606 film is `r:2160p`). Detail API: `TorrentDetail.probe` with each file's path from the server's own
 list and the label's description (docs/API.md), adult torrents included (D119). File indexes point into the `files` the detail returns: on a torrent with a Nostr
 event that is the event's list, so each probed file is matched to it by path (with or without
 the torrent's root folder) and size; a file not in that list is left out. After a worker token leak: `DELETE FROM probe_attrs WHERE supplied_by = '<name>'`
@@ -266,12 +290,22 @@ no_pieces / failed, skipped by reason, bytes in, uploaded, verified files, surpr
   how often real clients unchoke a peer that has nothing (`HAVE_NONE`), anti-leech bans,
   whether clients accept `HAVE_NONE` before the extended handshake, whether the Fast bit changes
   metadata success, real bytes and packets per probe on eee and the Pi, Pi SHA-1 speed.
-- No search filters on probe results (tags, facets in the search index), no app screen: the
-  Android `TorrentDetail` has no `probe` field yet, its JSON decoder drops the key
-  (`ignoreUnknownKeys`).
+- Search filters and filter-sheet chips on probe results are built (D122); the Android detail
+  shows the probe as a "Detected" card (D121, docs/APP.md).
 - v2-only piece checks (BEP 52 Merkle proofs) are not built: hybrid torrents are checked with
   their v1 piece hashes.
 - uTP peers are not reached (TCP only, as the metadata fetcher).
+- **Where languages are absent (D120).** AVI has none: `strh.wLanguage` is 0 in what we hold
+  and FFmpeg ignores it; `strn` is a free-form name; the `INFO` list (`ILNG`, `IAS1`…) is
+  rarely written. MPEG-TS carries them in the PMT (ISO 639 descriptor 0x0A, read; a PMT over
+  several packets is now reassembled), but Blu-ray M2TS has none there (the demo M2TS files
+  held here: none): a disc's languages are in the `.clpi` / `.mpls` stream tables, which are
+  fetched for BDMV layouts but not parsed yet. MPEG-PS (`.mpg`, `.vob`), FLV, ASF / WMV and
+  OGV have no recon parser, so their probe has no container or tracks (the "unknown" row);
+  DVD languages are in the `.IFO`, not parsed either. An MP4 track tagged `und` (FFmpeg's
+  default when the source has no tag) has no language by design. How the 61 % of MP4 probes
+  without audio languages split between `und` tracks, whole-piece budget cuts (fixed by D120)
+  and peers that lack the tail pieces is **UNVERIFIED** (production rows not re-read here).
 
 ## 10. Backfill (D118)
 

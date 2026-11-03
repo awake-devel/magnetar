@@ -30,6 +30,13 @@ val FILTER_OPTIONS: Map<String, List<String>> = mapOf(
         "pcm", "alac", "vorbis", "dsd",
     ),
     "media_kind" to listOf("movie", "series", "anime"),
+    // Header probes (D122): codes as the server stores them (docs/FILTERS.md "Probe filters").
+    "probe_language" to listOf("fre", "eng", "jpn", "spa", "ger", "ita"),
+    "probe_subtitles" to listOf("fre", "eng", "spa", "ger"),
+    "probe_resolution" to listOf("2160p", "1080p", "720p", "576p", "480p", "sd"),
+    "probe_codec" to listOf("hevc", "h264", "av1", "vp9"),
+    "probe_hdr" to listOf("any", "dolby_vision", "hdr10_plus", "hdr10", "hlg"),
+    "probe_audio" to listOf("atmos", "dts_x", "truehd", "dts", "eac3", "ac3", "aac", "flac", "opus"),
 )
 
 private val FIXED_LABELS: Map<String, String> = mapOf(
@@ -79,7 +86,56 @@ private val FIXED_LABELS: Map<String, String> = mapOf(
     "subtitles/multi" to "Multi-subs",
     "origin/nostr" to "Nostr",
     "origin/dht" to "DHT",
+    // Header-probe values (D122; app-side labels, no Rust counterpart).
+    "probe_resolution/2160p" to "2160p (4K and up)",
+    "probe_resolution/sd" to "SD",
+    "probe_codec/hevc" to "H.265/HEVC",
+    "probe_codec/h264" to "H.264/AVC",
+    "probe_codec/av1" to "AV1",
+    "probe_codec/vp9" to "VP9",
+    "probe_codec/vp8" to "VP8",
+    "probe_codec/mpeg4" to "MPEG-4 (XviD/DivX)",
+    "probe_codec/mpeg2video" to "MPEG-2",
+    "probe_codec/vc1" to "VC-1",
+    "probe_hdr/any" to "Any HDR",
+    "probe_hdr/dolby_vision" to "Dolby Vision",
+    "probe_hdr/hdr10_plus" to "HDR10+",
+    "probe_hdr/hdr10" to "HDR10",
+    "probe_hdr/hlg" to "HLG",
+    "probe_audio/atmos" to "Atmos",
+    "probe_audio/dts_x" to "DTS:X",
+    "probe_audio/truehd" to "TrueHD",
+    "probe_audio/mlp" to "MLP",
+    "probe_audio/dts" to "DTS",
+    "probe_audio/dtsuhd" to "DTS-UHD",
+    "probe_audio/eac3" to "DD+ (E-AC-3)",
+    "probe_audio/ac3" to "DD (AC-3)",
+    "probe_audio/aac" to "AAC",
+    "probe_audio/flac" to "FLAC",
+    "probe_audio/opus" to "Opus",
+    "probe_audio/mp3" to "MP3",
+    "probe_audio/mp2" to "MP2",
+    "probe_audio/vorbis" to "Vorbis",
+    "probe_audio/pcm" to "PCM",
 )
+
+/** ISO 639-2/B codes the probes store (D117) → names; others show upper-cased. */
+private val ISO639B_LABELS: Map<String, String> = mapOf(
+    "eng" to "English", "fre" to "French", "ger" to "German", "spa" to "Spanish", "ita" to "Italian",
+    "por" to "Portuguese", "rus" to "Russian", "jpn" to "Japanese", "chi" to "Chinese", "kor" to "Korean",
+    "ara" to "Arabic", "dut" to "Dutch", "swe" to "Swedish", "nor" to "Norwegian", "nob" to "Norwegian Bokmål",
+    "dan" to "Danish", "fin" to "Finnish", "pol" to "Polish", "cze" to "Czech", "slo" to "Slovak",
+    "hun" to "Hungarian", "rum" to "Romanian", "bul" to "Bulgarian", "gre" to "Greek", "tur" to "Turkish",
+    "heb" to "Hebrew", "hin" to "Hindi", "tha" to "Thai", "vie" to "Vietnamese", "ind" to "Indonesian",
+    "may" to "Malay", "ukr" to "Ukrainian", "hrv" to "Croatian", "srp" to "Serbian", "slv" to "Slovenian",
+    "est" to "Estonian", "lav" to "Latvian", "lit" to "Lithuanian", "per" to "Persian", "ice" to "Icelandic",
+    "cat" to "Catalan", "baq" to "Basque", "glg" to "Galician", "tam" to "Tamil", "tel" to "Telugu",
+    "ben" to "Bengali", "urd" to "Urdu", "fil" to "Filipino", "tgl" to "Tagalog", "mal" to "Malayalam",
+    "kan" to "Kannada", "lat" to "Latin",
+)
+
+/** A probe's track language (ISO 639-2/B): "fre" → "French". */
+fun iso639bLabel(code: String): String = ISO639B_LABELS[code] ?: code.uppercase()
 
 private val LANGUAGE_LABELS: Map<String, String> = mapOf(
     "multi-vff" to "MULTi (VFF)",
@@ -142,6 +198,7 @@ fun facetLabel(field: String, value: String): String {
         "genre", "edition" -> value.replaceFirstChar { it.uppercaseChar() }
         "format" -> value.uppercase()
         "category" -> categoryLabel(value)
+        "probe_language", "probe_subtitles" -> iso639bLabel(value)
         else -> value
     }
 }

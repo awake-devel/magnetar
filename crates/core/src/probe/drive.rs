@@ -312,7 +312,8 @@ impl Session<'_> {
                 break;
             }
             let whole = self.layout.piece_length <= self.cfg.whole_piece_max;
-            let s = self.sniff_file(t, whole).await;
+            let cap = self.file_cap(t, whole, &targets[n + 1..]);
+            let s = self.sniff_file(t, whole, cap).await;
             let Some(mut d) = s.detection else {
                 missing += 1;
                 continue;
@@ -347,7 +348,10 @@ impl Session<'_> {
                 // Whole pieces under every range the verdict read, within the budget left.
                 let cost: u64 = self.surprise_cost(t.file, &s.known);
                 if cost <= self.budget_left() && !self.out_of_time() {
-                    let v = self.sniff_file(t, true).await;
+                    // The verified re-read may fetch every piece the verdict read, even when
+                    // they cost more than the per-file cap once whole (D120).
+                    let cap = self.cfg.caps.max_bytes.max(cost);
+                    let v = self.sniff_file(t, true, cap).await;
                     match v.detection {
                         Some(vd)
                             if !vd.flags.unverified && vd.confidence >= self.cfg.min_confidence =>
@@ -520,8 +524,41 @@ impl Session<'_> {
         }
     }
 
+    /// Piece bytes one target may use: sniff's per-file cap, or for a video payload (the
+    /// largest file, always the first target) fetched in whole pieces, the torrent's budget
+    /// less the first reads of the other targets (D120). An MP4 / MOV with its `moov` at the
+    /// end costs, with whole pieces, the head piece plus one piece per track hop (a 2 h film
+    /// with three audio tracks: 5 MiB at 1 MiB pieces), which a 4 MiB cap cut after the first
+    /// audio track. Blocks cost a few 16 KiB reads, and other formats keep the per-file cap.
+    fn file_cap(&self, t: &Target, whole: bool, rest: &[Target]) -> u64 {
+        let per_file = self.cfg.caps.max_bytes;
+        if !(whole && t.priority == plan::PAYLOAD && t.kind == plan::Kind::Video) {
+            return per_file;
+        }
+        let mut pieces = HashSet::new();
+        for r in rest {
+            let off = self.layout.offsets[r.file];
+            for x in &r.initial {
+                pieces.extend(
+                    pieces_for(
+                        off + x.offset,
+                        x.len,
+                        self.layout.piece_length,
+                        self.layout.total,
+                    )
+                    .filter(|p| !self.verified.contains_key(p)),
+                );
+            }
+        }
+        let reserve: u64 = pieces
+            .iter()
+            .filter_map(|p| self.layout.piece_len(*p))
+            .sum();
+        per_file.max(self.budget_left().saturating_sub(reserve))
+    }
+
     /// Sniff one target: first read, then sniff's follow-ups, within the per-file caps.
-    async fn sniff_file(&mut self, t: &Target, whole: bool) -> Sniffed {
+    async fn sniff_file(&mut self, t: &Target, whole: bool, cap: u64) -> Sniffed {
         let off = self.layout.offsets[t.file];
         let size = self.layout.sizes[t.file];
         let caps = self.caps_for(t);
@@ -532,16 +569,46 @@ impl Session<'_> {
         let mut first = None;
         let mut contributors = HashSet::new();
         loop {
-            // Per-file byte cap: what is left of it, range by range.
-            let mut room = caps.max_bytes.saturating_sub(file.known_bytes());
+            // Per-file byte cap: what is left of it, range by range. Whole pieces are charged
+            // what they cost (D120): a 16-byte box header behind a 1 MiB piece costs 1 MiB, and
+            // a follow-up that does not fit is skipped, so a later, cheaper one still can.
+            let mut room = cap.saturating_sub(file.known_bytes());
             let mut blocks = Vec::new();
             let mut seen = HashSet::new();
+            let mut charged = HashSet::new();
             for r in ranges.iter().take(caps.max_ranges) {
-                let len = r.len.min(caps.max_range).min(room);
+                let len = if whole {
+                    r.len.min(caps.max_range)
+                } else {
+                    r.len.min(caps.max_range).min(room)
+                };
                 if len == 0 {
                     continue;
                 }
-                room -= len;
+                if whole {
+                    let cost: u64 = pieces_for(
+                        off + r.offset,
+                        len,
+                        self.layout.piece_length,
+                        self.layout.total,
+                    )
+                    .filter(|p| !self.verified.contains_key(p) && !charged.contains(p))
+                    .filter_map(|p| self.layout.piece_len(p))
+                    .sum();
+                    // The first read always goes (a piece may be longer than the cap).
+                    if rounds > 0 && cost > room {
+                        continue;
+                    }
+                    charged.extend(pieces_for(
+                        off + r.offset,
+                        len,
+                        self.layout.piece_length,
+                        self.layout.total,
+                    ));
+                    room = room.saturating_sub(cost);
+                } else {
+                    room -= len;
+                }
                 for b in blocks_for(
                     off + r.offset,
                     len,
@@ -583,7 +650,7 @@ impl Session<'_> {
             if a.need.is_empty()
                 || !grown
                 || rounds >= caps.rounds
-                || file.known_bytes() >= caps.max_bytes
+                || file.known_bytes() >= cap
                 || self.out_of_time()
                 || self.budget_left() == 0
             {

@@ -28,6 +28,8 @@ pub const VIDEO_HEAD: u64 = 64 * 1024;
 pub const HEAD: u64 = 16 * 1024;
 /// Largest disc metadata file (`.mpls`, `.clpi`, `.ifo`, `index.bdmv`) read whole.
 pub const DISC_META_MAX: u64 = 256 * 1024;
+/// Priority of the payload, the largest file of the torrent (always a target).
+pub const PAYLOAD: u8 = 12;
 /// Most disc metadata files read per torrent (they count as one target together).
 pub const DISC_META_FILES: usize = 40;
 
@@ -219,7 +221,7 @@ pub fn plan(files: &[PlanFile<'_>], max_targets: usize) -> Vec<Target> {
         }
         let mut pri = priority(kind);
         if is_largest {
-            pri = 12;
+            pri = PAYLOAD;
         }
         let dir = lower.rsplit_once('/').map_or("", |(d, _)| d);
         cands.push(Cand {
@@ -249,7 +251,7 @@ pub fn plan(files: &[PlanFile<'_>], max_targets: usize) -> Vec<Target> {
         let mut it = g.into_iter().enumerate();
         // The largest file of the torrent stays even when a group would drop it.
         for (i, c) in &mut it {
-            if i == 0 || (!one && i == median) || c.pri == 12 {
+            if i == 0 || (!one && i == median) || c.pri == PAYLOAD {
                 keep.push(c);
             }
         }

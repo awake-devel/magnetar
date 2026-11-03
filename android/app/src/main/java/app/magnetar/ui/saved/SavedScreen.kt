@@ -134,6 +134,15 @@ fun describe(q: SearchQuery): String = buildList {
     for ((field, values) in lists) {
         if (values.isNotEmpty()) add(values.joinToString("/") { facetLabel(field, it) })
     }
+    // Header-probe filters (D122): what the files themselves hold, kept apart from the name's.
+    val probes = listOf(
+        "probe_language" to q.probeLanguages, "probe_subtitles" to q.probeSubtitles,
+        "probe_resolution" to q.probeResolutions, "probe_codec" to q.probeVideoCodecs,
+        "probe_hdr" to q.probeHdr, "probe_audio" to q.probeAudio,
+    ).filter { it.second.isNotEmpty() }
+    if (probes.isNotEmpty()) {
+        add("files: " + probes.joinToString(", ") { (field, values) -> values.joinToString("/") { facetLabel(field, it) } })
+    }
     q.minRating?.let { add(formatRating(it).replace("★ ", "★ ≥ ")) }
     when {
         q.minYear != null && q.maxYear != null -> add("${q.minYear}–${q.maxYear}")

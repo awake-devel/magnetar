@@ -40,6 +40,7 @@ object Features {
     const val BROWSE_CHECKED_DHT = "browse_checked_dht"
     const val CRAWL_SOURCES = "crawl_sources"
     const val CRAWL_MAP = "crawl_map"
+    const val PROBE_FILTERS = "probe_filters"
     const val WORKERS = "workers"
 }
 
@@ -119,6 +120,17 @@ data class SearchQuery(
     @SerialName("max_year") val maxYear: Int? = null,
     /** Source chips (D51): `nostr`, `dht`; empty = every source. */
     val origins: List<String> = emptyList(),
+    /**
+     * Header-probe filters (D122, `Features.PROBE_FILTERS`): what a probe read from the files.
+     * Languages ISO 639-2/B (`fre`, `eng`), resolution classes, FFmpeg codec names, HDR
+     * (`any`, `dolby_vision`, …), audio codecs plus `atmos` / `dts_x`.
+     */
+    @SerialName("probe_languages") val probeLanguages: List<String> = emptyList(),
+    @SerialName("probe_subtitles") val probeSubtitles: List<String> = emptyList(),
+    @SerialName("probe_resolutions") val probeResolutions: List<String> = emptyList(),
+    @SerialName("probe_video_codecs") val probeVideoCodecs: List<String> = emptyList(),
+    @SerialName("probe_hdr") val probeHdr: List<String> = emptyList(),
+    @SerialName("probe_audio") val probeAudio: List<String> = emptyList(),
 ) {
     companion object {
         const val DEFAULT_LIMIT = 50
@@ -382,7 +394,92 @@ data class TorrentDetail(
     val comments: List<Comment> = emptyList(),
     val media: MediaInfo? = null,
     val dht: DhtInfo? = null,
+    /** Header-probe results (D117, D121); null when never probed or from an older server. */
+    val probe: ProbeInfo? = null,
 )
+
+/**
+ * What a crawl worker's header probe read from the files themselves (D117, docs/API.md
+ * "Header probes"). Every field has a default: a newer or partial answer never fails the page.
+ */
+@Serializable
+data class ProbeInfo(
+    val version: Int = 0,
+    @SerialName("probed_at") val probedAt: Long = 0,
+    /** `ok` (every target file read to the end) or `partial`. */
+    val status: String = "",
+    /** Every listed result was read from hash-checked pieces. */
+    val verified: Boolean = false,
+    val files: List<ProbeFileInfo> = emptyList(),
+)
+
+@Serializable
+data class ProbeFileInfo(
+    /** Index into [TorrentDetail.files] of the same detail. */
+    val index: Int = 0,
+    val path: String = "",
+    val size: Long = 0,
+    /** sniff label id (`video.mkv`, `game.ps5.pkg`, `exe.pe`, …). */
+    val label: String = "",
+    val description: String = "",
+    val confidence: Int = 0,
+    val verified: Boolean = false,
+    val flags: List<String> = emptyList(),
+    val game: ProbeGame? = null,
+    val video: ProbeVideo? = null,
+)
+
+@Serializable
+data class ProbeGame(
+    val platform: String = "",
+    val kind: String? = null,
+    val format: String? = null,
+    @SerialName("title_id") val titleId: String? = null,
+    @SerialName("content_id") val contentId: String? = null,
+    @SerialName("db_id") val dbId: String? = null,
+    val title: String? = null,
+    val version: String? = null,
+    val region: String? = null,
+)
+
+@Serializable
+data class ProbeVideo(
+    val container: String = "",
+    @SerialName("duration_ms") val durationMs: Long? = null,
+    @SerialName("bitrate_kbps") val bitrateKbps: Long? = null,
+    val video: List<ProbeVideoTrack> = emptyList(),
+    val audio: List<ProbeAudioTrack> = emptyList(),
+    val subs: List<ProbeSubTrack> = emptyList(),
+)
+
+@Serializable
+data class ProbeVideoTrack(
+    val codec: String = "",
+    val profile: String? = null,
+    val width: Int? = null,
+    val height: Int? = null,
+    /** Frames per second × 1000. */
+    @SerialName("fps_milli") val fpsMilli: Int? = null,
+    @SerialName("bit_depth") val bitDepth: Int? = null,
+    /** `hdr10`, `hdr10_plus`, `hlg`, `dolby_vision`. */
+    val hdr: List<String> = emptyList(),
+    /** Dolby Vision profile and base-layer compatibility id (D121); older servers send none. */
+    @SerialName("dv_profile") val dvProfile: Int? = null,
+    @SerialName("dv_compat") val dvCompat: Int? = null,
+)
+
+@Serializable
+data class ProbeAudioTrack(
+    val codec: String = "",
+    val channels: Int? = null,
+    /** ISO 639-2/B lowercase (`eng`, `fre`, `ger`). */
+    val lang: String? = null,
+    val atmos: Boolean = false,
+    @SerialName("dts_x") val dtsX: Boolean = false,
+)
+
+@Serializable
+data class ProbeSubTrack(val codec: String = "", val lang: String? = null)
 
 @Serializable
 data class LivenessPoint(

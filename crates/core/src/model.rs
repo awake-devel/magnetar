@@ -607,6 +607,14 @@ pub struct ProbeVideoTrack {
     /// `hdr10`, `hdr10_plus`, `hlg`, `dolby_vision`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub hdr: Vec<String>,
+    /// Dolby Vision profile (`5`, `7`, `8`, ...) from the configuration record, only with
+    /// `dolby_vision` in `hdr` (D121). Workers older than D121 send none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dv_profile: Option<u8>,
+    /// Dolby Vision base-layer compatibility id (profile 8: `1` HDR10, `2` SDR, `4` HLG),
+    /// so the app can say "8.1" (D121).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dv_compat: Option<u8>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

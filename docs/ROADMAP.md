@@ -28,13 +28,13 @@ Status: the detector is done (D116, `crates/sniff`: file types by content, conso
 video and audio recon from sparse byte ranges). (C) is built (D117, docs/PROBES.md): the probe
 engine on the workers (piece planner, message whitelist, streaming SHA-1, the opt-in upload
 below), results uploaded with the dict and stored in `probe_attrs` / `probe_files`, shown in
-the detail API. Left:
+the detail API and the app's "Detected" card (D121), searchable (D122). Left:
 - **next: the eee trial** with both upload settings (off, then on), under the router
   watchdog, measuring unchoke share, bytes and packets per probe, verified share and peer
   reactions; then the Pi. That is how the production switch (user decision: on) is
   recommended to happen, docs/PROBES.md §8;
-- probe facets in the search index and filters (`tags`), a VPN check (the backfill of rows
-  stored before C and of Nostr-only rows is built: D118, docs/PROBES.md §10);
+- a VPN check (the backfill of rows stored before C and of Nostr-only rows is built: D118,
+  docs/PROBES.md §10; the probe search filters and facets too: D122, docs/FILTERS.md);
 - (D) games enrichment keyed by the ids `sniff` reads (GameTDB files after GameTDB answers
   about automated downloads; Wikidata).
 

@@ -193,7 +193,9 @@ follow the worker crawler's metadata fetches, so they also need `MAGNETAR_DHT`.
 
 Fixed (docs/PROBES.md §5): 15 s unchoke wait, 10 s stall, 45 s per probe, 64 requests in flight
 (capped by the peer's `reqq`), 8 target files, sniff caps per file (16 KiB first read, 64 KiB
-for video, 6 rounds, 4 MiB), dicts over 2 MiB not probed, upload 4 MiB and 256 KiB/s per probe.
+for video, 10 rounds, 4 MiB; a video payload in whole pieces up to `MAGNETAR_PROBE_MAX_BYTES` less the other targets'
+first reads, D120), dicts over
+2 MiB not probed, upload 4 MiB and 256 KiB/s per probe.
 
 ### Built-in seed relays (ARCHITECTURE.md §9)
 

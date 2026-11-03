@@ -27,7 +27,7 @@ enums in `snake_case`). Checked for the app rebuild in 2026-10 (D77).
 |---|---|---|
 | Search / browse | `GET /api/v1/search?q=…` or `POST /api/v1/search` (`SearchQuery`) | `SearchPage {hits, total, source, total_is_lower_bound}`. Query string: `q, cat, min_size, max_size, since, until, min_seeders, hide_dead, min_trust, sort (relevance/date/size/seeders/rating), desc, limit (≤ 200), offset (≤ 10 000, else 400 `invalid`, D110), lang, sub, res, source, codec, hdr, audio, genre, kind, min_rating, min_year, max_year, origin (nostr,dht), adult=1`. `min_trust` omitted = the server's threshold. |
 | Adult switch (off by default) | `adult=1` / `"include_adult": true` on every search, facet, breakdown, releases and saved-search poll | Adult torrents are hidden, never deleted (D52, D70). Selecting category `porn` also shows them. |
-| Empty-query browse | same | D76: no text and no source filter → DHT-only torrents only once a seed check found peers. Text searches and `origin=dht` list every DHT result. |
+| Empty-query browse | same | D76: no text and no source filter → DHT-only torrents only once a seed check found peers. Text searches, `origin=dht` and any `probe_*` filter (D122) list every DHT result. |
 | Result row | `TorrentSummary` | `title, category, total_size, file_count, created_at, seeders, leechers, dead, best_peers` (max of tracker seeders and DHT peer estimate; show this when `seeders` is null), `trust, publisher_count, origin (nostr/dht/both), media_title, media_year, media_kind, media_id, media_rating, attrs` (resolution, languages, …), `matched_file`. |
 | Filter sheet counts | `POST /api/v1/facets` (`{query, fields, size}`) or `GET /api/v1/facets?field=…` | Disjunctive counts (docs/FILTERS.md); 503 while the index builds. |
 | Detail | `GET /api/v1/torrents/{infohash}` | `TorrentDetail`: summary, `magnet` (ready to hand to a torrent app), files, description, events, comments, trackers, `trust` (score + factors), `media` (`MediaInfo` incl. `poster`), `dht` (`DhtInfo` for DHT rows), `probe` (`ProbeInfo`, header-probe results, absent when never probed; see below). 404 unknown. |
@@ -106,8 +106,7 @@ server's queue, absent without workers).
 
 `TorrentDetail.probe` (absent when the torrent was never probed; adult and BEP 27 private
 torrents are probed too since D119, while older servers hid it on adult ones; older servers
-never send it; the Android app does not read it yet, its decoder
-ignores unknown keys):
+never send it; the Android app shows it as the detail's "Detected" card since D121):
 
 ```json
 "probe": {
@@ -118,7 +117,7 @@ ignores unknown keys):
     "flags": ["agreed"],
     "video": {"container": "matroska", "duration_ms": 7200000,
               "video": [{"codec": "hevc", "width": 3840, "height": 2160, "bit_depth": 10,
-                         "hdr": ["dolby_vision", "hdr10"]}],
+                         "hdr": ["dolby_vision", "hdr10"], "dv_profile": 8, "dv_compat": 1}],
               "audio": [{"codec": "eac3", "channels": 6, "lang": "fre", "atmos": true}],
               "subs": [{"codec": "subrip", "lang": "eng"}]}
   }]
@@ -136,9 +135,17 @@ ignores unknown keys):
   `surprise_changed`, `surprise_unverified`.
 - `game` (console files): `platform` (`ps5`, `switch`, …), `kind`, `format`, `title_id`,
   `content_id`, `db_id`, `title`, `version`, `region`.
+- `video[].dv_profile` / `dv_compat` (D121): the Dolby Vision profile and base-layer
+  compatibility id (profile 8: 1 HDR10, 2 SDR, 4 HLG) from the configuration record, only with
+  `dolby_vision` in `hdr`; probes stored by workers older than D121 have neither.
 - Languages are ISO 639-2/B lowercase. Every optional field is left out when unknown.
 
-No search filter on probe results yet (docs/ROADMAP.md).
+Search filters on probe results (D122, `features` lists `probe_filters`): `SearchQuery`
+`probe_languages`, `probe_subtitles`, `probe_resolutions`, `probe_video_codecs`, `probe_hdr`,
+`probe_audio` (query string `probe_lang`, `probe_sub`, `probe_res`, `probe_codec`, `probe_hdr`,
+`probe_audio`) and the facets `probe_language`, `probe_subtitles`, `probe_resolution`,
+`probe_codec`, `probe_hdr` (with `any`), `probe_audio` in `POST /api/v1/facets`; values and
+rules in docs/FILTERS.md "Probe filters". All optional: older clients send none.
 
 ## Not in the API (phone-local by design)
 
