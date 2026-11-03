@@ -506,4 +506,43 @@ data class FleetStats(
     val workers: List<WorkerStats> = emptyList(),
     /** None without workers or from an older server. */
     @SerialName("probe_backfill") val probeBackfill: ProbeBackfillStats? = null,
+    /** Detector accuracy from the user's track corrections (D130); null from older servers. */
+    @SerialName("probe_corrections") val probeCorrections: ProbeCorrectionStats? = null,
 )
+
+/** `StatsResponse.probe_corrections` (D130, docs/PROBES.md §12): counted on the snapshots. */
+@Serializable
+data class ProbeCorrectionStats(
+    /** Corrections on detected tracks. */
+    val tracks: Long = 0,
+    /** "Matches VLC", corrected, "doesn't exist". */
+    val checked: Long = 0,
+    val corrected: Long = 0,
+    val removed: Long = 0,
+    /** Tracks the probe missed. */
+    val added: Long = 0,
+    val languages: ProbeLangAccuracy = ProbeLangAccuracy(),
+    @SerialName("names_changed") val namesChanged: Long = 0,
+    /** Most wrong first. */
+    val kinds: List<ProbeKindAccuracy> = emptyList(),
+    /** Kinds the user added, most first. */
+    val missed: List<ProbeKindMissed> = emptyList(),
+    val at: Long = 0,
+)
+
+@Serializable
+data class ProbeLangAccuracy(val checked: Long = 0, val wrong: Long = 0, val filled: Long = 0)
+
+@Serializable
+data class ProbeKindAccuracy(
+    /** `audio` or `sub`. */
+    val track: String = "",
+    val kind: String = "",
+    /** `name` (track-name classifier) or `flags` (container or bitstream). */
+    val source: String = "",
+    val checked: Long = 0,
+    val wrong: Long = 0,
+)
+
+@Serializable
+data class ProbeKindMissed(val track: String = "", val kind: String = "", val count: Long = 0)

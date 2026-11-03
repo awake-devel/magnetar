@@ -113,6 +113,7 @@ Routes: `search`, `saved`, `stats`, `settings` (tabs); `torrent/{infohash}`, `ti
 | Filter sheet counts | `POST /api/v1/facets` `{query, fields, size}` (disjunctive) | `facet_set` |
 | Sort | `SearchQuery.sort` + `descending` (`rating` needs `filters`) | — |
 | Torrent detail | `GET /api/v1/torrents/{infohash}` (`TorrentDetail`: magnet, files, media + poster path, trust factors, DHT info, header probe (D121)) | — |
+| Track corrections (D131) | `POST /api/v1/torrents/{infohash}/probe/corrections` `{device: "android", items}`, `DELETE /api/v1/torrents/{infohash}/probe/corrections/{id}`; both answer the effective `ProbeInfo` | `probe_corrections` |
 | Poster | `GET /api/v1/media/{id}/poster` (bearer, ETag) | — |
 | Check now | `POST /api/v1/torrents/{infohash}/liveness` | — |
 | Seeder history chart | `GET /api/v1/torrents/{infohash}/liveness-history?days=90` | `liveness_history` |
@@ -126,7 +127,7 @@ Routes: `search`, `saved`, `stats`, `settings` (tabs); `torrent/{infohash}`, `ti
 | Web of trust / relays graphs | `GET /api/v1/graphs/wot`, `GET /api/v1/graphs/relays` | `graphs` |
 | Stats "Where discoveries come from" | `GET /api/v1/stats/sources` | `crawl_sources` |
 | Crawl map | `GET /api/v1/stats/map?layer=dht\|nostr&window=day\|all` | `crawl_map` |
-| Stats "Header probes" (workers, probe backfill) | `GET /api/v1/stats` (`workers`, `probe_backfill` only) | `workers` |
+| Stats "Header probes" (workers, probe backfill, your corrections) | `GET /api/v1/stats` (`workers`, `probe_backfill`, `probe_corrections` only) | `workers` |
 | Settings trust root + threshold | `GET` / `PUT /api/v1/settings/trust` `{root, threshold}` | — |
 
 A query that uses a feature-gated field (release filters, rating sort, source chips) is never
@@ -350,12 +351,78 @@ alternate mix), one line per distinct subtitle track with language, kinds and fo
 ("Subtitle: English · SDH · PGS", "Subtitle: unknown · CC · CEA-608", identical tracks grouped
 as "Subtitle: French · SRT ×2", at most 10 lines then "Subtitles: N more tracks"; kinds in the
 order forced, SDH, CC, signs & songs, commentary, descriptions, honorifics, bilingual, easy
-reader; unknown kinds last, as words); the track `name` the probe stores is never shown (free
-text from peers) and v1 probes carry no kinds (tests: `ProbeFormatTest`, `SearchModelTest`,
+reader; unknown kinds last, as words); the track `name` the probe stores was not shown until
+D131 (free text from peers; shown since, as VLC shows it, see *Track corrections* below) and v1
+probes carry no kinds (tests: `ProbeFormatTest`, `SearchModelTest`,
 `SearchViewModelTest`, `ScreensViewModelTest`; UNVERIFIED on a device); console platform, title, title / content id, region, version, warnings for
 `suspicious_executable` and `extension_mismatch`; then status, hash-check and probe age;
 ISO 639-2 names from a built-in table, `ui/detail/ProbeFormat.kt`), file tree, trackers, tags,
 description, comments, other publishers. Cached for offline viewing.
+
+**Track corrections** (D128–D131, docs/PROBES.md §12, docs/API.md; `ui/detail/ProbeCorrection.kt`
+pure, `ProbeCard.kt` UI). Only with `probe_corrections` in `/health`; without it the card is the
+D126 one above. Each probed video file then shows its container and video lines, one row per
+audio track, then one per subtitle track, **instead of** the "Audio:" lines and the grouped
+subtitle lines:
+
+- Row text: "Track {pos+1} · {language or "unknown language"} · {codec}{ channels} · {Dolby Atmos /
+  DTS:X} · {kinds}" for audio, "Track {pos+1} · {language} · {kinds} · {codec}" for subtitles
+  (codec last, as before). `pos` is the 0-based stored position the server sends, so the number is
+  VLC's (same container order; exceptions in docs/PROBES.md §12, **UNVERIFIED** per container).
+  A track the user added reads "Added · …" (no codec) and is marked *added by you*. The name, when
+  there is one, is a second line in quotes, without bidi controls.
+- Markers: *corrected* (the fix has `fields`), *✓ matches VLC* (a check), *not in the file* (the
+  row struck through: removed tracks stay in the list and leave search). A correction the probe
+  changed under (`review`) adds "⚠ The probe changed since you checked this track", or, on an
+  added track, "⚠ The probe now lists a different number of tracks: check this added track".
+- A corrected row has *Show detected* / *Hide detected*: "Detected: …", the current detection
+  (`fix.detected`) told by the same formatter.
+- Each row (and its edit button, "Edit audio track 2", "Edit added subtitle track") opens the
+  editor. More than 10 subtitle rows: the first 10, then *Show all N subtitle tracks*.
+- Per file: *Add a track the probe missed*, and *All tracks match VLC* while a detected track has
+  no correction (one `set: []` item per such track; snackbar "Marked N tracks as checked").
+- Under the files: "Corrections that no longer match the probe" (`ProbeInfo.unplaced`): "Movie.mkv:
+  subtitle track 4 (was English · SDH · PGS): kinds CC", or "…: the file is no longer probed",
+  each with *Remove* (the DELETE).
+
+The editor is a bottom sheet titled "Audio track N", "Subtitle track N", "Added … track" or "Add a
+track the probe missed", with the hint "Compare with VLC's Audio Track / Sub Track menu: tracks
+are listed in the same order.", the detection ("Detected: …", "Name in the file: “…”"), *Audio* /
+*Subtitle* segmented buttons when adding, the *Language* field (a picker with *Search languages*:
+"Unknown / none" first, then one ISO 639-2/B code per language sorted by English name, "French
+(fre)"; a search matches the name or the code, a /T code finds its /B language), *Kind* chips in
+the D126 order, *Track name (as VLC shows it)* (bidi and control characters dropped, cut to 64
+UTF-8 bytes on a code-point boundary), and on a detected track *This track doesn't exist*, which
+disables the other fields. Buttons: *Cancel*, *Undo correction* when the track has one (DELETE
+`fix.id`), and *Save* when the draft differs from the track, *Matches VLC* when it does not and the
+track has no correction, *Still correct* when it does not and the track's correction is flagged
+for review (it sends the correction again; the fresh snapshot clears the warning). While a
+request is in flight a swipe, a scrim tap or back does not close the sheet, so a failure keeps the
+draft. An expanded subtitle list stays expanded after a save.
+
+Request items (`itemOf`): a detected track sends `file` (`ProbeFileInfo.dht_index`, the stored DHT
+index, not the shown `index`), `track`, `pos` and in `set` the fields that differ from the
+**detection** (so an edit keeps the other overrides; none = a check), values from the draft; "no
+language" is a null in `set`, left out of the JSON (`explicitNulls = false`), which the server
+reads as none. "Doesn't exist" sends `removed: true` only. The server replaces a detected
+track's row on each save. An edit of an added track sends its correction `id` and all three
+fields in `set` (the server keeps a field left out of `set`, so a cleared language, kinds or
+name must be in it; an absent value is none); clearing all three is no item (*Undo correction*
+instead). A new added track sends neither `id` nor `pos`, and its non-empty fields. Kinds are
+sent sorted.
+
+`DetailViewModel.saveCorrections` / `undoCorrection`: while sending the sheet's buttons are
+disabled under a progress bar; the answer replaces `detail.probe` and the detail cache, snackbar
+"Correction saved" / "Correction removed". A detail fetch (refresh, the media retry) that
+started before a correction landed keeps the corrected probe and takes the rest. A failure keeps the sheet open with its draft:
+"Offline: the correction was not saved" or "Couldn't save the correction: {reason}" (the
+server's 400 message). No offline queue. `canCorrect` is read after `/health`; a cached detail
+keeps the edit actions when the features are known, and sending then fails with the offline
+message. Tests: `ProbeCorrectionTest`, `ScreensViewModelTest` (`saving a correction replaces the
+probe and the cache`, `a detail fetch from before a correction keeps the corrected probe`, `a
+failed correction keeps the draft and says why`, `corrections need probe_corrections`),
+`MagnetarApiTest` (`probe corrections are posted and deleted on the torrent's
+probe path`). **UNVERIFIED** on a device.
 
 **Title page** (`ui/title`): `POST /media/{id}/releases` with the Search tab's filters (no text,
 sort seeders); "N search filters apply · Show all" clears them; in-page chips for season,
@@ -538,4 +605,14 @@ Activity chart offers `probe_backfill_dht_rows` ("Probe backfill DHT rows") only
 sent `probe_backfill` (an older server refuses the metric); a picked chart that is no longer
 offered (another server, the counts gone) falls back to the total. Cached as `stats/fleet` like the
 other Stats answers. Tests: `ProbeStatsTest`, `MagnetarApiTest` (`fleet stats …`).
+
+**"Your corrections"** (D130, D131): the same card ends with the detector accuracy the server
+counts from the user's track corrections (`probe_corrections` of `GET /api/v1/stats`; the card is
+also shown without `probe_backfill` once `tracks + added > 0`): *Tracks checked*, *Matched VLC*,
+*Corrected*, *Not in the file*, *Added by you*, *Languages* ("6 of 120 wrong, 9 filled in"), up to
+8 kind lines in the server's order ("SDH (subtitles) from track names" → "4 of 31 wrong", "Forced
+(subtitles) from file flags"; `source` `name` = the track-name classifier, anything else = file
+flags) and up to 4 "… missed" lines (kinds the user added). Counted on the snapshots the server
+took when each correction was made (docs/PROBES.md §12). Asked only with `workers`, like the rest
+of the card. Test: `StatsFormatTest` (`correction stats lines`).
 

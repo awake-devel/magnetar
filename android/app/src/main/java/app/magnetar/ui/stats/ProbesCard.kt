@@ -27,6 +27,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import app.magnetar.api.FleetStats
+import app.magnetar.api.ProbeBackfillStats
 import app.magnetar.api.WorkerStats
 import app.magnetar.ui.common.cachedAgo
 import app.magnetar.ui.theme.ChartColors
@@ -34,12 +35,22 @@ import app.magnetar.ui.theme.ChartColors
 /**
  * Header probes (D117, D118): the backfill queue's progress (probed against what is left to
  * try), its states and closed outcomes, then one block per worker with its badges and backfill
- * counters. Shown only when the server sends `probe_backfill`.
+ * counters, when the server sends `probe_backfill`; then "Your corrections" (D131) once the
+ * user checked or added a track.
  */
 @Composable
 internal fun ProbesContent(fleet: FleetStats, colors: ChartColors, cachedAtMs: Long?) {
-    val b = fleet.probeBackfill ?: return
     cachedAtMs?.let { Text(cachedAgo(it), style = MaterialTheme.typography.labelSmall, color = colors.inkMuted) }
+    fleet.probeBackfill?.let { BackfillContent(fleet, it, colors) }
+    val c = fleet.probeCorrections
+    if (c != null && hasCorrections(c)) {
+        Text("Your corrections", Modifier.padding(top = 8.dp), style = MaterialTheme.typography.labelSmall, color = colors.inkMuted)
+        for ((k, v) in correctionLines(c)) Line(k, v)
+    }
+}
+
+@Composable
+private fun BackfillContent(fleet: FleetStats, b: ProbeBackfillStats, colors: ChartColors) {
     val p = backfillProgress(b)
     Row(Modifier.fillMaxWidth().padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
         Text("Backfill", Modifier.weight(1f), style = MaterialTheme.typography.labelSmall, color = colors.inkMuted)

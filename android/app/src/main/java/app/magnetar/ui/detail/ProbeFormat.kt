@@ -19,7 +19,7 @@ import java.util.Locale
  */
 
 /** ISO 639-2 (bibliographic, plus the terminology codes that differ) → English name. */
-private val ISO639_2: Map<String, String> = mapOf(
+internal val ISO639_2: Map<String, String> = mapOf(
     "eng" to "English", "fre" to "French", "fra" to "French", "ger" to "German", "deu" to "German",
     "spa" to "Spanish", "ita" to "Italian", "por" to "Portuguese", "rus" to "Russian", "jpn" to "Japanese",
     "chi" to "Chinese", "zho" to "Chinese", "kor" to "Korean", "ara" to "Arabic", "dut" to "Dutch", "nld" to "Dutch",
@@ -159,7 +159,7 @@ fun videoTrackText(t: ProbeVideoTrack): String = listOfNotNull(
 /** Audio track kinds (D123) in the order they are told, with their labels. */
 val AUDIO_KIND_ORDER = listOf("original", "dub", "voiceover", "description", "dialogue", "commentary", "music", "karaoke", "alternate")
 
-private val AUDIO_KIND_LABELS = mapOf(
+internal val AUDIO_KIND_LABELS = mapOf(
     "original" to "original", "dub" to "dub", "voiceover" to "voice-over", "description" to "audio description",
     "dialogue" to "clear dialogue", "commentary" to "commentary", "music" to "music only", "karaoke" to "karaoke",
     "alternate" to "alternate mix",
@@ -168,7 +168,7 @@ private val AUDIO_KIND_LABELS = mapOf(
 /** Subtitle track kinds (D123) in the order they are told, with their labels. */
 val SUB_KIND_ORDER = listOf("forced", "sdh", "cc", "signs", "commentary", "description", "honorifics", "bilingual", "easy_reader")
 
-private val SUB_KIND_LABELS = mapOf(
+internal val SUB_KIND_LABELS = mapOf(
     "forced" to "forced", "sdh" to "SDH", "cc" to "CC", "signs" to "signs & songs", "commentary" to "commentary",
     "description" to "descriptions", "honorifics" to "honorifics", "bilingual" to "bilingual", "easy_reader" to "easy reader",
 )
@@ -278,6 +278,11 @@ data class ProbeFileView(
     val lines: List<String>,
     val warnings: List<String>,
     val verified: Boolean,
+    /** The probed file itself, for the editable track rows (D131). */
+    val file: ProbeFileInfo? = null,
+    /** [lines] without the audio and subtitle lines: container and video, then the rest. */
+    val videoLines: List<String> = emptyList(),
+    val otherLines: List<String> = emptyList(),
 )
 
 fun probeFileView(f: ProbeFileInfo, shown: List<TorrentFile>): ProbeFileView {
@@ -288,15 +293,23 @@ fun probeFileView(f: ProbeFileInfo, shown: List<TorrentFile>): ProbeFileView {
         "${f.confidence}%".takeIf { f.confidence > 0 },
         if (f.verified) "verified" else "unverified",
     ).joinToString(" · ")
-    val lines = buildList {
+    val videoLines = buildList {
         f.video?.let { v ->
             containerText(v).takeIf { it.isNotEmpty() }?.let(::add)
             v.video.forEach { add("Video: " + videoTrackText(it)) }
+        }
+    }
+    val otherLines = buildList {
+        f.game?.let { addAll(gameLines(it)) }
+        if (notes.isNotEmpty()) add(notes.joinToString(" · ").replaceFirstChar { it.uppercaseChar() })
+    }
+    val lines = buildList {
+        addAll(videoLines)
+        f.video?.let { v ->
             v.audio.forEach { add("Audio: " + audioTrackText(it)) }
             addAll(subtitleLines(v))
         }
-        f.game?.let { addAll(gameLines(it)) }
-        if (notes.isNotEmpty()) add(notes.joinToString(" · ").replaceFirstChar { it.uppercaseChar() })
+        addAll(otherLines)
     }
     return ProbeFileView(
         name = fileName(path).ifBlank { path },
@@ -304,6 +317,9 @@ fun probeFileView(f: ProbeFileInfo, shown: List<TorrentFile>): ProbeFileView {
         lines = lines,
         warnings = warnings,
         verified = f.verified,
+        file = f,
+        videoLines = videoLines,
+        otherLines = otherLines,
     )
 }
 

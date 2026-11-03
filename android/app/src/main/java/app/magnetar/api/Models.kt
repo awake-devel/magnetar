@@ -44,6 +44,8 @@ object Features {
     /** Track-kind filters and facets (D125): `probe_sub_kinds`, `probe_audio_kinds`, `probe_sub_formats`. */
     const val PROBE_KINDS = "probe_kinds"
     const val WORKERS = "workers"
+    /** Track corrections (D128–D131): `POST`/`DELETE …/probe/corrections`, `fix` and `unplaced` in the detail. */
+    const val PROBE_CORRECTIONS = "probe_corrections"
 }
 
 /** `{"error": "<code>", "message": "…"}` of every 4xx/5xx. */
@@ -421,12 +423,19 @@ data class ProbeInfo(
     /** Every listed result was read from hash-checked pieces. */
     val verified: Boolean = false,
     val files: List<ProbeFileInfo> = emptyList(),
+    /** Corrections that no longer anchor to a detected track (D128); empty from older servers. */
+    val unplaced: List<ProbeUnplacedFix> = emptyList(),
 )
 
 @Serializable
 data class ProbeFileInfo(
     /** Index into [TorrentDetail.files] of the same detail. */
     val index: Int = 0,
+    /**
+     * The file's stored index in the DHT file list (`ProbeFile.i`, D128): what a correction
+     * names as `file`. Unlike [index], it does not move when a Nostr event arrives.
+     */
+    @SerialName("dht_index") val dhtIndex: Int = 0,
     val path: String = "",
     val size: Long = 0,
     /** sniff label id (`video.mkv`, `game.ps5.pkg`, `exe.pe`, …). */
@@ -488,8 +497,12 @@ data class ProbeAudioTrack(
     @SerialName("dts_x") val dtsX: Boolean = false,
     /** Track kinds (D123): `original`, `dub`, `description`, `commentary`, …; v1 probes send none. */
     val kinds: List<String> = emptyList(),
-    /** The track name as the file has it (D123): kept by the server, never shown (free text from peers). */
+    /** The track name as the file has it (D123); shown since D131, as VLC shows it. */
     val name: String? = null,
+    /** 0-based detected position (D128): "Track {pos+1}" as VLC numbers it; null on an added track. */
+    val pos: Int? = null,
+    /** The user's correction applied to this track (D129), when there is one. */
+    val fix: ProbeTrackFix? = null,
 )
 
 @Serializable
@@ -498,8 +511,96 @@ data class ProbeSubTrack(
     val lang: String? = null,
     /** Track kinds (D123): `forced`, `sdh`, `cc`, `signs`, …; v1 probes send none. */
     val kinds: List<String> = emptyList(),
-    /** As [ProbeAudioTrack.name]: never shown. */
+    /** As [ProbeAudioTrack.name]. */
     val name: String? = null,
+    /** As [ProbeAudioTrack.pos]. */
+    val pos: Int? = null,
+    /** As [ProbeAudioTrack.fix]. */
+    val fix: ProbeTrackFix? = null,
+)
+
+/**
+ * A correction anchored to a track (D129, docs/API.md). [fields] are the overridden values
+ * (subset of `lang`, `kinds`, `name`); empty and not [removed] = "matches VLC" (a check).
+ */
+@Serializable
+data class ProbeTrackFix(
+    val id: Long = 0,
+    val fields: List<String> = emptyList(),
+    /** "This track doesn't exist": kept in the list, left out of search. */
+    val removed: Boolean = false,
+    /** A track the probe missed, added by the user. */
+    val added: Boolean = false,
+    /** The detection changed since the correction was made: look again. */
+    val review: Boolean = false,
+    /** The current detection of this track (with [fields] or [removed], or a check under [review]). */
+    val detected: ProbeTrackDetected? = null,
+    val at: Long = 0,
+    /** Device that sent it (`android`, `api`). */
+    val by: String = "",
+)
+
+@Serializable
+data class ProbeTrackDetected(
+    val lang: String? = null,
+    val kinds: List<String> = emptyList(),
+    val name: String? = null,
+)
+
+/** A correction that no longer anchors to a detected track (D128): never applied to another one. */
+@Serializable
+data class ProbeUnplacedFix(
+    val id: Long = 0,
+    /** `ProbeFileInfo.dhtIndex` of the file. */
+    val file: Int = 0,
+    val path: String = "",
+    /** `audio` or `sub`. */
+    val track: String = "",
+    val pos: Int? = null,
+    /** `changed` (the track changed) or `file` (the file is no longer probed). */
+    val reason: String = "",
+    /** The track as it was detected when corrected. */
+    val was: ProbeUnplacedWas? = null,
+    val fields: List<String> = emptyList(),
+    val removed: Boolean = false,
+    val lang: String? = null,
+    val kinds: List<String> = emptyList(),
+    val name: String? = null,
+    val at: Long = 0,
+)
+
+@Serializable
+data class ProbeUnplacedWas(
+    val codec: String = "",
+    val channels: Int? = null,
+    val lang: String? = null,
+    val kinds: List<String> = emptyList(),
+    val name: String? = null,
+)
+
+/** `POST /api/v1/torrents/{infohash}/probe/corrections` (D130): all items or none. */
+@Serializable
+data class ProbeCorrectionRequest(
+    val device: String? = "android",
+    val items: List<ProbeCorrectionItem> = emptyList(),
+)
+
+/**
+ * One correction. [pos] without [id]: correct a detected track (`set: []` = matches VLC);
+ * neither: add a missed track; [id]: edit an added track. A field not in [set] is ignored; a
+ * null [lang] or [name] in [set] means none (`explicitNulls = false` leaves it out).
+ */
+@Serializable
+data class ProbeCorrectionItem(
+    val id: Long? = null,
+    val file: Int = 0,
+    val track: String = "",
+    val pos: Int? = null,
+    val set: List<String> = emptyList(),
+    val lang: String? = null,
+    val kinds: List<String> = emptyList(),
+    val name: String? = null,
+    val removed: Boolean = false,
 )
 
 @Serializable

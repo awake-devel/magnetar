@@ -149,6 +149,10 @@ fun DetailScreen(
                         threshold = threshold,
                         checking = state.checking,
                         history = state.history,
+                        canCorrect = state.canCorrect,
+                        correcting = state.correcting,
+                        onSaveCorrections = vm::saveCorrections,
+                        onUndoCorrection = vm::undoCorrection,
                         onCopy = ::copy,
                         onOpen = ::openMagnet,
                         onCheck = vm::checkNow,
@@ -168,6 +172,10 @@ private fun DetailBody(
     threshold: Int,
     checking: Boolean,
     history: LivenessHistory?,
+    canCorrect: Boolean,
+    correcting: Boolean,
+    onSaveCorrections: SaveCorrections,
+    onUndoCorrection: UndoCorrection,
     onCopy: (String, String) -> Unit,
     onOpen: () -> Unit,
     onCheck: () -> Unit,
@@ -238,7 +246,9 @@ private fun DetailBody(
         }
 
         // Header probes (D121): hidden when never probed or from an older server.
-        if (detail.probe != null && probed != null) item { ProbeCard(detail.probe, probed) }
+        if (detail.probe != null && probed != null) item {
+            ProbeCard(detail.probe, probed, canCorrect, correcting, onSaveCorrections, onUndoCorrection)
+        }
 
         item {
             SectionTitle("Infohash")

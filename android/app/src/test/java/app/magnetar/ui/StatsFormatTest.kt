@@ -4,6 +4,12 @@ import app.magnetar.api.DhtStats
 import app.magnetar.api.Features
 import app.magnetar.api.Health
 import app.magnetar.api.LivenessStats
+import app.magnetar.api.ProbeCorrectionStats
+import app.magnetar.api.ProbeKindAccuracy
+import app.magnetar.api.ProbeKindMissed
+import app.magnetar.api.ProbeLangAccuracy
+import app.magnetar.api.FleetStats
+import app.magnetar.api.MagnetarApi
 import app.magnetar.api.SearchIndexStatus
 import app.magnetar.api.UpnpMapping
 import app.magnetar.api.UpnpStatus
@@ -20,6 +26,8 @@ import app.magnetar.ui.stats.Activity
 import app.magnetar.ui.stats.ChartWindow
 import app.magnetar.ui.stats.backlogLines
 import app.magnetar.ui.stats.breakdownFields
+import app.magnetar.ui.stats.correctionLines
+import app.magnetar.ui.stats.hasCorrections
 import app.magnetar.ui.stats.dhtLines
 import app.magnetar.ui.stats.indexLines
 import app.magnetar.ui.stats.missingFeatures
@@ -201,5 +209,55 @@ class StatsFormatTest {
         )
         assertEquals(missingFeatures(Health(status = "ok", db = true, features = d122)), listOf("track-kind filters"))
         assertEquals(missingFeatures(Health(status = "ok", db = true, features = d122 + Features.PROBE_KINDS)), emptyList<String>())
+    }
+
+    @Test
+    fun `correction stats lines`() {
+        // The D130 example, as the server sends it.
+        val f = MagnetarApi.JSON.decodeFromString(
+            FleetStats.serializer(),
+            """{"probe_corrections": {
+                "tracks": 140, "checked": 92, "corrected": 41, "removed": 7, "added": 4,
+                "languages": {"checked": 120, "wrong": 6, "filled": 9},
+                "names_changed": 3,
+                "kinds": [{"track":"sub","kind":"sdh","source":"name","checked":31,"wrong":4},
+                          {"track":"sub","kind":"forced","source":"flags","checked":12,"wrong":1}],
+                "missed": [{"track":"sub","kind":"forced","count":3}],
+                "at": 1793500000
+              }}""",
+        )
+        val s = f.probeCorrections!!
+        assertEquals(s.namesChanged, 3L)
+        assertTrue(hasCorrections(s))
+        assertEquals(
+            correctionLines(s, en),
+            listOf(
+                "Tracks checked" to "140",
+                "Matched VLC" to "92",
+                "Corrected" to "41",
+                "Not in the file" to "7",
+                "Added by you" to "4",
+                "Languages" to "6 of 120 wrong, 9 filled in",
+                "SDH (subtitles) from track names" to "4 of 31 wrong",
+                "Forced (subtitles) from file flags" to "1 of 12 wrong",
+                "Forced (subtitles) missed" to "3",
+            ),
+        )
+        // Audio kinds use their labels; at most 8 kind lines and 4 missed lines.
+        val many = ProbeCorrectionStats(
+            tracks = 1,
+            languages = ProbeLangAccuracy(checked = 1_234, wrong = 0),
+            kinds = (1..10).map { ProbeKindAccuracy("audio", "description", "flags", checked = 2, wrong = 1) },
+            missed = (1..6).map { ProbeKindMissed("audio", "voiceover", 1) },
+        )
+        val lines = correctionLines(many, en)
+        assertTrue("Languages" to "0 of 1,234 wrong" in lines, lines.toString())
+        assertEquals(lines.count { it.first == "Audio description (audio) from file flags" }, 8)
+        assertEquals(lines.count { it.first == "Voice-over (audio) missed" }, 4)
+        // The Stats card shows the block only once something was checked or added.
+        assertFalse(hasCorrections(null))
+        assertFalse(hasCorrections(ProbeCorrectionStats()))
+        assertTrue(hasCorrections(ProbeCorrectionStats(added = 1)))
+        assertNull(MagnetarApi.JSON.decodeFromString(FleetStats.serializer(), "{}").probeCorrections)
     }
 }

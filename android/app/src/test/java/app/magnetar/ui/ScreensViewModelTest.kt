@@ -1,6 +1,13 @@
 package app.magnetar.ui
 
+import app.magnetar.api.ApiException
 import app.magnetar.api.MediaInfo
+import app.magnetar.api.ProbeAudioTrack
+import app.magnetar.api.ProbeCorrectionItem
+import app.magnetar.api.ProbeFileInfo
+import app.magnetar.api.ProbeInfo
+import app.magnetar.api.ProbeTrackFix
+import app.magnetar.api.ProbeVideo
 import app.magnetar.api.MediaReleases
 import app.magnetar.api.ReleaseGroup
 import app.magnetar.api.SavedSearch
@@ -14,6 +21,7 @@ import app.magnetar.ui.saved.describe
 import app.magnetar.ui.search.SearchFilters
 import app.magnetar.ui.title.TitleViewModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
@@ -188,5 +196,141 @@ class ScreensViewModelTest {
             describe(SearchQuery(probeLanguages = listOf("fre"), probeAudioKinds = listOf("description"), probeSubFormats = listOf("image", "text"))),
             "any text · files: French, Audio description, Image (PGS, VobSub…)/Text (SRT, ASS…)",
         )
+    }
+
+    private fun probed(lang: String, fix: ProbeTrackFix? = null) = ProbeInfo(
+        version = 2,
+        files = listOf(
+            ProbeFileInfo(
+                path = "a.mkv",
+                video = ProbeVideo(audio = listOf(ProbeAudioTrack(codec = "ac3", channels = 2, lang = lang, pos = 0, fix = fix))),
+            ),
+        ),
+    )
+
+    private fun detailWithProbe(fake: FakeService) {
+        fake.detailAnswer = { TorrentDetail(summary = TorrentSummary(infohash = ih, title = "x"), probe = probed("eng")) }
+    }
+
+    @Test
+    fun `saving a correction replaces the probe and the cache`() = runTest {
+        main()
+        val fake = FakeService()
+        fake.features = fake.features + "probe_corrections"
+        detailWithProbe(fake)
+        val after = probed("fre", ProbeTrackFix(id = 5, fields = listOf("lang"), by = "android"))
+        fake.correctionAnswer = { after }
+        val r = repo(fake)
+        val vm = DetailViewModel(r, ih)
+        advanceUntilIdle()
+        val item = ProbeCorrectionItem(file = 0, track = "audio", pos = 0, set = listOf("lang"), lang = "fre")
+        var result: Boolean? = null
+        vm.saveCorrections(listOf(item)) { result = it }
+        assertTrue(vm.state.value.correcting)
+        advanceUntilIdle()
+        assertEquals(result, true)
+        assertFalse(vm.state.value.correcting)
+        val (sentTo, request) = fake.correctionPosts.single()
+        assertEquals(sentTo, ih)
+        assertEquals(request.device, "android")
+        assertEquals(request.items, listOf(item))
+        assertEquals(vm.state.value.detail?.probe, after)
+        assertEquals(vm.state.value.detail?.summary?.title, "x")
+        assertEquals(vm.messages.first(), "Correction saved")
+        val cached = r.readCache(DetailViewModel.CACHE_DETAIL, ih, TorrentDetail.serializer())
+        assertEquals(cached?.value?.probe, after)
+
+        // Undo: DELETE the correction, the answer replaces the probe again.
+        fake.correctionAnswer = { probed("eng") }
+        vm.undoCorrection(5)
+        advanceUntilIdle()
+        assertEquals(fake.correctionDeletes.single(), ih to 5L)
+        assertEquals(vm.state.value.detail?.probe, probed("eng"))
+        assertEquals(vm.messages.first(), "Correction removed")
+        assertEquals(r.readCache(DetailViewModel.CACHE_DETAIL, ih, TorrentDetail.serializer())?.value?.probe, probed("eng"))
+    }
+
+    @Test
+    fun `a detail fetch from before a correction keeps the corrected probe`() = runTest {
+        main()
+        val fake = FakeService()
+        fake.features = fake.features + "probe_corrections"
+        detailWithProbe(fake)
+        val after = probed("fre", ProbeTrackFix(id = 5, fields = listOf("lang"), by = "android"))
+        fake.correctionAnswer = { after }
+        val r = repo(fake)
+        val vm = DetailViewModel(r, ih)
+        advanceUntilIdle()
+        // A refresh in flight (answering the probe as it was) while the correction is saved.
+        fake.detailDelayMs = 1_000
+        fake.detailAnswer = { TorrentDetail(summary = TorrentSummary(infohash = ih, title = "y"), probe = probed("eng")) }
+        vm.refresh()
+        vm.saveCorrections(listOf(ProbeCorrectionItem(file = 0, track = "audio", pos = 0, set = listOf("lang"), lang = "fre")))
+        advanceUntilIdle()
+        assertEquals(vm.state.value.detail?.summary?.title, "y")
+        assertEquals(vm.state.value.detail?.probe, after)
+        assertEquals(r.readCache(DetailViewModel.CACHE_DETAIL, ih, TorrentDetail.serializer())?.value?.probe, after)
+        // A fetch started after the correction takes the server's probe as it is.
+        vm.refresh()
+        advanceUntilIdle()
+        assertEquals(vm.state.value.detail?.probe, probed("eng"))
+    }
+
+    @Test
+    fun `a failed correction keeps the draft and says why`() = runTest {
+        main()
+        val fake = FakeService()
+        fake.features = fake.features + "probe_corrections"
+        detailWithProbe(fake)
+        val vm = DetailViewModel(repo(fake), ih)
+        advanceUntilIdle()
+        val before = vm.state.value.detail
+        val item = ProbeCorrectionItem(file = 0, track = "audio", pos = 0, set = listOf("lang"), lang = "xx")
+        fake.correctionError = ApiException.Http(400, "invalid", "item 0: unknown language code \"xx\"")
+        var result: Boolean? = null
+        vm.saveCorrections(listOf(item)) { result = it }
+        advanceUntilIdle()
+        assertEquals(result, false)
+        assertFalse(vm.state.value.correcting)
+        assertEquals(vm.state.value.detail, before)
+        assertEquals(vm.messages.first(), "Couldn't save the correction: item 0: unknown language code \"xx\"")
+        // Offline: said so; nothing is queued.
+        fake.correctionError = ApiException.Network(java.io.IOException("down"))
+        result = null
+        vm.saveCorrections(listOf(item)) { result = it }
+        advanceUntilIdle()
+        assertEquals(result, false)
+        assertEquals(vm.messages.first(), "Offline: the correction was not saved")
+        vm.undoCorrection(3) { result = it }
+        advanceUntilIdle()
+        assertEquals(result, false)
+        assertEquals(vm.messages.first(), "Offline: the correction was not saved")
+        assertEquals(fake.correctionPosts.size, 2)
+        assertEquals(vm.state.value.detail, before)
+    }
+
+    @Test
+    fun `corrections need probe_corrections`() = runTest {
+        main()
+        val fake = FakeService()
+        detailWithProbe(fake)
+        val r = repo(fake)
+        val vm = DetailViewModel(r, ih)
+        advanceUntilIdle()
+        assertFalse(vm.state.value.canCorrect)
+
+        val newer = FakeService()
+        newer.features = newer.features + "probe_corrections"
+        detailWithProbe(newer)
+        val r2 = repo(newer)
+        val vm2 = DetailViewModel(r2, ih)
+        advanceUntilIdle()
+        assertTrue(vm2.state.value.canCorrect)
+        // A cached detail keeps the edit actions once the features are known.
+        newer.detailAnswer = { throw ApiException.Network(java.io.IOException("down")) }
+        val cachedVm = DetailViewModel(r2, ih)
+        advanceUntilIdle()
+        assertNotNull(cachedVm.state.value.cachedAtMs)
+        assertTrue(cachedVm.state.value.canCorrect)
     }
 }

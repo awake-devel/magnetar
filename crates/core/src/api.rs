@@ -67,6 +67,11 @@ pub mod features {
     /// facets, and `kinds` on the probe tracks of `TorrentDetail` (D123–D125). A language with a
     /// kind of the same family matches one track having both.
     pub const PROBE_KINDS: &str = "probe_kinds";
+    /// Track corrections (D128–D130, docs/API.md "Track corrections"):
+    /// `POST /api/v1/torrents/{infohash}/probe/corrections`, `DELETE …/corrections/{id}`,
+    /// `pos` / `fix` on the probe tracks, `ProbeFileInfo.dht_index`, `ProbeInfo.unplaced`
+    /// and `StatsResponse.probe_corrections`. Probe filters and facets count corrected values.
+    pub const PROBE_CORRECTIONS: &str = "probe_corrections";
     pub const ALL: &[&str] = &[
         FILTERS,
         FACET_SET,
@@ -82,6 +87,7 @@ pub mod features {
         CRAWL_MAP,
         PROBE_FILTERS,
         PROBE_KINDS,
+        PROBE_CORRECTIONS,
     ];
 }
 
@@ -149,6 +155,109 @@ pub struct StatsResponse {
     /// older). Computed at most once a minute.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_backfill: Option<ProbeBackfillStats>,
+    /// Detector accuracy from the user's track corrections (D130, docs/PROBES.md §12): Some
+    /// on every server with `probe_corrections`, zero counts included. Older servers send none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_corrections: Option<ProbeCorrectionStats>,
+}
+
+/// Track corrections by the user against what VLC shows (D130): how often the detector was
+/// right. Every count reads the detection as it was when the user corrected the track (the
+/// stored snapshot), not the current one.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProbeCorrectionStats {
+    /// Corrections of detected tracks (checks, overrides and removals).
+    pub tracks: u64,
+    /// Detected tracks the user found right ("matches VLC").
+    pub checked: u64,
+    /// Detected tracks with at least one value overridden.
+    pub corrected: u64,
+    /// Detected tracks VLC does not list.
+    pub removed: u64,
+    /// Tracks the probe missed, added by the user.
+    pub added: u64,
+    pub languages: ProbeLangAccuracy,
+    /// Detected tracks whose name the user changed.
+    pub names_changed: u64,
+    /// Per detected kind and where it came from (`name`: the track-name classifier, `flags`:
+    /// container or bitstream flags): sorted by wrong, then checked (descending).
+    pub kinds: Vec<ProbeKindAccuracy>,
+    /// Kinds the user added that the probe did not detect, most first.
+    pub missed: Vec<ProbeKindMissed>,
+    /// Unix time these counts were taken.
+    pub at: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProbeLangAccuracy {
+    /// Detected tracks (not removed) that had a language.
+    pub checked: u64,
+    /// Of those, the ones whose language the user changed.
+    pub wrong: u64,
+    /// Detected tracks without a language that the user gave one.
+    pub filled: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProbeKindAccuracy {
+    /// `audio` or `sub`.
+    pub track: String,
+    pub kind: String,
+    /// `name` or `flags`.
+    pub source: String,
+    pub checked: u64,
+    pub wrong: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProbeKindMissed {
+    pub track: String,
+    pub kind: String,
+    pub count: u64,
+}
+
+/// `POST /api/v1/torrents/{infohash}/probe/corrections` (D130, docs/API.md "Track
+/// corrections"): all items or none.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProbeCorrectionRequest {
+    /// `android`, …; 1–32 printable bytes, default `api`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    /// 1–96.
+    pub items: Vec<ProbeCorrectionItem>,
+}
+
+/// One track correction. With `pos`: a detected track (check, override or removal); without
+/// `pos` and `id`: a track the probe missed; with `id`: an edit of such an added track.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProbeCorrectionItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<i64>,
+    /// `ProbeFileInfo::dht_index`.
+    pub file: u32,
+    /// `audio` or `sub`.
+    pub track: String,
+    /// 0-based position in the file's detected list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pos: Option<u16>,
+    /// Which of `lang`, `kinds`, `name` the item overrides; a field not listed is ignored, a
+    /// listed one absent means "none". Empty (and not `removed`): "matches VLC".
+    pub set: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// "This track doesn't exist" (a detected track only, with no other field).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub removed: bool,
 }
 
 /// The server's header-probe backfill queue (D118, docs/PROBES.md §10).
@@ -1208,6 +1317,28 @@ impl ApiClient {
         .await
         .map(drop)
     }
+    /// `POST /api/v1/torrents/{infohash}/probe/corrections` (D130): the effective probe.
+    pub async fn post_probe_corrections(
+        &self,
+        infohash: &str,
+        r: &ProbeCorrectionRequest,
+    ) -> crate::Result<ProbeInfo> {
+        let path = format!("/api/v1/torrents/{}/probe/corrections", encode(infohash));
+        self.json(self.req(Method::POST, &path).json(r)).await
+    }
+    /// `DELETE /api/v1/torrents/{infohash}/probe/corrections/{id}` (D130): back to the
+    /// detection; the effective probe.
+    pub async fn delete_probe_correction(
+        &self,
+        infohash: &str,
+        id: i64,
+    ) -> crate::Result<ProbeInfo> {
+        let path = format!(
+            "/api/v1/torrents/{}/probe/corrections/{id}",
+            encode(infohash)
+        );
+        self.json(self.req(Method::DELETE, &path)).await
+    }
     pub async fn saved_searches(&self) -> crate::Result<Vec<SavedSearch>> {
         self.json(self.req(Method::GET, "/api/v1/saved-searches"))
             .await
@@ -1319,4 +1450,66 @@ impl ApiClient {
 /// Percent-encode one path segment / query value.
 fn encode(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D130: the feature is listed, and the request reads what the app sends with
+    /// `explicitNulls = false` (absent defaults, `"set":["lang"]` without `lang` = no
+    /// language) and writes nothing it does not need.
+    #[test]
+    fn probe_corrections_feature_and_request_shape() {
+        assert!(features::ALL.contains(&features::PROBE_CORRECTIONS));
+        assert_eq!(features::PROBE_CORRECTIONS, "probe_corrections");
+        let r: ProbeCorrectionRequest = serde_json::from_str(
+            r#"{"device":"android","items":[
+              {"file":0,"track":"sub","pos":1,"set":["lang","kinds"],"lang":"fre","kinds":["forced"]},
+              {"file":0,"track":"audio","pos":0,"set":[]},
+              {"file":0,"track":"audio","pos":2,"removed":true},
+              {"file":0,"track":"sub","set":["lang","kinds","name"],"lang":"spa","kinds":["forced"],"name":"Español (forzados)"},
+              {"id":42,"file":0,"track":"sub","set":["lang"],"lang":"cat"},
+              {"file":0,"track":"audio","pos":1,"set":["lang"]}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(r.device.as_deref(), Some("android"));
+        assert_eq!(r.items.len(), 6);
+        assert_eq!(r.items[0].pos, Some(1));
+        assert_eq!(r.items[0].kinds, ["forced"]);
+        assert!(r.items[1].set.is_empty() && !r.items[1].removed);
+        assert!(r.items[2].removed && r.items[2].set.is_empty());
+        assert_eq!((r.items[3].pos, r.items[3].id), (None, None));
+        assert_eq!(r.items[4].id, Some(42));
+        assert_eq!(r.items[5].set, ["lang"]);
+        assert_eq!(r.items[5].lang, None);
+        let empty: ProbeCorrectionRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, ProbeCorrectionRequest::default());
+        let item = ProbeCorrectionItem {
+            file: 0,
+            track: "audio".into(),
+            pos: Some(1),
+            set: vec!["lang".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&item).unwrap(),
+            serde_json::json!({"file": 0, "track": "audio", "pos": 1, "set": ["lang"]})
+        );
+        // The stats block: absent on older servers.
+        let st: ProbeCorrectionStats = serde_json::from_str(
+            r#"{"tracks":140,"checked":92,"corrected":41,"removed":7,"added":4,
+                "languages":{"checked":120,"wrong":6,"filled":9},"names_changed":3,
+                "kinds":[{"track":"sub","kind":"sdh","source":"name","checked":31,"wrong":4}],
+                "missed":[{"track":"sub","kind":"forced","count":3}],"at":1793500000}"#,
+        )
+        .unwrap();
+        assert_eq!(st.kinds[0].wrong, 4);
+        assert_eq!(st.languages.filled, 9);
+        assert_eq!(st.missed[0].count, 3);
+        // Absent (older servers) stays absent.
+        let none = serde_json::to_value(StatsResponse::default()).unwrap();
+        assert!(none.get("probe_corrections").is_none());
+    }
 }

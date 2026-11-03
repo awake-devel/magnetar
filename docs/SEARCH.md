@@ -87,7 +87,12 @@ lowest id (D6). Fields:
   deadlock across tables) and over polling `updated_at` columns (most write paths, including
   the enrichers' raw SQL, would have to remember to set them). A log row committed late with a
   lower id is simply read on the next pass. Changes made while no server runs (`crawl-once`,
-  `enrich`) wait in the log.
+  `enrich`) wait in the log. Since D122 `probe_attrs` has the same triggers. The probe facets
+  hold **effective** values (D129): `probe_attrs.tags` is built from the detection with the
+  user's track corrections applied (docs/PROBES.md §12), by the probe store path and by every
+  correction write, which recomputes the row in its own transaction and writes it only when a
+  tag or a language column changed; that UPDATE is what logs the torrent here.
+  `probe_corrections` has no trigger of its own, and the index schema did not change.
 - **Segments**: a merge policy caps segments at 1/16 of the index (at least 200 000
   documents), so broad queries fan out over the search threads (CPUs − 2, at most 16). Tantivy's
   default policy had merged the 3.2 M benchmark into segments of 1.04 M, 995 k and 684 k

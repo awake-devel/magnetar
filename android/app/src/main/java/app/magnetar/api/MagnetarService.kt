@@ -33,6 +33,12 @@ interface MagnetarService {
     /** Feature `workers`: crawl workers and the header-probe backfill queue (D118). */
     suspend fun fleetStats(): FleetStats
 
+    /** Feature `probe_corrections` (D130): the effective probe after the write. */
+    suspend fun postProbeCorrections(infohash: String, request: ProbeCorrectionRequest): ProbeInfo
+
+    /** Feature `probe_corrections`: undo one correction (back to the detection). */
+    suspend fun deleteProbeCorrection(infohash: String, id: Long): ProbeInfo
+
     /** Feature `crawl_map`: [layer] `dht` | `nostr`, [window] `day` | `all`. */
     suspend fun crawlMap(layer: String, window: String): CrawlMap
 }
