@@ -1604,11 +1604,9 @@ impl Store for PgStore {
             })
             .collect();
         let magnet = magnet::build_magnet(infohash, Some(&canon.title), &trackers, total_size);
-        // D117: probe indexes point into the `files` shown (the Nostr event's here), and an
-        // adult Nostr row shows no probe either.
-        let probe = if dht.is_some()
-            && !crate::probes::adult(&canon.category, &canon.title, &canon.files.0)
-        {
+        // D117: probe indexes point into the `files` shown (the Nostr event's here). Adult
+        // rows show their probe too (D119).
+        let probe = if dht.is_some() {
             crate::probes::probe_for(&self.pool, infohash, &canon.files.0)
                 .await
                 .map_err(db)?

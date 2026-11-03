@@ -74,7 +74,8 @@ triage stays under ~800 KB. The server drops control characters from `version`, 
 shows them in `/api/v1/stats` (D111).
 
 `DhtResult = {sighted, via, peers_seen, kind, …}` with `kind` one of `metadata {raw}` (the raw
-bencoded info dict, base64), `blocked {v1?, tier, rule_version}` (hash only), `private`,
+bencoded info dict, base64), `blocked {v1?, tier, rule_version}` (hash only), `private`
+(sent only by workers older than D119: a BEP 27 private dict now goes up as `metadata`),
 `v2_only`, `invalid {code}`, `oversize`, `failed {code}`.
 
 ### Seed checks: leases (D98)
@@ -157,19 +158,19 @@ apply to it), from its own line: trackers see another IP, so the per-tracker rat
    refused item with a warning (`upload_dropped` in its report), instead of resending it
    forever.
 8. **Header probes (D117, docs/PROBES.md; `MAGNETAR_PROBE`, off by default).** On a worker
-   with probes on, a verified dict that passed step 3 (not blocked, not adult, dict ≤ 2 MiB)
+   with probes on, a verified dict that passed step 3 (not blocked, dict ≤ 2 MiB; adult and
+   BEP 27 private dicts included, D119)
    keeps its metadata connection: while no brake or pressure is on and a probe slot and turn
    are free, the probe reads the few blocks sniff needs and its report rides with the dict
    (`DhtResult.probe`) once it ends (≤ 45 s; a stop sends the dict without it). Only
    detections of confidence 80+ travel, with display indexes and no paths. The server checks
    every field against **its own** file list (index, size) and sniff's label registry, and
    stores it (`probe_attrs`, `probe_files`, `supplied_by` = the worker) only for a row it
-   stored itself, did not classify adult (category `porn` or the adult signal, the worker's
-   own gate) and did not block; a refused probe never costs its
+   stored itself and did not block (adult included, D119); a refused probe never costs its
    dict (`DhtAck.probe_stored` / `probe_rejected`). The server never probes.
 9. **Probe backfill (D118, docs/PROBES.md §10; `MAGNETAR_PROBE_BACKFILL`, off by default,
    needs `MAGNETAR_PROBE`).** The worker leases indexed torrents (`probe/lease`: DHT rows and
-   Nostr-only rows, never probed, not blocked, not adult, most known seeders first) and queues
+   Nostr-only rows, never probed, not blocked, adult included, most known seeders first) and queues
    them like triaged hashes: same peer lookup, fetcher, screen and probe gates; a backfill
    dict waits up to 30 s for its probe turn instead of being skipped. It uploads on
    `dht/results`, where **a hash leased to that worker and not answered yet counts as held**
@@ -177,8 +178,9 @@ apply to it), from its own line: trackers see another IP, so the per-tracker rat
    Nostr (that torrent gets its DHT row, `supplied_by` = the worker), an existing DHT row is
    `not_new` and never rewritten, the probe is stored as in item 8, and the lease is consumed:
    a stored probe deletes the queue row, anything else (no peers, a failed fetch, no probe) is
-   retried after 6 h, 3 days, 14 days and closed after the 4th attempt; private / v2-only /
-   invalid / oversize dicts and worker block reports close it (a worker's block report never
+   retried after 6 h, 3 days, 14 days and closed after the 4th attempt (a `private` status
+   from a worker older than D119 too); v2-only / invalid / oversize dicts and worker block
+   reports close it (a worker's block report never
    blocks a leased hash). Backfill statuses never touch `dht_seen`. With
    `MAGNETAR_DHT_DISCOVER=false` the worker samples nothing and triages nothing: its DHT node
    only looks peers up for the backfill.

@@ -18,7 +18,9 @@
 //! - nothing is written to disk; nothing here logs a name or path (docs/DHT.md §7.1).
 //!
 //! The probe never decides whether a torrent may be probed: the worker checks the blocklist,
-//! the adult class, the brakes and the dict size first ([`Skip`] counts why it did not).
+//! the brakes and the dict size first ([`Skip`] counts why it did not). Adult and BEP 27
+//! private torrents are probed like any other (D119); the `adult` skip code is gone (the
+//! heartbeat's `skipped` is keyed by code, so older servers and apps read it unchanged).
 
 mod drive;
 pub mod msg;
@@ -215,7 +217,6 @@ impl ProbeResult {
 pub enum Skip {
     Rate,
     Busy,
-    Adult,
     Blocklist,
     NoBlocklist,
     Brake,
@@ -224,10 +225,9 @@ pub enum Skip {
     NoHandoff,
 }
 
-const SKIPS: [Skip; 9] = [
+const SKIPS: [Skip; 8] = [
     Skip::Rate,
     Skip::Busy,
-    Skip::Adult,
     Skip::Blocklist,
     Skip::NoBlocklist,
     Skip::Brake,
@@ -241,7 +241,6 @@ impl Skip {
         match self {
             Skip::Rate => "rate",
             Skip::Busy => "busy",
-            Skip::Adult => "adult",
             Skip::Blocklist => "blocklist",
             Skip::NoBlocklist => "no_blocklist",
             Skip::Brake => "brake",
@@ -278,7 +277,7 @@ struct Counters {
     choked: AtomicU64,
     no_pieces: AtomicU64,
     failed: AtomicU64,
-    skipped: [AtomicU64; 9],
+    skipped: [AtomicU64; 8],
     bytes_in: AtomicU64,
     uploaded: AtomicU64,
     files: AtomicU64,

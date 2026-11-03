@@ -1,10 +1,10 @@
 //! Header probes (D117, docs/PROBES.md) end to end against a scratch schema: results uploaded
 //! with a dict are checked against the server's own file list and stored only for rows the
-//! server classified as not adult and did not block; a refused probe never costs its dict; the
+//! server did not block (adult included, D119); a refused probe never costs its dict; the
 //! detail API shows them with the server's paths; a weaker re-probe does not replace a stronger
 //! one; deleting the row removes them. Then an in-process worker on a fake DHT probes loopback
-//! fake seeders (`core` tests' `fake_seeder`): the allowed torrent is probed and stored, the
-//! adult and the blocklisted one never get a block request, a peer that never unchokes costs
+//! fake seeders (`core` tests' `fake_seeder`): the allowed and the adult torrent are probed and
+//! stored, the blocklisted one never gets a block request, a peer that never unchokes costs
 //! nothing but the probe. Needs MAGNETAR_TEST_DATABASE_URL (else SKIPPED). Loopback only.
 
 use std::collections::HashMap;
@@ -182,22 +182,35 @@ async fn uploaded_probes_are_checked_stored_and_shown() {
     assert_eq!((a.ignored, a.probe_stored), (1, 0));
     assert_eq!(count(s, PROBE_ROWS, &hex::encode(hu)).await, 0);
 
-    // Adult by the server's own classification, or blocked by its own screen: no probe row.
-    for name in [
-        "Studio.XXX.Probe.Scene.2024.1080p",
-        "Probe.Zorblax.2024.1080p",
-    ] {
-        let raw = info(name, "0");
-        let hx = sha1(&raw);
-        triage_one(&c1, hx).await;
-        let a = upload(
-            &c1,
-            vec![with_probe(hx, &raw, report(vec![mkv_file(0, SIZE)]))],
-        )
-        .await;
-        assert_eq!((a.probe_stored, a.probe_rejected), (0, 1), "{name}: {a:?}");
-        assert_eq!(count(s, PROBE_ROWS, &hex::encode(hx)).await, 0, "{name}");
-    }
+    // D119: adult by the server's own classification is stored and shown like any other.
+    let raw = info("Studio.XXX.Probe.Scene.2024.1080p", "0");
+    let hx = sha1(&raw);
+    triage_one(&c1, hx).await;
+    let a = upload(
+        &c1,
+        vec![with_probe(hx, &raw, report(vec![mkv_file(0, SIZE)]))],
+    )
+    .await;
+    assert_eq!(
+        (a.stored, a.probe_stored, a.probe_rejected),
+        (1, 1, 0),
+        "{a:?}"
+    );
+    let d = detail(&base, &hex::encode(hx)).await;
+    assert_eq!(d["summary"]["category"], "porn", "{d}");
+    assert_eq!(d["probe"]["files"][0]["label"], "video.mkv", "{d}");
+
+    // Blocked by the server's own screen: no probe row (the blocklist is unchanged).
+    let raw = info("Probe.Zorblax.2024.1080p", "0");
+    let hx = sha1(&raw);
+    triage_one(&c1, hx).await;
+    let a = upload(
+        &c1,
+        vec![with_probe(hx, &raw, report(vec![mkv_file(0, SIZE)]))],
+    )
+    .await;
+    assert_eq!((a.probe_stored, a.probe_rejected), (0, 1), "{a:?}");
+    assert_eq!(count(s, PROBE_ROWS, &hex::encode(hx)).await, 0);
 
     // A re-probe replaces the stored one only when it verifies at least as many files.
     let weaker = report(vec![ProbeFile {
@@ -241,14 +254,17 @@ async fn uploaded_probes_are_checked_stored_and_shown() {
         "video.webm"
     );
 
-    // The server reclassifying the torrent as adult hides the probe; deleting the row (as a
-    // `supplied_by` clean-up does) removes it.
+    // The server reclassifying the torrent as adult keeps the probe shown (D119); deleting the
+    // row (as a `supplied_by` clean-up does) removes it.
     sqlx::query("UPDATE dht_torrents SET category = 'porn' WHERE infohash = $1")
         .bind(&ih)
         .execute(s.pool())
         .await
         .unwrap();
-    assert!(detail(&base, &ih).await.get("probe").is_none());
+    assert_eq!(
+        detail(&base, &ih).await["probe"]["files"][0]["label"],
+        "video.webm"
+    );
     sqlx::query("DELETE FROM dht_torrents WHERE infohash = $1")
         .bind(&ih)
         .execute(s.pool())
@@ -305,8 +321,9 @@ pub(crate) fn mkv(size: usize) -> Vec<u8> {
 }
 
 /// One in-process worker with probes on, on a fake DHT, four loopback seeders: an allowed
-/// torrent (probed, verified, stored and shown), an adult one and a blocklisted one (never a
-/// block request), and one whose peer never unchokes (its dict is stored without a probe).
+/// torrent and an adult one (probed, verified, stored and shown; D119), a blocklisted one
+/// (never a block request), and one whose peer never unchokes (its dict is stored without a
+/// probe).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_probes_only_what_it_may() {
     let Some(db) = test_db().await else { return };
@@ -410,14 +427,18 @@ async fn worker_probes_only_what_it_may() {
     assert_eq!(f["path"], "Probe.Movie.2024.2160p.mkv");
     assert_eq!(f["video"]["video"][0]["codec"], "hevc");
     assert!(seeders["plain"].1.log().requests > 0);
-    // Adult and blocklisted: the probe never asked their peers for a block.
-    for n in ["adult", "blocked"] {
-        let l = seeders[n].1.log();
-        assert_eq!(l.requests, 0, "{n} got block requests: {rep}");
-        assert_eq!(count(s, PROBE_ROWS, &hex_of(n)).await, 0, "{n}");
-    }
+    // Adult (D119): probed, stored and shown like the plain one.
+    assert_eq!(count(s, PROBE_ROWS, &hex_of("adult")).await, 1, "{rep}");
+    let d = detail(&base, &hex_of("adult")).await;
+    assert_eq!(d["summary"]["category"], "porn", "{d}");
+    assert_eq!(d["probe"]["files"][0]["label"], "video.mkv", "{d}");
+    assert!(seeders["adult"].1.log().requests > 0);
+    // Blocklisted: the probe never asked its peers for a block.
+    let l = seeders["blocked"].1.log();
+    assert_eq!(l.requests, 0, "blocked got block requests: {rep}");
+    assert_eq!(count(s, PROBE_ROWS, &hex_of("blocked")).await, 0);
     let skipped: HashMap<String, u64> = ps.skipped.iter().cloned().collect();
-    assert!(skipped.get("adult").copied().unwrap_or(0) >= 1, "{rep}");
+    assert!(!skipped.contains_key("adult"), "{rep}");
     assert!(skipped.get("blocklist").copied().unwrap_or(0) >= 1, "{rep}");
     // Never unchoked: no probe, but the dict is stored all the same.
     assert_eq!(
@@ -442,7 +463,11 @@ async fn worker_probes_only_what_it_may() {
         for it in up.items {
             if it.probe.is_some() {
                 assert!(matches!(it.outcome, DhtOutcome::Metadata { .. }));
-                assert_eq!(it.sighted, hex_of("plain"));
+                assert!(
+                    it.sighted == hex_of("plain") || it.sighted == hex_of("adult"),
+                    "{}",
+                    it.sighted
+                );
             }
         }
     }
@@ -486,9 +511,9 @@ fn upload_of(ih: &str, files: Vec<ProbeFile>) -> Vec<probes::Upload> {
     }]
 }
 
-/// The server's adult gate is the worker's (`Classification::adult`: category `porn` or the
-/// adult signal), on store and on read; on a torrent with a Nostr and a DHT row, probe indexes
-/// point into the Nostr `files` the detail shows, and an adult Nostr row hides the probe.
+/// D119: adult (`Classification::adult`: category `porn` or the adult signal) is no gate, on
+/// store or on read, and a blocked hash is never stored; on a torrent with a Nostr and a DHT
+/// row, probe indexes point into the Nostr `files` the detail shows, an adult Nostr row too.
 #[tokio::test]
 async fn probe_gates_and_indexes_follow_the_detail_shown() {
     let Some(db) = test_db().await else { return };
@@ -501,7 +526,7 @@ async fn probe_gates_and_indexes_follow_the_detail_shown() {
         ..mkv_file(i, 40_000_000)
     };
 
-    // Adult signal on a non-visual majority (category `audio`, not `porn`): never stored.
+    // Adult signal on a non-visual majority (category `audio`, not `porn`): stored and shown.
     let adult = ih(0xad01);
     dht_row(
         s,
@@ -514,10 +539,55 @@ async fn probe_gates_and_indexes_follow_the_detail_shown() {
     let o = probes::store(s.pool(), "w1", upload_of(&adult, vec![flac(0)]), NOW)
         .await
         .unwrap();
-    assert_eq!((o.stored, o.rejected), (0, 1));
-    assert_eq!(count(s, PROBE_ROWS, &adult).await, 0);
+    assert_eq!((o.stored, o.rejected), (1, 0));
+    assert_eq!(count(s, PROBE_ROWS, &adult).await, 1);
+    assert_eq!(detail(&base, &adult).await["probe"]["files"][0]["index"], 0);
 
-    // Stored under a plain name, then the row reads as adult: the detail hides it.
+    // Category `porn`: stored and shown.
+    let porn = ih(0xad03);
+    dht_row(
+        s,
+        &porn,
+        "Plain.Scene.2024",
+        "porn",
+        &[("01.flac", 40_000_000)],
+    )
+    .await;
+    let o = probes::store(s.pool(), "w1", upload_of(&porn, vec![flac(0)]), NOW)
+        .await
+        .unwrap();
+    assert_eq!((o.stored, o.rejected), (1, 0));
+    assert_eq!(
+        detail(&base, &porn).await["probe"]["files"][0]["label"],
+        "audio.flac"
+    );
+
+    // A blocked hash (D53/D68) is never stored, whatever its row says.
+    let blocked = ih(0xad04);
+    dht_row(
+        s,
+        &blocked,
+        "Plain.Hits.2023",
+        "audio",
+        &[("01.flac", 40_000_000)],
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO blocked_infohashes (infohash, blocked_at, rule_version, origin)
+         VALUES ($1, $2, 1, 'dht')",
+    )
+    .bind(&blocked)
+    .bind(NOW)
+    .execute(s.pool())
+    .await
+    .unwrap();
+    let o = probes::store(s.pool(), "w1", upload_of(&blocked, vec![flac(0)]), NOW)
+        .await
+        .unwrap();
+    assert_eq!((o.stored, o.rejected), (0, 1));
+    assert_eq!(count(s, PROBE_ROWS, &blocked).await, 0);
+
+    // Stored under a plain name, then the row reads as adult: the detail still shows it.
     let renamed = ih(0xad02);
     dht_row(
         s,
@@ -540,7 +610,10 @@ async fn probe_gates_and_indexes_follow_the_detail_shown() {
         .execute(s.pool())
         .await
         .unwrap();
-    assert!(detail(&base, &renamed).await.get("probe").is_none());
+    assert_eq!(
+        detail(&base, &renamed).await["probe"]["files"][0]["index"],
+        0
+    );
 
     // Nostr and DHT rows list the files in different orders (and the Nostr one with the root
     // folder): the probe of the DHT row's file 1 (b.mkv) is the Nostr list's file 0.
@@ -579,7 +652,7 @@ async fn probe_gates_and_indexes_follow_the_detail_shown() {
     assert_eq!(f["path"], d["files"][at]["path"]);
     assert_eq!(f["label"], "video.mkv");
 
-    // The Nostr row the detail shows is adult: no probe, whatever the DHT row says.
+    // The Nostr row the detail shows is adult: the probe is shown all the same.
     let nostr_adult = ih(0xb0b1);
     dht_row(
         s,
@@ -608,5 +681,5 @@ async fn probe_gates_and_indexes_follow_the_detail_shown() {
     .await;
     let d = detail(&base, &nostr_adult).await;
     assert_eq!(d["summary"]["origin"], "both", "{d}");
-    assert!(d.get("probe").is_none(), "{d}");
+    assert_eq!(d["probe"]["files"][0]["path"], "Film.Two.mkv", "{d}");
 }

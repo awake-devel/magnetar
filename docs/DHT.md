@@ -623,8 +623,10 @@ mapping is UNVERIFIED (dht-crawling.md §6.2), and the wire format is ~150 LOC).
    was never triaged, so before it is stored it goes through the same checks as a sighting
    (`blocked_infohashes`, `torrent_infohashes`); a block records **both** hashes, and the
    sighted truncated hash is kept as `alias` (§2.4).
-6. **Info dict**: `private = 1` → status `private`, not stored (BEP 27: such a torrent "MUST ONLY"
-   use its private tracker; a magnet without it is useless). Name: `name.utf-8` if valid UTF-8,
+6. **Info dict**: `private = 1` was status `private`, not stored (BEP 27: such a torrent "MUST
+   ONLY" use its private tracker). Since D119 (user decision of 2026-11-03) a private dict is
+   stored and probed like any other; the DHT row keeps no private flag, and its magnet has no
+   private tracker (peers come from the DHT only). Name: `name.utf-8` if valid UTF-8,
    else `name` (lossy UTF-8). Files: `files[].path(.utf-8)` or single `length`, or v2 `file tree`
    for hybrids; BEP 47 padding files (`attr` contains `p`, or `.pad/` paths) dropped. Empty name
    or total size 0 → `invalid`. A dict with **duplicate keys** at any level → `invalid`: our

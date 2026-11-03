@@ -13,7 +13,7 @@
 //! [`Governor`] pauses discovery under memory or conntrack pressure. Nothing here logs a name.
 //!
 //! Header probes (D117, `MAGNETAR_PROBE`, off by default): after a verified dict that passed
-//! the blocklist and is not adult, while no brake or pressure is on and the prober has a free
+//! the blocklist (adult and BEP 27 private included, D119), while no brake or pressure is on and the prober has a free
 //! slot under its per-minute pace, the metadata connection is handed to a
 //! [`magnetar_core::probe::Prober`] task that reads the few blocks sniff needs; its report
 //! travels with the dict ([`DhtResult::probe`]). A probe never delays the dict for more than
@@ -597,8 +597,8 @@ struct Screened {
 }
 
 /// Classify and screen a verified dict here, before anything leaves the machine. With probes
-/// on, also decide whether the torrent may be probed: only one that passed the blocklist and
-/// is not adult (D117), with a dict of at most [`probe::MAX_DICT`].
+/// on, also decide whether the torrent may be probed: one that passed the blocklist (D117;
+/// adult and private included since D119), with a dict of at most [`probe::MAX_DICT`].
 fn outcome_item(p: &Crawl, job: &Job, outcome: Outcome) -> Option<Screened> {
     let skip = |why: Skip| {
         if let Some(pr) = &p.prober {
@@ -638,9 +638,8 @@ fn outcome_item(p: &Crawl, job: &Job, outcome: Outcome) -> Option<Screened> {
                 Verdict::Allow => {
                     let raw = f.raw.as_deref()?;
                     if p.prober.is_some() {
-                        if class.adult() {
-                            skip(Skip::Adult);
-                        } else if raw.len() > probe::MAX_DICT {
+                        // D119: adult and BEP 27 private dicts are probed like any other.
+                        if raw.len() > probe::MAX_DICT {
                             skip(Skip::BigDict);
                         } else {
                             seed = Some(ProbeSeed {

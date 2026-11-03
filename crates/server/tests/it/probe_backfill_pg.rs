@@ -1,7 +1,7 @@
 //! Header-probe backfill (D118, docs/PROBES.md §10) against a scratch schema: the queue is
-//! filled from every indexed infohash (DHT and Nostr-only) without probed, blocked or `porn`
-//! rows, in value order (known seeders first, then newest), the full adult rule is applied at
-//! lease time, leases are exclusive and come back on release; a leased hash counts as held for
+//! filled from every indexed infohash (DHT and Nostr-only) without probed or blocked rows (adult
+//! and private ones included, D119), in value order (known seeders first, then newest), leases
+//! are exclusive and come back on release; a leased hash counts as held for
 //! `dht/results` (the dict is stored for a Nostr-only torrent, an existing DHT row is never
 //! rewritten, the probe is stored and the lease closed), unreachable hashes are retried with
 //! backoff then closed; then an in-process worker with DHT discovery off and backfill on probes
@@ -166,10 +166,13 @@ async fn queue_fills_in_value_order_and_leases_exclusively() {
     dht_row(s, &c, "Dht.Album.2019", "audio", &[("01.flac", 10)]).await;
     nostr(s, 2, &dead, "Dead.Film.1999", NOW - 9000, &[]).await;
     seeders(s, &dead, Some(0)).await;
-    // d: Nostr, adult by its name only (not category porn): queued, closed at lease time.
+    // D119: d: Nostr, adult by its name only; e: DHT, category porn. Both known dead (the
+    // last tier), queued and leased like any other.
     nostr(s, 3, &d, "Studio.XXX.Scene.2024", NOW - 100, &[]).await;
-    // e: DHT, category porn; f: blocked; g: already probed. Never queued.
+    seeders(s, &d, Some(0)).await;
     dht_row(s, &e, "Something", "porn", &[("x.mp4", 10)]).await;
+    seeders(s, &e, Some(0)).await;
+    // f: blocked; g: already probed. Never queued.
     nostr(s, 4, &f, "Blocked.Film", NOW, &[]).await;
     sqlx::query(
         "INSERT INTO blocked_infohashes (infohash, blocked_at, rule_version, origin)
@@ -184,8 +187,8 @@ async fn queue_fills_in_value_order_and_leases_exclusively() {
     probed(s, &g).await;
 
     let n = bf::fill_pass(s.pool()).await.unwrap();
-    assert_eq!(n, 6, "a, b, newer, c, dead, d");
-    for h in [&e, &f, &g] {
+    assert_eq!(n, 7, "a, b, newer, c, dead, d, e");
+    for h in [&f, &g] {
         assert!(queue_row(s, h).await.is_none(), "{h} not queued");
     }
     // The SQL rank is the documented one.
@@ -214,10 +217,19 @@ async fn queue_fills_in_value_order_and_leases_exclusively() {
         vec![a.clone(), newer.clone(), b.clone(), c.clone()]
     );
     let l2 = bf::lease(s.pool(), "w2", now, 10, 900).await.unwrap();
-    assert_eq!(l2.items, vec![dead.clone()], "never a hash leased to w1");
-    assert_eq!(l2.closed, 1, "the adult row is closed, not leased");
-    let (_, due, _, out, w) = queue_row(s, &d).await.unwrap();
-    assert_eq!((due, out.as_deref(), w), (None, Some("adult"), None));
+    let mut got = l2.items.clone();
+    got.sort();
+    let mut want = vec![dead.clone(), d.clone(), e.clone()];
+    want.sort();
+    assert_eq!(
+        got, want,
+        "never a hash leased to w1; the adult rows are leased"
+    );
+    assert_eq!(l2.closed, 0, "nothing closed");
+    for h in [&d, &e] {
+        let (_, _, _, out, w) = queue_row(s, h).await.unwrap();
+        assert_eq!((out, w.as_deref()), (None, Some("w2")), "{h}");
+    }
     assert!(
         bf::lease(s.pool(), "w2", now, 10, 900)
             .await
@@ -254,7 +266,7 @@ async fn queue_fills_in_value_order_and_leases_exclusively() {
     );
     // Expired leases come back for anyone.
     let later = bf::lease(s.pool(), "w2", now + 901, 10, 900).await.unwrap();
-    assert_eq!(later.items.len(), 5, "{later:?}");
+    assert_eq!(later.items.len(), 7, "{later:?}");
 
     // A probe stored meanwhile (a new find's probe): the row is deleted at the next lease.
     let p = ih(0x61);
@@ -310,10 +322,7 @@ async fn queue_fills_in_value_order_and_leases_exclusively() {
         st.closed.iter().any(|(o, n)| o == "no_peers" && *n == 1),
         "{st:?}"
     );
-    assert!(
-        st.closed.iter().any(|(o, n)| o == "adult" && *n == 1),
-        "{st:?}"
-    );
+    assert!(!st.closed.iter().any(|(o, _)| o == "adult"), "{st:?}");
     assert_eq!(st.probed, 2);
 }
 
@@ -497,6 +506,247 @@ async fn leased_hashes_are_held_stored_probed_and_closed() {
     assert_eq!(w1["backfill_leased_total"], 3, "{w1}");
     assert_eq!(w1["backfill_probed_total"], 2);
     assert_eq!(w1["backfill_unprobed_total"], 1);
+}
+
+/// D119 (user decisions of 2026-11-03): adult torrents (category `porn`, or the adult signal on
+/// the name) and a BEP 27 private one are queued, leased, fetched, stored with their probe and
+/// shown in the detail; a blocked hash is still never queued, leased or stored.
+#[tokio::test]
+async fn adult_and_private_leases_are_probed_stored_and_shown() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    let (base, _) = spawn(s, 900).await;
+    let c1 = Client::new(&base, W1).unwrap();
+    const SIZE: u64 = 1_500_000_000;
+
+    // porn: a DHT row, category porn; xxx: a DHT row whose name carries the adult signal.
+    let porn_raw = info("Backfill.Porn.2024.1080p", "0");
+    let porn = hex::encode(sha1(&porn_raw));
+    dht_row(
+        s,
+        &porn,
+        "Plain.Scene.2024",
+        "porn",
+        &[("Backfill.Porn.2024.1080p.mkv", SIZE)],
+    )
+    .await;
+    let xxx_raw = info("Studio.XXX.Backfill.2024.1080p", "0");
+    let xxx = hex::encode(sha1(&xxx_raw));
+    dht_row(
+        s,
+        &xxx,
+        "Studio.XXX.Backfill.2024.1080p",
+        "video",
+        &[("Studio.XXX.Backfill.2024.1080p.mkv", SIZE)],
+    )
+    .await;
+    // private: Nostr only, its info dict has `private = 1` ("private" sorts last).
+    let mut private_raw = info("Backfill.Private.2024.1080p", "0");
+    assert_eq!(private_raw.pop(), Some(b'e'));
+    private_raw.extend_from_slice(b"7:privatei1ee");
+    let private = hex::encode(sha1(&private_raw));
+    nostr(
+        s,
+        41,
+        &private,
+        "Backfill Private 2024",
+        NOW,
+        &[("Backfill.Private.2024.1080p.mkv", SIZE)],
+    )
+    .await;
+    // legacy: Nostr only, answered `private` by a worker older than D119.
+    let legacy = ih(0x1e6a);
+    nostr(s, 43, &legacy, "Backfill Legacy 2024", NOW, &[]).await;
+    // blocked: a Nostr row whose hash is on the hard blocklist.
+    let blocked = ih(0xb10c);
+    nostr(s, 42, &blocked, "Backfill Blocked", NOW, &[]).await;
+    sqlx::query(
+        "INSERT INTO blocked_infohashes (infohash, blocked_at, rule_version, origin)
+         VALUES ($1, $2, 1, 'nostr')",
+    )
+    .bind(&blocked)
+    .bind(NOW)
+    .execute(s.pool())
+    .await
+    .unwrap();
+
+    let mut got: Vec<String> = Vec::new();
+    for _ in 0..100 {
+        let l: ProbeLease = c1
+            .post(PROBE_LEASE, &LeaseRequest { max: 10 })
+            .await
+            .unwrap();
+        got.extend(l.infohashes);
+        if got.len() >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    got.sort();
+    let mut want = vec![porn.clone(), xxx.clone(), private.clone(), legacy.clone()];
+    want.sort();
+    assert_eq!(got, want, "adult and private leased");
+    assert!(
+        queue_row(s, &blocked).await.is_none(),
+        "blocked never queued"
+    );
+
+    let probe = |raw: &[u8]| with_probe(sha1(raw), raw, report(vec![mkv_file(0, SIZE)]));
+    let blocked_raw = info("Backfill.Blocked.2024.1080p", "0");
+    let a = upload(
+        &c1,
+        vec![
+            probe(&porn_raw),
+            probe(&xxx_raw),
+            probe(&private_raw),
+            probe(&blocked_raw),
+            DhtResult {
+                sighted: legacy.clone(),
+                via: "get_peers".into(),
+                peers_seen: 1,
+                outcome: DhtOutcome::Private,
+                probe: None,
+            },
+        ],
+    )
+    .await;
+    assert_eq!(
+        (
+            a.backfill_stored,
+            a.not_new,
+            a.probe_stored,
+            a.ignored,
+            a.applied
+        ),
+        (1, 2, 3, 1, 1),
+        "{a:?}"
+    );
+    // An old worker's `private` answer is retried later (an updated worker probes it).
+    let (_, due, attempts, out, w) = queue_row(s, &legacy).await.unwrap();
+    assert_eq!((attempts, out.as_deref(), w), (1, Some("private"), None));
+    assert!(due.is_some(), "retried, not closed");
+    for h in [&porn, &xxx, &private] {
+        assert_eq!(
+            count(s, "SELECT count(*) FROM probe_attrs WHERE infohash = $1", h).await,
+            1,
+            "{h}"
+        );
+        assert!(
+            queue_row(s, h).await.is_none(),
+            "{h}: lease closed as probed"
+        );
+        let d = detail(&base, h).await;
+        assert_eq!(d["probe"]["files"][0]["label"], "video.mkv", "{h}: {d}");
+        assert_eq!(d["probe"]["files"][0]["index"], 0, "{h}: {d}");
+    }
+    assert_eq!(detail(&base, &porn).await["summary"]["category"], "porn");
+    // The private torrent's dict is stored as its DHT row.
+    assert_eq!(
+        count(
+            s,
+            "SELECT count(*) FROM dht_torrents WHERE infohash = $1",
+            &private
+        )
+        .await,
+        1
+    );
+    // Nothing for the blocked hash, nor for the hash of the dict sent in its place.
+    for h in [&blocked, &hex::encode(sha1(&blocked_raw))] {
+        assert_eq!(
+            count(s, "SELECT count(*) FROM probe_attrs WHERE infohash = $1", h).await,
+            0
+        );
+        assert_eq!(
+            count(
+                s,
+                "SELECT count(*) FROM dht_torrents WHERE infohash = $1",
+                h
+            )
+            .await,
+            0
+        );
+    }
+}
+
+/// D119: migration 20261107000000 reopens rows closed as `adult` or `private` the way a fresh
+/// row is queued (due_at = rank, no attempts, no outcome, no lease); other closed rows stay
+/// closed; the reopened rows are leased, a blocked hash is not.
+#[tokio::test]
+async fn migration_reopens_adult_and_private_rows() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    let now = magnetar_core::now();
+    let (adult, private, blocked, dead) = (ih(0xa7), ih(0xa8), ih(0xa9), ih(0xaa));
+    nostr(s, 51, &adult, "Studio.XXX.Closed.2024", NOW, &[]).await;
+    dht_row(
+        s,
+        &private,
+        "Private.Closed.2024",
+        "video",
+        &[("p.mkv", 10)],
+    )
+    .await;
+    nostr(s, 52, &blocked, "Blocked.Closed.2024", NOW, &[]).await;
+    sqlx::query(
+        "INSERT INTO blocked_infohashes (infohash, blocked_at, rule_version, origin)
+         VALUES ($1, $2, 1, 'nostr')",
+    )
+    .bind(&blocked)
+    .bind(NOW)
+    .execute(s.pool())
+    .await
+    .unwrap();
+    nostr(s, 53, &dead, "Dead.Closed.2024", NOW, &[]).await;
+    for (h, rank, attempts, out) in [
+        (&adult, -11i64, 1i16, "adult"),
+        (&private, -12, 2, "private"),
+        (&blocked, -13, 0, "blocked"),
+        (&dead, -14, 4, "no_peers"),
+    ] {
+        sqlx::query(
+            "INSERT INTO probe_backfill (infohash, rank, due_at, attempts, last_outcome, worker,
+                 leased_at, expires_at)
+             VALUES ($1, $2, NULL, $3, $4, NULL, $5, $5)",
+        )
+        .bind(h)
+        .bind(rank)
+        .bind(attempts)
+        .bind(out)
+        .bind(now - 100)
+        .execute(s.pool())
+        .await
+        .unwrap();
+    }
+    let m = magnetar_server::store::MIGRATOR
+        .iter()
+        .find(|m| m.version == 20261107000000)
+        .expect("the D119 migration");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(m.sql.as_str().to_string()))
+        .execute(s.pool())
+        .await
+        .unwrap();
+    for (h, rank) in [(&adult, -11i64), (&private, -12)] {
+        let (_, due, attempts, out, w) = queue_row(s, h).await.unwrap();
+        assert_eq!((due, attempts, out, w), (Some(rank), 0, None, None), "{h}");
+        let lease: (Option<i64>, Option<i64>) =
+            sqlx::query_as("SELECT leased_at, expires_at FROM probe_backfill WHERE infohash = $1")
+                .bind(h)
+                .fetch_one(s.pool())
+                .await
+                .unwrap();
+        assert_eq!(lease, (None, None), "{h}");
+    }
+    for (h, out) in [(&blocked, "blocked"), (&dead, "no_peers")] {
+        let (_, due, _, o, _) = queue_row(s, h).await.unwrap();
+        assert_eq!((due, o.as_deref()), (None, Some(out)), "{h} stays closed");
+    }
+    let l = bf::lease(s.pool(), "w1", now, 10, 900).await.unwrap();
+    assert_eq!(
+        l.items,
+        vec![private.clone(), adult.clone()],
+        "due order: {l:?}"
+    );
+    assert_eq!(l.closed, 0);
 }
 
 /// Review of D118: a backfill DHT row must not bring back a torrent no default search shows
@@ -696,9 +946,10 @@ async fn small_worker_oversize_is_retried_not_closed() {
     assert!(due.is_some(), "retried later, not closed");
 }
 
-/// One in-process worker with DHT discovery off and backfill on, on a fake DHT with two
-/// loopback seeders: a Nostr-only torrent and a stored DHT one are leased, looked up, fetched,
-/// probed and stored; the worker never samples and never triages.
+/// One in-process worker with DHT discovery off and backfill on, on a fake DHT with three
+/// loopback seeders: a Nostr-only torrent, a stored DHT one and a Nostr-only BEP 27 private
+/// one (D119) are leased, looked up, fetched, probed and stored; the worker never samples and
+/// never triages.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_backfills_without_discovering() {
     let Some(db) = test_db().await else { return };
@@ -728,8 +979,29 @@ async fn worker_backfills_without_discovering() {
         vec![("Backfill.Dht.2023.1080p.mkv", mkv(2_000_000))],
         256 * kib,
     );
+    // D119: a BEP 27 private torrent ("private" sorts last in the dict) is probed too.
+    let p = std::sync::Arc::try_unwrap(Torrent::new(
+        "x",
+        vec![("Backfill.Private.2024.1080p.mkv", mkv(2_000_000))],
+        256 * kib,
+    ))
+    .ok()
+    .unwrap();
+    let mut p_info = p.info;
+    assert_eq!(p_info.pop(), Some(b'e'));
+    p_info.extend_from_slice(b"7:privatei1ee");
+    let from_private = std::sync::Arc::new(Torrent {
+        hash: sha1(&p_info),
+        info: p_info,
+        data: p.data,
+        piece_len: p.piece_len,
+    });
     let mut seeders = HashMap::new();
-    for (name, t) in [("nostr", &from_nostr), ("dht", &from_dht)] {
+    for (name, t) in [
+        ("nostr", &from_nostr),
+        ("dht", &from_dht),
+        ("private", &from_private),
+    ] {
         seeders.insert(
             name,
             (
@@ -746,6 +1018,15 @@ async fn worker_backfills_without_discovering() {
         "Backfill Nostr 2024",
         NOW,
         &[("Backfill.Nostr.2024.2160p.mkv", 2_000_000)],
+    )
+    .await;
+    nostr(
+        s,
+        22,
+        &hex_of("private"),
+        "Backfill Private 2024",
+        NOW,
+        &[("Backfill.Private.2024.1080p.mkv", 2_000_000)],
     )
     .await;
     dht_row(
@@ -796,8 +1077,8 @@ async fn worker_backfills_without_discovering() {
     assert_eq!(dht.engine.sent_sample_infohashes, 0, "no sampling: {rep}");
     assert_eq!(dht.triaged, 0, "no triage");
     let b = dht.backfill.as_ref().expect("backfill stats");
-    assert!(b.leased >= 2 && b.probed >= 2, "{rep}");
-    for n in ["nostr", "dht"] {
+    assert!(b.leased >= 3 && b.probed >= 3, "{rep}");
+    for n in ["nostr", "dht", "private"] {
         assert_eq!(
             count(
                 s,

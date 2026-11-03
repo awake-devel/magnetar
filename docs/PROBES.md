@@ -21,9 +21,17 @@ and shows it in the detail API (`TorrentDetail.probe`, docs/API.md).
 - **Never the main server.** `serve`, `dht` and every other command never build a prober; with
   `MAGNETAR_PROBE=true` they log a warning and ignore it. `compose.yml` pins `MAGNETAR_PROBE`
   and `MAGNETAR_PROBE_UPLOAD` to `false`. Test: `probes::tests::only_the_worker_crawler_builds_a_prober`.
-- **Never on a torrent the worker's blocklist stops, one classified adult, or with no
-  blocklist loaded** (the worker's own classifier and screen run first, docs/WORKERS.md §1).
-  The server checks again with its own classification and blocklist before storing anything.
+- **Never on a torrent the worker's blocklist stops, or with no blocklist loaded** (the
+  worker's own classifier and screen run first, docs/WORKERS.md §1; the classifier's adult
+  result still turns on the blocklist's context tier, D53/D68). The server checks again with
+  its own blocklist before storing anything.
+- **Adult and BEP 27 private torrents are probed** like any other (D119, user decisions of
+  2026-11-03): category `porn` or the adult signal is no gate, on the worker, on the server or
+  in the backfill, and neither is `private = 1` in the info dict. For a private torrent the
+  peers come from the DHT, against what the BEP 27 flag asks (the user's choice), and with
+  `MAGNETAR_PROBE_UPLOAD=true` the worker also serves verified pieces to peers of that private
+  swarm. The DHT row keeps no private flag (`dht_torrents` has no column for it), so the
+  detail does not say a torrent is private.
 - Not while a brake is on (router health probe, answered-share brake, pressure brake) or the
   governor reports memory / conntrack pressure; not on dicts over 2 MiB; not without a free
   slot (`MAGNETAR_PROBE_PARALLEL`) and a turn of the per-minute pace (`MAGNETAR_PROBE_PER_MIN`,
@@ -159,9 +167,8 @@ The server (`server::probes`):
   fit its label (`video` only on `video.*` / `audio.*` labels; `game` only on `game`, `gamedata`,
   `package`, `disc`, `archive`, `exe` and `misc` labels); the worker drops the same values
   before sending;
-- writes it only when the `dht_torrents` row exists, the server does not classify it adult
-  (the worker's gate, `Classification::adult`: category `porn` **or** the adult signal on its
-  name and paths, re-computed from the stored row) and the hash is not blocked, one savepoint per row (D110); a re-probe replaces it only when it is of a
+- writes it only when the `dht_torrents` row exists and the hash is not blocked (adult rows
+  included, D119), one savepoint per row (D110); a re-probe replaces it only when it is of a
   newer version or verifies at least as many files;
 - answers `probe_stored` / `probe_rejected` in `DhtAck`. A refused probe never costs its dict.
 
@@ -178,9 +185,7 @@ Tables (migration `20261105000000_probes.sql`):
 No GIN index on `tags` and no search-index trigger yet: with `ORDER BY probed_at LIMIT` a tags
 GIN collapses to a full scan on rare mixes (check1 #3); facets go to the search index when
 filters are built. Detail API: `TorrentDetail.probe` with each file's path from the server's own
-list and the label's description (docs/API.md). It is hidden when the server now classifies the
-torrent adult (the DHT row, and the Nostr row the detail shows: category `porn` or the adult
-signal). File indexes point into the `files` the detail returns: on a torrent with a Nostr
+list and the label's description (docs/API.md), adult torrents included (D119). File indexes point into the `files` the detail returns: on a torrent with a Nostr
 event that is the event's list, so each probed file is matched to it by path (with or without
 the torrent's root folder) and size; a file not in that list is left out. After a worker token leak: `DELETE FROM probe_attrs WHERE supplied_by = '<name>'`
 (docs/WORKERS.md §7). The server cannot re-check a probe's bytes, the same gap as a dict (D113).
@@ -288,14 +293,16 @@ nobody.
 by a keyset walk over `torrent_infohashes` (5 000 per step, ~180 ms each on 1.8 M seeded rows,
 about a minute a pass), started by the first `probe/lease` and again at most every 6 h (to
 queue torrents indexed since). Skipped at fill time: torrents with a probe, blocked hashes,
-category `porn` on any row, and Nostr-only torrents that no default search shows (every event
+and Nostr-only torrents that no default search shows (every event
 from a blocked publisher, or below the trust threshold and not from a trusted publisher): a
 DHT row would bring them back as DHT torrents, since a DHT row passes every trust threshold
 (D51) and a publisher block only hides that publisher's events. They are queued by a later
 pass once shown (block lifted, threshold lowered in Settings). Checked again at lease time: a
-probe stored meanwhile deletes the row, and so does a torrent no longer shown; blocked, gone,
-or adult on any of its rows (DHT or Nostr, the worker's `Classification::adult` rule: category
-`porn` or the adult signal on its name and paths) closes it. A lease whose rows were all
+probe stored meanwhile deletes the row, and so does a torrent no longer shown; blocked or gone
+closes it. Adult torrents (category `porn` or the adult signal) are queued and leased like any
+other since D119; migration `20261107000000` reopened the rows earlier closed as `adult` or
+`private` (due again in their never-tried place), and the first fill pass after an upgrade
+queues the `porn` torrents earlier fills skipped. A lease whose rows were all
 closed or dropped reads the next due rows (up to 8 rounds), so a run of them does not send the
 worker idle. Order (value first, fixed when queued): known seeders (or DHT peers) in power-of-two tiers,
 most first; then torrents never seed-checked; known dead last; newest (`born`) first within a
@@ -311,7 +318,7 @@ gives unworked ones back (never-tried rows in their first place).
 torrents are in the worker (none under a brake or memory / conntrack pressure), and queues
 them for peer collection like triaged hashes: the crawler's DHT lookup (`collect_peers`, the
 shared D109 pace), the metadata fetcher (TCP pace, brake, address policy D112, identity D115),
-the worker's blocklist and adult check, then the probe gates. A backfill dict waits up to 30 s
+the worker's blocklist, then the probe gates (no adult or private check, D119). A backfill dict waits up to 30 s
 for a probe slot and turn (`Prober::slot`, paced like the others, no burst) instead of being
 skipped. Results go up on `dht/results` (`via: get_peers`); hashes still in the worker at a
 stop are released.
@@ -336,7 +343,8 @@ is ignored):
 | dict + probe stored | deleted |
 | dict without a stored probe (skipped, choked, nothing found, refused) | retried (`no_probe`) |
 | `failed` (`no_peers`, `connect`, `timeout`, …), or `oversize` from a worker whose `MAGNETAR_DHT_METADATA_MAX` is below the server's | retried with that code (a worker with room gets it later) |
-| `private`, `v2_only`, `invalid`, `oversize` (worker limit ≥ the server's), worker `blocked` | closed with that outcome |
+| `v2_only`, `invalid`, `oversize` (worker limit ≥ the server's), worker `blocked` | closed with that outcome |
+| `private`, sent only by a worker older than D119 (an updated one uploads the private dict) | retried (`private`), so an updated worker probes it |
 | dict for a torrent no default search shows any more | deleted (not stored) |
 
 Retries come after 6 h, 3 days and 14 days; the 4th unsuccessful attempt closes the row. A

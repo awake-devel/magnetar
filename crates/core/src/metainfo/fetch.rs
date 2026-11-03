@@ -247,7 +247,9 @@ pub struct Fetched {
 pub enum Outcome {
     /// v1 or hybrid, parsed: storable once classified and screened.
     Ok(Box<Fetched>),
-    /// BEP 27 `private = 1`: not stored (its magnet is useless outside the private tracker).
+    /// BEP 27 `private = 1`, as reported by workers older than D119 (`DhtOutcome::Private`).
+    /// The fetcher no longer produces it: since D119 (user decision of 2026-11-03) a private
+    /// dict is an [`Outcome::Ok`] like any other (`info.private` set), stored and probed.
     Private,
     /// Pure v2: no v1 identity for the data model.
     V2Only,
@@ -491,6 +493,8 @@ pub struct FetchStats {
     pub hashes: u64,
     pub ok: u64,
     pub hybrid: u64,
+    /// [`Outcome::Private`]: always 0 since D119 (private dicts count as `ok`); kept so the
+    /// stats keep their shape.
     pub private: u64,
     pub v2_only: u64,
     pub invalid: u64,
@@ -753,9 +757,6 @@ fn outcome_of(
         (_, Err(e)) => return Outcome::Invalid(e),
         (_, Ok(s)) => s,
     };
-    if info.private {
-        return Outcome::Private;
-    }
     let (v1, v2) = match id {
         Identity::V1 { v2 } => (sighted, v2),
         Identity::Hybrid { v1, v2 } => (v1, Some(v2)),
@@ -1600,12 +1601,13 @@ mod tests {
             outcome_from_raw(h1, v1_raw, 10).unwrap_err(),
             RawError::TooLarge
         );
+        // D119: a BEP 27 private dict is storable like any other.
         let private = b"d6:lengthi5e4:name1:a12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaa7:privatei1ee";
         let hp = sha1_smol::Sha1::from(&private[..]).digest().bytes();
-        assert!(matches!(
-            outcome_from_raw(hp, private, 1 << 20),
-            Ok(Outcome::Private)
-        ));
+        match outcome_from_raw(hp, private, 1 << 20) {
+            Ok(Outcome::Ok(f)) => assert!(f.info.private && f.v1 == hp),
+            o => panic!("{o:?}"),
+        }
         let junk = b"i5e";
         let hj = sha1_smol::Sha1::from(&junk[..]).digest().bytes();
         assert!(matches!(

@@ -235,6 +235,9 @@ legal position becomes blurry.
 - **Turning `MAGNETAR_PROBE_UPLOAD` on *is* sharing**: the worker then announces and serves
   the whole hash-checked pieces a probe holds to that probe's peers (capped at 4 MiB and
   256 KiB/s per probe).
+- Probes and their backfill include adult torrents and BEP 27 private ones (D119): a private
+  torrent's peers come from the DHT, against what its private flag asks, and with
+  `MAGNETAR_PROBE_UPLOAD` on the worker also shares pieces in that private swarm.
 - Other countries differ (Germany, for example, fines downloads too).
 
 This is an **UNVERIFIED legal reading, not legal advice**.
