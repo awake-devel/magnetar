@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "checkJs": true,
+    "strict": true,
+    "lib": ["dom", "dom.iterable", "esnext", "deno.ns"]
+  },
+  "lint": {
+    "include": ["js/", "test/", "sw.js"]
+  },
+  "tasks": {
+    "check": "deno check js/ test/ sw.js",
+    "test": "deno test --no-prompt --allow-read=.,../../../android/app/src/main/assets/world_110m.bin test/"
+  }
+}

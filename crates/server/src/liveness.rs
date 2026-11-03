@@ -304,7 +304,8 @@ impl LivenessService {
 }
 
 /// Server checker config from `MAGNETAR_LIVENESS_*` (docs/CONFIG.md). Torrents without a
-/// tracker are scraped on the trackers their magnet links get (`magnet::DEFAULT_TRACKERS`).
+/// tracker are scraped on the trackers their magnet links get (`magnet::DEFAULT_TRACKERS`),
+/// unless `MAGNETAR_LIVENESS_FALLBACK_TRACKERS=false` (D136).
 /// DHT walks wait for permits of `pacer`, the process's shared DHT pacer (D109), and so does
 /// each new tracker contact (D113): scrapes follow the router health brake too.
 pub fn liveness_config(
@@ -320,7 +321,11 @@ pub fn liveness_config(
         use_dht: cfg.liveness_dht,
         dht_concurrency: cfg.liveness_dht_concurrency.max(1),
         dht_budget: SERVER_DHT_BUDGET,
-        fallback_trackers: DEFAULT_TRACKERS.iter().map(|t| t.to_string()).collect(),
+        fallback_trackers: if cfg.liveness_fallback_trackers {
+            DEFAULT_TRACKERS.iter().map(|t| t.to_string()).collect()
+        } else {
+            Vec::new()
+        },
         ..LivenessConfig::default()
     }
 }

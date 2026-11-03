@@ -62,6 +62,9 @@ services:
       MAGNETAR_NIP66_TRUSTED:
       MAGNETAR_OWN_ADDRS:
       MAGNETAR_DOWNLOADS:
+      # Web UI at / (D132-D135, docs/WEB.md) and its session cookie on the API; false = bearer
+      # API only. Workers never serve it.
+      MAGNETAR_WEB_UI:
       MAGNETAR_NTFY_URL:
       MAGNETAR_NTFY_TOPIC:
       MAGNETAR_IMDB:
@@ -77,6 +80,8 @@ services:
       MAGNETAR_LIVENESS_TRACKER_RPS:
       MAGNETAR_LIVENESS_TRACKER_CONCURRENCY:
       MAGNETAR_LIVENESS_DHT:
+      # Scrape tracker-less (DHT-only) torrents on the default public trackers (default true).
+      MAGNETAR_LIVENESS_FALLBACK_TRACKERS:
       MAGNETAR_LIVENESS_DHT_CONCURRENCY:
       MAGNETAR_LIVENESS_DHT_QPS:
       # Crawl workers on other machines (docs/WORKERS.md): name:token,... ; unset = no workers.

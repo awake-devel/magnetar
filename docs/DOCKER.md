@@ -104,6 +104,10 @@ docker compose stop / start / down                    # down keeps the volumes
 `serve` (the default command) applies database migrations before it listens, so the first
 start and upgrades need no separate `migrate` step.
 
+The web UI (docs/WEB.md, D132) is on by default: the same port serves it at `/`, so behind
+`tailscale serve` on 8443 it is at `https://<host>:8443/` with nothing else to publish.
+`MAGNETAR_WEB_UI=false` turns it (and its session cookies) off.
+
 Heavy features can be switched off in `.env`: `MAGNETAR_DOWNLOADS=false` (no librqbit
 engine), `MAGNETAR_NIP66=false`, a longer `MAGNETAR_CRAWL_INTERVAL_SECS` or a lower
 `MAGNETAR_CRAWL_MAX_RELAYS` for small hardware. `MAGNETAR_CRAWL_INTERVAL_SECS=0` (continuous)

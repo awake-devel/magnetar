@@ -32,4 +32,5 @@ mod stats_bench;
 mod store_pg;
 mod tmdb;
 mod tmdb_imdb;
+mod web;
 mod workers;

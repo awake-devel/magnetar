@@ -63,6 +63,16 @@ cargo fmt --all --check
 step "cargo clippy --workspace --all-targets --all-features -D warnings"
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+step "web UI: deno lint, check, test (crates/server/web, docs/WEB.md)"
+web="$root/crates/server/web"
+if ! command -v deno >/dev/null 2>&1; then
+  echo "skipped: deno is not installed (the web UI's checks need deno 2)"
+elif [ ! -f "$web/deno.json" ]; then
+  echo "skipped: $web/deno.json does not exist"
+else
+  (cd "$web" && export DENO_NO_UPDATE_CHECK=1 && deno lint && deno task check && deno task test)
+fi
+
 step "Postgres for tests"
 ensure_postgres
 

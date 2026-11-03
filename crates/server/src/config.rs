@@ -125,6 +125,11 @@ pub struct Config {
     /// Start the librqbit download engine with `serve`.
     #[arg(long, env = "MAGNETAR_DOWNLOADS", default_value_t = true, action = clap::ArgAction::Set)]
     pub downloads: bool,
+    /// Serve the web UI (D132–D135, docs/WEB.md) at `/` with `serve`, and accept its session
+    /// cookie on the API. Off: no web routes, `/api/v1/web/*` answers 404 and cookies are
+    /// ignored; the bearer API is the same either way.
+    #[arg(long, env = "MAGNETAR_WEB_UI", default_value_t = true, action = clap::ArgAction::Set)]
+    pub web_ui: bool,
     /// Crawl Nostr relays with `serve` (D118): the relay crawl, its indexer metadata (kinds
     /// 0/3/10000/10002) and NIP-66 relay discovery. Off: no relay is contacted; the API, phone
     /// sync, seed checks, enrichment, trust scoring, the saved-search notifier and the worker
@@ -230,6 +235,11 @@ pub struct Config {
     /// DHT fallback for infohashes no tracker answered.
     #[arg(long, env = "MAGNETAR_LIVENESS_DHT", default_value_t = true, action = clap::ArgAction::Set)]
     pub liveness_dht: bool,
+    /// Scrape torrents that list no tracker (DHT-only ones) on the default public trackers
+    /// their magnet links get. Off: they are asked only through the DHT (if on), so a local
+    /// check server with every outbound activity off never contacts a public tracker (D136).
+    #[arg(long, env = "MAGNETAR_LIVENESS_FALLBACK_TRACKERS", default_value_t = true, action = clap::ArgAction::Set)]
+    pub liveness_fallback_trackers: bool,
     /// DHT walks at the same time.
     #[arg(long, env = "MAGNETAR_LIVENESS_DHT_CONCURRENCY", default_value_t = 32)]
     pub liveness_dht_concurrency: usize,
@@ -511,6 +521,41 @@ mod tests {
         assert_eq!(cli.config.db_pool, crate::store::DEFAULT_MAX_CONNECTIONS);
         assert!(Cli::try_parse_from(["magnetar-server", "--db-pool", "0", "serve"]).is_err());
         assert!(Cli::try_parse_from(["magnetar-server", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn fallback_trackers_flag() {
+        // On by default; off, a tracker-less torrent is never scraped on a public tracker (D136).
+        let on = Cli::try_parse_from(["magnetar-server", "serve"]).unwrap();
+        assert!(on.config.liveness_fallback_trackers);
+        assert!(
+            !crate::liveness::liveness_config(&on.config, None)
+                .fallback_trackers
+                .is_empty()
+        );
+        let off = Cli::try_parse_from([
+            "magnetar-server",
+            "--liveness-fallback-trackers",
+            "false",
+            "serve",
+        ])
+        .unwrap();
+        assert!(!off.config.liveness_fallback_trackers);
+        assert!(
+            crate::liveness::liveness_config(&off.config, None)
+                .fallback_trackers
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn web_ui_flag() {
+        // On by default (D132); `false` turns the UI and its cookie auth off.
+        let on = Cli::try_parse_from(["magnetar-server", "serve"]).unwrap();
+        assert!(on.config.web_ui);
+        let off = Cli::try_parse_from(["magnetar-server", "--web-ui", "false", "serve"]).unwrap();
+        assert!(!off.config.web_ui);
+        assert!(Cli::try_parse_from(["magnetar-server", "--web-ui", "maybe", "serve"]).is_err());
     }
 
     #[test]

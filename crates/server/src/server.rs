@@ -154,6 +154,10 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
         .with_downloader(downloader.clone())
         .with_tmdb(tmdb.clone())
         .with_fleet(fleet)
+        .with_web(
+            cfg.web_ui
+                .then(|| Arc::new(crate::web::WebState::from_config(&cfg))),
+        )
         .with_liveness(Arc::new(LivenessService::new(liveness::liveness_config(
             &cfg,
             dht_pacer.clone(),
