@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
@@ -258,7 +259,7 @@ private fun HealthCard(h: StatsHealth, colors: ChartColors) {
 }
 
 @Composable
-private fun Line(label: String, value: String, tag: String? = null) {
+internal fun Line(label: String, value: String, tag: String? = null) {
     Row(Modifier.fillMaxWidth().padding(top = 2.dp).then(if (tag != null) Modifier.testTag(tag) else Modifier)) {
         Text(label, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
         Text(value, style = MaterialTheme.typography.bodySmall)
@@ -281,7 +282,7 @@ private fun ActivityCard(state: StatsUiState, colors: ChartColors, vm: StatsView
                 )
             }
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                for (a in Activity.offered(state.hasDht)) {
+                for (a in Activity.offered(state.hasDht, state.hasProbes)) {
                     FilterChip(
                         selected = state.activity == a,
                         onClick = { vm.pickActivity(a) },
@@ -387,6 +388,7 @@ private fun Status(state: StatsUiState, colors: ChartColors) {
                     LinearProgressIndicator(Modifier.fillMaxWidth().padding(vertical = 12.dp))
                 }
             }
+            probesItem(state, colors)
             return@LazyColumn
         }
         state.statsCachedAtMs?.let { item { Banner(cachedAgo(it) + (state.statsError?.let { e -> " · $e" } ?: "")) } }
@@ -417,8 +419,15 @@ private fun Status(state: StatsUiState, colors: ChartColors) {
             }
         }
         h.dht?.let { d -> item { StatusCard("DHT crawler", "status_dht") { for ((k, v) in dhtLines(d)) Line(k, v) } } }
+        probesItem(state, colors)
         item { Text(" ", Modifier.padding(8.dp)) }
     }
+}
+
+/** "Header probes" (D117, D118), left out when the server sends no backfill counts. */
+private fun LazyListScope.probesItem(state: StatsUiState, colors: ChartColors) {
+    val fleet = state.fleet?.takeIf { it.probeBackfill != null } ?: return
+    item(key = "probes") { StatusCard("Header probes", "status_probes") { ProbesContent(fleet, colors, state.fleetCachedAtMs) } }
 }
 
 @Composable

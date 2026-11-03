@@ -8,6 +8,7 @@ import app.magnetar.api.BreakdownRequest
 import app.magnetar.api.BreakdownSet
 import app.magnetar.api.CrawlSources
 import app.magnetar.api.Features
+import app.magnetar.api.FleetStats
 import app.magnetar.api.Health
 import app.magnetar.api.SearchQuery
 import app.magnetar.api.Sort
@@ -63,6 +64,9 @@ data class StatsUiState(
     val sources: CrawlSources? = null,
     val sourcesError: String? = null,
     val sourcesCachedAtMs: Long? = null,
+    /** Crawl workers and the header-probe backfill (feature `workers`, D118). */
+    val fleet: FleetStats? = null,
+    val fleetCachedAtMs: Long? = null,
 ) {
     val features: Set<String> get() = (health?.features ?: knownFeatures).orEmpty().toSet()
     val hasStats: Boolean get() = Features.STATS in features
@@ -70,6 +74,10 @@ data class StatsUiState(
     val hasDht: Boolean get() = Features.DHT in features || stats?.dht != null
     val hasCrawlSources: Boolean get() = Features.CRAWL_SOURCES in features
     val hasCrawlMap: Boolean get() = Features.CRAWL_MAP in features
+    val hasWorkers: Boolean get() = Features.WORKERS in features
+
+    /** The server sends header-probe backfill counts (D118): newer server with workers. */
+    val hasProbes: Boolean get() = fleet?.probeBackfill != null
 }
 
 /**
@@ -125,7 +133,25 @@ class StatsViewModel(
                 loadStats()
             }
             if (_state.value.hasCrawlSources) loadSources() else _state.update { it.copy(sources = null, sourcesError = null, sourcesCachedAtMs = null) }
+            if (_state.value.hasWorkers) {
+                loadFleet()
+            } else {
+                _state.update { it.copy(fleet = null, fleetCachedAtMs = null) }
+                keepActivityOffered()
+            }
         }
+    }
+
+    /**
+     * The picked activity chart is no longer offered (another server, no DHT, or the probe
+     * backfill counts are gone): fall back to the total. Its chip is hidden, and an older server
+     * answers 400 for a metric it does not know.
+     */
+    private fun keepActivityOffered() {
+        val s = _state.value
+        if (s.activity in Activity.offered(s.hasDht, s.hasProbes)) return
+        _state.update { it.copy(activity = Activity.TOTAL, series = null, seriesError = null) }
+        seriesRequests.value++
     }
 
     private fun query(filters: SearchFilters): SearchQuery {
@@ -235,6 +261,29 @@ class StatsViewModel(
         }
     }
 
+    /** `/api/v1/stats` for the workers and probe backfill; an error leaves the section out (or the cached one). */
+    private fun loadFleet() = viewModelScope.launch {
+        val cached = repo.readCache(CACHE_FLEET, "", FleetStats.serializer())
+        if (cached != null && _state.value.fleet == null) {
+            _state.update { it.copy(fleet = cached.value, fleetCachedAtMs = cached.savedAtMs) }
+        }
+        try {
+            val f = repo.service().fleetStats()
+            repo.writeCache(CACHE_FLEET, "", FleetStats.serializer(), f)
+            _state.update { it.copy(fleet = f, fleetCachedAtMs = null) }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: ApiException) {
+            _state.update {
+                it.copy(
+                    fleet = if (e.isOffline) it.fleet else null,
+                    fleetCachedAtMs = if (e.isOffline) it.fleetCachedAtMs else null,
+                )
+            }
+        }
+        keepActivityOffered()
+    }
+
     private suspend fun loadSeries() {
         val s = _state.value
         val bucket = if (s.hourly) "hour" else "day"
@@ -308,5 +357,6 @@ class StatsViewModel(
         const val CACHE_HEALTH = "stats/health"
         const val CACHE_FEATURES = "stats/features"
         const val CACHE_SOURCES = "stats/sources"
+        const val CACHE_FLEET = "stats/fleet"
     }
 }

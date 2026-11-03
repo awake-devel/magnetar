@@ -126,6 +126,7 @@ Routes: `search`, `saved`, `stats`, `settings` (tabs); `torrent/{infohash}`, `ti
 | Web of trust / relays graphs | `GET /api/v1/graphs/wot`, `GET /api/v1/graphs/relays` | `graphs` |
 | Stats "Where discoveries come from" | `GET /api/v1/stats/sources` | `crawl_sources` |
 | Crawl map | `GET /api/v1/stats/map?layer=dht\|nostr&window=day\|all` | `crawl_map` |
+| Stats "Header probes" (workers, probe backfill) | `GET /api/v1/stats` (`workers`, `probe_backfill` only) | `workers` |
 | Settings trust root + threshold | `GET` / `PUT /api/v1/settings/trust` `{root, threshold}` | — |
 
 A query that uses a feature-gated field (release filters, rating sort, source chips) is never
@@ -498,4 +499,23 @@ build month, labels and the conversion format; the Stats view model asks for sou
 `crawl_sources` is listed (an older server: no request, no card, no button), keeps them offline
 from the cache; the map view model per layer / window, metric reset, cancellation, selection,
 offline cache per request, 404.
+
+
+**"Header probes"** (D117, D118, docs/PROBES.md §10; `GET /api/v1/stats`, asked only when
+`/health` lists `workers`): a card at the end of the Status tab (`ui/stats/ProbesCard.kt`,
+helpers in `ProbesModel.kt`), left out when the answer has no `probe_backfill` (older server,
+no workers) or the request fails. It shows the backfill progress as a bar and a percent, probed
+against what is left to try (`probed / (probed + remaining)`, never "100 %" while something is
+left, "<1 %" once something is probed); then *Probed*, *Remaining*, *Waiting / leased /
+retrying*, *Closed* with one line per outcome (`closed` pairs, most first; the blank outcome the server
+sends for rows closed without one shows as *unknown*), when the queue was
+last filled and when the counts were taken. One block per worker follows: connected or not,
+badges *discovery off* (`dht.discover: false`; an older worker sends none and discovers),
+*backfill on* (`dht.backfill` present), *probes on* (`dht.probe`), the server's
+`backfill_*_total` counters and the heartbeat's in-worker / fetched / no peers / failed / lease
+errors. A worker name that is an IP literal is redacted on decode, as on the sources card. The
+Activity chart offers `probe_backfill_dht_rows` ("Probe backfill DHT rows") only when the server
+sent `probe_backfill` (an older server refuses the metric); a picked chart that is no longer
+offered (another server, the counts gone) falls back to the total. Cached as `stats/fleet` like the
+other Stats answers. Tests: `ProbeStatsTest`, `MagnetarApiTest` (`fleet stats …`).
 

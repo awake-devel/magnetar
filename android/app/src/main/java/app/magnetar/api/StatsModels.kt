@@ -1,7 +1,17 @@
 package app.magnetar.api
 
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.descriptors.SerialDescriptor
+import kotlinx.serialization.descriptors.buildClassSerialDescriptor
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonDecoder
+import kotlinx.serialization.json.JsonEncoder
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.longOrNull
 
 /*
  * Stats and graph answers (D47, docs/STATS.md), mirrors of magnetar_core::api. Same rules as
@@ -376,4 +386,124 @@ data class CrawlMap(
     val totals: List<Long> = emptyList(),
     val since: Long = 0,
     @SerialName("computed_at") val computedAt: Long = 0,
+)
+
+/*
+ * `GET /api/v1/stats` (D96–D100, D117, D118): only the crawl workers and the header-probe
+ * backfill queue are read here (the rest is in `/stats/health`). Every field is optional: an
+ * older server sends neither, an older worker no `discover` / `backfill` / `probe`.
+ */
+
+/**
+ * One `(name, count)` pair, sent by the server as a two-element array (`["adult", 12]`: a Rust
+ * tuple). A malformed entry decodes with a null name, which [List.named] drops. A blank name is a
+ * real bucket: the server sends `""` for closed rows with no recorded outcome.
+ */
+@Serializable(with = NamedCountSerializer::class)
+data class NamedCount(val name: String? = null, val count: Long = 0)
+
+/** The named pairs that decoded, most first. */
+fun List<NamedCount>.named(): List<NamedCount> = filter { it.name != null }.sortedByDescending { it.count }
+
+object NamedCountSerializer : KSerializer<NamedCount> {
+    override val descriptor: SerialDescriptor = buildClassSerialDescriptor("app.magnetar.api.NamedCount")
+
+    override fun deserialize(decoder: Decoder): NamedCount {
+        val json = decoder as? JsonDecoder ?: return NamedCount()
+        val arr = json.decodeJsonElement() as? JsonArray ?: return NamedCount()
+        val name = (arr.getOrNull(0) as? JsonPrimitive)?.takeIf { it.isString }?.content ?: return NamedCount()
+        val count = (arr.getOrNull(1) as? JsonPrimitive)?.longOrNull ?: 0
+        return NamedCount(name, count)
+    }
+
+    override fun serialize(encoder: Encoder, value: NamedCount) {
+        val json = encoder as? JsonEncoder ?: error("NamedCount is JSON only")
+        json.encodeJsonElement(JsonArray(listOf(JsonPrimitive(value.name), JsonPrimitive(value.count))))
+    }
+}
+
+/** The server's header-probe backfill queue (D118, docs/PROBES.md §10). */
+@Serializable
+data class ProbeBackfillStats(
+    /** Never tried yet, leased to a worker now, waiting for a retry (backoff). */
+    val waiting: Long = 0,
+    val leased: Long = 0,
+    val retrying: Long = 0,
+    /** `waiting + leased + retrying`: what is left to try. */
+    val remaining: Long = 0,
+    /** Closed for good, by outcome (`adult`, `blocked`, `gone`, `private`, `no_peers`, …). */
+    val closed: List<NamedCount> = emptyList(),
+    /** Torrents with a stored probe (backfill or new finds). */
+    val probed: Long = 0,
+    /** The queue is being filled now; unix time the last fill pass ended. */
+    val filling: Boolean = false,
+    @SerialName("filled_at") val filledAt: Long? = null,
+    /** Unix time these counts were taken. */
+    val at: Long = 0,
+)
+
+/** A worker's probe-backfill counters since it started (D118). */
+@Serializable
+data class WorkerBackfillState(
+    val leased: Long = 0,
+    val released: Long = 0,
+    /** Leased hashes in the worker now (queued, looking for peers, fetching or probing). */
+    val outstanding: Long = 0,
+    @SerialName("no_peers") val noPeers: Long = 0,
+    val failed: Long = 0,
+    val fetched: Long = 0,
+    /** Dicts sent with a probe report, and without one. */
+    val probed: Long = 0,
+    val unprobed: Long = 0,
+    @SerialName("lease_errors") val leaseErrors: Long = 0,
+)
+
+/** A worker's header-probe counters since it started (D117). Counts only. */
+@Serializable
+data class WorkerProbeState(
+    val upload: Boolean = false,
+    val started: Long = 0,
+    val ok: Long = 0,
+    val partial: Long = 0,
+    val choked: Long = 0,
+    @SerialName("no_pieces") val noPieces: Long = 0,
+    val failed: Long = 0,
+    val skipped: List<NamedCount> = emptyList(),
+)
+
+/** A worker's DHT crawler, from its heartbeat (D99); only what the stats screen shows. */
+@Serializable
+data class WorkerDhtState(
+    val mode: String = "",
+    val qps: Double = 0.0,
+    @SerialName("brake_active") val brakeActive: Boolean = false,
+    val probe: WorkerProbeState? = null,
+    /** `MAGNETAR_DHT_DISCOVER` (D118): false = no new finds; null from older workers (they discover). */
+    val discover: Boolean? = null,
+    /** Header-probe backfill (D118), when on. */
+    val backfill: WorkerBackfillState? = null,
+)
+
+/** One crawl worker as the server sees it (D99); only what the stats screen shows. */
+@Serializable
+data class WorkerStats(
+    val name: String = "",
+    val connected: Boolean = false,
+    val version: String? = null,
+    @SerialName("last_seen") val lastSeen: Long? = null,
+    @SerialName("stored_total") val storedTotal: Long = 0,
+    /** Probe backfill (D118), since the server started. */
+    @SerialName("backfill_leased_total") val backfillLeasedTotal: Long = 0,
+    @SerialName("backfill_probed_total") val backfillProbedTotal: Long = 0,
+    @SerialName("backfill_unprobed_total") val backfillUnprobedTotal: Long = 0,
+    val pressure: Boolean = false,
+    val dht: WorkerDhtState? = null,
+)
+
+/** `GET /api/v1/stats` (feature `workers`), the parts the app reads. */
+@Serializable
+data class FleetStats(
+    val workers: List<WorkerStats> = emptyList(),
+    /** None without workers or from an older server. */
+    @SerialName("probe_backfill") val probeBackfill: ProbeBackfillStats? = null,
 )

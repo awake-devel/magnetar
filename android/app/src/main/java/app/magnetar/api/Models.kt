@@ -41,6 +41,7 @@ object Features {
     const val CRAWL_SOURCES = "crawl_sources"
     const val CRAWL_MAP = "crawl_map"
     const val PROBE_FILTERS = "probe_filters"
+    const val WORKERS = "workers"
 }
 
 /** `{"error": "<code>", "message": "…"}` of every 4xx/5xx. */
