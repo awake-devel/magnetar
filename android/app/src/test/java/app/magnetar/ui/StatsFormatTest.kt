@@ -1,6 +1,8 @@
 package app.magnetar.ui
 
 import app.magnetar.api.DhtStats
+import app.magnetar.api.Features
+import app.magnetar.api.Health
 import app.magnetar.api.LivenessStats
 import app.magnetar.api.SearchIndexStatus
 import app.magnetar.api.UpnpMapping
@@ -20,6 +22,7 @@ import app.magnetar.ui.stats.backlogLines
 import app.magnetar.ui.stats.breakdownFields
 import app.magnetar.ui.stats.dhtLines
 import app.magnetar.ui.stats.indexLines
+import app.magnetar.ui.stats.missingFeatures
 import app.magnetar.ui.stats.seedChecks
 import app.magnetar.ui.stats.selectedStat
 import app.magnetar.ui.stats.sliceAt
@@ -188,5 +191,15 @@ class StatsFormatTest {
         assertEquals(lines["Router ports"], "udp 6891, tcp 6891")
         assertEquals(lines["Address"], "public")
         assertEquals(dhtLines(DhtStats(mode = "polite", running = false, lastError = "bind failed"), en).first().second, "restarting after an error: bind failed")
+    }
+
+    @Test
+    fun `a server without track kinds is named on the server card`() {
+        val d122 = listOf(
+            Features.STATS, Features.GRAPHS, Features.SAVED_SEARCH_POLL, Features.FILTERS, Features.ORIGIN,
+            Features.CRAWL_SOURCES, Features.CRAWL_MAP, Features.PROBE_FILTERS,
+        )
+        assertEquals(missingFeatures(Health(status = "ok", db = true, features = d122)), listOf("track-kind filters"))
+        assertEquals(missingFeatures(Health(status = "ok", db = true, features = d122 + Features.PROBE_KINDS)), emptyList<String>())
     }
 }

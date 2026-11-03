@@ -106,7 +106,7 @@ Three areas work on this crate; each keeps to its files so they do not edit the 
 | `src/formats/{media,image,doc,archive,exe,disc,text}.rs` | Rust structural parsers | core |
 | `src/formats/console/` (`mod.rs`, `sony.rs`, `nintendo.rs`, `xbox.rs`, `iso.rs`, `retro.rs`) | console packages, disc images and cartridges, `GameInfo` | **console** |
 | `src/formats/console/listing.rs` | game / disc folders and split files from a torrent file list (no bytes) | **console** |
-| `src/video/` (`mod`, `src`, `bits`, `codec`, `audio`, `mkv`, `mp4`, `ts`, `avi`) | video recon: `analyze()` / `probe()`, `VideoInfo` and track types | **video** |
+| `src/video/` (`mod`, `src`, `bits`, `codec`, `audio`, `kind`, `mkv`, `mp4`, `ts`, `avi`; unit tests in `*_tests.rs` and the builders in `testkit.rs`) | video recon: `analyze()` / `probe()`, `VideoInfo` and track types | **video** |
 | `tests/formats.rs`, `tests/driver.rs`, `tests/signatures.rs`, `tests/props.rs` | per-format fixtures, driver, engine, property tests | core |
 | `tests/console*.rs`, `tests/ps5_samples.rs`, `tests/signatures_{fixtures,fp}.rs` | console fixtures and ids, listings, the two real PS5 packages (skipped when absent), per-rule fixtures and false positives | **console** |
 | `tests/video.rs`, `tests/video_props.rs`, `tests/video_corpus.rs`, `tests/video_fixtures/` | hand-built containers, hostile-input properties, ffprobe comparison (skipped without corpora or ffprobe; `SNIFF_VIDEO_CORPUS`) | **video** |
@@ -175,6 +175,24 @@ only); subtitle tracks. `atmos` / `dts_x` are `None` unless the parsed bytes dec
 stays `None`: its `dac4` is not parsed). Encrypted MP4 tracks (`encv` / `enca`) report the
 `frma` original format and are never frame-parsed.
 
+**Track kinds (D123, `src/video/kind.rs`).** Every audio and subtitle track carries `kinds`
+(`TrackKind`: `sdh`, `cc`, `forced`, `signs`, `commentary`, `description`, `honorifics`,
+`bilingual`, `easy_reader` on subtitles; `original`, `dub`, `voiceover`, `description`,
+`dialogue`, `commentary`, `music`, `karaoke`, `alternate` on audio) and `name_kinds` (the part
+only the track name gave). Sources: the Matroska v4 flags (0x55AB–0x55AF) and WebVTT CodecIDs;
+MP4 `udta` `name` / `tnam` / `tagc` / `kind`, `tref/forc`, `tx3g` forced bit, `dac3` / `dec3`
+bsmod; TS ISO 639 audio_type, every DVB subtitling and teletext entry (one track each),
+supplementary_audio, AC-3 / E-AC-3 component_type, ATSC 0x81 / 0x86; AC-3 / E-AC-3 bsmod in
+the frames already read; CEA-608 / 708 signalled in the first access unit (HEVC SEI anywhere,
+H.264 SEI and MPEG-2 user data in TS) as `eia_608` / `eia_708` tracks with the video track's
+id; AVI `DXSB` / `DXSA` as `xsub` subtitles. A multilingual name classifier
+(`classify_name`) adds kinds; `kind::resolve` merges them (a set flag wins, absent flags say
+nothing, a "full" / SDH / CC name cancels a forced flag). `SubtitleTrack::forced` stays the
+raw container flag. New codec names: `arib_caption`, `usf`, `eia_708`, `ttml` (`dfxp`),
+`dvd_subtitle` (`mp4s` under `subp`), `xsub`. No new reads: the 78 sample videos and the 53
+recon-corpus files fetch the same bytes in the same rounds as before. Rules and taxonomy:
+docs/PROBES.md §11.
+
 | Corpus (31 local files, `tests/video_corpus.rs`) | Field checks vs ffprobe on the whole file |
 |---|---|
 | `video::recommended_caps()` (64 KiB head, 10 rounds) | 649/649 |
@@ -225,6 +243,11 @@ sweep of all 864 sample files.
 
 ## UNVERIFIED and not ported
 
+- Track kinds (D123): the non-English and non-French name terms; the CEA-608 / 708 readers
+  (synthetic vectors only); how often real releases set the Matroska v4 flags or a non-zero
+  bsmod. Checked on local ffmpeg 9.0.2 output: Matroska dispositions, MP4 `udta/name` and
+  `kind` boxes (`tests/video_fixtures/ffmpeg_kinds.mp4`), AC-3 / E-AC-3 service types in TS,
+  MP4 and Matroska (E-AC-3) frames; and on the Matroska test suite's "Commentary" track.
 - QuickTime AAC in `wave`; `mfra` with several `tfra`; Macintosh language codes other than
   0, 1, 2, 4, 10, 11, 23, 128; Matroska header stripping and zlib frames; DTS Express; DV
   profile 7 and the RPU-only path (no legally clean profile 7 sample found); VC-1 in TS

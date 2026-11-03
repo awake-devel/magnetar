@@ -2,6 +2,7 @@ package app.magnetar.ui.stats
 
 import app.magnetar.api.DhtStats
 import app.magnetar.api.Features
+import app.magnetar.api.Health
 import app.magnetar.api.LivenessStats
 import app.magnetar.api.SearchIndexStatus
 import app.magnetar.ui.common.backlogEta
@@ -145,6 +146,15 @@ fun backlogLines(l: LivenessStats, locale: Locale = Locale.getDefault(), nowSec:
             )
         }
     }
+
+/** Features the server lacks, as the "Needs a newer server for" line names them. */
+fun missingFeatures(health: Health): List<String> =
+    listOf(
+        Features.STATS to "charts", Features.GRAPHS to "graphs", Features.SAVED_SEARCH_POLL to "saved-search alerts",
+        Features.FILTERS to "release filters", Features.ORIGIN to "Nostr / DHT source",
+        Features.CRAWL_SOURCES to "discovery sources", Features.CRAWL_MAP to "crawl map",
+        Features.PROBE_FILTERS to "probe filters", Features.PROBE_KINDS to "track-kind filters",
+    ).filter { !health.has(it.first) }.map { it.second }
 
 /** The search index (D43) as label → value lines. */
 fun indexLines(s: SearchIndexStatus, locale: Locale = Locale.getDefault(), nowSec: Long = System.currentTimeMillis() / 1000): List<Pair<String, String>> =

@@ -6,6 +6,11 @@
 //! the app can show how many results each other language/resolution/… would give. One pass
 //! serves all requested facets: a document failing no attribute filter counts for every facet,
 //! one failing exactly one filter counts only for that filter's facet.
+//!
+//! Projected facets (D125): with a language + kind pair filter (`f_probe_sub_pair`,
+//! `f_probe_audio_pair`), the language facet and the kind facet of that family are counted on
+//! the pair column, each projected on its side with the other side fixed, and leave out the
+//! pair filter: a count is what picking that value as well would give (one track having both).
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
@@ -401,6 +406,26 @@ impl Collector for TopFiltered {
 pub struct FacetField {
     pub field: String,
     pub filter: Option<usize>,
+    /// Count on a pair column (`{left}:{right}` values, D125) instead: `field` is then the
+    /// pair column and `filter` the pair filter.
+    pub project: Option<Project>,
+}
+
+/// How a pair value `{l}:{k}` (split at its first `:`) counts: with `keep_left`, as `l` when
+/// `k` is in `other`; else as `k` when `l` is in `other`. Each key at most once per document.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Project {
+    pub keep_left: bool,
+    pub other: Vec<String>,
+}
+
+impl Project {
+    /// The output key of pair value `v`, if it counts.
+    pub fn key<'a>(&self, v: &'a str) -> Option<&'a str> {
+        let (l, k) = v.split_once(':')?;
+        let (key, rest) = if self.keep_left { (l, k) } else { (k, l) };
+        self.other.iter().any(|o| o == rest).then_some(key)
+    }
 }
 
 /// Value counts of several keyword fast fields over the filtered hits, disjunctively.
@@ -420,11 +445,52 @@ pub struct FacetTally {
 /// Documents passing every filter, and one tally per facet.
 pub type FacetFruit = (u64, Vec<FacetTally>);
 
+/// A projected facet in one segment: pair-column ordinal → output key index (None = the
+/// value does not count), and the output keys. `counts` is then indexed by key.
+struct SegmentProjection {
+    key_of: Vec<Option<u32>>,
+    keys: Vec<String>,
+    /// Scratch: the keys of the document being counted.
+    seen: Vec<u32>,
+}
+
+impl SegmentProjection {
+    fn new(col: Option<&StrColumn>, p: &Project) -> tantivy::Result<Self> {
+        let mut out = SegmentProjection {
+            key_of: Vec::new(),
+            keys: Vec::new(),
+            seen: Vec::new(),
+        };
+        let Some(c) = col else {
+            return Ok(out);
+        };
+        let mut index: HashMap<String, u32> = HashMap::new();
+        let mut s = String::new();
+        for ord in 0..c.num_terms() as u64 {
+            s.clear();
+            let key = if c.ord_to_str(ord, &mut s)? {
+                p.key(&s)
+            } else {
+                None
+            };
+            out.key_of.push(key.map(|k| {
+                let next = out.keys.len() as u32;
+                *index.entry(k.to_string()).or_insert_with(|| {
+                    out.keys.push(k.to_string());
+                    next
+                })
+            }));
+        }
+        Ok(out)
+    }
+}
+
 pub struct FacetSegment {
     cols: Columns,
     filter: Filter,
     fields: Vec<FacetField>,
     columns: Vec<Option<StrColumn>>,
+    projections: Vec<Option<SegmentProjection>>,
     counts: Vec<Vec<u64>>,
     totals: Vec<u64>,
     missing: Vec<u64>,
@@ -436,10 +502,28 @@ impl FacetSegment {
         self.totals[i] += 1;
         let mut any = false;
         if let Some(c) = &self.columns[i] {
-            for ord in c.ords().values_for_doc(doc) {
-                any = true;
-                if let Some(n) = self.counts[i].get_mut(ord as usize) {
-                    *n += 1;
+            match &mut self.projections[i] {
+                None => {
+                    for ord in c.ords().values_for_doc(doc) {
+                        any = true;
+                        if let Some(n) = self.counts[i].get_mut(ord as usize) {
+                            *n += 1;
+                        }
+                    }
+                }
+                Some(p) => {
+                    p.seen.clear();
+                    for ord in c.ords().values_for_doc(doc) {
+                        if let Some(Some(k)) = p.key_of.get(ord as usize)
+                            && !p.seen.contains(k)
+                        {
+                            p.seen.push(*k);
+                        }
+                    }
+                    any = !p.seen.is_empty();
+                    for k in &p.seen {
+                        self.counts[i][*k as usize] += 1;
+                    }
                 }
             }
         }
@@ -478,7 +562,11 @@ impl SegmentCollector for FacetSegment {
         let mut out = Vec::with_capacity(self.fields.len());
         for (i, col) in self.columns.iter().enumerate() {
             let mut m = HashMap::new();
-            if let Some(c) = col {
+            if let Some(p) = &self.projections[i] {
+                for (k, n) in self.counts[i].iter().enumerate().filter(|(_, n)| **n > 0) {
+                    m.insert(p.keys[k].clone(), *n);
+                }
+            } else if let Some(c) = col {
                 let mut s = String::new();
                 for (ord, n) in self.counts[i].iter().enumerate().filter(|(_, n)| **n > 0) {
                     s.clear();
@@ -507,10 +595,23 @@ impl Collector for FacetCounts {
         reader: &SegmentReader,
     ) -> tantivy::Result<FacetSegment> {
         let mut columns = Vec::with_capacity(self.fields.len());
+        let mut projections = Vec::with_capacity(self.fields.len());
         let mut counts = Vec::with_capacity(self.fields.len());
         for f in &self.fields {
             let column = reader.fast_fields().str(&f.field)?;
-            counts.push(vec![0; column.as_ref().map_or(0, |c| c.num_terms())]);
+            let projection = f
+                .project
+                .as_ref()
+                .map(|p| SegmentProjection::new(column.as_ref(), p))
+                .transpose()?;
+            counts.push(vec![
+                0;
+                match &projection {
+                    Some(p) => p.keys.len(),
+                    None => column.as_ref().map_or(0, |c| c.num_terms()),
+                }
+            ]);
+            projections.push(projection);
             columns.push(column);
         }
         Ok(FacetSegment {
@@ -518,6 +619,7 @@ impl Collector for FacetCounts {
             filter: self.filter.clone(),
             fields: self.fields.clone(),
             columns,
+            projections,
             counts,
             totals: vec![0; self.fields.len()],
             missing: vec![0; self.fields.len()],
@@ -573,6 +675,26 @@ mod tests {
         let mut none = TopK::new(0);
         none.push(r(1.0, 0, 0));
         assert!(none.into_sorted().is_empty());
+    }
+
+    /// D125: a pair value counts on one side when its other side is wanted.
+    #[test]
+    fn projection_keys_split_at_the_first_colon() {
+        let lang = Project {
+            keep_left: true,
+            other: vec!["sdh".into(), "cc".into()],
+        };
+        assert_eq!(lang.key("fre:sdh"), Some("fre"));
+        assert_eq!(lang.key("eng:cc"), Some("eng"));
+        assert_eq!(lang.key("fre:forced"), None);
+        assert_eq!(lang.key("nocolon"), None);
+        let kind = Project {
+            keep_left: false,
+            other: vec!["fre".into()],
+        };
+        assert_eq!(kind.key("fre:sdh"), Some("sdh"));
+        assert_eq!(kind.key("fre:easy_reader"), Some("easy_reader"));
+        assert_eq!(kind.key("eng:sdh"), None);
     }
 
     #[test]

@@ -62,6 +62,11 @@ pub mod features {
     /// `probe_resolutions`, `probe_video_codecs`, `probe_hdr`, `probe_audio`) and the
     /// `probe_*` facets (D122). Facets still 503 while the search index builds.
     pub const PROBE_FILTERS: &str = "probe_filters";
+    /// The track-kind filters of `SearchQuery` (`probe_sub_kinds`, `probe_audio_kinds`,
+    /// `probe_sub_formats`), the `probe_sub_kind` / `probe_audio_kind` / `probe_sub_format`
+    /// facets, and `kinds` on the probe tracks of `TorrentDetail` (D123–D125). A language with a
+    /// kind of the same family matches one track having both.
+    pub const PROBE_KINDS: &str = "probe_kinds";
     pub const ALL: &[&str] = &[
         FILTERS,
         FACET_SET,
@@ -76,6 +81,7 @@ pub mod features {
         CRAWL_SOURCES,
         CRAWL_MAP,
         PROBE_FILTERS,
+        PROBE_KINDS,
     ];
 }
 

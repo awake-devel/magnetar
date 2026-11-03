@@ -630,6 +630,14 @@ pub struct ProbeAudioTrack {
     pub atmos: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub dts_x: bool,
+    /// Track kinds (D123): values of [`PROBE_AUDIO_KINDS`], alphabetical, no duplicates.
+    /// Probes older than D123 (version 1) have none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<String>,
+    /// The track name as the file has it, cleaned and cut to [`PROBE_MAX_TRACK_NAME`] bytes
+    /// (D123); kept to re-classify later, not shown by the app.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -638,7 +646,40 @@ pub struct ProbeSubTrack {
     pub codec: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
+    /// Track kinds (D123): values of [`PROBE_SUB_KINDS`], alphabetical, no duplicates.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<String>,
+    /// As [`ProbeAudioTrack::name`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
+
+/// Subtitle track kinds a probe may store (D123, docs/PROBES.md "Track kinds").
+pub const PROBE_SUB_KINDS: [&str; 9] = [
+    "bilingual",
+    "cc",
+    "commentary",
+    "description",
+    "easy_reader",
+    "forced",
+    "honorifics",
+    "sdh",
+    "signs",
+];
+/// Audio track kinds a probe may store (D123).
+pub const PROBE_AUDIO_KINDS: [&str; 9] = [
+    "alternate",
+    "commentary",
+    "description",
+    "dialogue",
+    "dub",
+    "karaoke",
+    "music",
+    "original",
+    "voiceover",
+];
+/// Longest stored track name, bytes (D123).
+pub const PROBE_MAX_TRACK_NAME: usize = 64;
 
 /// What a `media` row describes (D40).
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]

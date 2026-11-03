@@ -396,10 +396,86 @@ pub(crate) fn hevc_sps(nal: &[u8], t: &mut Tk) -> Option<()> {
 /// light level (144), HDR10+ (ITU-T T.35, B5 003C 0001 04).
 pub(crate) fn hevc_sei(nal: &[u8], t: &mut Tk) {
     let rb = unescape(nal.get(2..).unwrap_or(&[]), RBSP_CAP);
-    sei_messages(&rb, t);
+    for (pt, pl) in sei_payloads(&rb) {
+        match pt {
+            137 => t.mastering = true,
+            144 if pl.len() >= 4 => {
+                let mut c = Cur::new(pl);
+                if let (Some(a), Some(b)) = (c.u16(), c.u16()) {
+                    t.cll = Some((a, b));
+                }
+            }
+            4 if is_hdr10plus_t35(pl) => t.hdr10plus = true,
+            4 => t.captions |= ga94_t35(pl),
+            _ => {}
+        }
+    }
 }
 
-fn sei_messages(rb: &[u8], t: &mut Tk) {
+/// H.264 SEI NAL (1-byte header included): closed captions in user_data_registered_itu_t_t35
+/// (payload type 4, ATSC A/53 `GA94`), D123.
+pub(crate) fn h264_sei(nal: &[u8], t: &mut Tk) {
+    let rb = unescape(nal.get(1..).unwrap_or(&[]), RBSP_CAP);
+    for (pt, pl) in sei_payloads(&rb) {
+        if pt == 4 {
+            t.captions |= ga94_t35(pl);
+        }
+    }
+}
+
+/// ATSC A/53 caption data in an ITU-T T.35 payload: country 0xB5 (United States), provider
+/// 0x0031 (ATSC), `GA94`, user_data_type_code 3 (cc_data). Bit 1 = CEA-608, bit 2 = CEA-708.
+fn ga94_t35(pl: &[u8]) -> u8 {
+    match pl.get(..8) {
+        Some([0xb5, 0x00, 0x31, b'G', b'A', b'9', b'4', 0x03]) => {
+            cc_data(pl.get(8..).unwrap_or(&[]))
+        }
+        _ => 0,
+    }
+}
+
+/// ATSC A/53 `cc_data()` from its flags byte: `cc_count` (5 bits), `em_data`, then `cc_count`
+/// triples `marker(5) cc_valid(1) cc_type(2)`, data, data. Only valid triples count: cc_type
+/// 0 / 1 are CEA-608 fields, 2 / 3 CEA-708 (DTVCC) packets. A 608 pair whose two bytes are
+/// null once the parity bit is dropped (`80 80`, the padding many encoders send constantly
+/// with no caption service) does not count (review of D123), nor does a DTVCC data pair
+/// (cc_type 2) of two zero bytes.
+fn cc_data(d: &[u8]) -> u8 {
+    let n = usize::from(d.first().map_or(0, |b| b & 0x1f));
+    let mut out = 0;
+    for tr in d.get(2..).unwrap_or(&[]).as_chunks::<3>().0.iter().take(n) {
+        let [b, d1, d2] = *tr;
+        if b & 0x04 == 0 {
+            continue;
+        }
+        match b & 3 {
+            0 | 1 if (d1 | d2) & 0x7f != 0 => out |= 1,
+            2 if d1 | d2 != 0 => out |= 2,
+            3 => out |= 2,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Closed captions in MPEG-2 picture user data (`00 00 01 B2`): ATSC `GA94` cc_data, or the
+/// DVD style `CC 01 F8` (CEA-608), D123. Bit 1 = CEA-608, bit 2 = CEA-708.
+pub(crate) fn mpeg2_captions(buf: &[u8]) -> u8 {
+    let mut out = 0;
+    for i in memchr::memmem::find_iter(buf, &[0, 0, 1, 0xb2]).take(64) {
+        let u = buf.get(i + 4..).unwrap_or(&[]);
+        if u.starts_with(b"GA94\x03") {
+            out |= cc_data(u.get(5..).unwrap_or(&[]));
+        } else if u.starts_with(&[b'C', b'C', 0x01, 0xf8]) {
+            out |= 1;
+        }
+    }
+    out
+}
+
+/// SEI messages of an RBSP: (payload type, payload).
+fn sei_payloads(rb: &[u8]) -> Vec<(usize, &[u8])> {
+    let mut out = Vec::new();
     let mut q = 0usize;
     for _ in 0..64 {
         if q + 2 > rb.len() || rb.get(q) == Some(&0x80) {
@@ -420,19 +496,10 @@ fn sei_messages(rb: &[u8], t: &mut Tk) {
             break;
         };
         let pl = rb.get(q..q.saturating_add(ps).min(rb.len())).unwrap_or(&[]);
-        match pt {
-            137 => t.mastering = true,
-            144 if pl.len() >= 4 => {
-                let mut c = Cur::new(pl);
-                if let (Some(a), Some(b)) = (c.u16(), c.u16()) {
-                    t.cll = Some((a, b));
-                }
-            }
-            4 if is_hdr10plus_t35(pl) => t.hdr10plus = true,
-            _ => {}
-        }
+        out.push((pt, pl));
         q = q.saturating_add(ps);
     }
+    out
 }
 
 fn is_hdr10plus_t35(pl: &[u8]) -> bool {
@@ -1042,3 +1109,7 @@ pub(crate) fn prores_frame(f: &[u8], t: &mut Tk) {
     t.chroma = chroma_name(chroma);
     t.bit_depth = Some(depth);
 }
+
+#[cfg(test)]
+#[path = "codec_tests.rs"]
+mod tests;

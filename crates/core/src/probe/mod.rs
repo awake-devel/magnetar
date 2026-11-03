@@ -41,7 +41,8 @@ use tokio::time::Instant;
 use crate::metainfo::{Fetcher, InfoFile, PeerConn};
 
 /// Version of the probe's results (wire and storage, D117).
-pub const PROBE_VERSION: u16 = 1;
+/// 2: track kinds and names (D123).
+pub const PROBE_VERSION: u16 = 2;
 /// Dicts larger than this are not probed (the probe decodes the dict again for the layout).
 pub const MAX_DICT: usize = 2 * 1024 * 1024;
 

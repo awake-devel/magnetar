@@ -37,6 +37,14 @@ val FILTER_OPTIONS: Map<String, List<String>> = mapOf(
     "probe_codec" to listOf("hevc", "h264", "av1", "vp9"),
     "probe_hdr" to listOf("any", "dolby_vision", "hdr10_plus", "hdr10", "hlg"),
     "probe_audio" to listOf("atmos", "dts_x", "truehd", "dts", "eac3", "ac3", "aac", "flac", "opus"),
+    // Track kinds (D125, docs/PROBES.md "Track kinds"), offered with `probe_kinds`.
+    "probe_audio_kind" to listOf(
+        "original", "dub", "voiceover", "description", "dialogue", "commentary", "music", "karaoke", "alternate",
+    ),
+    "probe_sub_kind" to listOf(
+        "sdh", "cc", "forced", "signs", "commentary", "description", "honorifics", "bilingual", "easy_reader",
+    ),
+    "probe_sub_format" to listOf("text", "image", "cc"),
 )
 
 private val FIXED_LABELS: Map<String, String> = mapOf(
@@ -117,6 +125,27 @@ private val FIXED_LABELS: Map<String, String> = mapOf(
     "probe_audio/mp2" to "MP2",
     "probe_audio/vorbis" to "Vorbis",
     "probe_audio/pcm" to "PCM",
+    "probe_audio_kind/original" to "Original",
+    "probe_audio_kind/dub" to "Dubbed",
+    "probe_audio_kind/voiceover" to "Voice-over",
+    "probe_audio_kind/description" to "Audio description",
+    "probe_audio_kind/dialogue" to "Clear dialogue",
+    "probe_audio_kind/commentary" to "Commentary",
+    "probe_audio_kind/music" to "Music only",
+    "probe_audio_kind/karaoke" to "Karaoke",
+    "probe_audio_kind/alternate" to "Alternate mix",
+    "probe_sub_kind/sdh" to "SDH",
+    "probe_sub_kind/cc" to "Closed captions",
+    "probe_sub_kind/forced" to "Forced",
+    "probe_sub_kind/signs" to "Signs & songs",
+    "probe_sub_kind/commentary" to "Commentary",
+    "probe_sub_kind/description" to "Descriptions",
+    "probe_sub_kind/honorifics" to "Honorifics",
+    "probe_sub_kind/bilingual" to "Bilingual",
+    "probe_sub_kind/easy_reader" to "Easy reader",
+    "probe_sub_format/text" to "Text (SRT, ASS…)",
+    "probe_sub_format/image" to "Image (PGS, VobSub…)",
+    "probe_sub_format/cc" to "Closed captions (608/708)",
 )
 
 /** ISO 639-2/B codes the probes store (D117) → names; others show upper-cased. */
@@ -199,6 +228,8 @@ fun facetLabel(field: String, value: String): String {
         "format" -> value.uppercase()
         "category" -> categoryLabel(value)
         "probe_language", "probe_subtitles" -> iso639bLabel(value)
+        // A kind a newer server knows and this app does not: readable, not a code.
+        "probe_audio_kind", "probe_sub_kind", "probe_sub_format" -> value.replace('_', ' ').replaceFirstChar { it.uppercaseChar() }
         else -> value
     }
 }

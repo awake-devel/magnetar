@@ -36,13 +36,28 @@ val FACET_TITLES = mapOf(
     "probe_codec" to "Video track",
     "probe_hdr" to "HDR (probed)",
     "probe_audio" to "Audio format",
+    "probe_audio_kind" to "Audio track kind",
+    "probe_sub_kind" to "Subtitle kind",
+    "probe_sub_format" to "Subtitle format",
 )
 
 /**
  * Header-probe facets (D122): what a crawl worker read from the files, not the name. Shown
  * under their own heading when the server lists `probe_filters`; only probed torrents match.
  */
-val PROBE_FACET_FIELDS = listOf("probe_language", "probe_subtitles", "probe_resolution", "probe_codec", "probe_hdr", "probe_audio")
+val PROBE_FACET_FIELDS = listOf(
+    "probe_language", "probe_audio_kind", "probe_subtitles", "probe_sub_kind", "probe_sub_format",
+    "probe_resolution", "probe_codec", "probe_hdr", "probe_audio",
+)
+
+/**
+ * Track-kind facets (D125): offered only when the server lists `probe_kinds`. A kind with a
+ * language of the same family means one track ("French" + "SDH" = a French SDH track).
+ */
+val PROBE_KIND_FIELDS = listOf("probe_audio_kind", "probe_sub_kind", "probe_sub_format")
+
+/** The filter sheet's one-line note under the probe heading when a kind facet is shown (D125). */
+const val KIND_PAIR_HINT = "A kind with a language means one track: French + SDH = a French SDH track."
 
 /** Category codes in the order of the sheet (`magnetar_core::model::Category`). */
 val CATEGORIES = listOf("video", "audio", "application", "game", "porn", "anime", "book", "picture", "other")
@@ -82,6 +97,10 @@ data class SearchFilters(
     val probeCodecs: Set<String> = emptySet(),
     val probeHdr: Set<String> = emptySet(),
     val probeAudio: Set<String> = emptySet(),
+    /** Track-kind filters (D125), values of `probe_audio_kind`, `probe_sub_kind`, `probe_sub_format`. */
+    val probeAudioKinds: Set<String> = emptySet(),
+    val probeSubKinds: Set<String> = emptySet(),
+    val probeSubFormats: Set<String> = emptySet(),
 ) {
     val activeCount: Int
         get() = listOf(
@@ -92,6 +111,7 @@ data class SearchFilters(
             minRating != null, minYear != null || maxYear != null, origins.isNotEmpty(),
             probeLanguages.isNotEmpty(), probeSubtitles.isNotEmpty(), probeResolutions.isNotEmpty(),
             probeCodecs.isNotEmpty(), probeHdr.isNotEmpty(), probeAudio.isNotEmpty(),
+            probeAudioKinds.isNotEmpty(), probeSubKinds.isNotEmpty(), probeSubFormats.isNotEmpty(),
         ).count { it }
 
     /** Any header-probe filter set (D122). */
@@ -117,6 +137,9 @@ data class SearchFilters(
         "probe_codec" -> probeCodecs
         "probe_hdr" -> probeHdr
         "probe_audio" -> probeAudio
+        "probe_audio_kind" -> probeAudioKinds
+        "probe_sub_kind" -> probeSubKinds
+        "probe_sub_format" -> probeSubFormats
         else -> emptySet()
     }
 
@@ -141,6 +164,9 @@ data class SearchFilters(
             "probe_codec" -> copy(probeCodecs = probeCodecs.flip())
             "probe_hdr" -> copy(probeHdr = probeHdr.flip())
             "probe_audio" -> copy(probeAudio = probeAudio.flip())
+            "probe_audio_kind" -> copy(probeAudioKinds = probeAudioKinds.flip())
+            "probe_sub_kind" -> copy(probeSubKinds = probeSubKinds.flip())
+            "probe_sub_format" -> copy(probeSubFormats = probeSubFormats.flip())
             else -> this
         }
     }
@@ -148,7 +174,8 @@ data class SearchFilters(
     /**
      * Only what the server can apply: a field it would ignore must not be sent, or it answers
      * unfiltered (docs/APP.md §4). Release/media filters need `filters`, Source chips `origin`,
-     * probe filters `probe_filters`.
+     * probe filters `probe_filters`, track-kind filters `probe_kinds` as well (D125: a server with
+     * `probe_filters` only would ignore the kinds and answer unfiltered).
      */
     fun supportedBy(features: Set<String>): SearchFilters {
         var f = this
@@ -165,6 +192,9 @@ data class SearchFilters(
                 probeLanguages = emptySet(), probeSubtitles = emptySet(), probeResolutions = emptySet(),
                 probeCodecs = emptySet(), probeHdr = emptySet(), probeAudio = emptySet(),
             )
+        }
+        if (Features.PROBE_FILTERS !in features || Features.PROBE_KINDS !in features) {
+            f = f.copy(probeAudioKinds = emptySet(), probeSubKinds = emptySet(), probeSubFormats = emptySet())
         }
         return f
     }
@@ -218,6 +248,9 @@ fun buildQuery(
     probeVideoCodecs = filters.probeCodecs.sorted(),
     probeHdr = filters.probeHdr.sorted(),
     probeAudio = filters.probeAudio.sorted(),
+    probeSubKinds = filters.probeSubKinds.sorted(),
+    probeAudioKinds = filters.probeAudioKinds.sorted(),
+    probeSubFormats = filters.probeSubFormats.sorted(),
 )
 
 /** Inverse of [buildQuery], for running a saved search; `since` snaps to the nearest preset. */
@@ -251,6 +284,9 @@ fun filtersOf(q: SearchQuery, nowSec: Long = System.currentTimeMillis() / 1000) 
     probeCodecs = q.probeVideoCodecs.toSet(),
     probeHdr = q.probeHdr.toSet(),
     probeAudio = q.probeAudio.toSet(),
+    probeAudioKinds = q.probeAudioKinds.toSet(),
+    probeSubKinds = q.probeSubKinds.toSet(),
+    probeSubFormats = q.probeSubFormats.toSet(),
 )
 
 /** One chip of the filter sheet: value, label, count (null = no counts). */

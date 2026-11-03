@@ -41,6 +41,8 @@ object Features {
     const val CRAWL_SOURCES = "crawl_sources"
     const val CRAWL_MAP = "crawl_map"
     const val PROBE_FILTERS = "probe_filters"
+    /** Track-kind filters and facets (D125): `probe_sub_kinds`, `probe_audio_kinds`, `probe_sub_formats`. */
+    const val PROBE_KINDS = "probe_kinds"
     const val WORKERS = "workers"
 }
 
@@ -131,6 +133,14 @@ data class SearchQuery(
     @SerialName("probe_video_codecs") val probeVideoCodecs: List<String> = emptyList(),
     @SerialName("probe_hdr") val probeHdr: List<String> = emptyList(),
     @SerialName("probe_audio") val probeAudio: List<String> = emptyList(),
+    /**
+     * Track-kind filters (D125, `Features.PROBE_KINDS`): subtitle kinds (`sdh`, `cc`, `forced`, …),
+     * audio kinds (`original`, `description`, `commentary`, …) and subtitle format classes
+     * (`text`, `image`, `cc`). A kind with a language of the same family means one track.
+     */
+    @SerialName("probe_sub_kinds") val probeSubKinds: List<String> = emptyList(),
+    @SerialName("probe_audio_kinds") val probeAudioKinds: List<String> = emptyList(),
+    @SerialName("probe_sub_formats") val probeSubFormats: List<String> = emptyList(),
 ) {
     companion object {
         const val DEFAULT_LIMIT = 50
@@ -476,10 +486,21 @@ data class ProbeAudioTrack(
     val lang: String? = null,
     val atmos: Boolean = false,
     @SerialName("dts_x") val dtsX: Boolean = false,
+    /** Track kinds (D123): `original`, `dub`, `description`, `commentary`, …; v1 probes send none. */
+    val kinds: List<String> = emptyList(),
+    /** The track name as the file has it (D123): kept by the server, never shown (free text from peers). */
+    val name: String? = null,
 )
 
 @Serializable
-data class ProbeSubTrack(val codec: String = "", val lang: String? = null)
+data class ProbeSubTrack(
+    val codec: String = "",
+    val lang: String? = null,
+    /** Track kinds (D123): `forced`, `sdh`, `cc`, `signs`, …; v1 probes send none. */
+    val kinds: List<String> = emptyList(),
+    /** As [ProbeAudioTrack.name]: never shown. */
+    val name: String? = null,
+)
 
 @Serializable
 data class LivenessPoint(

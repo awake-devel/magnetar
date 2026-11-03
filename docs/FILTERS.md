@@ -190,6 +190,9 @@ small share of the index at first: 1 924 video probes in production on 2026-11-0
 | probe_video_codecs | `probe_codec` | `probe_codec` | FFmpeg names: `hevc`, `h264`, `av1`, `vp9`, `mpeg4`, … |
 | probe_hdr | `probe_hdr` | `probe_hdr` | `any`, `dolby_vision`, `hdr10`, `hdr10_plus`, `hlg` |
 | probe_audio | `probe_audio` | `probe_audio` | audio codecs (`truehd`, `eac3`, `dts`, `aac`, …) and `atmos`, `dts_x` |
+| probe_sub_kinds (D125) | `probe_sub_kind` | `probe_sub_kind` | subtitle track kinds: `sdh`, `cc`, `forced`, `signs`, `commentary`, `description`, `honorifics`, `bilingual`, `easy_reader` |
+| probe_audio_kinds (D125) | `probe_audio_kind` | `probe_audio_kind` | audio track kinds: `original`, `dub`, `voiceover`, `description` (audio description), `dialogue` (dialogue-enhanced), `commentary`, `music` (music & effects, isolated score), `karaoke`, `alternate` (alternate mix) |
+| probe_sub_formats (D125) | `probe_sub_format` | `probe_sub_format` | subtitle format class: `text` (SRT, ASS, WebVTT, mov_text, TTML, teletext, …), `image` (PGS, VobSub, DVB, XSUB), `cc` (CEA-608/708 captions) |
 
 Same rules as the name filters: any value within a field, AND across fields (and with the name
 filters), disjunctive counts, `serde(default)` so older apps and saved searches send none. The
@@ -219,8 +222,56 @@ server that lists it.
   shows it; they are not merged into the name filters, so "French" from the name and `fre` from
   an audio track stay two separate choices.
 
-Where they live: the search index (`SCHEMA_VERSION` 5) has one keyword facet per field, filled
-from `probe_attrs.tags` (`a:fre`, `r:2160p`, …; `server::probes::facet_values`), and a probe
+### Track kinds (D123–D125)
+
+Probes since D123 (probe version 2) carry the kinds of each audio and subtitle track (how they
+are found: docs/PROBES.md "Track kinds"). The three fields above filter on them; the server
+lists `probe_kinds` in `/health` `features` (a server with only `probe_filters` would ignore
+them and answer unfiltered, so the app sends them only to a server that lists it).
+
+- **A language with a kind of the same family is one track.** `probe_subtitles` with
+  `probe_sub_kinds`, or `probe_languages` with `probe_audio_kinds`, match a torrent only through
+  one track having a wanted language **and** a wanted kind: French + SDH is a French SDH track,
+  not French subtitles beside an English SDH track. French, English + SDH, CC is one track in
+  (`fre` or `eng`) with (`sdh` or `cc`). The server turns the two filters into one filter on the
+  `{lang}:{kind}` pairs of single tracks (`probes::search_filters`, the internal facets
+  `probe_sub_pair` / `probe_audio_pair`). A kind alone (any language, or none) and the format
+  class are ordinary any-of filters; other fields still combine with AND.
+- **Facet counts follow the pair rule.** With a pair filter, the language and kind facets of
+  that family are counted per track: each value's count is what picking it as well gives
+  (French + SDH set: the kind chips count the kinds of French tracks, the language chips the
+  languages of SDH tracks). With only one side set (a language, or a kind), the other side's
+  facet is counted the same way over the documents passing every filter except that one side,
+  since picking a chip turns both into one pair filter: with French alone, the SDH chip counts
+  torrents with a French SDH track (not every French torrent with some SDH track), and with
+  forced alone the French chip is offered even though a forced French track is not "French
+  subtitles". The facet of the side that is set is counted as the other facets.
+- **Bounded pairs.** Only the stored kinds are paired (at most 9 per language); kinds that no
+  probe can hold are dropped from the pair, and when none is left the filter matches nothing.
+- **Stricter language tags.** On probes with kinds, a subtitle track whose kinds include
+  `forced`, `signs`, `commentary` or `description` does not count as "subtitles in that
+  language", and an audio track whose kinds include `commentary`, `music` or `karaoke` does not
+  count as "audio in that language" (an English commentary is not English audio). Such a track
+  still matches through its kind (English + commentary), and the stored `audio_langs` /
+  `sub_langs` columns keep every language.
+- **Version-1 probes have no kinds.** Probes stored before D123 carry no kinds (track names were
+  never stored, so none can be derived): they match no kind filter and keep their old language
+  tags (any French track counts as French). Kind filters therefore see only torrents probed by a
+  D123 worker.
+
+| user picks | matches |
+|---|---|
+| Subtitle track French | a non-forced, non-signs, non-commentary, non-description French subtitle track (version-1 probes: any French track) |
+| Subtitle kind SDH | any SDH track, any language or none |
+| French + SDH | one French SDH track |
+| French, English + SDH, CC | one track in (fre or eng) with (sdh or cc) |
+| Audio track English | an English track that is not commentary, music only or karaoke |
+| French + audio description | one French audio-description track |
+| Subtitle format Image | any PGS / VobSub / DVB / XSUB track |
+
+Where they live: the search index (`SCHEMA_VERSION` 6 since D125) has one keyword facet per
+field, filled from `probe_attrs.tags` (`a:fre`, `r:2160p`, `sk:sdh`, `sp:fre:sdh`, `sf:image`, …;
+`server::probes::facet_values`), plus the two internal pair facets, and a probe
 written, replaced or removed re-indexes its torrent through the change log (triggers on
 `probe_attrs`, migration `20261108220000_probe_search.sql`). The Postgres fallback (index off or
 building) tests the same tags with `EXISTS (… probe_attrs p … p.tags && …)`. Measurements in

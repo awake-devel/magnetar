@@ -145,6 +145,8 @@ fun FilterSheet(
                 val probeChips = PROBE_FACET_FIELDS.mapNotNull { field ->
                     val selected = f.selected(field)
                     if (!state.canFilterProbes && selected.isEmpty()) return@mapNotNull null
+                    // Track kinds (D125) need `probe_kinds`; kept while set, so they can be cleared.
+                    if (field in PROBE_KIND_FIELDS && !state.canFilterProbeKinds && selected.isEmpty()) return@mapNotNull null
                     facetChips(field, selected, facets?.field(field)).takeIf { it.isNotEmpty() }?.let { field to it }
                 }
                 if (probeChips.isNotEmpty()) {
@@ -154,6 +156,9 @@ fun FilterSheet(
                         style = MaterialTheme.typography.titleMedium,
                         modifier = Modifier.semantics { heading() },
                     )
+                    if (probeChips.any { (field, _) -> field == "probe_audio_kind" || field == "probe_sub_kind" }) {
+                        Text(KIND_PAIR_HINT, style = MaterialTheme.typography.bodySmall)
+                    }
                     for ((field, chips) in probeChips) {
                         Title(FACET_TITLES[field] ?: field)
                         ChipRow(field, chips)

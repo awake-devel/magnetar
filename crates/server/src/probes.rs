@@ -16,8 +16,8 @@
 use std::collections::HashSet;
 
 use magnetar_core::model::{
-    ProbeAudioTrack, ProbeFile, ProbeFileInfo, ProbeGame, ProbeInfo, ProbeSubTrack, ProbeVideo,
-    ProbeVideoTrack, TorrentFile,
+    PROBE_AUDIO_KINDS, PROBE_MAX_TRACK_NAME, PROBE_SUB_KINDS, ProbeAudioTrack, ProbeFile,
+    ProbeFileInfo, ProbeGame, ProbeInfo, ProbeSubTrack, ProbeVideo, ProbeVideoTrack, TorrentFile,
 };
 use magnetar_core::probe::{PROBE_VERSION, ProbeResult, ProbeStatus};
 use sqlx::PgPool;
@@ -50,6 +50,12 @@ pub const FLAGS: [&str; 8] = [
     "surprise_unverified",
 ];
 const HDR: [&str; 4] = ["hdr10", "hdr10_plus", "hlg", "dolby_vision"];
+/// Audio kinds whose track does not count as "audio in that language" (D124): the
+/// `a:{lang}` tag is not written for them (the `audio_langs` column keeps the language).
+const AUDIO_KINDS_NOT_LANGUAGE: [&str; 3] = ["commentary", "music", "karaoke"];
+/// Subtitle kinds whose track does not count as "subtitles in that language" (D124): no
+/// `s:{lang}` tag for them (the `sub_langs` column keeps the language).
+const SUB_KINDS_NOT_LANGUAGE: [&str; 4] = ["forced", "signs", "commentary", "description"];
 const GAME_KINDS: [&str; 4] = ["package", "image", "compressed_image", "metadata"];
 /// sniff's platforms (a platform added to sniff later is refused by a server that does not
 /// list it: the probe only, never the dict).
@@ -281,6 +287,23 @@ fn ok_id(s: &str) -> bool {
 }
 
 fn video_of(v: &sniff::VideoInfo) -> Option<ProbeVideo> {
+    /// Track kinds the server stores (D123): sniff's kinds in `allowed`, sorted, unique.
+    fn kinds_of(k: &[sniff::video::TrackKind], allowed: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = k
+            .iter()
+            .map(|k| k.as_str())
+            .filter(|k| allowed.contains(k))
+            .map(str::to_string)
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+    /// The track name, cleaned and cut to `PROBE_MAX_TRACK_NAME` bytes (D123).
+    fn track_name(n: &Option<String>) -> Option<String> {
+        n.as_deref()
+            .and_then(|n| clean(n, magnetar_core::model::PROBE_MAX_TRACK_NAME))
+    }
     let container = token(&v.container)?;
     let video = v
         .video
@@ -320,6 +343,8 @@ fn video_of(v: &sniff::VideoInfo) -> Option<ProbeVideo> {
                 lang: a.language.as_deref().and_then(normalize_lang),
                 atmos: a.atmos == Some(true) || feature(sniff::video::AudioFeature::Atmos),
                 dts_x: a.dts_x == Some(true) || feature(sniff::video::AudioFeature::DtsX),
+                kinds: kinds_of(&a.kinds, &PROBE_AUDIO_KINDS),
+                name: track_name(&a.name),
             })
         })
         .take(MAX_AUDIO_TRACKS)
@@ -328,9 +353,26 @@ fn video_of(v: &sniff::VideoInfo) -> Option<ProbeVideo> {
         .subtitles
         .iter()
         .filter_map(|s| {
+            let mut kinds = kinds_of(&s.kinds, &PROBE_SUB_KINDS);
+            let mut lang = s.language.as_deref().and_then(normalize_lang);
+            // `enm` (English with honorifics, as fansub releases tag it) is English plus the
+            // honorifics kind (D123).
+            let primary = s
+                .language
+                .as_deref()
+                .and_then(|l| l.split(['-', '_']).next());
+            if primary.is_some_and(|p| p.eq_ignore_ascii_case("enm")) {
+                lang = Some("eng".into());
+                if !kinds.iter().any(|k| k == "honorifics") {
+                    kinds.push("honorifics".into());
+                    kinds.sort();
+                }
+            }
             Some(ProbeSubTrack {
                 codec: token(&s.codec)?,
-                lang: s.language.as_deref().and_then(normalize_lang),
+                lang,
+                kinds,
+                name: track_name(&s.name),
             })
         })
         .take(MAX_SUB_TRACKS)
@@ -403,14 +445,178 @@ pub fn report_of(r: &ProbeResult) -> Option<ProbeReport> {
     if files.is_empty() {
         return None;
     }
-    Some(ProbeReport {
+    let mut report = ProbeReport {
         v: PROBE_VERSION,
         status: r.status.code().into(),
         bytes_in: r.bytes_in,
         uploaded: r.uploaded,
         peers: r.peers_used,
         files,
-    })
+    };
+    // Track names are the first thing to give up when the report would be refused for its
+    // size (D123); the kinds stay. Still too large, the server refuses it as before.
+    if serde_json::to_vec(&report).map_or(usize::MAX, |b| b.len()) > MAX_JSON {
+        for v in report.files.iter_mut().filter_map(|f| f.video.as_mut()) {
+            v.audio.iter_mut().for_each(|a| a.name = None);
+            v.subs.iter_mut().for_each(|s| s.name = None);
+        }
+    }
+    Some(report)
+}
+
+#[cfg(test)]
+mod worker_kind_tests {
+    use magnetar_core::model::{PROBE_MAX_TRACK_NAME, ProbeSubTrack};
+    use magnetar_core::probe::{FileResult, PROBE_VERSION, ProbeResult, ProbeStatus};
+    use sniff::video::{AudioTrack, SubtitleTrack, TrackKind, VideoInfo};
+
+    use super::{MAX_JSON, MAX_SUB_TRACKS, report_of, video_of};
+
+    fn info(audio: Vec<AudioTrack>, subtitles: Vec<SubtitleTrack>) -> VideoInfo {
+        VideoInfo {
+            container: "matroska".into(),
+            audio,
+            subtitles,
+            ..VideoInfo::default()
+        }
+    }
+
+    #[test]
+    fn video_of_keeps_kinds_and_names() {
+        let v = info(
+            vec![AudioTrack {
+                codec: "ac3".into(),
+                channels: Some(2),
+                language: Some("en".into()),
+                name: Some("Director's\u{7} Commentary".into()),
+                // Unsorted, duplicated, and a subtitle kind that is no audio kind.
+                kinds: vec![TrackKind::Original, TrackKind::Commentary, TrackKind::Sdh],
+                ..AudioTrack::default()
+            }],
+            vec![
+                SubtitleTrack {
+                    codec: "hdmv_pgs_subtitle".into(),
+                    language: Some("eng".into()),
+                    name: Some(format!("English (SDH) {}", "x".repeat(80))),
+                    kinds: vec![TrackKind::Sdh, TrackKind::Dub, TrackKind::Sdh],
+                    ..SubtitleTrack::default()
+                },
+                SubtitleTrack {
+                    codec: "subrip".into(),
+                    language: Some("fre".into()),
+                    ..SubtitleTrack::default()
+                },
+            ],
+        );
+        let p = video_of(&v).unwrap();
+        assert_eq!(p.audio[0].kinds, ["commentary", "original"]);
+        assert_eq!(p.audio[0].name.as_deref(), Some("Director's Commentary"));
+        assert_eq!(p.audio[0].lang.as_deref(), Some("eng"));
+        assert_eq!(p.subs[0].kinds, ["sdh"]);
+        let n = p.subs[0].name.as_deref().unwrap();
+        assert!(n.starts_with("English (SDH) x") && n.len() == PROBE_MAX_TRACK_NAME);
+        assert_eq!(
+            p.subs[1],
+            ProbeSubTrack {
+                codec: "subrip".into(),
+                lang: Some("fre".into()),
+                ..ProbeSubTrack::default()
+            }
+        );
+        // The wire JSON leaves out empty kinds and absent names (§3).
+        let j = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            j["subs"][1],
+            serde_json::json!({"codec": "subrip", "lang": "fre"})
+        );
+        assert_eq!(
+            j["audio"][0]["kinds"],
+            serde_json::json!(["commentary", "original"])
+        );
+    }
+
+    #[test]
+    fn enm_is_english_with_honorifics() {
+        let v = info(
+            vec![],
+            vec![
+                SubtitleTrack {
+                    codec: "ass".into(),
+                    language: Some("enm".into()),
+                    ..SubtitleTrack::default()
+                },
+                SubtitleTrack {
+                    codec: "ass".into(),
+                    language: Some("enm".into()),
+                    kinds: vec![TrackKind::Honorifics, TrackKind::Signs],
+                    ..SubtitleTrack::default()
+                },
+            ],
+        );
+        let p = video_of(&v).unwrap();
+        assert_eq!(p.subs[0].lang.as_deref(), Some("eng"));
+        assert_eq!(p.subs[0].kinds, ["honorifics"]);
+        assert_eq!(p.subs[1].lang.as_deref(), Some("eng"));
+        assert_eq!(p.subs[1].kinds, ["honorifics", "signs"]);
+    }
+
+    #[test]
+    fn names_dropped_when_the_report_is_too_large() {
+        let sub = SubtitleTrack {
+            codec: "hdmv_pgs_subtitle".into(),
+            language: Some("eng".into()),
+            name: Some("n".repeat(PROBE_MAX_TRACK_NAME)),
+            kinds: vec![TrackKind::Sdh],
+            ..SubtitleTrack::default()
+        };
+        let v = info(vec![], vec![sub; MAX_SUB_TRACKS]);
+        let file = |index: u32| FileResult {
+            index,
+            size: 1_000_000,
+            detection: sniff::Detection {
+                label: "video.mkv".into(),
+                mime: String::new(),
+                description: String::new(),
+                confidence: 95,
+                fields: Vec::new(),
+                game: None,
+                video: Some(v.clone()),
+                flags: sniff::Flags::default(),
+                extensions: Vec::new(),
+                candidates: Vec::new(),
+            },
+            verified: true,
+            agreed: 1,
+            notes: Vec::new(),
+        };
+        let mut r = ProbeResult {
+            status: ProbeStatus::Ok,
+            files: (0..16).map(file).collect(),
+            bytes_in: 1,
+            uploaded: 0,
+            peers_used: 1,
+            unchoked: true,
+            incomplete: false,
+            surprises: 0,
+        };
+        let rep = report_of(&r).unwrap();
+        assert_eq!(rep.files.len(), 16);
+        let len = serde_json::to_vec(&rep).unwrap().len();
+        assert!(len <= MAX_JSON, "{len}");
+        let subs = &rep.files[0].video.as_ref().unwrap().subs;
+        assert_eq!(subs.len(), MAX_SUB_TRACKS);
+        assert!(subs.iter().all(|s| s.name.is_none() && s.kinds == ["sdh"]));
+        // A small report keeps its names.
+        r.files.truncate(1);
+        let rep = report_of(&r).unwrap();
+        let subs = &rep.files[0].video.as_ref().unwrap().subs;
+        assert!(subs.iter().all(|s| s.name.is_some()));
+    }
+
+    #[test]
+    fn probe_version_is_2() {
+        assert_eq!(PROBE_VERSION, 2);
+    }
 }
 
 // ---------------------------------------------------------------- server side
@@ -421,6 +627,16 @@ fn ok_text(s: &str, max: usize) -> bool {
 
 fn ok_opt(s: &Option<String>, max: usize) -> bool {
     s.as_deref().is_none_or(|s| ok_text(s, max))
+}
+
+/// Track kinds (D124): values of `allowed` only, no duplicates (order is not checked).
+fn ok_kinds(kinds: &[String], allowed: &[&str]) -> bool {
+    kinds.len() <= allowed.len()
+        && kinds.iter().all(|k| allowed.contains(&k.as_str()))
+        && kinds
+            .iter()
+            .enumerate()
+            .all(|(i, k)| !kinds[..i].contains(k))
 }
 
 fn ok_lang(s: &Option<String>) -> bool {
@@ -514,12 +730,21 @@ fn check_video(v: &ProbeVideo) -> Result<(), &'static str> {
         }
     }
     for a in &v.audio {
-        if !ok_token(&a.codec) || !ok_lang(&a.lang) || !in_range(a.channels, 1, MAX_CHANNELS) {
+        if !ok_token(&a.codec)
+            || !ok_lang(&a.lang)
+            || !in_range(a.channels, 1, MAX_CHANNELS)
+            || !ok_kinds(&a.kinds, &PROBE_AUDIO_KINDS)
+            || !ok_opt(&a.name, PROBE_MAX_TRACK_NAME)
+        {
             return Err("audio_track");
         }
     }
     for s in &v.subs {
-        if !ok_token(&s.codec) || !ok_lang(&s.lang) {
+        if !ok_token(&s.codec)
+            || !ok_lang(&s.lang)
+            || !ok_kinds(&s.kinds, &PROBE_SUB_KINDS)
+            || !ok_opt(&s.name, PROBE_MAX_TRACK_NAME)
+        {
             return Err("sub_track");
         }
     }
@@ -593,8 +818,10 @@ pub struct Summary {
     pub audio_langs: Vec<String>,
     pub sub_langs: Vec<String>,
     pub flags: Vec<String>,
-    /// Facets for a later search filter (`k:video`, `r:2160p`, `v:hevc`, `h:dolby_vision`,
-    /// `a:fre`, `s:eng`, `ac:eac3`, `p:ps5`, `x:atmos`); no index on them yet (check1 #3).
+    /// The search facets (D122, `facet_values`): `k:video`, `r:2160p`, `v:hevc`,
+    /// `h:dolby_vision`, `a:fre`, `s:eng`, `ac:eac3`, `p:ps5`, `x:atmos`; and the track kinds
+    /// (D124): `ak:commentary`, `ap:eng:commentary` (language and kind of one audio track),
+    /// `sk:sdh`, `sp:fre:sdh`, `sf:image` (subtitle format class, `sub_format`).
     pub tags: Vec<String>,
 }
 
@@ -619,9 +846,39 @@ pub fn resolution(width: Option<u32>, height: u32) -> &'static str {
     }
 }
 
+/// The format class of a subtitle codec (D124, docs/PROBES.md "Track kinds"): `text`, `image`
+/// or `cc` (CEA-608/708 captions); None for a codec of no known class. The app keeps the same
+/// table (`ProbeFormat.kt`).
+pub fn sub_format(codec: &str) -> Option<&'static str> {
+    match codec {
+        "subrip" | "ass" | "ssa" | "webvtt" | "mov_text" | "ttml" | "hdmv_text_subtitle"
+        | "dvb_teletext" | "arib_caption" | "kate" | "usf" => Some("text"),
+        "hdmv_pgs_subtitle" | "dvd_subtitle" | "dvb_subtitle" | "xsub" => Some("image"),
+        "eia_608" | "eia_708" => Some("cc"),
+        _ => None,
+    }
+}
+
+/// The pair facets (D125): a language filter and a kind filter of the same family become one
+/// filter on the `{lang}:{kind}` pairs of single tracks: (language facet, kind facet, pair
+/// facet).
+pub const PAIR_FACETS: [(&str, &str, &str); 2] = [
+    ("probe_language", "probe_audio_kind", "probe_audio_pair"),
+    ("probe_subtitles", "probe_sub_kind", "probe_sub_pair"),
+];
+
 /// The header-probe search filters of `q` (D122) as (facet name, values), the language codes
 /// normalised as stored (ISO 639-2/B: `fr`, `fra`, `FRE` → `fre`). A code that names no
 /// language is kept as typed, so it matches nothing instead of dropping the filter.
+///
+/// D125: a language filter with a kind filter of the same family (`probe_subtitles` with
+/// `probe_sub_kind`, `probe_language` with `probe_audio_kind`) is replaced by one pair filter
+/// (`probe_sub_pair` / `probe_audio_pair`, values `{lang}:{kind}` for every language and kind
+/// asked): "French + SDH" is one French SDH track, not French subtitles and some SDH track.
+/// Only the stored kinds ([`PROBE_SUB_KINDS`], [`PROBE_AUDIO_KINDS`]) are paired, so the pair
+/// filter holds at most 9 values per language however many kinds a request lists (review of
+/// D125: an unchecked cross product of two long lists would exhaust memory); when no kind
+/// asked is a stored one, the first is kept, so the filter still matches nothing.
 pub fn search_filters(q: &magnetar_core::query::SearchQuery) -> Vec<(&'static str, Vec<String>)> {
     let mut out = q.probe_filters();
     for (name, values) in out.iter_mut() {
@@ -636,6 +893,32 @@ pub fn search_filters(q: &magnetar_core::query::SearchQuery) -> Vec<(&'static st
             *values = norm;
         }
     }
+    for (lang, kind, pair) in PAIR_FACETS {
+        let langs = out.iter().find(|(n, _)| *n == lang).map(|(_, v)| v.clone());
+        let kinds = out.iter().find(|(n, _)| *n == kind).map(|(_, v)| v.clone());
+        if let (Some(langs), Some(asked)) = (langs, kinds) {
+            out.retain(|(n, _)| *n != lang && *n != kind);
+            let known: &[&str] = if kind == "probe_sub_kind" {
+                &PROBE_SUB_KINDS
+            } else {
+                &PROBE_AUDIO_KINDS
+            };
+            let mut kinds: Vec<String> = Vec::new();
+            for k in &asked {
+                if known.contains(&k.as_str()) && !kinds.contains(k) {
+                    kinds.push(k.clone());
+                }
+            }
+            if kinds.is_empty() {
+                kinds.extend(asked.into_iter().take(1));
+            }
+            let pairs = langs
+                .iter()
+                .flat_map(|l| kinds.iter().map(move |k| format!("{l}:{k}")))
+                .collect();
+            out.push((pair, pairs));
+        }
+    }
     out
 }
 
@@ -648,6 +931,12 @@ pub fn tag_prefixes(name: &str) -> &'static [&'static str] {
         "probe_codec" => &["v:"],
         "probe_hdr" => &["h:"],
         "probe_audio" => &["ac:", "x:"],
+        // D125 track kinds; the pair facets are internal (`search_filters`).
+        "probe_sub_kind" => &["sk:"],
+        "probe_audio_kind" => &["ak:"],
+        "probe_sub_format" => &["sf:"],
+        "probe_sub_pair" => &["sp:"],
+        "probe_audio_pair" => &["ap:"],
         _ => &[],
     }
 }
@@ -717,7 +1006,20 @@ pub fn summary(r: &ProbeReport) -> Summary {
             push_unique(&mut s.tags, &format!("ac:{}", a.codec));
             if let Some(l) = &a.lang {
                 push_unique(&mut s.audio_langs, l);
-                push_unique(&mut s.tags, &format!("a:{l}"));
+                // D124: a commentary, music-only or karaoke track is not audio in its language.
+                let speech = !a
+                    .kinds
+                    .iter()
+                    .any(|k| AUDIO_KINDS_NOT_LANGUAGE.contains(&k.as_str()));
+                if speech {
+                    push_unique(&mut s.tags, &format!("a:{l}"));
+                }
+            }
+            for k in &a.kinds {
+                push_unique(&mut s.tags, &format!("ak:{k}"));
+                if let Some(l) = &a.lang {
+                    push_unique(&mut s.tags, &format!("ap:{l}:{k}"));
+                }
             }
             if a.atmos {
                 push_unique(&mut s.tags, "x:atmos");
@@ -729,7 +1031,24 @@ pub fn summary(r: &ProbeReport) -> Summary {
         for t in &v.subs {
             if let Some(l) = &t.lang {
                 push_unique(&mut s.sub_langs, l);
-                push_unique(&mut s.tags, &format!("s:{l}"));
+                // D124: forced, signs, commentary and description tracks are not "subtitles
+                // in that language".
+                let full = !t
+                    .kinds
+                    .iter()
+                    .any(|k| SUB_KINDS_NOT_LANGUAGE.contains(&k.as_str()));
+                if full {
+                    push_unique(&mut s.tags, &format!("s:{l}"));
+                }
+            }
+            for k in &t.kinds {
+                push_unique(&mut s.tags, &format!("sk:{k}"));
+                if let Some(l) = &t.lang {
+                    push_unique(&mut s.tags, &format!("sp:{l}:{k}"));
+                }
+            }
+            if let Some(class) = sub_format(&t.codec) {
+                push_unique(&mut s.tags, &format!("sf:{class}"));
             }
         }
     }
@@ -1282,6 +1601,7 @@ mod tests {
                             .map(|_| ProbeSubTrack {
                                 codec: "srt".into(),
                                 lang: None,
+                                ..Default::default()
                             })
                             .collect(),
                         ..Default::default()
@@ -1340,6 +1660,7 @@ mod tests {
             subs: vec![ProbeSubTrack {
                 codec: "subrip".into(),
                 lang: Some("eng".into()),
+                ..Default::default()
             }],
             ..Default::default()
         });
@@ -1454,6 +1775,328 @@ mod tests {
                 ("probe_hdr", vec!["any".into()]),
             ]
         );
+    }
+
+    /// The worker → server example of docs/PROBES.md (D123, spec §3): kinds and names on
+    /// audio and subtitle tracks.
+    const KINDS_JSON: &str = r#"{"container":"matroska","duration_ms":7200000,
+        "video":[{"codec":"h264","width":1920,"height":1080}],
+        "audio":[{"codec":"eac3","channels":6,"lang":"fre"},
+                 {"codec":"ac3","channels":2,"lang":"eng","kinds":["commentary"],"name":"Director's Commentary"},
+                 {"codec":"aac","channels":2,"lang":"fre","kinds":["description"],"name":"Audiodescription"}],
+        "subs":[{"codec":"hdmv_pgs_subtitle","lang":"eng","kinds":["sdh"],"name":"English (SDH)"},
+                {"codec":"subrip","lang":"fre","kinds":["forced"],"name":"Français (forcés)"},
+                {"codec":"subrip","lang":"fre"},
+                {"codec":"eia_608","kinds":["cc"]},
+                {"codec":"ass","lang":"jpn","kinds":["signs"],"name":"Signs & Songs"}]}"#;
+
+    fn kinds_video() -> ProbeVideo {
+        serde_json::from_str(KINDS_JSON).unwrap()
+    }
+
+    /// D124: kinds are whitelisted per track type, without duplicates; names are short
+    /// printable text.
+    #[test]
+    fn kinds_and_names_validated() {
+        let v = kinds_video();
+        assert_eq!(v.audio[1].kinds, vec!["commentary"]);
+        assert_eq!(v.audio[1].name.as_deref(), Some("Director's Commentary"));
+        assert_eq!(v.subs[3].kinds, vec!["cc"]);
+        assert_eq!(check_video(&v), Ok(()));
+        let files = stored(&[100, 5000]);
+        let with = |v: ProbeVideo| {
+            report(vec![ProbeFile {
+                video: Some(v),
+                ..file(1, 5000, "video.mkv")
+            }])
+        };
+        assert_eq!(validate(&with(kinds_video()), &files), Ok(()));
+        let audio = |f: &dyn Fn(&mut ProbeAudioTrack)| {
+            let mut v = kinds_video();
+            f(&mut v.audio[1]);
+            v
+        };
+        let sub = |f: &dyn Fn(&mut ProbeSubTrack)| {
+            let mut v = kinds_video();
+            f(&mut v.subs[0]);
+            v
+        };
+        let bad = [
+            (audio(&|a| a.kinds = vec!["loud".into()]), "audio_track"),
+            (
+                audio(&|a| a.kinds = vec!["commentary".into(), "commentary".into()]),
+                "audio_track",
+            ),
+            (audio(&|a| a.kinds = vec!["sdh".into()]), "audio_track"),
+            (
+                audio(&|a| a.name = Some("x".repeat(PROBE_MAX_TRACK_NAME + 1))),
+                "audio_track",
+            ),
+            (
+                audio(&|a| a.name = Some("two\nlines".into())),
+                "audio_track",
+            ),
+            (audio(&|a| a.name = Some(String::new())), "audio_track"),
+            (sub(&|s| s.kinds = vec!["dub".into()]), "sub_track"),
+            (sub(&|s| s.kinds = vec!["Sdh".into()]), "sub_track"),
+            (
+                sub(&|s| s.kinds = vec!["sdh".into(), "cc".into(), "sdh".into()]),
+                "sub_track",
+            ),
+            (
+                sub(&|s| s.name = Some("é".repeat(PROBE_MAX_TRACK_NAME / 2 + 1))),
+                "sub_track",
+            ),
+            (sub(&|s| s.name = Some("a\u{7}b".into())), "sub_track"),
+        ];
+        for (v, code) in bad {
+            assert_eq!(check_video(&v), Err(code), "{v:?}");
+            assert_eq!(validate(&with(v), &files), Err(code));
+        }
+        // Order is not checked; a name of exactly the limit passes.
+        let ok = sub(&|s| {
+            s.kinds = vec!["sdh".into(), "forced".into()];
+            s.name = Some("x".repeat(PROBE_MAX_TRACK_NAME));
+        });
+        assert_eq!(check_video(&ok), Ok(()));
+        let every = audio(&|a| a.kinds = PROBE_AUDIO_KINDS.map(String::from).to_vec());
+        assert_eq!(check_video(&every), Ok(()));
+    }
+
+    /// D124 golden vector: per-track kind and pair tags, the format class, and the stricter
+    /// `a:` / `s:` rule (a commentary track is not English audio; signs are not Japanese
+    /// subtitles), while the language columns keep every language.
+    #[test]
+    fn kind_tags_and_language_rules() {
+        let mut main = file(1, 5000, "video.mkv");
+        main.video = Some(kinds_video());
+        let s = summary(&report(vec![file(0, 100, "text.plain"), main]));
+        let got: std::collections::BTreeSet<&str> = s.tags.iter().map(String::as_str).collect();
+        let want: std::collections::BTreeSet<&str> = "k:video v:h264 r:1080p \
+            ac:eac3 ac:ac3 ac:aac a:fre ak:commentary ap:eng:commentary ak:description \
+            ap:fre:description s:eng sk:sdh sp:eng:sdh sf:image sk:forced sp:fre:forced sf:text \
+            s:fre sk:cc sf:cc sk:signs sp:jpn:signs"
+            .split_whitespace()
+            .collect();
+        assert_eq!(got, want);
+        assert_eq!(s.tags.len(), want.len(), "no duplicate tags");
+        assert_eq!(s.audio_langs, vec!["fre", "eng"]);
+        assert_eq!(s.sub_langs, vec!["eng", "fre", "jpn"]);
+        // Through the facets the index reads.
+        assert_eq!(facet_values("probe_language", &s.tags), vec!["fre"]);
+        assert_eq!(facet_values("probe_subtitles", &s.tags), vec!["eng", "fre"]);
+        assert_eq!(
+            facet_values("probe_sub_kind", &s.tags),
+            vec!["sdh", "forced", "cc", "signs"]
+        );
+        assert_eq!(
+            facet_values("probe_audio_kind", &s.tags),
+            vec!["commentary", "description"]
+        );
+        assert_eq!(
+            facet_values("probe_sub_format", &s.tags),
+            vec!["image", "text", "cc"]
+        );
+        assert_eq!(
+            facet_values("probe_sub_pair", &s.tags),
+            vec!["eng:sdh", "fre:forced", "jpn:signs"]
+        );
+        assert_eq!(
+            facet_values("probe_audio_pair", &s.tags),
+            vec!["eng:commentary", "fre:description"]
+        );
+        // Music and karaoke tracks lose `a:` too; dub, original... keep it.
+        for (kind, lang_tag) in [
+            ("music", false),
+            ("karaoke", false),
+            ("dub", true),
+            ("original", true),
+            ("description", true),
+            ("dialogue", true),
+        ] {
+            let mut f = file(0, 5000, "video.mkv");
+            f.video = Some(ProbeVideo {
+                container: "matroska".into(),
+                audio: vec![ProbeAudioTrack {
+                    codec: "aac".into(),
+                    lang: Some("ger".into()),
+                    kinds: vec![kind.into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            let s = summary(&report(vec![f]));
+            assert_eq!(s.tags.iter().any(|t| t == "a:ger"), lang_tag, "{kind}");
+            assert_eq!(s.audio_langs, vec!["ger"], "{kind}");
+        }
+        for (kind, lang_tag) in [
+            ("description", false),
+            ("commentary", false),
+            ("sdh", true),
+            ("cc", true),
+            ("honorifics", true),
+            ("bilingual", true),
+            ("easy_reader", true),
+        ] {
+            let mut f = file(0, 5000, "video.mkv");
+            f.video = Some(ProbeVideo {
+                container: "matroska".into(),
+                subs: vec![ProbeSubTrack {
+                    codec: "subrip".into(),
+                    lang: Some("ger".into()),
+                    kinds: vec![kind.into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            let s = summary(&report(vec![f]));
+            assert_eq!(s.tags.iter().any(|t| t == "s:ger"), lang_tag, "{kind}");
+            assert_eq!(s.sub_langs, vec!["ger"], "{kind}");
+        }
+    }
+
+    /// The format classes of spec §1.3 (the app keeps the same table).
+    #[test]
+    fn subtitle_format_classes() {
+        for c in [
+            "subrip",
+            "ass",
+            "ssa",
+            "webvtt",
+            "mov_text",
+            "ttml",
+            "hdmv_text_subtitle",
+            "dvb_teletext",
+            "arib_caption",
+            "kate",
+            "usf",
+        ] {
+            assert_eq!(sub_format(c), Some("text"), "{c}");
+        }
+        for c in ["hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"] {
+            assert_eq!(sub_format(c), Some("image"), "{c}");
+        }
+        assert_eq!(sub_format("eia_608"), Some("cc"));
+        assert_eq!(sub_format("eia_708"), Some("cc"));
+        assert_eq!(sub_format("srt"), None);
+        assert_eq!(sub_format(""), None);
+    }
+
+    /// Probes stored before D123 (version 1) have no `kinds` or `name`: they still parse, and
+    /// serialise back unchanged (no empty fields).
+    #[test]
+    fn old_probe_json_parses_without_kinds() {
+        let old = r#"{"container":"matroska","audio":[{"codec":"eac3","channels":6,"lang":"fre","atmos":true}],"subs":[{"codec":"subrip","lang":"eng"}]}"#;
+        let v: ProbeVideo = serde_json::from_str(old).unwrap();
+        assert!(v.audio[0].kinds.is_empty() && v.audio[0].name.is_none());
+        assert!(v.subs[0].kinds.is_empty() && v.subs[0].name.is_none());
+        assert_eq!(check_video(&v), Ok(()));
+        let back = serde_json::to_value(&v).unwrap();
+        assert_eq!(back["audio"][0].get("kinds"), None);
+        assert_eq!(back["audio"][0].get("name"), None);
+        assert_eq!(back["subs"][0].get("kinds"), None);
+        assert_eq!(
+            back["subs"][0],
+            serde_json::json!({"codec": "subrip", "lang": "eng"})
+        );
+        let mut f = file(0, 5000, "video.mkv");
+        f.video = Some(v);
+        let s = summary(&report(vec![f]));
+        assert!(s.tags.iter().any(|t| t == "a:fre"));
+        assert!(s.tags.iter().any(|t| t == "s:eng"));
+        assert!(
+            !s.tags
+                .iter()
+                .any(|t| t.starts_with("ak:") || t.starts_with("sk:") || t.starts_with("sp:")),
+            "{:?}",
+            s.tags
+        );
+    }
+
+    /// D125: a language and a kind of the same family become one filter on single tracks'
+    /// `{lang}:{kind}` pairs; other filters, and a kind alone, are untouched.
+    #[test]
+    fn pair_filters_replace_language_and_kind() {
+        use magnetar_core::query::SearchQuery;
+        let q = SearchQuery {
+            probe_subtitles: vec!["fr".into()],
+            probe_sub_kinds: vec!["sdh".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            search_filters(&q),
+            vec![("probe_sub_pair", vec!["fre:sdh".to_string()])]
+        );
+        let q = SearchQuery {
+            probe_languages: vec!["fra".into(), "en".into()],
+            probe_audio_kinds: vec!["Description".into(), "commentary".into()],
+            probe_subtitles: vec!["jpn".into()],
+            probe_sub_formats: vec!["image".into()],
+            probe_hdr: vec!["any".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            search_filters(&q),
+            vec![
+                ("probe_subtitles", vec!["jpn".to_string()]),
+                ("probe_hdr", vec!["any".to_string()]),
+                ("probe_sub_format", vec!["image".to_string()]),
+                (
+                    "probe_audio_pair",
+                    vec![
+                        "fre:description".to_string(),
+                        "fre:commentary".to_string(),
+                        "eng:description".to_string(),
+                        "eng:commentary".to_string(),
+                    ]
+                ),
+            ]
+        );
+        // A kind of the other family does not pair.
+        let q = SearchQuery {
+            probe_languages: vec!["fre".into()],
+            probe_sub_kinds: vec!["sdh".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            search_filters(&q),
+            vec![
+                ("probe_language", vec!["fre".to_string()]),
+                ("probe_sub_kind", vec!["sdh".to_string()]),
+            ]
+        );
+        // Only stored kinds are paired (review of D125): thousands of junk kinds with
+        // thousands of languages stay |languages| × 1, not a cross product of both lists.
+        let junk = |p: &str| (0..5000).map(|i| format!("{p}{i}")).collect::<Vec<_>>();
+        let q = SearchQuery {
+            probe_subtitles: junk("l"),
+            probe_sub_kinds: [vec!["sdh".to_string()], junk("k"), vec!["sdh".into()]].concat(),
+            ..Default::default()
+        };
+        let f = search_filters(&q);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].0, "probe_sub_pair");
+        assert_eq!(f[0].1.len(), 5000);
+        assert!(f[0].1.iter().all(|v| v.ends_with(":sdh")));
+        // No stored kind at all: the first one asked is kept, so nothing matches.
+        let q = SearchQuery {
+            probe_subtitles: vec!["fre".into()],
+            probe_sub_kinds: junk("k"),
+            ..Default::default()
+        };
+        assert_eq!(
+            search_filters(&q),
+            vec![("probe_sub_pair", vec!["fre:k0".to_string()])]
+        );
+        for (facet, prefix) in [
+            ("probe_sub_kind", "sk:"),
+            ("probe_audio_kind", "ak:"),
+            ("probe_sub_format", "sf:"),
+            ("probe_sub_pair", "sp:"),
+            ("probe_audio_pair", "ap:"),
+        ] {
+            assert_eq!(tag_prefixes(facet), &[prefix], "{facet}");
+        }
     }
 
     #[test]

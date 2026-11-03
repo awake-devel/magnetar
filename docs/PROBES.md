@@ -174,6 +174,21 @@ pieces: the torrent's budget less the other targets' first reads).
 
 The worker sends `DhtResult.probe` (`ProbeReport`: version, status `ok` / `partial`, bytes in
 and served, peers used, files: index, size, label, confidence, verified, flags, game, video).
+`PROBE_VERSION` is **2** since D123: each audio and subtitle track may carry `kinds` (values of
+`PROBE_AUDIO_KINDS` / `PROBE_SUB_KINDS`, alphabetical, no duplicates, left out when empty) and
+`name` (the track name, cleaned, at most 64 bytes, left out when absent; stored so the server
+can re-classify later, not shown by the app). Version 1 rows have neither. When names would
+push a report over 64 KiB the worker drops every name first (the kinds stay). §11 has the
+taxonomy and how sniff finds the kinds.
+
+```json
+"audio": [{"codec":"eac3","channels":6,"lang":"fre"},
+          {"codec":"ac3","channels":2,"lang":"eng","kinds":["commentary"],"name":"Director's Commentary"}],
+"subs":  [{"codec":"hdmv_pgs_subtitle","lang":"eng","kinds":["sdh"],"name":"English (SDH)"},
+          {"codec":"subrip","lang":"fre","kinds":["forced"],"name":"Français (forcés)"},
+          {"codec":"eia_608","kinds":["cc"]}]
+```
+
 The server (`server::probes`):
 
 - takes it only on a `metadata` item for a hash the worker holds (D113), only once that dict
@@ -200,7 +215,13 @@ Tables (migration `20261105000000_probes.sql`):
   payload (largest probed file): kind, platform, title id, container, video codec, height, HDR,
   bit depth, duration, audio codecs and languages, subtitle languages, flags, and `tags`
   (`k:video`, `r:2160p`, `v:hevc`, `h:dolby_vision`, `a:fre`, `s:eng`, `ac:eac3`, `p:ps5`,
-  `x:atmos`). About 1 GB per million probes (storage report, S4).
+  `x:atmos`; since D124 also `ak:{kind}` / `sk:{kind}` per audio / subtitle kind, the
+  same-track pairs `ap:{lang}:{kind}` / `sp:{lang}:{kind}`, and the subtitle format class
+  `sf:text` / `sf:image` / `sf:cc`). On version 2 rows `a:{lang}` leaves out audio tracks
+  whose kinds include `commentary`, `music` or `karaoke`, and `s:{lang}` leaves out subtitle
+  tracks whose kinds include `forced`, `signs`, `commentary` or `description`, so "French
+  subtitles" means a French track to read the film with. The `audio_langs` / `sub_langs`
+  columns keep every language. About 1 GB per million probes (storage report, S4).
 - `probe_files`: the per-file JSON (`[ProbeFile]`).
 
 No GIN index on `tags`: with `ORDER BY probed_at LIMIT` a tags GIN collapses to a full scan on
@@ -280,6 +301,11 @@ the checkout: `sudo docker compose build && sudo docker compose up -d`; the publ
 lag `main`). Not switched on either, for the same reasons; the server side needs no other
 setting.
 
+**Deploy the server before the workers** whenever `PROBE_VERSION` moves (2 since D123): a
+server older than its workers refuses their reports (`probe_rejected`, reason "version")
+instead of storing them without the new fields. The reverse is safe: a newer server takes
+version 1 reports as before.
+
 What to watch: `workers[].dht.probe` in `GET /api/v1/stats` (started, ok / partial / choked /
 no_pieces / failed, skipped by reason, bytes in, uploaded, verified files, surprises),
 `probe_backfill` and `workers[].dht.backfill` (§10), and the router health brakes.
@@ -306,6 +332,17 @@ no_pieces / failed, skipped by reason, bytes in, uploaded, verified files, surpr
   default when the source has no tag) has no language by design. How the 61 % of MP4 probes
   without audio languages split between `und` tracks, whole-piece budget cuts (fixed by D120)
   and peers that lack the tail pieces is **UNVERIFIED** (production rows not re-read here).
+- **Track kinds (D123), UNVERIFIED:** every non-English and non-French term of the name
+  classifier; how often real releases set the Matroska v4 flags (0x55AB–0x55AF) or a non-zero
+  AC-3 / E-AC-3 bsmod; how often captions are signalled in a first access unit; the hit rate
+  on real swarms; how often a muxer sets FlagForced by mistake on an unnamed track (it then
+  reads forced and leaves its language's subtitle filter); whether caption services silent in
+  the first access unit are missed now that null padding no longer counts; the negation list
+  beyond English, French and German. Checked here only on hand-built containers and on local ffmpeg 9.0.2 output
+  (Matroska dispositions → v4 flags; MP4 `udta/name` and `kind` boxes; AC-3 / E-AC-3
+  `-audio_service_type` in TS frames, MP4 `dac3` / `dec3` and Matroska E-AC-3 frames). The
+  CEA-608 / 708 readers have only synthetic vectors. Version 1 rows have no kinds and cannot
+  get any without a re-probe (names were never stored).
 
 ## 10. Backfill (D118)
 
@@ -399,3 +436,106 @@ probes per hour eee and the Pi reach, and their line load. The traffic per torre
 of a new find (one lookup, metadata TCP attempts, one probe), paced by the same settings; the
 D109 router rules apply unchanged (CLAUDE.md "Network safety": not run here without the
 watchdog). Tests: loopback fake seeders on a fake DHT only (`probe_backfill_pg`).
+
+## 11. Track kinds (D123)
+
+What a subtitle or audio track is for, read from bytes a probe already fetches: no new peer
+reads. On the 78 sample videos under `~/sniff-samples/video` and the 53 files of the local
+recon corpora, the bytes fetched and the rounds are identical before and after D123.
+
+### Taxonomy (closed sets)
+
+| subtitle kind | meaning | container / bitstream sources | name |
+|---|---|---|---|
+| `bilingual` | two languages in one track | — | 双语, dual subs, … |
+| `cc` | closed captions (EIA-608 / 708) | MP4 `c608` / `c708`; CEA-608 / 708 in the first video access unit; ATSC caption_service_descriptor | CC, closed captions |
+| `commentary` | subtitles of a commentary | Matroska FlagCommentary; DASH role `commentary` | commentary, Kommentar, … |
+| `description` | text descriptions | Matroska FlagTextDescriptions, FlagVisualImpaired; `D_WEBVTT/DESCRIPTIONS`; DASH `description`; Apple `describes-video`; html-kind `descriptions` | text description(s) |
+| `easy_reader` | easy reader | Apple `public.easy-to-read`; DASH `easyreader` | easy reader, … |
+| `forced` | forced / foreign parts only | Matroska FlagForced (resolved, below); DASH `forced-subtitle`; `tx3g` displayFlags 0x80000000; `tref/forc` target | forced, forcés, … |
+| `honorifics` | honorifics track | language `enm` | honorifics |
+| `sdh` | SDH / hearing impaired | Matroska FlagHearingImpaired; `D_WEBVTT/CAPTIONS`; DASH `caption`; html-kind `captions`; Apple `describes-music-and-sound`; DVB subtitling_type 0x20–0x25; teletext type 5 | SDH, HI, SME, Hörgeschädigte, … |
+| `signs` | signs & songs, songs, typesetting, karaoke | DASH `karaoke` on a subtitle | Signs & Songs, Songs, … |
+
+| audio kind | meaning | container / bitstream sources | name |
+|---|---|---|---|
+| `alternate` | alternate mix | — | Original Mono, theatrical mix, … |
+| `commentary` | commentary | Matroska FlagCommentary; AC-3 / E-AC-3 bsmod or DVB service_type 5; DASH / html-kind `commentary` | commentary, 音声解説, … |
+| `description` | audio description | Matroska FlagVisualImpaired; bsmod 2; ISO 639 audio_type 3; DVB supplementary_audio editorial 1 or 3; DASH `description`; Apple `describes-video`; html-kind `description` / `main-desc` | AD, DVS, Audiodescription, … |
+| `dialogue` | dialogue-enhanced / clean audio | Matroska FlagHearingImpaired on audio; bsmod 3 or 4; audio_type 2; editorial 2; DASH `enhanced-audio-intelligibility` | Dialogue Boost, … |
+| `dub` | dubbed | Matroska FlagOriginal present and 0; DASH `dub`; html-kind `translation` | Dubbed, doublage, … |
+| `karaoke` | karaoke | bsmod 7 on ≥ 2 channels | karaoke |
+| `music` | music & effects, isolated score | bsmod 1; audio_type 1 | M&E, Isolated Score, … |
+| `original` | original language | Matroska FlagOriginal = 1 | Original, VO (not ru / uk / pl), VOF, … |
+| `voiceover` | voice-over | bsmod 7 on < 2 channels | Lektor, MVO, DVO, VO (ru / uk / pl), … |
+
+DVB editorial_classification 3 ("spoken subtitles") is taken as `description` and bsmod 4
+("dialogue only") as `dialogue`. The app shows `sdh` and `cc` apart. The subtitle format class
+(`text`, `image`, `cc`) is derived from the codec on the server, never stored per track.
+
+### Where sniff reads them
+
+- **Matroska** `TrackEntry`: FlagHearingImpaired (0x55AB), FlagVisualImpaired (0x55AC),
+  FlagTextDescriptions (0x55AD), FlagOriginal (0x55AE), FlagCommentary (0x55AF), FlagForced
+  (0x55AA, kept raw in `SubtitleTrack::forced`), the name (0x536E), the WebVTT CodecIDs
+  (`D_WEBVTT/METADATA` is no subtitle track), `S_ARIBSUB` (`arib_caption`), `S_TEXT/USF`.
+  FlagEnabled is not read.
+- **MP4 / MOV** inside `moov`: `trak/udta` `name` / `tnam` (three layouts; ffmpeg writes the
+  bare text), Apple `tagc`, ISO `kind` (DASH roles and HTML kinds: ffmpeg writes one per
+  disposition), `tref/forc`, the `hdlr` name as a fallback (muxer boilerplate dropped),
+  `tx3g` displayFlags, `dac3` / `dec3` bsmod, `c708`, `dfxp`, `mp4s` under handler `subp`.
+  `udta` ends the `trak` whose header the walk reads anyway.
+- **MPEG-TS** PMT: ISO 639 audio_type, every DVB subtitling entry and every teletext subtitle
+  page (one track each, with its language: teletext tracks had none before; a 0x46 VBI
+  teletext PID is a subtitle track only when it lists a subtitle page), DVB
+  supplementary_audio, the DVB AC-3 / E-AC-3 component_type, ATSC 0x81 (bsmod, with acmod from
+  `num_channels`: bsmod 7 on a mono track is a voice-over, otherwise karaoke; only on AC-3 /
+  E-AC-3 streams) and 0x86 (caption services); bsmod of the AC-3 / E-AC-3 frame already read.
+- **First access units already read**: CEA-608 / 708 (`GA94` cc_data with a valid triple)
+  in the HEVC prefix SEI in every container, the H.264 SEI and the MPEG-2 picture user data in
+  TS. A 608 pair that is null once parity is dropped (`80 80`, the padding many encoders send
+  with no caption service) and a zero DTVCC data pair do not count. These say captions are
+  *signalled*, not that the text exists. They become `eia_608` / `eia_708` subtitle tracks
+  with the video track's id, unless the container already lists a track of that codec (the PMT
+  caption service, or an MP4 `c608` / `c708` track).
+- **E-AC-3 frames** (read for Atmos in every container): bsmod when `infomdate` is set.
+- **AVI**: a `vids` stream with FOURCC `DXSB` / `DXSA` is an `xsub` subtitle; `strn` is the
+  name.
+
+### Merge rules (`sniff::video::kind::resolve`)
+
+1. A container or bitstream flag that is set wins. Absent or 0 is never evidence, except
+   Matroska FlagOriginal = 0, which means `dub`.
+2. Name kinds are added, never subtracted.
+3. Forced is the one conflict the name wins: a subtitle whose name says "full", "complete",
+   "dialogue", SDH or CC (and not "forced") loses a forced flag (muxers set it by mistake).
+4. The default flag implies no kind.
+5. Audio: commentary, description, music or karaoke removes original and dub; original or
+   voice-over removes dub.
+
+`kinds` is the result; `name_kinds` the part only the name gave.
+
+### Name classifier (`sniff::video::classify_name`)
+
+Pure Rust, no dependency. The name is normalised (full-width forms to ASCII, apostrophes
+removed, `+` as `&`), cut into alphanumeric tokens (`&` is a token), and matched on whole
+tokens, token prefixes, token sequences, case-sensitive tokens (`HI`, `AD`, `VO`, `MVO`) and
+CJK substrings. `HI` is not SDH on a Hindi track; `VO` is a voice-over on a Russian, Ukrainian
+or Polish track and the original elsewhere; `VF` / `VFF` / `VFQ` / `VFI` give nothing; "Sign
+Language" is not signs; "Full HD" is not "full". A negation right before a term cancels it
+(`non`, `no`, `not`, `without`, `sans`, `ohne`, `sin`, `senza`, `zonder`, `utan`, `uden`,
+`uten`, `ilman`, `bez`, `без`): "Non-Forced", "Non-SDH", "No Commentary", "Sans commentaire"
+and "Non-Dubbed" give nothing, while phrases that start with one ("per non udenti", "Non
+English Parts") still match. Names that only repeat the codec, the channels or the language
+give nothing. The 44 spec vectors and 11 negation vectors are `kind::tests::name_vectors`.
+
+### Not read (docs/ROADMAP.md)
+
+CEA-608 / 708 for H.264 / MPEG-2 in Matroska and MP4 (a new block per file) and AV1 T.35;
+AC-3 bsmod in Matroska (the frame is not read when the header gives the channels); the DTS
+ExSS asset type; DVD IFO and Blu-ray clpi / mpls; ASS style names; torrent-name and sidecar
+file kinds (`.sdh.srt`, DUBBED, Lektor); original vs dub from TMDB; language variants
+(pt-BR, es-419, zh-Hant); a re-probe of version 1 rows; server-side re-classification; showing
+names in the app; MKV FlagEnabled, MP4 `txas` / `folw` / `alternate_group`, ATSC 0xCC, DVB EIT
+component descriptors, SCTE-27, per-sample forced flags, SDH from subtitle content, Ogg / ASF /
+FLV roles and a sign-language video kind.
