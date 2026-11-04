@@ -179,6 +179,14 @@ async fn blocks_only_on_big_pieces() {
     let r = probe(&t, &s, &[], cfg()).await;
     assert_eq!(r.status, ProbeStatus::Ok, "{r:?}");
     assert_eq!(label(&r), vec![("video.mkv", false)]);
+    // Diagnostics: block mode, every target tried, bytes and a time for them.
+    assert_eq!(r.diag.end, "done");
+    assert!(!r.diag.whole && !r.diag.late && r.diag.cut == 0);
+    assert_eq!(
+        (r.diag.targets, r.diag.no_bytes, r.diag.max_alive),
+        (1, 0, 1)
+    );
+    assert!(r.diag.first_byte_ms.is_some() && r.diag.ms > 0);
     let f = &r.files[0];
     assert!(f.detection.flags.unverified);
     assert_eq!(f.detection.video.as_ref().unwrap().video[0].codec, "hevc");
@@ -317,6 +325,11 @@ async fn never_unchoked_and_allowed_fast() {
     assert_eq!(r.status, ProbeStatus::Choked, "{r:?}");
     assert!(!r.unchoked);
     assert!(started.elapsed() < Duration::from_secs(6));
+    // Diagnostics: the hand-off peer choked us past the wait; no byte, no unchoke.
+    assert!(r.diag.handoff_choked, "{:?}", r.diag);
+    assert_eq!(r.diag.choke_expired, 1, "{:?}", r.diag);
+    assert_eq!((r.diag.unchoke_ms, r.diag.first_byte_ms), (None, None));
+    assert_eq!(r.diag.no_bytes, r.diag.targets - r.diag.cut);
     let s = fs::start(
         t.clone(),
         Opts {
@@ -477,6 +490,28 @@ async fn reqq_caps_the_pipeline() {
     .await;
     probe(&t, &s, &[], cfg()).await;
     assert!(s.log().max_outstanding > 4);
+}
+
+/// Diagnostics of the peer cap: two peers that are dropped use up `peers` (2) although none
+/// is alive, so the good third candidate is never tried (`cap_blocked`, `no_peers`).
+#[tokio::test]
+async fn diag_dead_slots_block_the_next_peer() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(1_000_000))], 256 * KIB);
+    let bad = || Opts {
+        junk: Junk::Unrequested,
+        ..Opts::default()
+    };
+    let first = fs::start(t.clone(), bad()).await;
+    let second = fs::start(t.clone(), bad()).await;
+    let good = fs::start(t.clone(), Opts::default()).await;
+    let r = probe(&t, &first, &[second.addr, good.addr], cfg()).await;
+    let d = &r.diag;
+    assert!(r.files.is_empty(), "{r:?}");
+    assert_eq!(d.drops, vec![("unrequested", 2)], "{d:?}");
+    assert_eq!(d.connects, vec![("ok", 1)], "{d:?}");
+    assert!(d.cap_blocked, "{d:?}");
+    assert_eq!(d.candidates_left, 1, "{d:?}");
+    assert_eq!(good.log().requests, 0, "the good peer was never asked");
 }
 
 /// 10: hostile input never panics: oversize pieces, spare bitfield bits, unrequested blocks,

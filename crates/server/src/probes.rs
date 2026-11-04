@@ -603,6 +603,7 @@ mod worker_kind_tests {
             unchoked: true,
             incomplete: false,
             surprises: 0,
+            diag: Default::default(),
         };
         let rep = report_of(&r).unwrap();
         assert_eq!(rep.files.len(), 16);
@@ -2275,6 +2276,7 @@ mod tests {
             unchoked: true,
             incomplete: true,
             surprises: 1,
+            diag: Default::default(),
         };
         let w = report_of(&r).unwrap();
         assert_eq!(w.status, "partial");

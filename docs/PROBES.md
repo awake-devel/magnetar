@@ -698,3 +698,34 @@ and `wrong` 4.
 Codec, resolution and HDR corrections; an offline correction queue on the phone; corrections in
 the result list's badges. **UNVERIFIED**: the app on a device, and VLC numbering parity per
 container (above).
+
+## 13. Diagnostics (D141)
+
+Each probe fills a `ProbeDiag` (crates/core/src/probe/mod.rs) that the worker logs, one line
+per probe, at debug level under the target `probe_diag`. Turn it on with
+`RUST_LOG=info,probe_diag=debug` in the worker's environment. Nothing new is sent to the server.
+
+```
+kind=probe src=backfill status=no_pieces end=no_peers late=false ms=17342 whole=true piece_kib=1024
+  targets=3 results=0 cut=2 no_bytes=1 no_det=0 low_conf=- struck=0 first_byte_ms=- unchoke_ms=-
+  handoff_choked=true connects=ok:1,timeout:1 max_alive=1 cap_blocked=true cand_left=6
+  drops=closed:2 choke_expired=0 bytes_in=0 incomplete=true
+kind=skip why=slot_wait        # backfill dict not probed: slot_wait, no_handoff or gate
+```
+
+| field | meaning |
+|---|---|
+| `end` | why the target loop stopped: `done`, `deadline` (session), `budget` (`max_bytes`), `no_peers`; or a failure code (`timeout`, `layout`, `no_targets`, `big_dict`) |
+| `late` | the session deadline had passed when it stopped |
+| `whole`, `piece_kib` | first reads fetched whole pieces; the piece length |
+| `cut`, `no_bytes`, `no_det` | targets never started, started with no byte, with bytes and no detection |
+| `low_conf` | detections dropped under `min_confidence` (label:confidence) |
+| `first_byte_ms`, `unchoke_ms` | since the probe started |
+| `connects` | further connections by outcome (`ok` or the peer error code) |
+| `drops` | peers closed, by reason (`stall`, `closed`, `write`, `unrequested`, `hash_mismatch`, ...) |
+| `choke_expired` | peers that had a wanted piece and still choked us after `unchoke_wait` |
+| `cap_blocked` | a further peer was wanted with fewer than `peers` alive, refused because dead slots count toward `peers` |
+| `cand_left` | candidate addresses never tried |
+
+Codes and counts only: no hash, name, path or address.
+

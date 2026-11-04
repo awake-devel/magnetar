@@ -198,6 +198,64 @@ pub struct ProbeResult {
     pub incomplete: bool,
     /// Surprise checks started.
     pub surprises: u32,
+    /// Why the probe ended as it did (logged by the worker, never sent to the server).
+    pub diag: ProbeDiag,
+}
+
+/// What one probe went through: counts and codes only, never a name, path or address
+/// (docs/DHT.md §7.1). The worker logs it (target `probe_diag`, level debug).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProbeDiag {
+    /// Wall time of the probe.
+    pub ms: u64,
+    /// Why the target loop stopped: `done` (every target tried), `deadline` (session),
+    /// `budget` (`max_bytes`), `no_peers` (none alive and none to connect); or the failure
+    /// code (`timeout`, `layout`, `no_targets`, `big_dict`).
+    pub end: &'static str,
+    /// The session deadline had passed when the loop stopped (also after `done`: the last
+    /// target was cut by time).
+    pub late: bool,
+    /// First reads fetched whole pieces (piece length <= `whole_piece_max`).
+    pub whole: bool,
+    pub piece_len: u64,
+    pub targets: u32,
+    /// Targets never started (the loop stopped first).
+    pub cut: u32,
+    /// Targets started that got no byte.
+    pub no_bytes: u32,
+    /// Targets with bytes and no detection.
+    pub no_detection: u32,
+    /// Detections dropped under `min_confidence`: label and confidence.
+    pub low_conf: Vec<(String, u8)>,
+    /// Results dropped because a peer caught lying contributed.
+    pub struck: u32,
+    /// Since the start: first piece payload, first unchoke.
+    pub first_byte_ms: Option<u64>,
+    pub unchoke_ms: Option<u64>,
+    /// The hand-off peer was choking us when the probe started.
+    pub handoff_choked: bool,
+    /// Connections tried after the hand-off, and how they ended (`ok` or the error code).
+    pub connects: Vec<(&'static str, u32)>,
+    /// Most peers alive at once.
+    pub max_alive: u32,
+    /// A further peer was wanted while fewer than `peers` were alive, and refused because
+    /// dead slots still counted toward `peers`.
+    pub cap_blocked: bool,
+    /// Candidate addresses never tried.
+    pub candidates_left: u32,
+    /// Peers closed, by reason (`stall`, `closed`, `write`, `hash_mismatch`, ...).
+    pub drops: Vec<(&'static str, u32)>,
+    /// Peers that had a wanted piece and still choked us after `unchoke_wait`.
+    pub choke_expired: u32,
+}
+
+impl ProbeDiag {
+    pub(crate) fn bump(v: &mut Vec<(&'static str, u32)>, k: &'static str) {
+        match v.iter_mut().find(|(x, _)| *x == k) {
+            Some((_, n)) => *n += 1,
+            None => v.push((k, 1)),
+        }
+    }
 }
 
 impl ProbeResult {
@@ -211,6 +269,10 @@ impl ProbeResult {
             unchoked: false,
             incomplete: false,
             surprises: 0,
+            diag: ProbeDiag {
+                end: r,
+                ..ProbeDiag::default()
+            },
         }
     }
 }
@@ -390,12 +452,14 @@ impl Prober {
         let c = &self.inner.c;
         add(&c.started, 1);
         let cfg = &self.inner.cfg;
-        let r = tokio::time::timeout(
+        let t0 = Instant::now();
+        let mut r = tokio::time::timeout(
             cfg.session + Duration::from_secs(5),
             drive::run(cfg, &self.inner.fetcher, job),
         )
         .await
         .unwrap_or_else(|_| ProbeResult::failed("timeout"));
+        r.diag.ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
         drop(slot);
         match r.status {
             ProbeStatus::Ok => add(&c.ok, 1),

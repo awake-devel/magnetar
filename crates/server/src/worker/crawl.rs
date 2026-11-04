@@ -39,7 +39,7 @@ use magnetar_core::api::{WorkerBackfillState, WorkerDhtState, WorkerProbeState};
 use magnetar_core::dht::{Dht, EngineConfig, EngineStats, Mode, Sighting, Via, collect_peers};
 use magnetar_core::metainfo::{FetchConfig, FetchStats, Fetcher, Handoff, InfoFile, Outcome};
 use magnetar_core::model::TorrentFile;
-use magnetar_core::probe::{self, ProbeConfig, ProbeJob, Prober, Skip};
+use magnetar_core::probe::{self, ProbeConfig, ProbeJob, ProbeResult, Prober, Skip};
 use serde::Serialize;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
@@ -687,6 +687,65 @@ fn probe_slot(p: &Crawl, prober: &Prober) -> Option<probe::ProbeSlot> {
 }
 
 /// The brake and pressure gates of [`probe_slot`], each refusal counted.
+/// One line per probe at debug level, target `probe_diag` (`RUST_LOG=info,probe_diag=debug`):
+/// codes and counts only, never a hash, name or address (docs/PROBES.md, Diagnostics).
+fn log_probe_diag(r: &ProbeResult, src: &str) {
+    if !tracing::enabled!(target: "probe_diag", tracing::Level::DEBUG) {
+        return;
+    }
+    tracing::debug!(target: "probe_diag", "{}", probe_diag_line(r, src));
+}
+
+fn log_probe_skip(why: &str) {
+    tracing::debug!(target: "probe_diag", "kind=skip why={why}");
+}
+
+fn probe_diag_line(r: &ProbeResult, src: &str) -> String {
+    fn pairs<K: std::fmt::Display, V: std::fmt::Display>(v: &[(K, V)]) -> String {
+        if v.is_empty() {
+            return "-".into();
+        }
+        v.iter()
+            .map(|(k, n)| format!("{k}:{n}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+    fn ms(v: Option<u64>) -> String {
+        v.map_or_else(|| "-".into(), |m| m.to_string())
+    }
+    let d = &r.diag;
+    format!(
+        "kind=probe src={src} status={} end={} late={} ms={} whole={} piece_kib={} targets={} \
+         results={} cut={} no_bytes={} no_det={} low_conf={} struck={} first_byte_ms={} \
+         unchoke_ms={} handoff_choked={} connects={} max_alive={} cap_blocked={} \
+         cand_left={} drops={} choke_expired={} bytes_in={} incomplete={}",
+        r.status.code(),
+        d.end,
+        d.late,
+        d.ms,
+        d.whole,
+        d.piece_len / 1024,
+        d.targets,
+        r.files.len(),
+        d.cut,
+        d.no_bytes,
+        d.no_detection,
+        pairs(&d.low_conf),
+        d.struck,
+        ms(d.first_byte_ms),
+        ms(d.unchoke_ms),
+        d.handoff_choked,
+        pairs(&d.connects),
+        d.max_alive,
+        d.cap_blocked,
+        d.candidates_left,
+        pairs(&d.drops),
+        d.choke_expired,
+        r.bytes_in,
+        r.incomplete,
+    )
+}
+
 fn probe_allowed(p: &Crawl, prober: &Prober) -> bool {
     if p.fetcher.braked() || p.fetcher.brake_level() > 0 {
         prober.skip(Skip::Brake);
@@ -757,6 +816,7 @@ async fn fetch_worker(
                 None,
             ),
         };
+        let had_dict = seed.is_some();
         // Not probed: the connection closes now (its permit goes back to the fetcher).
         let probe_input = match (seed, handoff, &p.prober) {
             (Some(seed), Some(h), Some(_)) => Some((seed, h)),
@@ -794,9 +854,16 @@ async fn fetch_worker(
         // of being skipped; the brake and pressure gates still apply.
         let backfill = p.backfill.as_ref().is_some_and(|b| b.has(&job.info_hash));
         if backfill {
+            if had_dict && probe_input.is_none() && p.prober.is_some() {
+                log_probe_skip("no_handoff");
+            }
             let waiting = probe_input.and_then(|(seed, h)| {
                 let prober = p.prober.clone()?;
-                probe_allowed(&p, &prober).then_some((prober, seed, h))
+                let ok = probe_allowed(&p, &prober);
+                if !ok {
+                    log_probe_skip("gate");
+                }
+                ok.then_some((prober, seed, h))
             });
             let (p2, out, mut stop) = (p.clone(), out.clone(), stop.clone());
             tokio::spawn(async move {
@@ -815,12 +882,16 @@ async fn fetch_worker(
                             Some(prober.probe(slot, pj).await)
                         } => match r {
                             Some(r) => {
+                                log_probe_diag(&r, "backfill");
                                 if let Some(rep) = crate::probes::report_of(&r) {
                                     pending.bytes += serde_json::to_vec(&rep).map_or(0, |b| b.len());
                                     pending.item.probe = Some(rep);
                                 }
                             }
-                            None => prober.skip(Skip::Busy),
+                            None => {
+                                log_probe_skip("slot_wait");
+                                prober.skip(Skip::Busy);
+                            }
                         },
                         _ = stop_requested(&mut stop) => {}
                     }
@@ -857,6 +928,7 @@ async fn fetch_worker(
             let mut pending = pending;
             tokio::select! {
                 r = prober.probe(slot, pj) => {
+                    log_probe_diag(&r, "live");
                     if let Some(rep) = crate::probes::report_of(&r) {
                         pending.bytes += serde_json::to_vec(&rep).map_or(0, |b| b.len());
                         pending.item.probe = Some(rep);
