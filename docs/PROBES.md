@@ -164,9 +164,9 @@ Why these numbers (planner cost simulation on real torrents and the check report
 - 2 peers: the metadata peer and one for the agreement read or a choke fallback.
 
 Constants (code, `probe::ProbeConfig::default`): 15 s unchoke wait, 10 s stall, 45 s session,
-64 requests in flight, second peer after 3 s, 4 further connection attempts, 8 targets, minimum
+64 requests in flight, second peer after 3 s, 8 targets, minimum
 confidence 80, agreement slack 15, upload 4 MiB / 256 KiB/s and a 5 s linger, dicts ≤ 2 MiB,
-sniff caps per file of 10 rounds (6 before D120: an MP4 asks its track skeleton before its
+connection attempts (D142: `connect_attempts` unbounded, so every candidate address is tried until `peers` are alive or the session ends; `connect_parallel` 4 attempts in flight at once, each through the shared fetcher), sniff caps per file of 10 rounds (6 before D120: an MP4 asks its track skeleton before its
 sample tables, a 2 h film with four tracks takes 9), 16 ranges and 4 MiB (a video payload in whole
 pieces: the torrent's budget less the other targets' first reads).
 
@@ -721,11 +721,35 @@ kind=skip why=slot_wait        # backfill dict not probed: slot_wait, no_handoff
 | `cut`, `no_bytes`, `no_det` | targets never started, started with no byte, with bytes and no detection |
 | `low_conf` | detections dropped under `min_confidence` (label:confidence) |
 | `first_byte_ms`, `unchoke_ms` | since the probe started |
-| `connects` | further connections by outcome (`ok` or the peer error code) |
+| `connects` | further connections by outcome: `ok`, the peer error code, `surplus` (connected after `peers` were already alive, closed) or `cancelled` (in flight when `peers` became alive, D142) |
 | `drops` | peers closed, by reason (`stall`, `closed`, `write`, `unrequested`, `hash_mismatch`, ...) |
 | `choke_expired` | peers that had a wanted piece and still choked us after `unchoke_wait` |
-| `cap_blocked` | a further peer was wanted with fewer than `peers` alive, refused because dead slots count toward `peers` |
-| `cand_left` | candidate addresses never tried |
+| `cap_blocked` | a further peer was wanted with fewer than `peers` alive and candidates left, refused because `connect_attempts` was used up (D142; before, dead slots counted toward `peers`, a bug: two dropped peers blocked every further connection) |
+| `cand_left` | candidate addresses never tried (attempts cancelled in flight count as tried) |
 
 Codes and counts only: no hash, name, path or address.
 
+### Connections and partial pieces (D142)
+
+Measured on rpi, 688 backfill probes (2026-11-04): 190 ended with nothing; 102 of them had used
+all 4 connection attempts with candidates left (median 12), 13 were `cap_blocked`, 20 got part of
+a whole piece from a slow peer and threw it away. Now:
+
+- `peers` (`MAGNETAR_PROBE_PEERS`) bounds the **live** peers; dead slots (a dropped peer keeps its
+  slot index for the session) do not count. A further connection starts only while fewer than
+  `peers` are alive.
+- Every candidate address is tried: `ProbeConfig::connect_attempts` defaults to `usize::MAX`
+  (a code constant, no `MAGNETAR_` setting). Attempts run `ProbeConfig::connect_parallel` (default
+  4, constant) at a time; each goes through `Fetcher::connect_for_probe`, so the address filter,
+  attempt pace, brake and open-connection cap still apply. In-flight attempts are not counted
+  toward `peers` (with `peers = 2` that would allow one attempt at a time and no parallelism):
+  a connection that succeeds when `peers` are already alive is closed (`surplus`), and once
+  `peers` are alive the attempts still in flight are cancelled (`cancelled`). No attempt starts
+  after the session deadline. `connect_parallel` 0 is treated as 1. The worst case of the parallelism is `connect_parallel - 1` connections that succeed at the same moment and are closed as `surplus` (counted in `connects`, so the router cost can be measured; UNVERIFIED on the router). The bounds on connections are therefore: `peers` live, `connect_parallel`
+  in flight, `connect_attempts` in all, `session` in time, plus the fetcher's own.
+- Whole-piece mode (`piece length <= whole_piece_max`): a piece that completes is verified as
+  before. Blocks of a piece that does not complete (the peer stalled, was dropped, or the session
+  ended) are used as **unverified** data, as in block mode (`insert_unverified`, the sending peer
+  recorded, so a later strike voids the result); the result has `verified=false` and
+  `detection.flags.unverified`. Bytes of a piece that failed its hash are dropped, with the peer's
+  other unverified blocks. `max_bytes` accounting is unchanged (every received byte counts).

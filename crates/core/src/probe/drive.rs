@@ -13,15 +13,14 @@
 //! its own task into one channel, so no half-read frame is ever dropped by the loop.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::future::Future;
 use std::net::SocketAddrV4;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use sniff::{Detection, Detector, Range, SparseFile};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use super::msg::{BLOCK, Block, PeerMsg, ProbeMsg, metadata_request};
@@ -43,7 +42,8 @@ const REJECTS: usize = 1024;
 /// An agreement read waits at most this long.
 const AGREEMENT_WAIT: Duration = Duration::from_secs(5);
 
-type Connecting = Pin<Box<dyn Future<Output = Result<PeerConn, PeerError>> + Send>>;
+/// One finished connection attempt: the candidate and how it went.
+type Attempt = (SocketAddrV4, Result<PeerConn, PeerError>);
 
 struct Cached {
     data: Vec<u8>,
@@ -62,7 +62,10 @@ struct Session<'a> {
     tx: mpsc::Sender<(usize, Event)>,
     rx: mpsc::Receiver<(usize, Event)>,
     candidates: VecDeque<SocketAddrV4>,
-    connecting: Option<Connecting>,
+    /// Connection attempts in flight (at most [`ProbeConfig::connect_parallel`]); dropped
+    /// (aborted) with the session.
+    connecting: JoinSet<Attempt>,
+    /// Attempts started so far (against [`ProbeConfig::connect_attempts`]).
     attempts: usize,
     /// Unverified blocks, by request.
     cache: HashMap<Block, Cached>,
@@ -160,7 +163,7 @@ pub(super) async fn run(cfg: &ProbeConfig, fetcher: &Fetcher, job: ProbeJob) -> 
         tx,
         rx,
         candidates,
-        connecting: None,
+        connecting: JoinSet::new(),
         attempts: 0,
         cache: HashMap::new(),
         verified: HashMap::new(),
@@ -250,13 +253,12 @@ impl Session<'_> {
         }
     }
 
-    /// A further peer is wanted, fewer than `peers` are alive, and the dead slots still
-    /// count toward `peers` (diagnostics only).
+    /// A further peer is wanted, fewer than `peers` are alive, candidates remain, and
+    /// `connect_attempts` is used up (diagnostics only).
     fn note_cap_block(&mut self) {
-        if self.connecting.is_none()
-            && self.peers.len() >= self.cfg.peers
+        if self.connecting.is_empty()
             && self.alive().count() < self.cfg.peers
-            && self.attempts < self.cfg.connect_attempts
+            && self.attempts >= self.cfg.connect_attempts
             && !self.candidates.is_empty()
         {
             self.diag.cap_blocked = true;
@@ -345,7 +347,8 @@ impl Session<'_> {
                 Some("deadline")
             } else if self.budget_left() == 0 {
                 Some("budget")
-            } else if self.alive().count() == 0 && !self.can_connect() {
+            } else if self.alive().count() == 0 && self.connecting.is_empty() && !self.can_connect()
+            {
                 self.note_cap_block();
                 Some("no_peers")
             } else {
@@ -460,6 +463,7 @@ impl Session<'_> {
         missing += before - results.len();
         self.diag.struck += (before - results.len()) as u32;
         self.diag.late = self.out_of_time();
+        self.stop_connecting().await;
         self.diag.candidates_left = self.candidates.len() as u32;
         self.diag.choke_expired = self.choke_expired.len() as u32;
         let results: Vec<FileResult> = results.into_iter().map(|(r, _)| r).collect();
@@ -686,7 +690,7 @@ impl Session<'_> {
             let until = self.deadline;
             self.get(&blocks, whole, None, until).await;
             let before = file.known_bytes();
-            self.fill(&mut file, off, size, &blocks, whole, &mut contributors);
+            self.fill(&mut file, off, size, &blocks, &mut contributors);
             let grown = file.known_bytes() > before;
             let d2 = det.clone();
             let Ok((f, a)) = tokio::task::spawn_blocking(move || {
@@ -743,14 +747,14 @@ impl Session<'_> {
     }
 
     /// Insert what is known of `blocks` into the file: verified pieces as verified, single
-    /// blocks (block mode only) as unverified.
+    /// blocks as unverified. In whole mode the unverified blocks are those of pieces that did
+    /// not complete (D142); a peer struck for a bad hash has none left in the cache.
     fn fill(
         &self,
         file: &mut SparseFile,
         off: u64,
         size: u64,
         blocks: &[Block],
-        whole: bool,
         contributors: &mut HashSet<usize>,
     ) {
         let pl = self.layout.piece_length;
@@ -762,9 +766,6 @@ impl Session<'_> {
                 }
                 continue;
             }
-            if whole {
-                continue;
-            }
             if let Some(c) = self.cache.get(b) {
                 let abs = u64::from(b.index) * pl + u64::from(b.begin);
                 if insert_clipped(file, off, size, abs, &c.data, false) {
@@ -774,11 +775,15 @@ impl Session<'_> {
         }
     }
 
+    /// Another connection attempt may start: fewer than `peers` live peers, fewer than
+    /// `connect_parallel` attempts in flight, `connect_attempts` not used up, a candidate left
+    /// and the session not over. Dead slots do not count: only live peers do.
     fn can_connect(&self) -> bool {
-        self.connecting.is_none()
-            && self.peers.len() < self.cfg.peers
+        self.connecting.len() < self.cfg.connect_parallel.max(1)
+            && self.alive().count() < self.cfg.peers
             && self.attempts < self.cfg.connect_attempts
             && !self.candidates.is_empty()
+            && !self.out_of_time()
     }
 
     fn maybe_connect(&mut self, queue: &VecDeque<Block>) {
@@ -801,17 +806,55 @@ impl Session<'_> {
             return;
         }
         let connected: HashSet<SocketAddrV4> = alive.iter().map(|p| p.addr).collect();
-        while let Some(addr) = self.candidates.pop_front() {
+        while self.can_connect() {
+            let Some(addr) = self.candidates.pop_front() else {
+                break;
+            };
             if self.struck_addrs.contains(&addr) || connected.contains(&addr) {
                 continue;
             }
             self.attempts += 1;
             let f = self.fetcher.clone();
             let hash = self.hash;
-            self.connecting = Some(Box::pin(
-                async move { f.connect_for_probe(hash, addr).await },
-            ));
-            return;
+            // Each attempt goes through the fetcher (address filter, pace, brake, connection
+            // cap): `connect_parallel` only says how many wait on it at once.
+            self.connecting
+                .spawn(async move { (addr, f.connect_for_probe(hash, addr).await) });
+        }
+    }
+
+    /// The session is over: attempts still in flight stop (they would otherwise run on during
+    /// the upload linger) and are counted: `cancelled`, or their real outcome when finished.
+    async fn stop_connecting(&mut self) {
+        self.connecting.abort_all();
+        while let Some(r) = self.connecting.join_next().await {
+            match r {
+                Ok((_, Ok(_))) => ProbeDiag::bump(&mut self.diag.connects, "surplus"),
+                Ok((_, Err(e))) => ProbeDiag::bump(&mut self.diag.connects, e.code()),
+                Err(e) if e.is_cancelled() => ProbeDiag::bump(&mut self.diag.connects, "cancelled"),
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// A connection attempt finished. A success past `peers` live peers is closed; once
+    /// `peers` are live the attempts still in flight are cancelled.
+    fn on_attempt(&mut self, (_, res): Attempt) {
+        match res {
+            Ok(c) => {
+                if self.alive().count() >= self.cfg.peers {
+                    ProbeDiag::bump(&mut self.diag.connects, "surplus");
+                    return;
+                }
+                ProbeDiag::bump(&mut self.diag.connects, "ok");
+                self.add_peer(c);
+                if self.alive().count() >= self.cfg.peers {
+                    // Counted as `cancelled` when each aborted task is reaped (a task that
+                    // had already finished keeps its real outcome).
+                    self.connecting.abort_all();
+                }
+            }
+            Err(e) => ProbeDiag::bump(&mut self.diag.connects, e.code()),
         }
     }
 
@@ -848,6 +891,9 @@ impl Session<'_> {
                     self.deliver_whole(*b, c.data, c.peer, &mut queue, &wanted);
                     continue;
                 }
+                // Its peer is gone (or another owns the piece): the bytes stay usable as
+                // unverified data for `fill`.
+                self.cache.insert(*b, c);
             }
             if !queue.contains(b) {
                 queue.push_back(*b);
@@ -888,7 +934,7 @@ impl Session<'_> {
         if queue.is_empty() {
             return true;
         }
-        if self.connecting.is_some() && only.is_none() {
+        if !self.connecting.is_empty() && only.is_none() {
             return false;
         }
         let smallest = queue.iter().map(|b| u64::from(b.len)).min().unwrap_or(0);
@@ -927,7 +973,7 @@ impl Session<'_> {
         }
         if only.is_none() && self.can_connect() {
             self.maybe_connect(queue);
-            return self.connecting.is_none();
+            return self.connecting.is_empty();
         }
         if only.is_none() {
             self.note_cap_block();
@@ -1001,21 +1047,20 @@ impl Session<'_> {
     /// One turn of the event loop: a peer message, a finished connection, or a tick.
     async fn pump(&mut self, queue: &mut VecDeque<Block>, wanted: &HashSet<Block>, until: Instant) {
         let wake = (Instant::now() + TICK).min(until).min(self.deadline);
-        let connecting = self.connecting.is_some();
+        let connecting = !self.connecting.is_empty();
         tokio::select! {
             m = self.rx.recv() => {
                 if let Some((slot, ev)) = m {
                     self.on_event(slot, ev, queue, wanted).await;
                 }
             }
-            c = async { self.connecting.as_mut().expect("guarded").await }, if connecting => {
-                self.connecting = None;
+            c = self.connecting.join_next(), if connecting => {
                 match c {
-                    Ok(c) => {
-                        ProbeDiag::bump(&mut self.diag.connects, "ok");
-                        self.add_peer(c);
+                    Some(Ok(a)) => self.on_attempt(a),
+                    Some(Err(e)) if e.is_cancelled() => {
+                        ProbeDiag::bump(&mut self.diag.connects, "cancelled");
                     }
-                    Err(e) => ProbeDiag::bump(&mut self.diag.connects, e.code()),
+                    _ => {}
                 }
             }
             _ = tokio::time::sleep_until(wake) => {}
@@ -1262,10 +1307,25 @@ impl Session<'_> {
         let Some(a) = self.asm.get_mut(&b.index) else {
             return false;
         };
+        // A copy stays in `cache` until the piece verifies: if the piece never completes
+        // (a slow or gone peer), `fill` uses these blocks as unverified data (D142). A strike
+        // or a hash mismatch removes them.
+        // A copy of a dead peer's block gives way to the live peer's.
+        let copy = self
+            .cache
+            .get(&b)
+            .is_none_or(|c| self.peers.get(c.peer).is_none_or(Option::is_none))
+            .then(|| data.clone());
         if a.insert(b.begin, data, slot).is_err() {
             self.kill(slot, "bad_block", Some((queue, wanted)));
             return false;
         }
+        if let Some(data) = copy {
+            self.cache.insert(b, Cached { data, peer: slot });
+        }
+        let Some(a) = self.asm.get(&b.index) else {
+            return false;
+        };
         if !a.is_complete() {
             return false;
         }
@@ -1283,6 +1343,8 @@ impl Session<'_> {
                 true
             }
             Err(AsmError::Mismatch(peers)) => {
+                // Bytes of a piece that failed its hash are never used, whoever sent them.
+                self.cache.retain(|k, _| k.index != b.index);
                 // One peer sent the whole piece (pinned): it lied. Several (cannot happen
                 // with pinning): nobody is named, the piece is asked again.
                 if let [p] = peers[..] {

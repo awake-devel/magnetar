@@ -77,8 +77,12 @@ pub struct ProbeConfig {
     /// A second peer is connected when the first one is still choked after this long, lacks
     /// a piece, or is gone.
     pub second_peer_after: Duration,
-    /// Connection attempts per probe for further peers.
+    /// Connection attempts per probe for further peers. `usize::MAX` (default): every
+    /// candidate address is tried, until `peers` are alive or the session ends (D142).
     pub connect_attempts: usize,
+    /// Connection attempts in flight at once per probe (D142). Each still goes through
+    /// [`Fetcher::connect_for_probe`] (address filter, pace, brake, connection cap).
+    pub connect_parallel: usize,
     /// Upload caps per probe (upload mode only).
     pub upload_max_bytes: u64,
     pub upload_rate: u64,
@@ -107,7 +111,8 @@ impl Default for ProbeConfig {
             session: Duration::from_secs(45),
             pipeline: 64,
             second_peer_after: Duration::from_secs(3),
-            connect_attempts: 4,
+            connect_attempts: usize::MAX,
+            connect_parallel: 4,
             upload_max_bytes: serve::UPLOAD_MAX_BYTES,
             upload_rate: serve::UPLOAD_RATE,
             upload_linger: Duration::from_secs(5),
@@ -234,12 +239,15 @@ pub struct ProbeDiag {
     pub unchoke_ms: Option<u64>,
     /// The hand-off peer was choking us when the probe started.
     pub handoff_choked: bool,
-    /// Connections tried after the hand-off, and how they ended (`ok` or the error code).
+    /// Connections tried after the hand-off, and how they ended (`ok`, the error code,
+    /// `surplus` for one closed because `peers` were already alive, `cancelled` for attempts
+    /// stopped once `peers` were alive).
     pub connects: Vec<(&'static str, u32)>,
     /// Most peers alive at once.
     pub max_alive: u32,
-    /// A further peer was wanted while fewer than `peers` were alive, and refused because
-    /// dead slots still counted toward `peers`.
+    /// A further peer was wanted while fewer than `peers` were alive and candidates were
+    /// left, and refused because `connect_attempts` was used up (D142; before it also meant
+    /// dead slots counting toward `peers`, a bug fixed there).
     pub cap_blocked: bool,
     /// Candidate addresses never tried.
     pub candidates_left: u32,
