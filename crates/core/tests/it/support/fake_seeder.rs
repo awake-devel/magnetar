@@ -130,6 +130,29 @@ pub enum Junk {
     BadHave,
 }
 
+/// Peer exchange (BEP 11): the fake advertises `ut_pex` and sends these raw payloads, with the
+/// id the prober advertised, `delay` after the prober's extended handshake arrives.
+#[derive(Clone, Debug, Default)]
+pub struct Pex {
+    pub payloads: Vec<Vec<u8>>,
+    pub delay: Duration,
+}
+
+/// A well-formed `ut_pex` payload: compact IPv4 `added` and its `added.f` (0x02 = seed).
+pub fn pex_payload(peers: &[(SocketAddrV4, bool)]) -> Vec<u8> {
+    let mut added = Vec::new();
+    let mut flags = Vec::new();
+    for (a, seed) in peers {
+        added.extend_from_slice(&a.ip().octets());
+        added.extend_from_slice(&a.port().to_be_bytes());
+        flags.push(if *seed { 0x02 } else { 0x00 });
+    }
+    bencode::encode(&dict(vec![
+        ("added", Value::Bytes(added)),
+        ("added.f", Value::Bytes(flags)),
+    ]))
+}
+
 #[derive(Clone, Debug)]
 pub struct Opts {
     pub fast: bool,
@@ -158,6 +181,8 @@ pub struct Opts {
     /// After this many blocks served, answer nothing more (no reject, no choke): a slow peer
     /// that stalls.
     pub stall_after: Option<usize>,
+    /// Advertise `ut_pex` and send these messages (None: not advertised).
+    pub pex: Option<Pex>,
 }
 
 impl Default for Opts {
@@ -179,6 +204,7 @@ impl Default for Opts {
             delay_first: 0,
             have_all_after: None,
             stall_after: None,
+            pex: None,
         }
     }
 }
@@ -190,6 +216,11 @@ pub struct Log {
     pub peer_ids: Vec<[u8; 20]>,
     pub reserved: Vec<[u8; 8]>,
     pub client: Vec<String>,
+    /// The raw bencoded payload of every extended handshake the prober sent.
+    pub ext_handshakes: Vec<Vec<u8>>,
+    /// Extended ids (after the handshake) of every extended message the prober sent: 2 is
+    /// `ut_metadata`, 9 would be `ut_pex` (never sent, D143).
+    pub ext_ids: Vec<u8>,
     /// Message ids received from the prober, in order (255 = keep-alive).
     pub ids: Vec<u8>,
     /// `ut_metadata` msg_types received from the prober.
@@ -302,6 +333,8 @@ struct State {
     unchoked_by_prober: bool,
     have_all_at: Option<Instant>,
     asked: std::collections::HashSet<u32>,
+    /// `ut_pex` due at, and the id to send it with.
+    pex_at: Option<(Instant, u8)>,
 }
 
 async fn send(w: &mut OwnedWriteHalf, b: &[u8]) -> bool {
@@ -348,7 +381,9 @@ async fn conn(s: TcpStream, t: Arc<Torrent>, o: Opts, log: Arc<Mutex<Log>>) {
         }
     }
     let mut m = vec![("ut_metadata", Value::Int(2))];
-    m.push(("ut_pex", Value::Int(9)));
+    if o.pex.is_some() {
+        m.push(("ut_pex", Value::Int(9)));
+    }
     let mut e = vec![
         ("m", dict(m)),
         ("metadata_size", Value::Int(t.info.len() as i64)),
@@ -427,12 +462,17 @@ async fn conn(s: TcpStream, t: Arc<Torrent>, o: Opts, log: Arc<Mutex<Log>>) {
         unchoked_by_prober: false,
         have_all_at: o.have_all_after.map(|d| Instant::now() + d),
         asked: Default::default(),
+        pex_at: None,
     };
     loop {
         let wake = st
             .unchoke_at
             .unwrap_or_else(|| Instant::now() + Duration::from_millis(50))
-            .min(Instant::now() + Duration::from_millis(50));
+            .min(Instant::now() + Duration::from_millis(50))
+            .min(
+                st.pex_at
+                    .map_or_else(|| Instant::now() + Duration::from_millis(50), |p| p.0),
+            );
         let ev = tokio::select! {
             m = rx.recv() => match m {
                 Some(Some((id, b))) => Ev::Frame(id, b),
@@ -450,6 +490,20 @@ async fn conn(s: TcpStream, t: Arc<Torrent>, o: Opts, log: Arc<Mutex<Log>>) {
             };
             if !send(&mut w, &m).await {
                 return;
+            }
+        }
+        if let Some((at, id)) = st.pex_at
+            && Instant::now() >= at
+        {
+            st.pex_at = None;
+            if let Some(px) = &o.pex {
+                let mut out = Vec::new();
+                for pl in &px.payloads {
+                    out.extend(wire::extended(id, pl));
+                }
+                if !send(&mut w, &out).await {
+                    return;
+                }
             }
         }
         if st.unchoke_at.is_some_and(|t| Instant::now() >= t) {
@@ -542,16 +596,28 @@ async fn conn(s: TcpStream, t: Arc<Torrent>, o: Opts, log: Arc<Mutex<Log>>) {
                     continue;
                 }
                 if body[0] == 0 {
-                    if let Ok(v) = bencode::decode(&body[1..])
-                        && let Some(c) = v.get(b"v").and_then(Value::as_bytes)
-                    {
-                        log.lock()
-                            .unwrap()
-                            .client
-                            .push(String::from_utf8_lossy(c).into_owned());
+                    log.lock().unwrap().ext_handshakes.push(body[1..].to_vec());
+                    if let Ok(v) = bencode::decode(&body[1..]) {
+                        if let Some(c) = v.get(b"v").and_then(Value::as_bytes) {
+                            log.lock()
+                                .unwrap()
+                                .client
+                                .push(String::from_utf8_lossy(c).into_owned());
+                        }
+                        // The prober takes `ut_pex` messages on the id it advertised.
+                        if let Some(px) = &o.pex
+                            && let Some(id) = v
+                                .get(b"m")
+                                .and_then(|m| m.get(b"ut_pex"))
+                                .and_then(Value::as_int)
+                                .and_then(|i| u8::try_from(i).ok())
+                        {
+                            st.pex_at = Some((Instant::now() + px.delay, id));
+                        }
                     }
                     continue;
                 }
+                log.lock().unwrap().ext_ids.push(body[0]);
                 if body[0] != 2 {
                     continue;
                 }

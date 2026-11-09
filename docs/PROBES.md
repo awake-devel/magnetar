@@ -166,7 +166,7 @@ Why these numbers (planner cost simulation on real torrents and the check report
 Constants (code, `probe::ProbeConfig::default`): 15 s unchoke wait, 10 s stall, 45 s session,
 64 requests in flight, second peer after 3 s, 8 targets, minimum
 confidence 80, agreement slack 15, upload 4 MiB / 256 KiB/s and a 5 s linger, dicts ≤ 2 MiB,
-connection attempts (D142: `connect_attempts` unbounded, so every candidate address is tried until `peers` are alive or the session ends; `connect_parallel` 4 attempts in flight at once, each through the shared fetcher), sniff caps per file of 10 rounds (6 before D120: an MP4 asks its track skeleton before its
+connection attempts (D142: `connect_attempts` unbounded, so every candidate address is tried until `peers` are alive or the session ends; `connect_parallel` 4 attempts in flight at once, each through the shared fetcher), peer exchange (D143): `pex_per_peer` 200, `pex_msgs_per_peer` 16, `pex_candidates_max` 1024, `pex_total` 400, `ports_per_ip` 3, `pex_wait` 3 s (see §13), sniff caps per file of 10 rounds (6 before D120: an MP4 asks its track skeleton before its
 sample tables, a 2 h film with four tracks takes 9), 16 ranges and 4 MiB (a video payload in whole
 pieces: the torrent's budget less the other targets' first reads).
 
@@ -709,7 +709,7 @@ per probe, at debug level under the target `probe_diag`. Turn it on with
 kind=probe src=backfill status=no_pieces end=no_peers late=false ms=17342 whole=true piece_kib=1024
   targets=3 results=0 cut=2 no_bytes=1 no_det=0 low_conf=- struck=0 first_byte_ms=- unchoke_ms=-
   handoff_choked=true connects=ok:1,timeout:1 max_alive=1 cap_blocked=true cand_left=6
-  drops=closed:2 choke_expired=0 bytes_in=0 incomplete=true
+  drops=closed:2 choke_expired=0 pex_msgs=2 pex_added=9 pex_ok=1 bytes_in=0 incomplete=true
 kind=skip why=slot_wait        # backfill dict not probed: slot_wait, no_handoff or gate
 ```
 
@@ -726,6 +726,9 @@ kind=skip why=slot_wait        # backfill dict not probed: slot_wait, no_handoff
 | `choke_expired` | peers that had a wanted piece and still choked us after `unchoke_wait` |
 | `cap_blocked` | a further peer was wanted with fewer than `peers` alive and candidates left, refused because `connect_attempts` was used up (D142; before, dead slots counted toward `peers`, a bug: two dropped peers blocked every further connection) |
 | `cand_left` | candidate addresses never tried (attempts cancelled in flight count as tried) |
+| `pex_msgs` | `ut_pex` messages received from peers, all of them (D143) |
+| `pex_added` | new candidate addresses learned from them: not already known (candidate, connected, tried or struck), within the bounds below |
+| `pex_ok` | connections that came from such an address and succeeded (became a live peer; a `surplus` one does not count) |
 
 Codes and counts only: no hash, name, path or address.
 
@@ -753,3 +756,54 @@ a whole piece from a slow peer and threw it away. Now:
   recorded, so a later strike voids the result); the result has `verified=false` and
   `detection.flags.unverified`. Bytes of a piece that failed its hash are dropped, with the peer's
   other unverified blocks. `max_bytes` accounting is unchanged (every received byte counts).
+
+### Peer exchange, receive-only (D143)
+
+Measured on eee after D142 (657 probes): 28.5 % ended with nothing; the empty ones tried a
+median of 4 candidate addresses and 153 of 187 had none left; 92 % of connection attempts fail
+(stale DHT peer lists). Connected peers know fresh peers, so probe connections speak BEP 11
+(`ut_pex`), receive-only:
+
+- **Advertised on probe connections only.** With `FetchConfig::probe` on, our extended handshake
+  adds `m.ut_pex` = 2 (the hand-off connection and `Fetcher::connect_for_probe`). With probes off
+  the handshake is byte-identical to before (test `only_probe_connections_advertise_pex`).
+- **Never sent.** D117's policy holds: only `ProbeMsg` goes out; there is no `ut_pex` variant, so
+  a probe cannot tell a peer about other peers (the tests check the fake peers never get one).
+- **Parsed with care** (`wire::parse_pex`): the bencoded dict's `added` (compact IPv4, 6 bytes
+  each) and `added.f` (one flag byte each, `0x02` = seed). `added6`, `dropped` and `dropped6`
+  are ignored. A trailing partial entry, port 0 and `0.0.0.0` are skipped; a wrong type is the
+  same as absent; a payload that is not a dict is ignored (the peer is kept; a flood is cut by the
+  per-peer skipped-bytes budget, 1 MiB, that already existed). The extended-message cap of 64 KiB
+  applies as before.
+- **Fed to the candidates.** New addresses (not already a candidate, connected, tried or struck)
+  are queued, seeds at the front. They are tried like any candidate: `connect_parallel` at a time,
+  each through `Fetcher::connect_for_probe` (address filter, pace, brake, open-connection cap).
+  PEX never bypasses the fetcher. Messages that arrive while the hand-off peer still sends the
+  metadata are kept (at most 8 messages, `PEX_HANDOFF_MSGS`) and handed to the probe.
+- **A stuck probe waits** (`pex_wait`): when no live peer has a wanted piece (or all choke) and
+  no candidate can be tried, the probe waits up to `pex_wait` after a peer connected for its first
+  `ut_pex` message, only for a peer that advertised `ut_pex` in its extended handshake and has
+  sent none yet; never past the session deadline.
+- `probe_peers` (worker) no longer cuts the list at 16: every known address is passed, deduped.
+
+Bounds (all `ProbeConfig` fields or constants, none is a `MAGNETAR_` setting; generous, meant to
+stop abuse only):
+
+| bound | value | why |
+|---|---|---|
+| `pex_per_peer` | 200 addresses per peer per probe | BEP 11 senders keep a message to about 50 entries; 200 is four messages' worth |
+| `pex_msgs_per_peer` | 16 messages parsed per peer per probe | a client sends one about every minute; later ones are only counted |
+| `pex_candidates_max` | 1024 queued candidates | memory; the addresses the job brings are never cut, PEX stops adding past it |
+| `pex_total` | 400 addresses from PEX per probe, all peers together | `pex_per_peer` is per peer, and each PEX-found peer may name 200 more: this is the real ceiling on extra attempts |
+| `ports_per_ip` | 3 distinct ports per IPv4 per probe (job addresses and PEX alike; the hand-off peer counts) | one ut_pex message must not become a port scan of one host from our line; NATed swarms rarely show more |
+| `pex_wait` | 3 s (0 = never wait) | the same order as `second_peer_after`; also bounded by `session`; only taken while a peer slot is free and `connect_attempts` is not used up (a learned address could not be tried otherwise) |
+| `wire::PEX_MAX_ADDED` | 1024 entries per message | the 64 KiB message cap would allow about 10 000 |
+| `PEX_HANDOFF_MSGS` | 8 messages kept from the metadata phase | the hand-off connection reads the peer's messages before the probe starts; this bound (not `pex_msgs_per_peer`) governs that phase, and those messages count against `pex_msgs_per_peer` afterwards |
+
+Not measured on real swarms (**UNVERIFIED**): the gain in results, and the cost on the line and
+the router: every PEX address is one more connection attempt, so the number of attempts per probe
+goes up. Worst case per probe: the job's addresses (at most `ports_per_ip` per IP) plus at most
+`pex_total` 400 from PEX, each tried once; with `connect_parallel` 4 and a 3 s connect timeout
+about 60 attempts fit in a 45 s session, more when attempts fail fast, always paced and braked
+by the fetcher (before D143: at most 16). Watch `connects`,
+`pex_added` and `pex_ok` on a worker before trusting it on the Pi's router.

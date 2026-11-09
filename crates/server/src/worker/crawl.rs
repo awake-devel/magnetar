@@ -664,15 +664,24 @@ fn outcome_item(p: &Crawl, job: &Job, outcome: Outcome) -> Option<Screened> {
 }
 
 /// Further peers for a probe: those that took our handshake for this hash first, then the
-/// rest of the DHT's list; never the hand-off peer itself.
+/// rest of the DHT's list; never the hand-off peer itself. Every known address, deduped: no
+/// cap (D143; the 16-address cut of D142 left empty probes with stale lists). The inputs are
+/// already bounded (`answered` holds at most 64, the DHT list is the lookup's own).
 fn probe_peers(h: &Handoff, found: &[SocketAddrV4]) -> Vec<SocketAddrV4> {
-    let mut seen: HashSet<SocketAddrV4> = HashSet::from([h.conn.addr]);
-    h.answered
+    probe_candidates(h.conn.addr, &h.answered, found)
+}
+
+fn probe_candidates(
+    first: SocketAddrV4,
+    answered: &[SocketAddrV4],
+    found: &[SocketAddrV4],
+) -> Vec<SocketAddrV4> {
+    let mut seen: HashSet<SocketAddrV4> = HashSet::from([first]);
+    answered
         .iter()
         .chain(found)
         .filter(|a| seen.insert(**a))
         .copied()
-        .take(16)
         .collect()
 }
 
@@ -718,7 +727,8 @@ fn probe_diag_line(r: &ProbeResult, src: &str) -> String {
         "kind=probe src={src} status={} end={} late={} ms={} whole={} piece_kib={} targets={} \
          results={} cut={} no_bytes={} no_det={} low_conf={} struck={} first_byte_ms={} \
          unchoke_ms={} handoff_choked={} connects={} max_alive={} cap_blocked={} \
-         cand_left={} drops={} choke_expired={} bytes_in={} incomplete={}",
+         cand_left={} drops={} choke_expired={} pex_msgs={} pex_added={} pex_ok={} bytes_in={} \
+         incomplete={}",
         r.status.code(),
         d.end,
         d.late,
@@ -741,6 +751,9 @@ fn probe_diag_line(r: &ProbeResult, src: &str) -> String {
         d.candidates_left,
         pairs(&d.drops),
         d.choke_expired,
+        d.pex_msgs,
+        d.pex_added,
+        d.pex_ok,
         r.bytes_in,
         r.incomplete,
     )
@@ -1514,6 +1527,56 @@ mod tests {
     use axum::Json;
     use axum::http::StatusCode;
     use axum::routing::post;
+
+    /// D143: every known address reaches the probe, deduped, in order: the hand-off's
+    /// `answered` first, then the DHT's list, never the hand-off peer. The 16-address cut left
+    /// empty probes with stale lists.
+    #[test]
+    fn probe_candidates_are_not_truncated() {
+        let a = |i: u32| {
+            SocketAddrV4::new(
+                std::net::Ipv4Addr::new(10, 0, (i >> 8) as u8, i as u8),
+                6881,
+            )
+        };
+        let first = a(0);
+        let answered: Vec<_> = (0..5).map(a).collect();
+        let found: Vec<_> = (3..60).map(a).collect();
+        let got = probe_candidates(first, &answered, &found);
+        assert_eq!(
+            got.len(),
+            59,
+            "addresses 1..=59, the hand-off peer left out"
+        );
+        assert_eq!(got[0], a(1));
+        assert!(!got.contains(&first));
+        assert_eq!(
+            got.iter().collect::<HashSet<_>>().len(),
+            got.len(),
+            "deduped"
+        );
+        assert_eq!(got.last(), Some(&a(59)));
+    }
+
+    #[test]
+    fn probe_diag_line_has_pex_counts() {
+        let mut r = ProbeResult {
+            status: probe::ProbeStatus::NoPieces,
+            files: Vec::new(),
+            bytes_in: 0,
+            uploaded: 0,
+            peers_used: 1,
+            unchoked: false,
+            incomplete: false,
+            surprises: 0,
+            diag: probe::ProbeDiag::default(),
+        };
+        r.diag.pex_msgs = 3;
+        r.diag.pex_added = 7;
+        r.diag.pex_ok = 2;
+        let l = probe_diag_line(&r, "t");
+        assert!(l.contains("pex_msgs=3 pex_added=7 pex_ok=2"), "{l}");
+    }
 
     /// A loopback server that answers 503 to the first request, refuses more than two items
     /// with 413 and an item for `bad` with 400, and records what it took.

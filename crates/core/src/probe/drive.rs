@@ -11,9 +11,15 @@
 //! same filter, pace, brake and connection cap) when the first is gone, still choked after
 //! [`ProbeConfig::second_peer_after`], or lacks a wanted piece. Each peer's frames are read by
 //! its own task into one channel, so no half-read frame is ever dropped by the loop.
+//!
+//! Peer exchange (BEP 11, receive-only, D143): the probe's connections advertise `ut_pex`; the
+//! addresses a peer sends are queued as candidates (seeds first), bounded by
+//! [`ProbeConfig::pex_per_peer`], [`ProbeConfig::pex_msgs_per_peer`] and
+//! [`ProbeConfig::pex_candidates_max`], and tried like any other candidate, through
+//! [`Fetcher::connect_for_probe`]. We never send `ut_pex`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddrV4;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -62,6 +68,15 @@ struct Session<'a> {
     tx: mpsc::Sender<(usize, Event)>,
     rx: mpsc::Receiver<(usize, Event)>,
     candidates: VecDeque<SocketAddrV4>,
+    /// Every address ever a candidate, connected or learned (never removed): PEX does not
+    /// queue an address twice, nor one already tried or struck.
+    known: HashSet<SocketAddrV4>,
+    /// Candidates that came from PEX (for `diag.pex_ok`).
+    pex_found: HashSet<SocketAddrV4>,
+    /// Addresses accepted per IPv4 (against [`ProbeConfig::ports_per_ip`]).
+    ip_ports: HashMap<Ipv4Addr, usize>,
+    /// Addresses accepted from PEX in all (against [`ProbeConfig::pex_total`]).
+    pex_total: usize,
     /// Connection attempts in flight (at most [`ProbeConfig::connect_parallel`]); dropped
     /// (aborted) with the session.
     connecting: JoinSet<Attempt>,
@@ -142,13 +157,19 @@ pub(super) async fn run(cfg: &ProbeConfig, fetcher: &Fetcher, job: ProbeJob) -> 
         return ProbeResult::failed("no_targets");
     }
     let (tx, rx) = mpsc::channel(256);
-    let mut first = None;
     let mut candidates = VecDeque::new();
+    let mut known = HashSet::new();
+    let mut ip_ports: HashMap<Ipv4Addr, usize> = HashMap::new();
     if let Some(c) = &conn {
-        first = Some(c.addr);
+        known.insert(c.addr);
+        *ip_ports.entry(*c.addr.ip()).or_default() += 1;
     }
+    // The addresses the job brings (the worker passes them all, deduped), at most
+    // `ports_per_ip` per IPv4.
     for p in peers {
-        if Some(p) != first && !candidates.contains(&p) {
+        let n = ip_ports.entry(*p.ip()).or_default();
+        if *n < cfg.ports_per_ip.max(1) && known.insert(p) {
+            *n += 1;
             candidates.push_back(p);
         }
     }
@@ -163,6 +184,10 @@ pub(super) async fn run(cfg: &ProbeConfig, fetcher: &Fetcher, job: ProbeJob) -> 
         tx,
         rx,
         candidates,
+        known,
+        pex_found: HashSet::new(),
+        ip_ports,
+        pex_total: 0,
         connecting: JoinSet::new(),
         attempts: 0,
         cache: HashMap::new(),
@@ -204,8 +229,9 @@ impl Session<'_> {
         self.layout.piece_count()
     }
 
-    fn add_peer(&mut self, c: PeerConn) {
+    fn add_peer(&mut self, mut c: PeerConn) {
         let slot = self.peers.len();
+        let batch = std::mem::take(&mut c.pex);
         let p = Peer::start(
             c,
             slot,
@@ -223,6 +249,14 @@ impl Session<'_> {
         self.addrs.push(p.addr);
         self.peers.push(Some(p));
         self.diag.max_alive = self.diag.max_alive.max(self.alive().count() as u32);
+        // `ut_pex` messages that came while the metadata was fetched (hand-off connection).
+        if batch.msgs > 0 {
+            self.diag.pex_msgs = self.diag.pex_msgs.saturating_add(batch.msgs);
+            if let Some(p) = self.peer_mut(slot) {
+                p.pex_msgs = batch.msgs as usize;
+            }
+            self.learn_pex(slot, &batch.peers);
+        }
         if let Some(r) = dead {
             self.kill(slot, r, None);
         }
@@ -263,6 +297,74 @@ impl Session<'_> {
         {
             self.diag.cap_blocked = true;
         }
+    }
+
+    /// Queue addresses a peer sent by `ut_pex`: new ones only, seeds at the front, within the
+    /// per-peer and total bounds.
+    fn learn_pex(&mut self, slot: usize, peers: &[wire::PexPeer]) {
+        let Some(p) = self.peers.get_mut(slot).and_then(Option::as_mut) else {
+            return;
+        };
+        for x in peers {
+            if p.pex_added >= self.cfg.pex_per_peer
+                || self.pex_total >= self.cfg.pex_total
+                || self.candidates.len() >= self.cfg.pex_candidates_max
+            {
+                break;
+            }
+            if !self.known.insert(x.addr) {
+                continue;
+            }
+            let n = self.ip_ports.entry(*x.addr.ip()).or_default();
+            if *n >= self.cfg.ports_per_ip.max(1) {
+                continue;
+            }
+            *n += 1;
+            self.pex_total += 1;
+            p.pex_added += 1;
+            self.pex_found.insert(x.addr);
+            if x.seed {
+                self.candidates.push_front(x.addr);
+            } else {
+                self.candidates.push_back(x.addr);
+            }
+            self.diag.pex_added += 1;
+        }
+    }
+
+    /// A `ut_pex` message from `slot`: counted; the first `pex_msgs_per_peer` of a peer are
+    /// parsed (a malformed one is ignored, the peer is kept: the read loop's skipped-bytes
+    /// budget already drops a flood).
+    fn on_pex(&mut self, slot: usize, payload: &[u8]) {
+        self.diag.pex_msgs = self.diag.pex_msgs.saturating_add(1);
+        let Some(p) = self.peers.get_mut(slot).and_then(Option::as_mut) else {
+            return;
+        };
+        p.pex_msgs += 1;
+        if p.pex_msgs > self.cfg.pex_msgs_per_peer {
+            return;
+        }
+        if let Ok(got) = wire::parse_pex(payload) {
+            self.learn_pex(slot, &got);
+        }
+    }
+
+    /// A stuck probe may wait for peer exchange: a live peer advertised `ut_pex`, has sent no
+    /// message yet and connected less than `pex_wait` ago; never past the session. Only when
+    /// a learned address could be tried (a free peer slot and attempts left).
+    fn pex_hope(&self) -> bool {
+        let now = Instant::now();
+        !self.cfg.pex_wait.is_zero()
+            && self.alive().count() < self.cfg.peers
+            && self.attempts < self.cfg.connect_attempts
+            && self.pex_total < self.cfg.pex_total
+            && now < self.deadline
+            && self.candidates.len() < self.cfg.pex_candidates_max
+            && self.alive().any(|p| {
+                p.ut_pex
+                    && p.pex_msgs == 0
+                    && now.saturating_duration_since(p.since) < self.cfg.pex_wait
+            })
     }
 
     fn out_of_time(&self) -> bool {
@@ -839,7 +941,7 @@ impl Session<'_> {
 
     /// A connection attempt finished. A success past `peers` live peers is closed; once
     /// `peers` are live the attempts still in flight are cancelled.
-    fn on_attempt(&mut self, (_, res): Attempt) {
+    fn on_attempt(&mut self, (addr, res): Attempt) {
         match res {
             Ok(c) => {
                 if self.alive().count() >= self.cfg.peers {
@@ -847,6 +949,9 @@ impl Session<'_> {
                     return;
                 }
                 ProbeDiag::bump(&mut self.diag.connects, "ok");
+                if self.pex_found.contains(&addr) {
+                    self.diag.pex_ok += 1;
+                }
                 self.add_peer(c);
                 if self.alive().count() >= self.cfg.peers {
                     // Counted as `cancelled` when each aborted task is reaped (a task that
@@ -973,7 +1078,13 @@ impl Session<'_> {
         }
         if only.is_none() && self.can_connect() {
             self.maybe_connect(queue);
-            return self.connecting.is_empty();
+            if !self.connecting.is_empty() {
+                return false;
+            }
+        }
+        // Nobody to try: a peer that speaks `ut_pex` may still name some (D143).
+        if only.is_none() && self.pex_hope() {
+            return false;
         }
         if only.is_none() {
             self.note_cap_block();
@@ -1117,6 +1228,9 @@ impl Session<'_> {
             }
             PeerMsg::Piece { index, begin, data } => {
                 return self.on_piece(slot, index, begin, data, queue, wanted);
+            }
+            PeerMsg::Extended { id, ref payload } if id == wire::OUR_UT_PEX => {
+                return self.on_pex(slot, payload);
             }
             _ => {}
         }

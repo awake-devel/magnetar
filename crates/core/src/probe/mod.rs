@@ -83,6 +83,25 @@ pub struct ProbeConfig {
     /// Connection attempts in flight at once per probe (D142). Each still goes through
     /// [`Fetcher::connect_for_probe`] (address filter, pace, brake, connection cap).
     pub connect_parallel: usize,
+    /// Peer exchange (BEP 11, receive-only, D143): addresses accepted from one peer per probe.
+    /// Only abuse is meant to hit it (BEP 11 senders keep a message to ~50 entries).
+    pub pex_per_peer: usize,
+    /// `ut_pex` messages parsed per peer per probe; later ones are ignored (still charged to
+    /// the per-peer skipped-bytes budget).
+    pub pex_msgs_per_peer: usize,
+    /// Candidate addresses queued at once; PEX stops adding past it. The addresses the job
+    /// brings are never cut by it.
+    pub pex_candidates_max: usize,
+    /// Addresses accepted from PEX in all per probe (all peers together): bounds the extra
+    /// connection attempts a hostile or huge swarm can cause.
+    pub pex_total: usize,
+    /// Distinct ports accepted per IPv4 per probe (job addresses and PEX alike): a peer cannot
+    /// aim a port scan at one host through us.
+    pub ports_per_ip: usize,
+    /// A stuck probe (no live peer has a wanted piece, or all choke) waits this long after a
+    /// peer connected for a `ut_pex` message from it, when that peer advertised `ut_pex` and
+    /// has sent none yet; also bounded by `session`. Zero: never wait.
+    pub pex_wait: Duration,
     /// Upload caps per probe (upload mode only).
     pub upload_max_bytes: u64,
     pub upload_rate: u64,
@@ -113,6 +132,12 @@ impl Default for ProbeConfig {
             second_peer_after: Duration::from_secs(3),
             connect_attempts: usize::MAX,
             connect_parallel: 4,
+            pex_per_peer: 200,
+            pex_msgs_per_peer: 16,
+            pex_candidates_max: 1024,
+            pex_total: 400,
+            ports_per_ip: 3,
+            pex_wait: Duration::from_secs(3),
             upload_max_bytes: serve::UPLOAD_MAX_BYTES,
             upload_rate: serve::UPLOAD_RATE,
             upload_linger: Duration::from_secs(5),
@@ -255,6 +280,12 @@ pub struct ProbeDiag {
     pub drops: Vec<(&'static str, u32)>,
     /// Peers that had a wanted piece and still choked us after `unchoke_wait`.
     pub choke_expired: u32,
+    /// `ut_pex` messages received from peers (D143; counts, never addresses).
+    pub pex_msgs: u32,
+    /// New candidate addresses learned from them (not already known, within the bounds).
+    pub pex_added: u32,
+    /// Connections that came from such an address and succeeded (became a live peer).
+    pub pex_ok: u32,
 }
 
 impl ProbeDiag {

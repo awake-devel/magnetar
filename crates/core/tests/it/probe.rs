@@ -12,12 +12,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use magnetar_core::identity::{CLIENT_NAME, PEER_ID_PREFIX};
+use magnetar_core::liveness::bencode::{self, Value};
+use magnetar_core::metainfo::wire;
 use magnetar_core::metainfo::{FetchConfig, Fetcher, Outcome};
 use magnetar_core::probe::{ProbeConfig, ProbeJob, ProbeResult, ProbeStatus, Prober};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Instant;
 
-use crate::support::fake_seeder::{self as fs, ALLOWED_IDS, Has, Junk, Opts, Torrent, Unchoke};
+use crate::support::fake_seeder::{
+    self as fs, ALLOWED_IDS, Has, Junk, Opts, Pex, Torrent, Unchoke, pex_payload,
+};
 
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * 1024;
@@ -108,6 +112,8 @@ fn cfg() -> ProbeConfig {
         second_peer_after: Duration::from_millis(300),
         upload_linger: Duration::from_millis(800),
         per_min: 60_000,
+        // Every fake peer is 127.0.0.1: the per-IP bound has its own test.
+        ports_per_ip: 10_000,
         ..ProbeConfig::default()
     }
 }
@@ -763,6 +769,334 @@ async fn fetcher_without_probes_is_unchanged() {
     );
     // `connect_for_probe` refuses on a fetcher without probes.
     assert!(f.connect_for_probe(t.hash, s.addr).await.is_err());
+}
+
+/// A bound then closed loopback port: connecting is refused at once.
+async fn refused_addr() -> SocketAddrV4 {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(a) = l.local_addr().unwrap() else {
+        unreachable!()
+    };
+    a
+}
+
+/// A hand-off peer with no pieces.
+fn empty_with(pex: Pex) -> Opts {
+    Opts {
+        has: Has::Pieces(vec![]),
+        pex: Some(pex),
+        ..Opts::default()
+    }
+}
+
+/// Peer exchange (D143): the hand-off peer has no piece and the only good seeder is known
+/// solely through its `ut_pex` message (a seed, listed behind a refusing address). The probe
+/// connects it (through `connect_for_probe`), reads the file, counts what it learned and never
+/// sends `ut_pex` itself.
+#[tokio::test]
+async fn pex_names_the_only_good_seeder() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(1_000_000))], 256 * KIB);
+    let good = fs::start(t.clone(), Opts::default()).await;
+    let dead = refused_addr().await;
+    let first = fs::start(
+        t.clone(),
+        empty_with(Pex {
+            payloads: vec![pex_payload(&[(dead, false), (good.addr, true)])],
+            delay: Duration::ZERO,
+        }),
+    )
+    .await;
+    let r = probe(&t, &first, &[], cfg()).await;
+    let d = &r.diag;
+    assert_eq!(label(&r), vec![("video.mkv", true)], "{r:?}");
+    assert!(good.log().requests > 0, "the PEX seeder was asked");
+    assert!(d.pex_msgs >= 1, "{d:?}");
+    assert_eq!(d.pex_added, 2, "{d:?}");
+    assert_eq!(d.pex_ok, 1, "{d:?}");
+    assert!(d.connects.contains(&("ok", 1)), "{d:?}");
+    // Receive-only: no `ut_pex` (the fake's id 9) and nothing outside the whitelist.
+    for l in [first.log(), good.log()] {
+        assert!(!l.ext_ids.contains(&9), "{:?}", l.ext_ids);
+        assert_whitelist(&l);
+        // The probe's own handshake advertises ut_pex.
+        let hs = bencode::decode(&l.ext_handshakes[0]).unwrap();
+        assert_eq!(
+            hs.get(b"m")
+                .and_then(|m| m.get(b"ut_pex"))
+                .and_then(Value::as_int),
+            Some(i64::from(wire::OUR_UT_PEX))
+        );
+    }
+}
+
+/// A `ut_pex` message that comes after the probe is stuck is waited for (`pex_wait`); with no
+/// wait the same probe ends empty.
+#[tokio::test]
+async fn a_stuck_probe_waits_for_a_late_pex_message() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(1_000_000))], 256 * KIB);
+    let good = fs::start(t.clone(), Opts::default()).await;
+    let late = || Pex {
+        payloads: vec![pex_payload(&[(good.addr, false)])],
+        delay: Duration::from_millis(700),
+    };
+    let first = fs::start(t.clone(), empty_with(late())).await;
+    let c = ProbeConfig {
+        pex_wait: Duration::from_secs(5),
+        ..cfg()
+    };
+    let r = probe(&t, &first, &[], c).await;
+    assert_eq!(label(&r), vec![("video.mkv", true)], "{r:?}");
+    assert_eq!(r.diag.pex_ok, 1, "{:?}", r.diag);
+
+    let first = fs::start(t.clone(), empty_with(late())).await;
+    let c = ProbeConfig {
+        pex_wait: Duration::ZERO,
+        ..cfg()
+    };
+    let r = probe(&t, &first, &[], c).await;
+    assert!(r.files.is_empty(), "{r:?}");
+    assert_eq!(r.status, ProbeStatus::NoPieces, "{r:?}");
+
+    // A peer that never advertised ut_pex is not waited for: no delay on the old path.
+    let first = fs::start(
+        t.clone(),
+        Opts {
+            has: Has::Pieces(vec![]),
+            ..Opts::default()
+        },
+    )
+    .await;
+    let t0 = Instant::now();
+    let r = probe(&t, &first, &[], cfg()).await;
+    assert!(r.files.is_empty());
+    assert!(
+        t0.elapsed() < Duration::from_millis(2500),
+        "{:?}",
+        t0.elapsed()
+    );
+}
+
+/// Hostile `ut_pex` payloads (truncated list, wrong types, garbage, not a dict) are ignored
+/// without dropping the peer: the valid message behind them still counts.
+#[tokio::test]
+async fn hostile_pex_messages_are_ignored() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(1_000_000))], 256 * KIB);
+    let good = fs::start(t.clone(), Opts::default()).await;
+    let mut truncated = pex_payload(&[(good.addr, true), (good.addr, true)]);
+    // Cut inside the compact list: the declared length is now past the payload.
+    truncated.truncate(truncated.len() - 20);
+    let payloads = vec![
+        truncated,
+        b"d5:addedi5e7:added.fli1eee".to_vec(),
+        b"d5:addedl4:abcde6:added618:aaaaaaaaaaaaaaaaaae".to_vec(),
+        b"li1ee".to_vec(),
+        vec![0xFF; 300],
+        b"d5:added6:\x01\x02\x03\x04e".to_vec(),
+        pex_payload(&[(good.addr, false)]),
+    ];
+    let first = fs::start(
+        t.clone(),
+        empty_with(Pex {
+            payloads,
+            delay: Duration::ZERO,
+        }),
+    )
+    .await;
+    let r = probe(&t, &first, &[], cfg()).await;
+    assert_eq!(label(&r), vec![("video.mkv", true)], "{r:?}");
+    assert_eq!(r.diag.pex_msgs, 7, "{:?}", r.diag);
+    assert_eq!(r.diag.pex_added, 1, "{:?}", r.diag);
+    assert!(
+        r.diag.drops.iter().all(|(k, _)| *k != "malformed"),
+        "{:?}",
+        r.diag
+    );
+}
+
+/// A huge list is cut at `pex_per_peer`: the good seeder behind 2000 refusing entries is never
+/// reached, and exactly that many are queued and tried.
+#[tokio::test]
+async fn a_huge_pex_list_is_bounded() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(1_000_000))], 256 * KIB);
+    let good = fs::start(t.clone(), Opts::default()).await;
+    let mut list: Vec<(SocketAddrV4, bool)> = (0..2000u16)
+        .map(|i| (SocketAddrV4::new([127, 0, 0, 1].into(), 20_000 + i), false))
+        .collect();
+    list.push((good.addr, false));
+    let first = fs::start(
+        t.clone(),
+        empty_with(Pex {
+            payloads: vec![pex_payload(&list)],
+            delay: Duration::ZERO,
+        }),
+    )
+    .await;
+    let c = ProbeConfig {
+        pex_per_peer: 20,
+        pex_wait: Duration::from_millis(200),
+        ..cfg()
+    };
+    let r = probe(&t, &first, &[], c).await;
+    let d = &r.diag;
+    assert_eq!(d.pex_added, 20, "{d:?}");
+    assert!(r.files.is_empty(), "{r:?}");
+    assert_eq!(good.log().accepts, 0, "beyond the bound, never tried");
+    let tried: u32 = d.connects.iter().map(|(_, n)| *n).sum();
+    assert_eq!(tried, 20, "{d:?}");
+    assert_eq!(d.candidates_left, 0, "{d:?}");
+}
+
+/// The total of queued candidates is bounded too (`pex_candidates_max`), without cutting the
+/// addresses the job brought.
+#[tokio::test]
+async fn pex_candidates_max_bounds_the_queue() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(1_000_000))], 256 * KIB);
+    let list: Vec<(SocketAddrV4, bool)> = (0..50u16)
+        .map(|i| (SocketAddrV4::new([127, 0, 0, 1].into(), 30_000 + i), false))
+        .collect();
+    let first = fs::start(
+        t.clone(),
+        empty_with(Pex {
+            payloads: vec![pex_payload(&list)],
+            delay: Duration::ZERO,
+        }),
+    )
+    .await;
+    let mut mine = Vec::new();
+    for _ in 0..3 {
+        mine.push(refused_addr().await);
+    }
+    let c = ProbeConfig {
+        pex_candidates_max: 10,
+        pex_wait: Duration::from_millis(200),
+        // Room for the job's 3 addresses to still be waiting while PEX arrives.
+        connect_attempts: 0,
+        ..cfg()
+    };
+    let r = probe(&t, &first, &mine, c).await;
+    let d = &r.diag;
+    // 3 from the job + 7 learned fill the 10; attempts are off, so all stay queued.
+    assert_eq!(d.pex_added, 7, "{d:?}");
+    assert_eq!(d.candidates_left, 10, "{d:?}");
+}
+
+/// `pex_total` bounds the addresses accepted from PEX in all (D143).
+#[tokio::test]
+async fn pex_total_bounds_the_addresses_learned() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(1_000_000))], 256 * KIB);
+    let list: Vec<(SocketAddrV4, bool)> = (0..50u16)
+        .map(|i| (SocketAddrV4::new([127, 0, 0, 1].into(), 31_000 + i), false))
+        .collect();
+    let first = fs::start(
+        t.clone(),
+        empty_with(Pex {
+            payloads: vec![pex_payload(&list)],
+            delay: Duration::ZERO,
+        }),
+    )
+    .await;
+    let c = ProbeConfig {
+        pex_total: 7,
+        pex_wait: Duration::from_millis(200),
+        ..cfg()
+    };
+    let r = probe(&t, &first, &[], c).await;
+    assert_eq!(r.diag.pex_added, 7, "{:?}", r.diag);
+}
+
+/// `ports_per_ip` bounds the distinct ports accepted for one IPv4 (PEX and job addresses): a
+/// peer cannot aim a port scan at one host through us.
+#[tokio::test]
+async fn ports_per_ip_bounds_one_host() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(1_000_000))], 256 * KIB);
+    let list: Vec<(SocketAddrV4, bool)> = (0..50u16)
+        .map(|i| (SocketAddrV4::new([127, 0, 0, 1].into(), 32_000 + i), false))
+        .collect();
+    let first = fs::start(
+        t.clone(),
+        empty_with(Pex {
+            payloads: vec![pex_payload(&list)],
+            delay: Duration::ZERO,
+        }),
+    )
+    .await;
+    // The hand-off peer itself is one of the 5 ports allowed for 127.0.0.1.
+    let c = ProbeConfig {
+        ports_per_ip: 5,
+        pex_wait: Duration::from_millis(200),
+        ..cfg()
+    };
+    let r = probe(&t, &first, &[], c).await;
+    assert_eq!(r.diag.pex_added, 4, "{:?}", r.diag);
+}
+
+/// The PEX wait is only worth it when a learned address could be tried: with every peer slot
+/// taken (`peers` 1, the hand-off peer alive) a stuck probe ends at once, not after `pex_wait`.
+#[tokio::test]
+async fn no_pex_wait_without_a_free_peer_slot() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(1_000_000))], 256 * KIB);
+    let good = fs::start(t.clone(), Opts::default()).await;
+    let first = fs::start(
+        t.clone(),
+        empty_with(Pex {
+            payloads: vec![pex_payload(&[(good.addr, false)])],
+            delay: Duration::from_secs(2),
+        }),
+    )
+    .await;
+    let c = ProbeConfig {
+        peers: 1,
+        pex_wait: Duration::from_secs(5),
+        ..cfg()
+    };
+    let t0 = Instant::now();
+    let r = probe(&t, &first, &[], c).await;
+    assert!(r.files.is_empty(), "{r:?}");
+    assert!(
+        t0.elapsed() < Duration::from_millis(1500),
+        "{:?}",
+        t0.elapsed()
+    );
+}
+
+/// 13b: the extended handshake of a fetcher without probes has no `ut_pex` (byte-identical to
+/// before D143); with probes on, both the hand-off and `connect_for_probe` advertise it.
+#[tokio::test]
+async fn only_probe_connections_advertise_pex() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(100_000))], 256 * KIB);
+    let px = || Opts {
+        pex: Some(Pex::default()),
+        ..Opts::default()
+    };
+    let plain = wire::our_extended_handshake(CLIENT_NAME)[6..].to_vec();
+    let s = fs::start(t.clone(), px()).await;
+    let f = fetcher(false);
+    let (r, h) = f.fetch_with_handoff(t.hash, &[s.addr]).await;
+    assert!(matches!(r, Ok(Outcome::Ok(_))) && h.is_none());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let l = s.log();
+    assert_eq!(l.ext_handshakes, vec![plain.clone()], "{l:?}");
+    assert!(!String::from_utf8_lossy(&plain).contains("ut_pex"));
+
+    let s = fs::start(t.clone(), px()).await;
+    let f = fetcher(true);
+    let (r, h) = f.fetch_with_handoff(t.hash, &[s.addr]).await;
+    assert!(matches!(r, Ok(Outcome::Ok(_))));
+    let h = h.expect("hand-off");
+    let c = f
+        .connect_for_probe(t.hash, s.addr)
+        .await
+        .expect("probe conn");
+    drop((h, c));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let l = s.log();
+    assert_eq!(l.ext_handshakes.len(), 2, "{l:?}");
+    for hs in &l.ext_handshakes {
+        let v = bencode::decode(hs).unwrap();
+        let m = v.get(b"m").unwrap();
+        assert_eq!(m.get(b"ut_pex").and_then(Value::as_int), Some(2));
+        assert_eq!(m.get(b"ut_metadata").and_then(Value::as_int), Some(1));
+    }
 }
 
 /// 14: the byte budget stops the probe: cut short, flagged incomplete.

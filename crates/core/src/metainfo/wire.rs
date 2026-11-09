@@ -5,6 +5,8 @@
 //! Everything parsed here comes from an untrusted peer: lengths are checked before use and no
 //! function panics on any input (property tests below).
 
+use std::net::{Ipv4Addr, SocketAddrV4};
+
 use crate::liveness::bencode::{self, Value};
 
 /// BEP 3: "character ninteen (decimal) followed by the string 'BitTorrent protocol'".
@@ -41,6 +43,14 @@ pub const EXT_HANDSHAKE: u8 = 0;
 /// The id we ask peers to use when they send `ut_metadata` messages to us (BEP 10: "The IDs are
 /// local to this particular peer", i.e. the receiver chooses).
 pub const OUR_UT_METADATA: u8 = 1;
+/// The id we ask peers to use for `ut_pex` (BEP 11) messages to us; advertised by header
+/// probes only (D143). We never send `ut_pex`.
+pub const OUR_UT_PEX: u8 = 2;
+/// Most `added` entries kept from one `ut_pex` message (BEP 11 asks senders for at most 50; the
+/// 64 KiB extended-message cap allows ~10 000). A longer list is cut, not an error.
+pub const PEX_MAX_ADDED: usize = 1024;
+/// BEP 11 `added.f` flag bit: the peer is a seed.
+pub const PEX_SEED: u8 = 0x02;
 /// BEP 9: "The metadata is handled in blocks of 16KiB (16384 Bytes)".
 pub const BLOCK: usize = 16 * 1024;
 
@@ -140,14 +150,21 @@ pub fn extended(ext_id: u8, payload: &[u8]) -> Vec<u8> {
 /// Our extended handshake: `m.ut_metadata` = [`OUR_UT_METADATA`] and `v`. No `metadata_size`
 /// (BEP 9 adds it only when the sender has the metadata, and we have none).
 pub fn our_extended_handshake(client: &str) -> Vec<u8> {
+    our_extended_handshake_with(client, false)
+}
+
+/// [`our_extended_handshake`], with `m.ut_pex` = [`OUR_UT_PEX`] too when `pex` (header probes,
+/// D143). With `pex` false the bytes are those of [`our_extended_handshake`].
+pub fn our_extended_handshake_with(client: &str, pex: bool) -> Vec<u8> {
+    let mut m = vec![(
+        b"ut_metadata".to_vec(),
+        Value::Int(i64::from(OUR_UT_METADATA)),
+    )];
+    if pex {
+        m.push((b"ut_pex".to_vec(), Value::Int(i64::from(OUR_UT_PEX))));
+    }
     let dict = Value::Dict(vec![
-        (
-            b"m".to_vec(),
-            Value::Dict(vec![(
-                b"ut_metadata".to_vec(),
-                Value::Int(i64::from(OUR_UT_METADATA)),
-            )]),
-        ),
+        (b"m".to_vec(), Value::Dict(m)),
         (b"v".to_vec(), Value::Bytes(client.as_bytes().to_vec())),
     ]);
     extended(EXT_HANDSHAKE, &bencode::encode(&dict))
@@ -158,6 +175,9 @@ pub fn our_extended_handshake(client: &str) -> Vec<u8> {
 pub struct ExtHandshake {
     /// The id to send `ut_metadata` messages to this peer with (None: absent or 0 = disabled).
     pub ut_metadata: Option<u8>,
+    /// The id the peer uses for `ut_pex` (BEP 11): present when it supports peer exchange, so
+    /// a message may come (None: absent or 0 = disabled). We never send one (D143).
+    pub ut_pex: Option<u8>,
     /// BEP 9 `metadata_size` (any integer as sent; the caller checks the range).
     pub metadata_size: Option<i64>,
     /// BEP 10 `reqq`: outstanding requests the peer accepts (1..=65535 kept, else None).
@@ -177,6 +197,12 @@ pub fn parse_ext_handshake(payload: &[u8]) -> Result<ExtHandshake, WireError> {
         .and_then(Value::as_int)
         .and_then(|i| u8::try_from(i).ok())
         .filter(|&i| i != 0);
+    let ut_pex = v
+        .get(b"m")
+        .and_then(|m| m.get(b"ut_pex"))
+        .and_then(Value::as_int)
+        .and_then(|i| u8::try_from(i).ok())
+        .filter(|&i| i != 0);
     let metadata_size = v.get(b"metadata_size").and_then(Value::as_int);
     let reqq = v
         .get(b"reqq")
@@ -185,6 +211,7 @@ pub fn parse_ext_handshake(payload: &[u8]) -> Result<ExtHandshake, WireError> {
         .filter(|&i| (1..=65_535).contains(&i));
     Ok(ExtHandshake {
         ut_metadata,
+        ut_pex,
         metadata_size,
         reqq,
     })
@@ -252,6 +279,54 @@ pub fn parse_metadata_msg(payload: &[u8]) -> Result<MetadataMsg<'_>, WireError> 
         },
         _ => MetadataMsg::Unknown,
     })
+}
+
+/// One peer learned from a `ut_pex` message: its address and whether it said it is a seed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PexPeer {
+    pub addr: SocketAddrV4,
+    pub seed: bool,
+}
+
+/// Parse a BEP 11 `ut_pex` payload (after the extended id byte): the compact IPv4 `added` list
+/// (6 bytes each) with its `added.f` flags (one byte each, [`PEX_SEED`] = 0x02). `added6`,
+/// `dropped` and `dropped6` are ignored. Untrusted input: at most [`PEX_MAX_ADDED`] entries are
+/// returned, a trailing partial entry is ignored, a missing or short `added.f` means flags 0,
+/// entries with port 0 or an unspecified address are skipped, and a payload that is not a
+/// bencoded dict is an error (the caller ignores the message). Never panics.
+pub fn parse_pex(payload: &[u8]) -> Result<Vec<PexPeer>, WireError> {
+    let v = bencode::decode(payload).map_err(|_| WireError::Malformed)?;
+    if v.as_dict().is_none() {
+        return Err(WireError::Malformed);
+    }
+    // A wrong type (`added` an int or a list) is the same as absent.
+    let added = v
+        .get(b"added")
+        .and_then(Value::as_bytes)
+        .unwrap_or_default();
+    let flags = v
+        .get(b"added.f")
+        .and_then(Value::as_bytes)
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for (i, c) in added
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .take(PEX_MAX_ADDED)
+        .enumerate()
+    {
+        let ip = Ipv4Addr::new(c[0], c[1], c[2], c[3]);
+        let port = u16::from_be_bytes([c[4], c[5]]);
+        if port == 0 || ip.is_unspecified() {
+            continue;
+        }
+        out.push(PexPeer {
+            addr: SocketAddrV4::new(ip, port),
+            seed: flags.get(i).is_some_and(|f| f & PEX_SEED != 0),
+        });
+    }
+    Ok(out)
 }
 
 /// Number of 16 KiB blocks for `size` bytes of metadata.
@@ -360,6 +435,114 @@ mod tests {
     }
 
     #[test]
+    fn extended_handshake_with_pex() {
+        // Without pex: the bytes are those of the plain handshake.
+        assert_eq!(
+            our_extended_handshake_with("Magnetar 0.2.0", false),
+            our_extended_handshake("Magnetar 0.2.0")
+        );
+        let p = our_extended_handshake_with("Magnetar 0.2.0", true);
+        assert_eq!(
+            &p[6..],
+            b"d1:md11:ut_metadatai1e6:ut_pexi2ee1:v14:Magnetar 0.2.0e".as_slice()
+        );
+        let hs = parse_ext_handshake(&p[6..]).unwrap();
+        assert_eq!(hs.ut_pex, Some(OUR_UT_PEX));
+        assert_eq!(
+            parse_ext_handshake(&our_extended_handshake("x")[6..])
+                .unwrap()
+                .ut_pex,
+            None
+        );
+        let off = parse_ext_handshake(b"d1:md6:ut_pexi0eee").unwrap();
+        assert_eq!(off.ut_pex, None);
+    }
+
+    fn compact(list: &[([u8; 4], u16)]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for (ip, port) in list {
+            b.extend_from_slice(ip);
+            b.extend_from_slice(&port.to_be_bytes());
+        }
+        b
+    }
+
+    fn pex_msg(added: &[u8], flags: &[u8]) -> Vec<u8> {
+        let mut m = format!("d5:added{}:", added.len()).into_bytes();
+        m.extend_from_slice(added);
+        m.extend_from_slice(format!("7:added.f{}:", flags.len()).as_bytes());
+        m.extend_from_slice(flags);
+        m.extend_from_slice(b"e");
+        m
+    }
+
+    #[test]
+    fn pex_parses_added_and_flags() {
+        let a = compact(&[
+            ([1, 2, 3, 4], 6881),
+            ([5, 6, 7, 8], 51413),
+            ([9, 9, 9, 9], 1),
+        ]);
+        let got = parse_pex(&pex_msg(&a, &[0x02, 0x01, 0x03])).unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].addr, "1.2.3.4:6881".parse().unwrap());
+        assert!(got[0].seed);
+        assert!(!got[1].seed, "0x01 = prefers encryption, not a seed");
+        assert!(got[2].seed, "0x03 has the seed bit");
+        // Short or missing flags: 0.
+        let got = parse_pex(&pex_msg(&a, &[0x02])).unwrap();
+        assert!(got[0].seed && !got[1].seed && !got[2].seed);
+        let got = parse_pex(
+            &format!("d5:added{}:", a.len())
+                .bytes()
+                .chain(a.iter().copied())
+                .chain(*b"e")
+                .collect::<Vec<u8>>(),
+        )
+        .unwrap();
+        assert_eq!(got.len(), 3);
+        // Other keys are ignored (added6, dropped, dropped6, unknown).
+        let mut m = b"d5:added0:6:added618:".to_vec();
+        m.extend_from_slice(&[7; 18]);
+        m.extend_from_slice(b"7:dropped6:");
+        m.extend_from_slice(&[1; 6]);
+        m.extend_from_slice(b"e");
+        assert_eq!(parse_pex(&m).unwrap(), vec![]);
+        // Port 0 and 0.0.0.0 are skipped.
+        let z = compact(&[([1, 2, 3, 4], 0), ([0, 0, 0, 0], 80), ([1, 2, 3, 4], 80)]);
+        assert_eq!(parse_pex(&pex_msg(&z, &[])).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pex_hostile_payloads_are_bounded_and_never_panic() {
+        // Truncated compact list: the partial last entry is dropped.
+        let mut a = compact(&[([1, 2, 3, 4], 80), ([5, 6, 7, 8], 81)]);
+        a.extend_from_slice(&[9, 9, 9, 9]);
+        let got = parse_pex(&pex_msg(&a, &[])).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(parse_pex(&pex_msg(&[1, 2, 3], &[])).unwrap(), vec![]);
+        // A declared length past the payload is malformed.
+        assert!(parse_pex(b"d5:added600:abce").is_err());
+        // Huge list: cut at PEX_MAX_ADDED (10 000 entries fit the 64 KiB message cap).
+        let big: Vec<([u8; 4], u16)> = (0..10_000u32)
+            .map(|i| ([10, 0, (i >> 8) as u8, i as u8], 1000 + (i % 5000) as u16))
+            .collect();
+        let got = parse_pex(&pex_msg(&compact(&big), &vec![0x02; 10_000])).unwrap();
+        assert_eq!(got.len(), PEX_MAX_ADDED);
+        // Wrong types are the same as absent; a non-dict is an error.
+        assert_eq!(parse_pex(b"d5:addedi5e7:added.fli1eee").unwrap(), vec![]);
+        assert_eq!(parse_pex(b"d5:addedl4:abcdee").unwrap(), vec![]);
+        assert_eq!(parse_pex(b"de").unwrap(), vec![]);
+        assert!(parse_pex(b"li1ee").is_err());
+        assert!(parse_pex(b"i5e").is_err());
+        assert!(parse_pex(b"").is_err());
+        assert!(parse_pex(b"d5:added").is_err());
+        // Deep nesting is refused by the decoder, not a stack overflow.
+        let deep = [vec![b'l'; 100_000], vec![b'e'; 100_000]].concat();
+        assert!(parse_pex(&deep).is_err());
+    }
+
+    #[test]
     fn blocks() {
         assert_eq!(block_count(1), 1);
         assert_eq!(block_count(BLOCK), 1);
@@ -375,6 +558,9 @@ mod tests {
         fn arbitrary_bytes_never_panic(b in proptest::collection::vec(any::<u8>(), 0..512)) {
             let _ = parse_ext_handshake(&b);
             let _ = parse_metadata_msg(&b);
+            if let Ok(v) = parse_pex(&b) {
+                prop_assert!(v.len() <= PEX_MAX_ADDED);
+            }
             let mut hs = [0u8; HANDSHAKE_LEN];
             for (d, s) in hs.iter_mut().zip(b.iter()) {
                 *d = *s;

@@ -391,6 +391,22 @@ impl PeerState {
     }
 }
 
+/// Most `ut_pex` messages whose addresses are kept from the metadata phase of a hand-off
+/// connection (D143); further ones are counted and dropped. A message keeps at most
+/// [`wire::PEX_MAX_ADDED`] entries, so a batch holds at most 8 192 addresses before the probe's
+/// own per-peer bound applies.
+pub const PEX_HANDOFF_MSGS: usize = 8;
+
+/// The `ut_pex` messages (BEP 11) a peer sent while the metadata was fetched (header probes,
+/// D143), received only: we never send any.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PexBatch {
+    /// Messages received, parsed or not.
+    pub msgs: u32,
+    /// Addresses of the first [`PEX_HANDOFF_MSGS`] messages that parsed.
+    pub peers: Vec<wire::PexPeer>,
+}
+
 /// A live peer connection handed from the metadata fetch to a header probe (D117). It holds
 /// one of the fetcher's `max_connections` permits until dropped, so probes and metadata
 /// fetches share the router's single cap on open connections.
@@ -401,6 +417,8 @@ pub struct PeerConn {
     pub peer_id: [u8; 20],
     pub ext: ExtHandshake,
     pub state: PeerState,
+    /// `ut_pex` messages received before the hand-off (D143).
+    pub pex: PexBatch,
     /// We sent `HAVE_NONE` (both sides set the BEP 6 bit).
     pub sent_have_none: bool,
     /// We sent `INTERESTED`.
@@ -448,6 +466,7 @@ struct Live {
     peer_id: [u8; 20],
     ext: ExtHandshake,
     state: PeerState,
+    pex: PexBatch,
     sent_have_none: bool,
     sent_interested: bool,
 }
@@ -1174,6 +1193,7 @@ impl Fetcher {
             peer_id: l.peer_id,
             ext: l.ext,
             state: l.state,
+            pex: l.pex,
             sent_have_none: l.sent_have_none,
             sent_interested: l.sent_interested,
             rd: l.rd,
@@ -1223,7 +1243,7 @@ impl Fetcher {
         if fast {
             out.extend_from_slice(&wire::frame(wire::MSG_HAVE_NONE, &[]));
         }
-        out.extend_from_slice(&wire::our_extended_handshake(&cfg.client));
+        out.extend_from_slice(&wire::our_extended_handshake_with(&cfg.client, cfg.probe));
         out.extend_from_slice(extra);
         wr.write_all(&out).await?;
         add(&c.tcp_bytes_out, out.len() as u64);
@@ -1307,6 +1327,7 @@ impl Fetcher {
         let mut have = vec![false; n];
         let mut missing = n;
         let mut rejects = 0usize;
+        let mut pex = PexBatch::default();
         while missing > 0 {
             let Msg::Extended(p) =
                 read_msg(&mut rd, &mut discard, &c.tcp_bytes_in, track.as_deref_mut()).await?
@@ -1314,9 +1335,19 @@ impl Fetcher {
                 continue;
             };
             if p.first() != Some(&wire::OUR_UT_METADATA) {
-                // Another extension (ut_pex, a repeated handshake, …): skipped, but within the
-                // same per-peer budget as other messages.
+                // Another extension (a repeated handshake, …): skipped, but within the same
+                // per-peer budget as other messages. Probing keeps what `ut_pex` (BEP 11, the id
+                // we advertised) says, for the probe's candidates (D143): a message that does
+                // not parse is ignored, never a reason to drop the peer.
                 charge(&mut discard, p.len())?;
+                if cfg.probe && p.first() == Some(&wire::OUR_UT_PEX) {
+                    pex.msgs = pex.msgs.saturating_add(1);
+                    if (pex.msgs as usize) <= PEX_HANDOFF_MSGS
+                        && let Ok(mut got) = wire::parse_pex(&p[1..])
+                    {
+                        pex.peers.append(&mut got);
+                    }
+                }
                 continue;
             }
             match wire::parse_metadata_msg(&p[1..]).map_err(|_| PeerError::Protocol)? {
@@ -1364,6 +1395,7 @@ impl Fetcher {
             peer_id: theirs.peer_id,
             ext,
             state,
+            pex,
             sent_have_none,
             sent_interested: cfg.probe,
         });
@@ -1474,6 +1506,7 @@ impl Fetcher {
             peer_id: theirs.peer_id,
             ext,
             state,
+            pex: PexBatch::default(),
             sent_have_none: fast,
             sent_interested: true,
             rd,
