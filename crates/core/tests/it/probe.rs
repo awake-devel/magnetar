@@ -179,6 +179,14 @@ async fn blocks_only_on_big_pieces() {
     let r = probe(&t, &s, &[], cfg()).await;
     assert_eq!(r.status, ProbeStatus::Ok, "{r:?}");
     assert_eq!(label(&r), vec![("video.mkv", false)]);
+    // Diagnostics: block mode, every target tried, bytes and a time for them.
+    assert_eq!(r.diag.end, "done");
+    assert!(!r.diag.whole && !r.diag.late && r.diag.cut == 0);
+    assert_eq!(
+        (r.diag.targets, r.diag.no_bytes, r.diag.max_alive),
+        (1, 0, 1)
+    );
+    assert!(r.diag.first_byte_ms.is_some() && r.diag.ms > 0);
     let f = &r.files[0];
     assert!(f.detection.flags.unverified);
     assert_eq!(f.detection.video.as_ref().unwrap().video[0].codec, "hevc");
@@ -317,6 +325,11 @@ async fn never_unchoked_and_allowed_fast() {
     assert_eq!(r.status, ProbeStatus::Choked, "{r:?}");
     assert!(!r.unchoked);
     assert!(started.elapsed() < Duration::from_secs(6));
+    // Diagnostics: the hand-off peer choked us past the wait; no byte, no unchoke.
+    assert!(r.diag.handoff_choked, "{:?}", r.diag);
+    assert_eq!(r.diag.choke_expired, 1, "{:?}", r.diag);
+    assert_eq!((r.diag.unchoke_ms, r.diag.first_byte_ms), (None, None));
+    assert_eq!(r.diag.no_bytes, r.diag.targets - r.diag.cut);
     let s = fs::start(
         t.clone(),
         Opts {
@@ -477,6 +490,212 @@ async fn reqq_caps_the_pipeline() {
     .await;
     probe(&t, &s, &[], cfg()).await;
     assert!(s.log().max_outstanding > 4);
+}
+
+/// Dead slots do not count toward `peers` (D142): two peers that are dropped leave room for the
+/// good third candidate, which gives the result. (Before, `cap_blocked` and `no_peers`.)
+#[tokio::test]
+async fn dead_slots_do_not_block_the_next_peer() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(1_000_000))], 256 * KIB);
+    let bad = || Opts {
+        junk: Junk::Unrequested,
+        ..Opts::default()
+    };
+    let first = fs::start(t.clone(), bad()).await;
+    let second = fs::start(t.clone(), bad()).await;
+    let good = fs::start(t.clone(), Opts::default()).await;
+    let r = probe(&t, &first, &[second.addr, good.addr], cfg()).await;
+    let d = &r.diag;
+    assert_eq!(label(&r), vec![("video.mkv", true)], "{r:?}");
+    assert!(good.log().requests > 0, "the good peer was asked");
+    assert!(!d.cap_blocked, "{d:?}");
+    assert_eq!(d.candidates_left, 0, "{d:?}");
+    assert_eq!(d.end, "done", "{d:?}");
+    assert!(d.drops.contains(&("unrequested", 2)), "{d:?}");
+    assert!(d.connects.contains(&("ok", 2)), "{d:?}");
+}
+
+/// Stale peer lists (D142): more refusing candidates than the old 4-attempt cap, then a good
+/// one. Every candidate is tried, `connect_parallel` at a time; the hand-off peer has no piece.
+#[tokio::test]
+async fn many_refusing_candidates_then_a_good_one() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(1_000_000))], 256 * KIB);
+    let first = fs::start(
+        t.clone(),
+        Opts {
+            has: Has::Pieces(vec![]),
+            ..Opts::default()
+        },
+    )
+    .await;
+    let mut others = Vec::new();
+    for _ in 0..7 {
+        // A bound then closed port: connecting is refused at once.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let std::net::SocketAddr::V4(a) = l.local_addr().unwrap() else {
+            unreachable!()
+        };
+        others.push(a);
+    }
+    let good = fs::start(t.clone(), Opts::default()).await;
+    others.push(good.addr);
+    let r = probe(&t, &first, &others, cfg()).await;
+    let d = &r.diag;
+    assert_eq!(label(&r), vec![("video.mkv", true)], "{r:?}");
+    assert!(good.log().requests > 0);
+    let refused: u32 = d
+        .connects
+        .iter()
+        .filter(|(k, _)| *k != "ok")
+        .map(|(_, n)| *n)
+        .sum();
+    assert_eq!(refused, 7, "{d:?}");
+    assert!(d.connects.contains(&("ok", 1)), "{d:?}");
+    assert!(!d.cap_blocked && d.candidates_left == 0, "{d:?}");
+}
+
+/// `connect_parallel` and `connect_attempts` bound the attempts: with 1 attempt allowed the
+/// good candidate behind 3 refusing ones is never reached, and `cap_blocked` says why.
+#[tokio::test]
+async fn connect_attempts_cap_is_reported() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(1_000_000))], 256 * KIB);
+    let first = fs::start(
+        t.clone(),
+        Opts {
+            has: Has::Pieces(vec![]),
+            ..Opts::default()
+        },
+    )
+    .await;
+    let mut others = Vec::new();
+    for _ in 0..3 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let std::net::SocketAddr::V4(a) = l.local_addr().unwrap() else {
+            unreachable!()
+        };
+        others.push(a);
+    }
+    let good = fs::start(t.clone(), Opts::default()).await;
+    others.push(good.addr);
+    let c = ProbeConfig {
+        connect_attempts: 1,
+        connect_parallel: 1,
+        ..cfg()
+    };
+    let r = probe(&t, &first, &others, c).await;
+    assert!(r.files.is_empty(), "{r:?}");
+    assert!(r.diag.cap_blocked, "{:?}", r.diag);
+    assert_eq!(r.diag.candidates_left, 3, "{:?}", r.diag);
+    assert_eq!(good.log().requests, 0);
+}
+
+/// Whole-piece mode, a peer that sends part of the piece and stalls (D142): the blocks received
+/// are used as unverified data instead of thrown away.
+#[tokio::test]
+async fn partial_whole_piece_gives_an_unverified_result() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(3_000_000))], 512 * KIB);
+    let s = fs::start(
+        t.clone(),
+        Opts {
+            stall_after: Some(8),
+            ..Opts::default()
+        },
+    )
+    .await;
+    let r = probe(&t, &s, &[], cfg()).await;
+    assert!(r.diag.whole, "{:?}", r.diag);
+    assert_eq!(label(&r), vec![("video.mkv", false)], "{r:?}");
+    assert!(r.files[0].detection.flags.unverified);
+    assert_eq!(r.bytes_in, 128 * KIB, "8 blocks of 16 KiB");
+    assert!(r.diag.drops.contains(&("stall", 1)), "{:?}", r.diag);
+}
+
+/// A liar that sends complete pieces is struck on the hash and nothing is used from it.
+#[tokio::test]
+async fn a_lying_peer_in_whole_mode_gives_no_result() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(3_000_000))], 256 * KIB);
+    let liar = fs::start(
+        t.clone(),
+        Opts {
+            lie: Some(flipped(&t.data)),
+            ..Opts::default()
+        },
+    )
+    .await;
+    let r = probe(&t, &liar, &[], cfg()).await;
+    assert!(r.files.is_empty(), "{r:?}");
+}
+
+/// A liar that sends part of a whole piece and stalls: its blocks stay out of the result, the
+/// honest second peer fetches the piece again and the result is verified.
+#[tokio::test]
+async fn a_stalled_liars_partial_piece_is_not_used() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(3_000_000))], 256 * KIB);
+    let liar = fs::start(
+        t.clone(),
+        Opts {
+            lie: Some(flipped(&t.data)),
+            stall_after: Some(4),
+            ..Opts::default()
+        },
+    )
+    .await;
+    let good = fs::start(t.clone(), Opts::default()).await;
+    let r = probe(&t, &liar, &[good.addr], cfg()).await;
+    assert_eq!(label(&r), vec![("video.mkv", true)], "{r:?}");
+    assert!(good.log().requests > 0, "{:?}", r.diag);
+}
+
+/// Several attempts at once (D142): three candidates accept and never handshake, the fourth is
+/// good. With `connect_parallel` 4 the good one is reached at once and the silent attempts are
+/// cancelled; with 1 each silent one holds the line for the handshake timeout first.
+#[tokio::test]
+async fn connection_attempts_run_in_parallel() {
+    let t = Torrent::new("x", vec![("Movie.mkv", mkv(1_000_000))], 256 * KIB);
+    let mut times = Vec::new();
+    for parallel in [4usize, 1] {
+        let first = fs::start(
+            t.clone(),
+            Opts {
+                has: Has::Pieces(vec![]),
+                ..Opts::default()
+            },
+        )
+        .await;
+        let mut others = Vec::new();
+        for _ in 0..3 {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let std::net::SocketAddr::V4(a) = l.local_addr().unwrap() else {
+                unreachable!()
+            };
+            others.push(a);
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((s, _)) = l.accept().await {
+                    held.push(s);
+                }
+            });
+        }
+        let good = fs::start(t.clone(), Opts::default()).await;
+        others.push(good.addr);
+        let c = ProbeConfig {
+            connect_parallel: parallel,
+            ..cfg()
+        };
+        let start = std::time::Instant::now();
+        let r = probe(&t, &first, &others, c).await;
+        times.push(start.elapsed());
+        assert_eq!(label(&r), vec![("video.mkv", true)], "{r:?}");
+        if parallel == 4 {
+            assert!(r.diag.connects.contains(&("cancelled", 3)), "{:?}", r.diag);
+        }
+    }
+    assert!(
+        times[0] + Duration::from_secs(3) < times[1],
+        "parallel {:?} vs serial {:?}",
+        times[0],
+        times[1]
+    );
 }
 
 /// 10: hostile input never panics: oversize pieces, spare bitfield bits, unrequested blocks,

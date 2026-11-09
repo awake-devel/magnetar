@@ -946,6 +946,7 @@ async fn track_kinds_end_to_end_from_file_bytes() {
         unchoked: true,
         incomplete: false,
         surprises: 0,
+        diag: Default::default(),
     };
     // The worker's side: what it uploads.
     let report = magnetar_server::probes::report_of(&result).expect("a storable report");

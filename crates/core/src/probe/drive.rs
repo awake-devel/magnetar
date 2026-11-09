@@ -13,15 +13,14 @@
 //! its own task into one channel, so no half-read frame is ever dropped by the loop.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::future::Future;
 use std::net::SocketAddrV4;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use sniff::{Detection, Detector, Range, SparseFile};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use super::msg::{BLOCK, Block, PeerMsg, ProbeMsg, metadata_request};
@@ -29,7 +28,7 @@ use super::peer::{Avail, Event, Peer, bitfield};
 use super::plan::{self, PlanFile, Target, blocks_for, pieces_for};
 use super::serve::{ServeMsg, Take, UploadGate};
 use super::verify::{AsmError, PieceAssembler};
-use super::{FileResult, ProbeConfig, ProbeJob, ProbeResult, ProbeStatus};
+use super::{FileResult, ProbeConfig, ProbeDiag, ProbeJob, ProbeResult, ProbeStatus};
 use crate::metainfo::{Fetcher, InfoFile, Layout, PeerConn, PeerError, wire};
 
 /// The loop wakes at least this often (timeouts, upload pacing).
@@ -43,7 +42,8 @@ const REJECTS: usize = 1024;
 /// An agreement read waits at most this long.
 const AGREEMENT_WAIT: Duration = Duration::from_secs(5);
 
-type Connecting = Pin<Box<dyn Future<Output = Result<PeerConn, PeerError>> + Send>>;
+/// One finished connection attempt: the candidate and how it went.
+type Attempt = (SocketAddrV4, Result<PeerConn, PeerError>);
 
 struct Cached {
     data: Vec<u8>,
@@ -62,7 +62,10 @@ struct Session<'a> {
     tx: mpsc::Sender<(usize, Event)>,
     rx: mpsc::Receiver<(usize, Event)>,
     candidates: VecDeque<SocketAddrV4>,
-    connecting: Option<Connecting>,
+    /// Connection attempts in flight (at most [`ProbeConfig::connect_parallel`]); dropped
+    /// (aborted) with the session.
+    connecting: JoinSet<Attempt>,
+    /// Attempts started so far (against [`ProbeConfig::connect_attempts`]).
     attempts: usize,
     /// Unverified blocks, by request.
     cache: HashMap<Block, Cached>,
@@ -90,6 +93,10 @@ struct Session<'a> {
     saw_pieces: bool,
     wire_in: Arc<AtomicU64>,
     wire_out: Arc<AtomicU64>,
+    started: Instant,
+    diag: ProbeDiag,
+    /// Slots counted in `diag.choke_expired`.
+    choke_expired: HashSet<usize>,
 }
 
 /// What one sniff pass over a target gave.
@@ -156,7 +163,7 @@ pub(super) async fn run(cfg: &ProbeConfig, fetcher: &Fetcher, job: ProbeJob) -> 
         tx,
         rx,
         candidates,
-        connecting: None,
+        connecting: JoinSet::new(),
         attempts: 0,
         cache: HashMap::new(),
         verified: HashMap::new(),
@@ -178,8 +185,15 @@ pub(super) async fn run(cfg: &ProbeConfig, fetcher: &Fetcher, job: ProbeJob) -> 
         saw_pieces: false,
         wire_in: Arc::new(AtomicU64::new(0)),
         wire_out: Arc::new(AtomicU64::new(0)),
+        started: Instant::now(),
+        diag: ProbeDiag::default(),
+        choke_expired: HashSet::new(),
     };
+    s.diag.targets = targets.len() as u32;
+    s.diag.piece_len = s.layout.piece_length;
+    s.diag.whole = s.layout.piece_length <= cfg.whole_piece_max;
     if let Some(c) = conn {
+        s.diag.handoff_choked = c.state.choked;
         s.add_peer(c);
     }
     s.run(&targets).await
@@ -203,10 +217,12 @@ impl Session<'_> {
         );
         if !p.choked {
             self.ever_unchoked = true;
+            self.mark_unchoke();
         }
         let dead = p.dead;
         self.addrs.push(p.addr);
         self.peers.push(Some(p));
+        self.diag.max_alive = self.diag.max_alive.max(self.alive().count() as u32);
         if let Some(r) = dead {
             self.kill(slot, r, None);
         }
@@ -227,6 +243,28 @@ impl Session<'_> {
             .sum()
     }
 
+    fn since_start(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn mark_unchoke(&mut self) {
+        if self.diag.unchoke_ms.is_none() {
+            self.diag.unchoke_ms = Some(self.since_start());
+        }
+    }
+
+    /// A further peer is wanted, fewer than `peers` are alive, candidates remain, and
+    /// `connect_attempts` is used up (diagnostics only).
+    fn note_cap_block(&mut self) {
+        if self.connecting.is_empty()
+            && self.alive().count() < self.cfg.peers
+            && self.attempts >= self.cfg.connect_attempts
+            && !self.candidates.is_empty()
+        {
+            self.diag.cap_blocked = true;
+        }
+    }
+
     fn out_of_time(&self) -> bool {
         Instant::now() >= self.deadline
     }
@@ -239,12 +277,13 @@ impl Session<'_> {
     fn kill(
         &mut self,
         slot: usize,
-        _why: &'static str,
+        why: &'static str,
         requeue: Option<(&mut VecDeque<Block>, &HashSet<Block>)>,
     ) {
         let Some(p) = self.peers.get_mut(slot).and_then(Option::take) else {
             return;
         };
+        ProbeDiag::bump(&mut self.diag.drops, why);
         // Pieces this peer was fetching whole start over with another peer.
         let owned: Vec<u32> = self
             .owner
@@ -302,11 +341,22 @@ impl Session<'_> {
         let mut missing = 0usize;
         let mut incomplete = false;
         let mut surprises = 0u32;
+        self.diag.end = "done";
         for (n, t) in targets.iter().enumerate() {
-            if self.out_of_time()
-                || self.budget_left() == 0
-                || (self.alive().count() == 0 && !self.can_connect())
+            let stop = if self.out_of_time() {
+                Some("deadline")
+            } else if self.budget_left() == 0 {
+                Some("budget")
+            } else if self.alive().count() == 0 && self.connecting.is_empty() && !self.can_connect()
             {
+                self.note_cap_block();
+                Some("no_peers")
+            } else {
+                None
+            };
+            if let Some(why) = stop {
+                self.diag.end = why;
+                self.diag.cut = (targets.len() - n) as u32;
                 missing += targets.len() - n;
                 incomplete = true;
                 break;
@@ -315,6 +365,11 @@ impl Session<'_> {
             let cap = self.file_cap(t, whole, &targets[n + 1..]);
             let s = self.sniff_file(t, whole, cap).await;
             let Some(mut d) = s.detection else {
+                if s.known.is_empty() {
+                    self.diag.no_bytes += 1;
+                } else {
+                    self.diag.no_detection += 1;
+                }
                 missing += 1;
                 continue;
             };
@@ -373,6 +428,7 @@ impl Session<'_> {
             }
             // Bytes from a peer later caught lying are not trusted.
             if !verified && contributors.iter().any(|c| self.struck.contains(c)) {
+                self.diag.struck += 1;
                 missing += 1;
                 continue;
             }
@@ -380,6 +436,7 @@ impl Session<'_> {
                 incomplete = true;
             }
             if d.confidence < self.cfg.min_confidence {
+                self.diag.low_conf.push((d.label.clone(), d.confidence));
                 missing += 1;
                 continue;
             }
@@ -404,6 +461,11 @@ impl Session<'_> {
         let before = results.len();
         results.retain(|(_, from)| from.iter().all(|c| !self.struck.contains(c)));
         missing += before - results.len();
+        self.diag.struck += (before - results.len()) as u32;
+        self.diag.late = self.out_of_time();
+        self.stop_connecting().await;
+        self.diag.candidates_left = self.candidates.len() as u32;
+        self.diag.choke_expired = self.choke_expired.len() as u32;
         let results: Vec<FileResult> = results.into_iter().map(|(r, _)| r).collect();
         self.linger().await;
         let status = if !results.is_empty() {
@@ -428,6 +490,7 @@ impl Session<'_> {
             unchoked: self.ever_unchoked,
             incomplete: incomplete || self.budget_hit,
             surprises,
+            diag: self.diag,
         }
     }
 
@@ -627,7 +690,7 @@ impl Session<'_> {
             let until = self.deadline;
             self.get(&blocks, whole, None, until).await;
             let before = file.known_bytes();
-            self.fill(&mut file, off, size, &blocks, whole, &mut contributors);
+            self.fill(&mut file, off, size, &blocks, &mut contributors);
             let grown = file.known_bytes() > before;
             let d2 = det.clone();
             let Ok((f, a)) = tokio::task::spawn_blocking(move || {
@@ -684,14 +747,14 @@ impl Session<'_> {
     }
 
     /// Insert what is known of `blocks` into the file: verified pieces as verified, single
-    /// blocks (block mode only) as unverified.
+    /// blocks as unverified. In whole mode the unverified blocks are those of pieces that did
+    /// not complete (D142); a peer struck for a bad hash has none left in the cache.
     fn fill(
         &self,
         file: &mut SparseFile,
         off: u64,
         size: u64,
         blocks: &[Block],
-        whole: bool,
         contributors: &mut HashSet<usize>,
     ) {
         let pl = self.layout.piece_length;
@@ -703,9 +766,6 @@ impl Session<'_> {
                 }
                 continue;
             }
-            if whole {
-                continue;
-            }
             if let Some(c) = self.cache.get(b) {
                 let abs = u64::from(b.index) * pl + u64::from(b.begin);
                 if insert_clipped(file, off, size, abs, &c.data, false) {
@@ -715,15 +775,20 @@ impl Session<'_> {
         }
     }
 
+    /// Another connection attempt may start: fewer than `peers` live peers, fewer than
+    /// `connect_parallel` attempts in flight, `connect_attempts` not used up, a candidate left
+    /// and the session not over. Dead slots do not count: only live peers do.
     fn can_connect(&self) -> bool {
-        self.connecting.is_none()
-            && self.peers.len() < self.cfg.peers
+        self.connecting.len() < self.cfg.connect_parallel.max(1)
+            && self.alive().count() < self.cfg.peers
             && self.attempts < self.cfg.connect_attempts
             && !self.candidates.is_empty()
+            && !self.out_of_time()
     }
 
     fn maybe_connect(&mut self, queue: &VecDeque<Block>) {
         if !self.can_connect() {
+            self.note_cap_block();
             return;
         }
         let now = Instant::now();
@@ -741,17 +806,55 @@ impl Session<'_> {
             return;
         }
         let connected: HashSet<SocketAddrV4> = alive.iter().map(|p| p.addr).collect();
-        while let Some(addr) = self.candidates.pop_front() {
+        while self.can_connect() {
+            let Some(addr) = self.candidates.pop_front() else {
+                break;
+            };
             if self.struck_addrs.contains(&addr) || connected.contains(&addr) {
                 continue;
             }
             self.attempts += 1;
             let f = self.fetcher.clone();
             let hash = self.hash;
-            self.connecting = Some(Box::pin(
-                async move { f.connect_for_probe(hash, addr).await },
-            ));
-            return;
+            // Each attempt goes through the fetcher (address filter, pace, brake, connection
+            // cap): `connect_parallel` only says how many wait on it at once.
+            self.connecting
+                .spawn(async move { (addr, f.connect_for_probe(hash, addr).await) });
+        }
+    }
+
+    /// The session is over: attempts still in flight stop (they would otherwise run on during
+    /// the upload linger) and are counted: `cancelled`, or their real outcome when finished.
+    async fn stop_connecting(&mut self) {
+        self.connecting.abort_all();
+        while let Some(r) = self.connecting.join_next().await {
+            match r {
+                Ok((_, Ok(_))) => ProbeDiag::bump(&mut self.diag.connects, "surplus"),
+                Ok((_, Err(e))) => ProbeDiag::bump(&mut self.diag.connects, e.code()),
+                Err(e) if e.is_cancelled() => ProbeDiag::bump(&mut self.diag.connects, "cancelled"),
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// A connection attempt finished. A success past `peers` live peers is closed; once
+    /// `peers` are live the attempts still in flight are cancelled.
+    fn on_attempt(&mut self, (_, res): Attempt) {
+        match res {
+            Ok(c) => {
+                if self.alive().count() >= self.cfg.peers {
+                    ProbeDiag::bump(&mut self.diag.connects, "surplus");
+                    return;
+                }
+                ProbeDiag::bump(&mut self.diag.connects, "ok");
+                self.add_peer(c);
+                if self.alive().count() >= self.cfg.peers {
+                    // Counted as `cancelled` when each aborted task is reaped (a task that
+                    // had already finished keeps its real outcome).
+                    self.connecting.abort_all();
+                }
+            }
+            Err(e) => ProbeDiag::bump(&mut self.diag.connects, e.code()),
         }
     }
 
@@ -788,6 +891,9 @@ impl Session<'_> {
                     self.deliver_whole(*b, c.data, c.peer, &mut queue, &wanted);
                     continue;
                 }
+                // Its peer is gone (or another owns the piece): the bytes stay usable as
+                // unverified data for `fill`.
+                self.cache.insert(*b, c);
             }
             if !queue.contains(b) {
                 queue.push_back(*b);
@@ -828,7 +934,7 @@ impl Session<'_> {
         if queue.is_empty() {
             return true;
         }
-        if self.connecting.is_some() && only.is_none() {
+        if !self.connecting.is_empty() && only.is_none() {
             return false;
         }
         let smallest = queue.iter().map(|b| u64::from(b.len)).min().unwrap_or(0);
@@ -839,6 +945,7 @@ impl Session<'_> {
         let now = Instant::now();
         let mut hope = false;
         let mut saw = false;
+        let mut expired = Vec::new();
         for p in self
             .peers
             .iter()
@@ -850,18 +957,26 @@ impl Session<'_> {
                 .any(|b| p.avail.has(b.index) && !p.refused.contains(b));
             if has {
                 saw = true;
-                if p.choked && now.saturating_duration_since(p.since) < self.cfg.unchoke_wait {
-                    hope = true;
+                if p.choked {
+                    if now.saturating_duration_since(p.since) < self.cfg.unchoke_wait {
+                        hope = true;
+                    } else {
+                        expired.push(p.slot);
+                    }
                 }
             }
         }
+        self.choke_expired.extend(expired);
         self.saw_pieces |= saw;
         if hope {
             return false;
         }
         if only.is_none() && self.can_connect() {
             self.maybe_connect(queue);
-            return self.connecting.is_none();
+            return self.connecting.is_empty();
+        }
+        if only.is_none() {
+            self.note_cap_block();
         }
         true
     }
@@ -932,17 +1047,20 @@ impl Session<'_> {
     /// One turn of the event loop: a peer message, a finished connection, or a tick.
     async fn pump(&mut self, queue: &mut VecDeque<Block>, wanted: &HashSet<Block>, until: Instant) {
         let wake = (Instant::now() + TICK).min(until).min(self.deadline);
-        let connecting = self.connecting.is_some();
+        let connecting = !self.connecting.is_empty();
         tokio::select! {
             m = self.rx.recv() => {
                 if let Some((slot, ev)) = m {
                     self.on_event(slot, ev, queue, wanted).await;
                 }
             }
-            c = async { self.connecting.as_mut().expect("guarded").await }, if connecting => {
-                self.connecting = None;
-                if let Ok(c) = c {
-                    self.add_peer(c);
+            c = self.connecting.join_next(), if connecting => {
+                match c {
+                    Some(Ok(a)) => self.on_attempt(a),
+                    Some(Err(e)) if e.is_cancelled() => {
+                        ProbeDiag::bump(&mut self.diag.connects, "cancelled");
+                    }
+                    _ => {}
                 }
             }
             _ = tokio::time::sleep_until(wake) => {}
@@ -1024,6 +1142,10 @@ impl Session<'_> {
                 p.choked = false;
                 p.last_block = Instant::now();
                 self.ever_unchoked = true;
+                if self.diag.unchoke_ms.is_none() {
+                    self.diag.unchoke_ms =
+                        Some(u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX));
+                }
             }
             PeerMsg::NotInterested => p.interested = false,
             PeerMsg::Have(i) => {
@@ -1141,6 +1263,9 @@ impl Session<'_> {
         p.last_block = Instant::now();
         p.bytes_in += u64::from(b.len);
         p.got_any = true;
+        if self.diag.first_byte_ms.is_none() {
+            self.diag.first_byte_ms = Some(self.since_start());
+        }
         self.bytes_in += u64::from(b.len);
         queue.retain(|x| *x != b);
         self.deliver(b, data, slot, queue, wanted);
@@ -1182,10 +1307,25 @@ impl Session<'_> {
         let Some(a) = self.asm.get_mut(&b.index) else {
             return false;
         };
+        // A copy stays in `cache` until the piece verifies: if the piece never completes
+        // (a slow or gone peer), `fill` uses these blocks as unverified data (D142). A strike
+        // or a hash mismatch removes them.
+        // A copy of a dead peer's block gives way to the live peer's.
+        let copy = self
+            .cache
+            .get(&b)
+            .is_none_or(|c| self.peers.get(c.peer).is_none_or(Option::is_none))
+            .then(|| data.clone());
         if a.insert(b.begin, data, slot).is_err() {
             self.kill(slot, "bad_block", Some((queue, wanted)));
             return false;
         }
+        if let Some(data) = copy {
+            self.cache.insert(b, Cached { data, peer: slot });
+        }
+        let Some(a) = self.asm.get(&b.index) else {
+            return false;
+        };
         if !a.is_complete() {
             return false;
         }
@@ -1203,6 +1343,8 @@ impl Session<'_> {
                 true
             }
             Err(AsmError::Mismatch(peers)) => {
+                // Bytes of a piece that failed its hash are never used, whoever sent them.
+                self.cache.retain(|k, _| k.index != b.index);
                 // One peer sent the whole piece (pinned): it lied. Several (cannot happen
                 // with pinning): nobody is named, the piece is asked again.
                 if let [p] = peers[..] {

@@ -155,6 +155,9 @@ pub struct Opts {
     pub delay_first: usize,
     /// Send `have_all` (or a full bitfield) this long after the handshake.
     pub have_all_after: Option<Duration>,
+    /// After this many blocks served, answer nothing more (no reject, no choke): a slow peer
+    /// that stalls.
+    pub stall_after: Option<usize>,
 }
 
 impl Default for Opts {
@@ -175,6 +178,7 @@ impl Default for Opts {
             delay: Duration::ZERO,
             delay_first: 0,
             have_all_after: None,
+            stall_after: None,
         }
     }
 }
@@ -592,6 +596,11 @@ async fn conn(s: TcpStream, t: Arc<Torrent>, o: Opts, log: Arc<Mutex<Log>>) {
                         let _ = send(&mut w, &j).await;
                         continue;
                     }
+                }
+                if o.stall_after.is_some_and(|n| st.served >= n) {
+                    answered.fetch_add(1, Ordering::SeqCst);
+                    st.outstanding.pop_back();
+                    continue;
                 }
                 let allowed = fast && o.allowed_fast.contains(&r.0);
                 if st.choked && !allowed {
