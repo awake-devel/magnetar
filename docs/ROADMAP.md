@@ -37,23 +37,6 @@ the detail API and the app's "Detected" card (D121), searchable (D122). Left:
   docs/PROBES.md §10; the probe search filters and facets too: D122, docs/FILTERS.md);
 - (D) games enrichment keyed by the ids `sniff` reads (GameTDB files after GameTDB answers
   about automated downloads; Wikidata).
-- **Peer exchange for probes (BEP 11, receive-only)** — agreed with the user 2026-11-08,
-  deferred ("we'll do it later"). Measured on eee after D142 (657 probes): 28.5 % end with
-  nothing; empty probes tried a median of 4 candidate addresses and 153 of 187 had none
-  left; 92 % of connection attempts fail (stale DHT peer lists). Plan:
-  - advertise `ut_pex` in the extended handshake of probe connections only (the hand-off
-    and `connect_for_probe`; the non-probe fetcher's handshake stays byte-identical); never
-    send `ut_pex` ourselves;
-  - parse incoming `added` / `added.f` (compact IPv4, seed flag 0x02), hostile-input safe;
-    feed new addresses into the probe's candidates, seeds first, deduped, every connection
-    still through `Fetcher::connect_for_probe`;
-  - when a probe is stuck and a live peer advertised `ut_pex`, wait briefly for its message
-    (a documented `pex_wait`, bounded by the session);
-  - drop the 16-address cap in `probe_peers` (`crates/server/src/worker/crawl.rs`);
-  - diag fields `pex_msgs`, `pex_added`, `pex_ok`; every new bound a named, documented
-    setting (the user rejects unannounced limits); tests that fail on the old code; row D143.
-  The workflow prompt with the full spec is kept in
-  `~/.claude/projects/-home-dude-magnetar/ab655fe2-024e-43d8-9df4-03634ee729f5/workflows/scripts/probe-pex-wf_7fa3668e-f58.js`.
 
 **Legal note, required with the feature (README "Legal" and the feature's doc).** Today
 Magnetar only handles metadata: info dicts (names, sizes, hashes), never file data. Header

@@ -153,6 +153,11 @@ pub(crate) struct Peer {
     _reader: ReaderGuard,
     _permit: OwnedSemaphorePermit,
     pub(crate) ut_metadata: Option<u8>,
+    /// The peer advertised `ut_pex` (BEP 11): a message may come (D143).
+    pub(crate) ut_pex: bool,
+    /// `ut_pex` messages received from it, and addresses accepted from them.
+    pub(crate) pex_msgs: usize,
+    pub(crate) pex_added: usize,
     pub(crate) pipeline: usize,
     /// The peer chokes us.
     pub(crate) choked: bool,
@@ -211,6 +216,9 @@ impl Peer {
             _reader: ReaderGuard(reader),
             _permit,
             ut_metadata: ext.ut_metadata,
+            ut_pex: ext.ut_pex.is_some(),
+            pex_msgs: 0,
+            pex_added: 0,
             pipeline: ext
                 .reqq
                 .map_or(pipeline, |q| (q as usize).min(pipeline))

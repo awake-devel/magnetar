@@ -9,8 +9,9 @@ pub mod info;
 pub mod wire;
 
 pub use fetch::{
-    FetchConfig, FetchFailure, FetchStats, Fetched, Fetcher, Handoff, Identity, Outcome, PeerConn,
-    PeerError, PeerState, RawError, outcome_from_raw, verify_and_parse,
+    FetchConfig, FetchFailure, FetchStats, Fetched, Fetcher, Handoff, Identity, Outcome,
+    PEX_HANDOFF_MSGS, PeerConn, PeerError, PeerState, PexBatch, RawError, outcome_from_raw,
+    verify_and_parse,
 };
 pub use info::{
     InfoError, InfoFile, InfoSummary, Layout, layout, output_bound, output_max, parse_info,
