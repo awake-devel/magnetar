@@ -22,7 +22,8 @@
 //!
 //! `enrich_checked` remembers what was looked at with which `MATCHER_VERSION`; a new event for
 //! an infohash clears its row (PgStore::put_torrent), and unmatched title lookups are retried
-//! after each dataset import.
+//! after each dataset import. What is due is found through the `enrich_due` queue and the
+//! `enrich_checked_pending` index, never by scanning both tables (D144, `due`).
 
 pub mod imdb;
 
@@ -40,7 +41,7 @@ use magnetar_core::enrich::{MIN_DISPLAY_CONFIDENCE, method};
 use magnetar_core::model::{Category, MediaInfo, MediaKind, TorrentFile};
 use serde::Serialize;
 use sqlx::types::Json;
-use sqlx::{FromRow, PgConnection, PgPool, Postgres, QueryBuilder};
+use sqlx::{Connection, FromRow, PgConnection, PgPool, Postgres, QueryBuilder};
 use tokio::sync::watch;
 
 use crate::config::Config;
@@ -149,21 +150,159 @@ enum Decision {
     AnimeSkipped,
 }
 
-async fn due(pool: &PgPool, retry_before: i64, limit: usize) -> anyhow::Result<Vec<String>> {
-    Ok(sqlx::query_scalar(
-        // Every infohash, Nostr or DHT (D50: a torrent_infohashes row exists while it has
-        // events or a DHT row), so DHT names are matched too (D68).
-        "SELECT t.infohash FROM torrent_infohashes t
-         WHERE NOT EXISTS (
-             SELECT 1 FROM enrich_checked c WHERE c.infohash = t.infohash
-               AND c.matcher_version >= $1 AND NOT (c.pending_title AND c.checked_at <= $2))
-         LIMIT $3",
+/// Serialises `sync_queue` between processes.
+const SYNC_LOCK: i64 = 0x656e_7263_6875_0001;
+
+/// Infohashes due for a look (D144), at most `limit`, read on `conn`: no `enrich_checked` row or one from an older
+/// matcher (the `enrich_due` queue, see migration 20261112000000), then pending-title retries
+/// (`pending_title` and `checked_at <= retry_before`, found through `enrich_checked_pending`).
+/// Same set as `torrent_infohashes` anti-joined with `enrich_checked` on
+/// `matcher_version >= MATCHER_VERSION AND NOT (pending_title AND checked_at <= retry_before)`,
+/// but the cost follows the number of due rows, not the table size. Retries get at least a
+/// quarter of the batch (`limit / 4`) while any are due, so a dataset import's backlog neither
+/// starves new torrents nor is starved by them.
+pub async fn due(
+    conn: &mut PgConnection,
+    retry_before: i64,
+    limit: usize,
+) -> anyhow::Result<Vec<String>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    sync_queue(&mut *conn).await?;
+    // Retries first, up to their share; the queue gets the rest (so the whole batch when no
+    // retry is due), and retries fill whatever the queue leaves.
+    let quota = if limit < 2 { 0 } else { (limit / 4).max(1) };
+    let mut retries = if retry_before >= 0 && quota > 0 {
+        retry_due(&mut *conn, retry_before, quota).await?
+    } else {
+        Vec::new()
+    };
+    let mut out = queue_due(&mut *conn, retry_before, limit - retries.len()).await?;
+    out.retain(|ih| !retries.contains(ih));
+    if out.len() + retries.len() < limit && retry_before >= 0 && retries.len() == quota {
+        let more = retry_due(&mut *conn, retry_before, limit - out.len()).await?;
+        for ih in more {
+            if !retries.contains(&ih) && !out.contains(&ih) {
+                retries.push(ih);
+            }
+        }
+    }
+    retries.truncate(limit);
+    out.truncate(limit - retries.len());
+    out.extend(retries);
+    Ok(out)
+}
+
+/// A new matcher version makes every older check due: queue them once (a full pass is expected
+/// then). Keyed on equality, so a downgrade followed by an upgrade syncs again.
+async fn sync_queue(conn: &mut PgConnection) -> anyhow::Result<()> {
+    const READ: &str = "SELECT value FROM meta WHERE key = 'enrich_queue_version'";
+    let want = i64::from(MATCHER_VERSION);
+    if sqlx::query_scalar::<_, i64>(READ)
+        .fetch_optional(&mut *conn)
+        .await?
+        == Some(want)
+    {
+        return Ok(());
+    }
+    let mut tx = conn.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(SYNC_LOCK)
+        .execute(&mut *tx)
+        .await?;
+    if sqlx::query_scalar::<_, i64>(READ)
+        .fetch_optional(&mut *tx)
+        .await?
+        != Some(want)
+    {
+        sqlx::query(
+            "INSERT INTO enrich_due (infohash)
+             SELECT infohash FROM enrich_checked WHERE matcher_version < $1
+             ON CONFLICT (infohash) DO NOTHING",
+        )
+        .bind(MATCHER_VERSION)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO meta (key, value) VALUES ('enrich_queue_version', $1)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(want)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Oldest queue rows that are really due. Candidates that are not (the torrent is gone, or it
+/// was checked since) leave the queue; the delete only takes a row whose `seq` is the one read,
+/// so an infohash re-queued meanwhile stays.
+async fn queue_due(
+    conn: &mut PgConnection,
+    retry_before: i64,
+    limit: usize,
+) -> anyhow::Result<Vec<String>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let want = i64::try_from(limit).unwrap_or(i64::MAX);
+    // Each pass deletes the stale rows it read, so the loop ends: with a window that holds a
+    // due row, a short window (queue exhausted), or an emptier queue.
+    loop {
+        let rows: Vec<(String, bool)> = sqlx::query_as(
+            "WITH cand AS (SELECT infohash, seq FROM enrich_due ORDER BY seq LIMIT $3),
+                  chk AS (SELECT cand.infohash, cand.seq,
+                       EXISTS (SELECT 1 FROM torrent_infohashes t
+                               WHERE t.infohash = cand.infohash) AS present,
+                       EXISTS (SELECT 1 FROM enrich_checked c WHERE c.infohash = cand.infohash
+                               AND c.matcher_version >= $1
+                               AND NOT (c.pending_title AND c.checked_at <= $2)) AS current
+                       FROM cand),
+                  gone AS (DELETE FROM enrich_due d USING chk
+                           WHERE d.infohash = chk.infohash AND d.seq = chk.seq
+                             AND (NOT chk.present OR chk.current) RETURNING 1)
+             SELECT infohash, (present AND NOT current) FROM chk ORDER BY seq",
+        )
+        .bind(MATCHER_VERSION)
+        .bind(retry_before)
+        .bind(want)
+        .fetch_all(&mut *conn)
+        .await?;
+        let seen = rows.len();
+        let due: Vec<String> = rows.into_iter().filter(|r| r.1).map(|r| r.0).collect();
+        if !due.is_empty() || seen < limit {
+            return Ok(due);
+        }
+    }
+}
+
+/// Oldest pending-title checks from before the last import whose torrent still exists. A check
+/// whose torrent is gone is dropped: it would be due again the moment the torrent came back, as
+/// a missing check is.
+async fn retry_due(
+    conn: &mut PgConnection,
+    retry_before: i64,
+    limit: usize,
+) -> anyhow::Result<Vec<String>> {
+    let want = i64::try_from(limit).unwrap_or(i64::MAX);
+    let rows: Vec<(String, bool)> = sqlx::query_as(
+        "WITH r AS (SELECT c.infohash, c.checked_at,
+                           EXISTS (SELECT 1 FROM torrent_infohashes t
+                                   WHERE t.infohash = c.infohash) AS present
+                    FROM enrich_checked c WHERE c.pending_title AND c.checked_at <= $1
+                    ORDER BY c.checked_at LIMIT $2),
+              gone AS (DELETE FROM enrich_checked c USING r
+                       WHERE c.infohash = r.infohash AND NOT r.present AND c.pending_title
+                         AND c.checked_at = r.checked_at RETURNING 1)
+         SELECT infohash, present FROM r ORDER BY checked_at",
     )
-    .bind(MATCHER_VERSION)
     .bind(retry_before)
-    .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-    .fetch_all(pool)
-    .await?)
+    .bind(want)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows.into_iter().filter(|r| r.1).map(|r| r.0).collect())
 }
 
 async fn load_groups(pool: &PgPool, infohashes: &[String]) -> anyhow::Result<Vec<Group>> {
@@ -1120,6 +1259,14 @@ async fn apply(
     let mut rep = EnrichReport::default();
     let mut tx = pool.begin().await?;
     media_lock::lock(&mut tx).await?;
+    // Off the queue first, in the same transaction as the checks, so a rolled-back or cancelled
+    // batch stays due. Done before the loop, not after: a heal query below may delete the check
+    // of a member applied earlier, and the trigger re-queues it; that row must survive.
+    let done: Vec<&str> = groups.iter().map(|g| g.infohash.as_str()).collect();
+    sqlx::query("DELETE FROM enrich_due WHERE infohash = ANY($1)")
+        .bind(&done)
+        .execute(&mut *tx)
+        .await?;
     let mut imdb_cache: HashMap<u32, (i64, Option<i32>, Option<i32>)> = HashMap::new();
     for (g, d) in groups.iter().zip(decisions) {
         rep.checked += 1;
@@ -1268,7 +1415,10 @@ pub async fn enrich_batch(
         None => None,
     };
     // Same-second checks are retried too (`<=`): a retry is cheap, a missed one waits a week.
-    let infohashes = due(pool, imported.unwrap_or(-1), limit).await?;
+    let infohashes = {
+        let mut conn = pool.acquire().await?;
+        due(&mut conn, imported.unwrap_or(-1), limit).await?
+    };
     if infohashes.is_empty() {
         return Ok(EnrichReport::default());
     }
