@@ -29,9 +29,18 @@ services:
     # Docker gives containers 64 MB of /dev/shm; Postgres parallel hash joins (the search index
     # load, D122) need more and fail with "could not resize shared memory segment".
     shm_size: 512m
+    # Write settings (docs/DOCKER.md "Postgres settings", D145). The Postgres defaults (1 GB of
+    # write-ahead log, 128 MB of buffers) force a checkpoint every few minutes once workers
+    # insert continuously. Command-line settings win over ALTER SYSTEM.
+    command:
+      - postgres
+      - -c
+      - max_wal_size=${POSTGRES_MAX_WAL_SIZE:-8GB}
+      - -c
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-1GB}
     # Optional resource limits (none by default; docs/DOCKER.md "Resource limits"):
     # cpus: "2.0"
-    # mem_limit: 1g
+    # mem_limit: 2g      # keep it at least twice POSTGRES_SHARED_BUFFERS
     # No published port: only the magnetar service talks to Postgres, over the compose network.
 
   magnetar:

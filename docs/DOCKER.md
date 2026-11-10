@@ -127,7 +127,7 @@ services:
     mem_limit: 2g    # killed and restarted (restart: unless-stopped) above this
   db:
     cpus: "2.0"
-    mem_limit: 1g
+    mem_limit: 2g    # at least twice POSTGRES_SHARED_BUFFERS (below)
 ```
 
 Rough needs measured on a production-sized copy (~0.5 M infohashes): the server averages well
@@ -137,6 +137,26 @@ minutes, and a CPU limit only makes them take longer. Memory: about 0.5 GB for t
 steady state (production, 2026-10-26), more during the index build and dataset imports, so
 leave headroom above `mem_limit: 1g`. Postgres also used about 0.5 GB; it caches what it is
 allowed to, and `mem_limit` there mostly bounds the page cache it gets.
+
+### Postgres settings
+
+The `db` service starts Postgres with two settings raised from the Postgres defaults (D145).
+Set them in `.env`; they apply when the `db` container is recreated (`docker compose up -d`,
+a few seconds without the database).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `POSTGRES_MAX_WAL_SIZE` | `8GB` | Disk space the write-ahead log may use between checkpoints (Postgres default: 1 GB). Too small, and Postgres starts a checkpoint each time the log fills instead of every 5 minutes |
+| `POSTGRES_SHARED_BUFFERS` | `1GB` | Memory for Postgres's own page cache (Postgres default: 128 MB). Around a quarter of the RAM you give the database, less on a small machine; keep `mem_limit` of `db` at least twice this |
+
+They are command-line settings, so they win over anything set with `ALTER SYSTEM`. They only
+apply to the bundled `db` service, not to an external `DATABASE_URL`.
+
+Why: on 2026-11-09, with workers inserting continuously and the database on a USB disk, the
+server logged `COMMIT`s of up to 25 s and inserts of up to 55 s, and a search from the app
+timed out (15 s). 916 of 1,910 checkpoints since 2026-10-30 had been started because the log
+was full. **UNVERIFIED**: that the new values remove these stalls; they were applied on
+2026-11-10 and not yet measured over a comparable load.
 
 ## Updates
 

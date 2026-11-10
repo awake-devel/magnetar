@@ -94,6 +94,8 @@ variables above it passes to the server. Two more are used by compose itself:
 |---|---|---|
 | `MAGNETAR_VERSION` | `latest` | image tag of `ghcr.io/awake-devel/magnetar`: `latest` (newest non-prerelease), `X.Y.Z`, `X.Y.Z-rc1`, or `edge` (newest `main`) |
 | `MAGNETAR_PUBLISH` | `127.0.0.1:8787` | where the host publishes the API (exact format in docs/DOCKER.md). Change it only to put it on a LAN or Tailscale address |
+| `POSTGRES_MAX_WAL_SIZE` | `8GB` | `db` service: disk space the write-ahead log may use between checkpoints (docs/DOCKER.md "Postgres settings", D145) |
+| `POSTGRES_SHARED_BUFFERS` | `1GB` | `db` service: memory for Postgres's page cache; keep the service's `mem_limit` at least twice this |
 
 The Postgres credentials and volumes are described in docs/DOCKER.md.
 
