@@ -249,11 +249,9 @@ pub async fn dht_results(
     let cfg = fleet.config();
     let now = magnetar_core::now();
     let mut ack = DhtAck::default();
-    let worker_max = fleet.with(&name, |e| {
-        e.hello
-            .as_ref()
-            .map_or(cfg.metadata_max as u64, |h| h.metadata_max)
-    });
+    // No hello on record (a restarted server, D146): the worker's limit is unknown, so its
+    // oversize reports are never final; the hash is retried, by a worker with room if needed.
+    let worker_max = fleet.with(&name, |e| e.hello.as_ref().map_or(0, |h| h.metadata_max));
 
     // Only hashes this worker holds (D113); the rest is ignored before any decoding. Each hash
     // counts once: the first item for it that decodes and verifies, so a malformed copy does

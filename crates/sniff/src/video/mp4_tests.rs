@@ -233,3 +233,26 @@ fn hdlr_name_is_a_fallback_without_boilerplate() {
     assert_eq!(i.audio[0].name.as_deref(), Some("Commentary"));
     assert_eq!(kinds(&i.audio[0].kinds), ["commentary"]);
 }
+
+/// D146: a `trun` with no per-sample fields reads no bytes per sample; its `n` samples are
+/// taken at once (the old loop ran up to 2^20 times per box over nothing, and stopped there).
+#[test]
+fn trun_without_per_sample_fields_takes_all_samples_at_once() {
+    use super::parse_traf;
+    // tfhd: default duration (0x8) and size (0x10) for track 1.
+    let mut tfhd = 1u32.to_be_bytes().to_vec();
+    tfhd.extend_from_slice(&10u32.to_be_bytes());
+    tfhd.extend_from_slice(&500u32.to_be_bytes());
+    let mut traf = full(b"tfhd", 0, 0x18, &tfhd);
+    let n: u32 = 3 << 20;
+    for _ in 0..256 {
+        traf.extend(full(b"trun", 0, 0, &n.to_be_bytes()));
+    }
+    let started = std::time::Instant::now();
+    let t = parse_traf(&traf, 0, &[]).unwrap();
+    // 255 runs: the tfhd takes one of the 256 child slots.
+    assert_eq!(t.count, 255 * u64::from(n));
+    assert_eq!(t.total_dur, 10 * 255 * u64::from(n));
+    assert_eq!((t.first_dur, t.first_size), (Some(10), Some(500)));
+    assert!(started.elapsed() < std::time::Duration::from_millis(50));
+}

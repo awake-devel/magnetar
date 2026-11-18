@@ -17,6 +17,7 @@ mod dht_pg;
 mod dht_search_pg;
 mod dht_upnp;
 mod enrich_anime;
+mod enrich_due;
 mod enrich_pg;
 mod filters;
 mod liveness_pg;

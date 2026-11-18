@@ -123,14 +123,16 @@ pub fn default_peer_lookups(qps: u32) -> usize {
     (qps as usize * 2 / 5).clamp(8, 4096)
 }
 
-/// The pacer every DHT sender of the process shares (D109): the crawler's engine and the seed
-/// checker's walks. Its rate is `MAGNETAR_DHT_QPS` (or the mode's default) with the crawler on,
-/// `MAGNETAR_LIVENESS_DHT_QPS` with only seed checks; None when no DHT traffic is configured.
-/// The caller runs it ([`Pacer::run`]).
+/// The pacer every sender of the process shares (D109, D146): the crawler's engine, the seed
+/// checker's walks and its tracker contacts (D113). Its rate is `MAGNETAR_DHT_QPS` (or the
+/// mode's default) with the crawler on, `MAGNETAR_LIVENESS_DHT_QPS` with only seed checks, even
+/// with `MAGNETAR_LIVENESS_DHT=false`: tracker scrapes alone still open a flow per tracker
+/// through the router, so they need the pace and the router health brake that comes with it
+/// (D146). None when the process sends neither. The caller runs it ([`Pacer::run`]).
 pub fn shared_pacer(cfg: &Config, crawler: bool, seed_checks: bool) -> Option<Arc<Pacer>> {
     let qps = match DhtOptions::from_config(cfg, cfg.dht).filter(|_| crawler) {
         Some(o) => o.qps,
-        None if seed_checks && cfg.liveness_dht => cfg.liveness_dht_qps,
+        None if seed_checks => cfg.liveness_dht_qps,
         None => return None,
     };
     Some(Arc::new(Pacer::new(qps, Instant::now())))
@@ -1515,6 +1517,31 @@ mod tests {
         assert_eq!(default_tcp_rate(200), 100);
         assert_eq!(default_tcp_rate(1000), 150, "the measured cap");
         assert_eq!(default_tcp_rate(4), 5, "a floor so fetching still moves");
+    }
+
+    /// D146: with the crawler off and `MAGNETAR_LIVENESS_DHT=false` (the main server here),
+    /// seed checks still get the shared pacer, so tracker scrapes are paced and the caller
+    /// starts the router health probe that brakes them.
+    #[test]
+    fn seed_checks_without_dht_still_get_the_pacer() {
+        use super::shared_pacer;
+        use crate::config::Cli;
+        use clap::Parser;
+        let cfg = |args: &[&str]| {
+            let mut v = vec!["magnetar-server"];
+            v.extend(args);
+            v.push("serve");
+            Cli::try_parse_from(v).unwrap().config
+        };
+        let prod = cfg(&["--dht", "off", "--liveness-dht", "false"]);
+        let p = shared_pacer(&prod, false, true).expect("seed checks send tracker traffic");
+        assert_eq!(p.rate(), f64::from(prod.liveness_dht_qps));
+        assert!(
+            shared_pacer(&prod, false, false).is_none(),
+            "no crawler, no seed checks: nothing to pace"
+        );
+        let crawl = cfg(&["--dht", "polite", "--dht-qps", "7"]);
+        assert_eq!(shared_pacer(&crawl, true, true).unwrap().rate(), 7.0);
     }
 
     #[test]

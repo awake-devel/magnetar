@@ -1013,6 +1013,42 @@ async fn small_worker_oversize_is_retried_not_closed() {
     assert!(due.is_some(), "retried later, not closed");
 }
 
+/// D146: a worker the server has no hello for (it kept running through a server restart)
+/// reports oversize; its limit is unknown, so the lease is retried, not closed for good.
+#[tokio::test]
+async fn oversize_without_hello_is_retried_not_closed() {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    let (base, _) = spawn(s, 900).await;
+    let c1 = Client::new(&base, W1).unwrap();
+    let big = ih(0xb17);
+    nostr(s, 32, &big, "Big.Dict.Film.Two", NOW, &[]).await;
+    let mut got: Vec<String> = Vec::new();
+    for _ in 0..100 {
+        let l: ProbeLease = c1
+            .post(PROBE_LEASE, &LeaseRequest { max: 10 })
+            .await
+            .unwrap();
+        got.extend(l.infohashes);
+        if !got.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(got, vec![big.clone()]);
+    let item = DhtResult {
+        sighted: big.clone(),
+        via: "get_peers".into(),
+        peers_seen: 3,
+        outcome: DhtOutcome::Oversize,
+        probe: None,
+    };
+    assert_eq!(upload(&c1, vec![item]).await.applied, 1);
+    let (_, due, attempts, out, w) = queue_row(s, &big).await.unwrap();
+    assert_eq!((attempts, out.as_deref(), w), (1, Some("oversize"), None));
+    assert!(due.is_some(), "retried later, not closed");
+}
+
 /// One in-process worker with DHT discovery off and backfill on, on a fake DHT with three
 /// loopback seeders: a Nostr-only torrent, a stored DHT one and a Nostr-only BEP 27 private
 /// one (D119) are leased, looked up, fetched, probed and stored; the worker never samples and

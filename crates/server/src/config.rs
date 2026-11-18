@@ -243,8 +243,9 @@ pub struct Config {
     /// DHT walks at the same time.
     #[arg(long, env = "MAGNETAR_LIVENESS_DHT_CONCURRENCY", default_value_t = 32)]
     pub liveness_dht_concurrency: usize,
-    /// Queries per second of the seed checker's DHT walks while the crawler is off (D109). With
-    /// the crawler on, walks share `MAGNETAR_DHT_QPS` with it instead.
+    /// The seed checker's shared pace while the crawler is off (D109): its DHT walks and, with
+    /// `MAGNETAR_LIVENESS_DHT=false` too, its tracker contacts (D113, D146). With the crawler
+    /// on, walks share `MAGNETAR_DHT_QPS` with it instead.
     #[arg(long, env = "MAGNETAR_LIVENESS_DHT_QPS", default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=20_000))]
     pub liveness_dht_qps: u32,
     /// Native DHT crawler (docs/DHT.md): off, polite or aggressive.

@@ -478,6 +478,7 @@ pub async fn run(
     // Heartbeats until the stop.
     let mut heartbeats = 0u64;
     let mut heartbeat_errors = 0u64;
+    let mut need_hello = false;
     let mut pressure_ms = 0u64;
     let mut stop_rx = int_rx.clone();
     let mut tick = tokio::time::interval(opts.heartbeat_every);
@@ -499,10 +500,26 @@ pub async fn run(
             pressure: governor.pressure() || governor.conntrack_full(),
             dht: crawl.as_ref().and_then(|(c, _)| c.state()),
         };
-        match client.post::<_, serde_json::Value>(HEARTBEAT, &hb).await {
-            Ok(_) => {
+        match client.post::<_, HeartbeatAnswer>(HEARTBEAT, &hb).await {
+            Ok(a) => {
                 heartbeats += 1;
                 state::touch_heartbeat(&opts.state_dir);
+                // A restarted server forgets who we are (D146): it says so, and a failed
+                // heartbeat means it may have restarted; hello until one gets through.
+                need_hello |= a.hello_needed;
+                if need_hello {
+                    match client.post::<_, HelloResponse>(HELLO, &hello).await {
+                        Ok(_) => {
+                            need_hello = false;
+                            tracing::info!("worker: said hello again to the server");
+                        }
+                        Err(e) if e.is_fatal() => {
+                            abort.fatal(&e);
+                            break;
+                        }
+                        Err(e) => tracing::warn!("worker: hello: {e}"),
+                    }
+                }
             }
             Err(e) if e.is_fatal() => {
                 abort.fatal(&e);
@@ -511,8 +528,7 @@ pub async fn run(
             Err(e) => {
                 heartbeat_errors += 1;
                 tracing::warn!("worker: heartbeat: {e}");
-                // A restarted server forgets who we are: say hello again on the next answer.
-                let _ = client.post::<_, HelloResponse>(HELLO, &hello).await;
+                need_hello = true;
             }
         }
     }
