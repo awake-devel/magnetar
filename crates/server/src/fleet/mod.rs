@@ -793,14 +793,23 @@ async fn hello(
     }))
 }
 
+/// `204` when the worker's hello is on record; otherwise `200` with `hello_needed` (D146): a
+/// restarted server has forgotten it, and without its hello the worker's limits are unknown.
 async fn heartbeat(
     State(st): State<AppState>,
     Extension(WorkerName(name)): Extension<WorkerName>,
     body: Result<Json<Heartbeat>, axum::extract::rejection::JsonRejection>,
-) -> ApiResult<StatusCode> {
+) -> ApiResult<Response> {
     let h = clean_heartbeat(json(body)?);
-    st.fleet.with(&name, |e| e.heartbeat = Some(h));
-    Ok(StatusCode::NO_CONTENT)
+    let known = st.fleet.with(&name, |e| {
+        e.heartbeat = Some(h);
+        e.hello.is_some()
+    });
+    Ok(if known {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        Json(HeartbeatAnswer { hello_needed: true }).into_response()
+    })
 }
 
 async fn lease(
@@ -1202,7 +1211,10 @@ mod tests {
         let (code, _) = worker_post(addr, PROBE_LEASE, T1, br#"{"max":1}"#.to_vec()).await;
         assert_eq!(code, 503, "the backfill lease too");
         let (code, _) = worker_post(addr, HEARTBEAT, T2, b"{}".to_vec()).await;
-        assert_eq!(code, 204, "another worker is not held back");
+        assert_eq!(
+            code, 200,
+            "another worker is not held back (no hello yet: asked for one, D146)"
+        );
         drop(held);
     }
 

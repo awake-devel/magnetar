@@ -56,8 +56,8 @@ any change an older peer could misread.
 
 | Path | Body → answer | |
 |---|---|---|
-| `/api/v1/worker/hello` | `Hello {version, arch, liveness, dht, dht_ports, metadata_max, blocklist_version}` → `HelloResponse {name, server_version, worker_api, lease_secs, max_lease, max_triage, max_results, max_body, metadata_max}` | at start, and again after a failed heartbeat |
-| `/api/v1/worker/heartbeat` | `Heartbeat {uptime_secs, rss_mb, mem_available_mb, pressure, dht}` → 204 | every 30 s |
+| `/api/v1/worker/hello` | `Hello {version, arch, liveness, dht, dht_ports, metadata_max, blocklist_version}` → `HelloResponse {name, server_version, worker_api, lease_secs, max_lease, max_triage, max_results, max_body, metadata_max}` | at start, and again after a failed heartbeat or when a heartbeat answer asks for it, until one gets through (D146) |
+| `/api/v1/worker/heartbeat` | `Heartbeat {uptime_secs, rss_mb, mem_available_mb, pressure, dht}` → 204, or 200 `{hello_needed: true}` when the server has no hello for the worker (it restarted, D146) | every 30 s |
 | `/api/v1/worker/liveness/lease` | `{max}` → `Lease {expires_at, items:[{infohash, trackers}]}` | |
 | `/api/v1/worker/liveness/results` | `{results:[Liveness]}` → `{accepted, ignored}` | |
 | `/api/v1/worker/liveness/release` | `{infohashes}` → `{accepted, ignored}` | unchecked leases given back at stop |
@@ -127,7 +127,8 @@ apply to it), from its own line: trackers see another IP, so the per-tracker rat
 5. Statuses (`no_peers`, other failures with the 1 h / 6 h / 24 h backoff, private, v2-only,
    invalid) are applied only to hashes the worker holds (see 6). `oversize` is final only from
    a worker whose limit is at least the server's; a smaller worker (the Pi's 4 MiB) leaves the
-   torrent to someone with room (normal backoff).
+   torrent to someone with room (normal backoff). A worker without a hello on record (a
+   restarted server, D146) has an unknown limit and counts as smaller.
 6. **Holders (D113).** Triage records the worker it queued a hash for in `dht_seen.holder`
    (NULL = the server's own crawler; its retry loop takes a row back by clearing it). Every
    item of an upload, dict or status, is for a hash this worker holds, or it is `ignored`

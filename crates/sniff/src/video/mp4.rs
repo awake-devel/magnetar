@@ -1066,10 +1066,30 @@ fn parse_traf(t: &[u8], moof_off: u64, trex: &[(u32, u32, u32)]) -> Option<Traf>
                     .filter(|f| fl & **f != 0)
                     .count()
                     * 4;
+                if per == 0 {
+                    // No per-sample fields: every sample is the default one and reads no
+                    // bytes, so take all `n` at once instead of looping up to 2^20 times per
+                    // box over nothing (a crafted moof of 64 trafs × 256 such runs was
+                    // ~1.7e10 iterations per parse, D146).
+                    if n > 0 {
+                        if first_trun {
+                            r.first_dur = Some(def_dur);
+                            r.first_size = Some(def_size);
+                            r.first_off = data_off.and_then(|o| base.checked_add_signed(o));
+                        }
+                        r.total_dur = r
+                            .total_dur
+                            .saturating_add(def_dur.saturating_mul(u64::from(n)));
+                        r.count = r.count.saturating_add(u64::from(n));
+                    }
+                    first_trun = false;
+                    q = next;
+                    continue;
+                }
                 for i in 0..n.min(1 << 20) {
                     let mut dur = def_dur;
                     let mut size = def_size;
-                    if per > 0 && c.left() < per {
+                    if c.left() < per {
                         break;
                     }
                     if fl & 0x100 != 0 {

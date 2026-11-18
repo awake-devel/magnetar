@@ -67,6 +67,15 @@ pub struct HelloResponse {
     pub metadata_max: u64,
 }
 
+/// The answer to a heartbeat the server has no hello for (D146): its worker table lives in
+/// memory, so after a restart it asks each worker to say hello again. A server that knows the
+/// worker answers `204` with no body (read as the default: nothing needed).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct HeartbeatAnswer {
+    pub hello_needed: bool,
+}
+
 /// Every ~30 s: what the server shows in `/api/v1/stats.workers`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]

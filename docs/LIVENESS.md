@@ -120,8 +120,10 @@ checks a minute and 2 at once server-wide, past that `429` with `Retry-After`.
 **Trackers per torrent (D113).** At most 30 distinct trackers are scraped for one torrent (its
 own first, then the extra trackers): events can list made-up trackers by the thousand, and each
 is a new flow through the router. Each tracker contact of a batch also waits for a permit of
-the process's shared DHT pacer when there is one (D109: the crawler or `MAGNETAR_LIVENESS_DHT`
-on), so scrapes slow down with the router health brake like the walks.
+the process's shared pacer, so scrapes slow down with the router health brake like the walks.
+Every process that runs seed checks has that pacer and the probe, also with the DHT crawler off
+and `MAGNETAR_LIVENESS_DHT=false` (then at `MAGNETAR_LIVENESS_DHT_QPS`, D146): before D146 that
+configuration, the main server's here, scraped with no pace and no probe at all.
 
 ## History
 

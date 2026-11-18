@@ -16,7 +16,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use common::*;
 use magnetar_core::dht::{Dht, EngineConfig, Mode, Via};
 use magnetar_core::liveness::LivenessConfig;
@@ -370,6 +370,84 @@ async fn worker_refuses_an_incompatible_or_old_server() {
         .to_string();
         assert!(err.contains(want), "{err}");
     }
+}
+
+/// D146: the server's worker table lives in memory, so a restarted server has no hello for a
+/// worker that kept running; its heartbeat answer asks for one, and stops asking once it came.
+#[tokio::test]
+async fn heartbeat_asks_for_a_forgotten_hello() {
+    let Some(db) = test_db().await else { return };
+    let (base, _) = spawn(&db.store, 900).await;
+    let v = Some("1");
+    let (s, j) = post(&base, HEARTBEAT, W1, v, json!({"uptime_secs": 5})).await;
+    assert_eq!((s, j["hello_needed"].as_bool()), (200, Some(true)));
+    let (s, _) = post(&base, HELLO, W1, v, json!({"version": "0.3.2"})).await;
+    assert_eq!(s, 200);
+    let (s, _) = post(&base, HEARTBEAT, W1, v, json!({"uptime_secs": 6})).await;
+    assert_eq!(s, 204, "known again");
+}
+
+/// D146: a worker says hello again when a heartbeat answer asks for it (a server that
+/// restarted between two heartbeats, so no heartbeat failed), and only until one got through.
+#[tokio::test]
+async fn worker_says_hello_again_when_asked() {
+    use axum::routing::post as p;
+    let hellos = Arc::new(AtomicUsize::new(0));
+    let (h1, h2) = (hellos.clone(), hellos.clone());
+    let app = axum::Router::new()
+        .route(
+            HELLO,
+            p(move || {
+                let h = h1.clone();
+                async move {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(HelloResponse {
+                        name: "w1".into(),
+                        server_version: "test".into(),
+                        worker_api: WORKER_API,
+                        lease_secs: 900,
+                        max_lease: 10,
+                        max_triage: 10,
+                        max_results: 10,
+                        max_body: 1 << 20,
+                        metadata_max: 1 << 20,
+                    })
+                }
+            }),
+        )
+        .route(
+            HEARTBEAT,
+            p(move || {
+                let h = h2.clone();
+                async move {
+                    // The first hello is the start-up one; the server "restarts" after it.
+                    if h.load(Ordering::SeqCst) < 2 {
+                        axum::Json(json!({"hello_needed": true})).into_response()
+                    } else {
+                        axum::http::StatusCode::NO_CONTENT.into_response()
+                    }
+                }
+            }),
+        );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let (_tx, stop) = tokio::sync::watch::channel(false);
+    let r = worker::run(
+        opts(&format!("http://{a}"), W1, None, None),
+        stop,
+        Some(Duration::from_millis(4500)),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert!(r.heartbeats >= 3, "{}", r.heartbeats);
+    assert_eq!(
+        hellos.load(Ordering::SeqCst),
+        2,
+        "start-up hello, then one more"
+    );
 }
 
 fn state_dir() -> std::path::PathBuf {

@@ -50,8 +50,10 @@ The API is published on `127.0.0.1:8787` only, so by default nothing outside the
 reach it. Choose one of:
 
 - **Tailscale** (recommended for a phone): HTTPS with a real certificate, reachable only from
-  your tailnet. Either run `tailscale serve --bg --https=443 http://127.0.0.1:8787` on the
-  host, or use the sidecar profile below.
+  your tailnet. Either run `tailscale serve --bg --https=8443 http://127.0.0.1:8787` on the
+  host, or use the sidecar profile below. Check `tailscale serve status` first and pick an
+  HTTPS port nothing else serves: `tailscale serve` on a port that is in use replaces what
+  was there (D146). Port 443 gives the shortest URL when it is free.
 - **LAN**: `MAGNETAR_PUBLISH=0.0.0.0:8787` (or the host's LAN address). Plain HTTP: the
   token travels in clear, so only on a network you trust.
 - **A reverse proxy** you already run (Caddy, Traefik, nginx, Synology's own) in front of
@@ -264,7 +266,8 @@ node has joined.
 With the sidecar you can leave `MAGNETAR_PUBLISH` at `127.0.0.1:8787`.
 
 If the host already runs Tailscale, skip the sidecar and use the host's
-`tailscale serve --bg --https=443 http://127.0.0.1:8787` instead.
+`tailscale serve --bg --https=8443 http://127.0.0.1:8787` instead (a port nothing else
+serves, see above).
 
 **UNVERIFIED:** the sidecar was checked with `docker compose --profile tailscale config` only;
 it has not been run against a real tailnet.
