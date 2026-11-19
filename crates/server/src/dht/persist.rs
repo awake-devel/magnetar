@@ -718,6 +718,52 @@ pub async fn reclassify_batch(
     Ok(o)
 }
 
+/// Re-classify every row of an older classifier version, 500 per transaction (D69). Stops
+/// between two batches when `stop` turns true.
+pub async fn reclassify_all(
+    pool: &PgPool,
+    screen: &dyn Screen,
+    stop: Option<&tokio::sync::watch::Receiver<bool>>,
+) -> anyhow::Result<ReclassifyOutcome> {
+    let mut total = ReclassifyOutcome::default();
+    let mut after = String::new();
+    loop {
+        let o = reclassify_batch(pool, screen, &after, 500, magnetar_core::now())
+            .await
+            .map_err(|e| anyhow::anyhow!("DHT reclassify: {}", error_class(&e)))?;
+        total.rows += o.rows;
+        total.changed += o.changed;
+        total.blocked += o.blocked;
+        match o.last {
+            Some(last) if o.rows == 500 && !stop.is_some_and(|s| *s.borrow()) => after = last,
+            _ => break,
+        }
+    }
+    if total.rows > 0 {
+        tracing::info!(
+            "DHT: re-classified {} rows ({} with a category, {} blocked)",
+            total.rows,
+            total.changed,
+            total.blocked
+        );
+    }
+    Ok(total)
+}
+
+/// Job of `serve` (D155): once per start, re-classify the DHT torrents an older classifier
+/// stored. Before D155 this ran only when the server's own DHT crawler started, so a server
+/// that left crawling to workers never did it. No screen loaded: nothing is done (a row
+/// cannot be screened again). A failure is logged and left for the next start.
+pub async fn reclassify_job(pool: PgPool, stop: tokio::sync::watch::Receiver<bool>) {
+    let Some(screen) = crate::dht::screen::global_screen() else {
+        tracing::warn!("DHT re-classification skipped: no blocklist loaded");
+        return;
+    };
+    if let Err(e) = reclassify_all(&pool, screen.as_ref(), Some(&stop)).await {
+        tracing::warn!("{e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

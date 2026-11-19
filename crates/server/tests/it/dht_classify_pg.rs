@@ -315,6 +315,33 @@ async fn stage2_rows_are_reclassified_and_rescreened() {
     );
 }
 
+/// D155: the `serve` job walks every stale row, whoever stored it (no crawler needed).
+#[tokio::test]
+async fn reclassify_all_walks_every_stale_row() {
+    let Some(db) = test_db().await else { return };
+    let pool = db.store.pool();
+    insert_dht(pool, &ih(1), "Some.Film.2020.1080p.BluRay.x264", "other", 0).await;
+    insert_dht(pool, &ih(2), "Studio.XXX.Wibblewob.Scene", "other", 0).await;
+    insert_dht(pool, &ih(3), "Current.Row", "video", CLASSIFIER_VERSION).await;
+    let screen = BlocklistScreen(Arc::new(test_list()));
+    let o = magnetar_server::dht::persist::reclassify_all(pool, &screen, None)
+        .await
+        .unwrap();
+    assert_eq!((o.rows, o.blocked), (2, 1), "{o:?}");
+    let stale: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM dht_torrents WHERE classifier_version < $1")
+            .bind(CLASSIFIER_VERSION)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(stale, 0);
+    // A second run finds nothing.
+    let again = magnetar_server::dht::persist::reclassify_all(pool, &screen, None)
+        .await
+        .unwrap();
+    assert_eq!(again.rows, 0);
+}
+
 #[tokio::test]
 async fn dht_rows_enter_the_seed_check_schedule() {
     let Some(db) = test_db().await else { return };

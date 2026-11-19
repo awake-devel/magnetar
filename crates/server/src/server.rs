@@ -132,7 +132,8 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
 
     let (stop_tx, stop_rx) = watch::channel(false);
     // Every background loop is named and watched (D147): one that exits or panics before
-    // shutdown is logged and makes /health answer "degraded".
+    // shutdown is logged and makes /health answer "degraded". `spawn_job` is for the ones that
+    // may end by themselves (a finished backfill, a feature switched off): only a panic counts.
     let mut daemons = crate::supervise::Daemons::new(stop_rx.clone());
     // One destination budget for every non-DHT connection of the process (D150), braked by
     // the router health probe like the DHT pacer.
@@ -199,7 +200,7 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
         );
     }
     if nostr.discovery {
-        daemons.spawn(
+        daemons.spawn_job(
             "nip66-discovery",
             discovery::discovery_loop(store.clone(), cfg.clone(), stop_rx.clone()),
         );
@@ -229,15 +230,19 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
         "enrich",
         enrich::enrich_loop(store.clone(), cfg.clone(), stop_rx.clone()),
     );
-    daemons.spawn(
+    daemons.spawn_job(
         "attrs-backfill",
         attrs::backfill_loop(store.pool().clone(), stop_rx.clone()),
+    );
+    daemons.spawn_job(
+        "dht-reclassify",
+        crate::dht::persist::reclassify_job(store.pool().clone(), stop_rx.clone()),
     );
     daemons.spawn(
         "stats",
         stats::stats_loop(store.pool().clone(), stop_rx.clone()),
     );
-    daemons.spawn(
+    daemons.spawn_job(
         "anime",
         enrich_anime::anime_loop(store.pool().clone(), cfg.clone(), stop_rx.clone()),
     );
@@ -256,7 +261,7 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
         );
     }
     if let Some(hub) = dht_health.clone() {
-        daemons.spawn(
+        daemons.spawn_job(
             "router-health",
             crate::dht::health::health_loop(
                 crate::dht::health::parse_targets(&cfg.dht_probe),
@@ -265,7 +270,7 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
             ),
         );
     }
-    daemons.spawn(
+    daemons.spawn_job(
         "crawlmap-refresh",
         crawlmap::refresh_loop(crawlmap.clone(), geo_cfg.clone(), stop_rx.clone()),
     );

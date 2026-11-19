@@ -3,7 +3,9 @@
 //! without a word (a dead router health loop meant no brake at all). Every daemon is now
 //! spawned here under a name: an exit or a panic before shutdown is logged at ERROR with that
 //! name and recorded, and `/health` then answers `status: "degraded"`. Nothing is restarted:
-//! a loop that dies has a bug, and restarting it would hide that.
+//! a loop that dies has a bug, and restarting it would hide that. Work that ends by itself (a
+//! backfill, a loop whose feature is switched off) is a job ([`Daemons::spawn_job`]): returning
+//! is normal for it and only a panic counts.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -54,12 +56,25 @@ impl Daemons {
         self.adopt(name, tokio::spawn(fut));
     }
 
+    /// Spawn `fut` as the job `name`: work that ends by itself (a backfill, a loop whose
+    /// feature is off). Returning is normal for it; only a panic is recorded.
+    pub fn spawn_job<F>(&mut self, name: &'static str, fut: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.watch(name, tokio::spawn(fut), true);
+    }
+
     /// Watch a task that is already running (e.g. a pool of workers spawned elsewhere).
     pub fn adopt(&mut self, name: &'static str, task: JoinHandle<()>) {
+        self.watch(name, task, false);
+    }
+
+    fn watch(&mut self, name: &'static str, task: JoinHandle<()>, may_finish: bool) {
         let (health, stop) = (self.health.clone(), self.stop.clone());
         let watcher = tokio::spawn(async move {
             match task.await {
-                Ok(()) if *stop.borrow() => {}
+                Ok(()) if may_finish || *stop.borrow() => {}
                 Ok(()) => {
                     tracing::error!("daemon {name} exited before shutdown; it is not restarted");
                     health.record(name);
@@ -113,6 +128,17 @@ mod tests {
         d.join(Duration::from_secs(1)).await;
         // A daemon that stops because shutdown was asked is not "dead".
         assert_eq!(health.dead().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_job_may_finish_but_not_panic() {
+        let (_tx, rx) = watch::channel(false);
+        let mut d = Daemons::new(rx);
+        let health = d.health();
+        d.spawn_job("backfill", async {});
+        d.spawn_job("bad-job", async { panic!("boom") });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(health.dead(), ["bad-job"]);
     }
 
     #[tokio::test]

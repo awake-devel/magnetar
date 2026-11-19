@@ -1181,7 +1181,7 @@ pub async fn run(
         cfg.identity = store::load_identity(pool, &opts.ports).await?;
     }
     let reclassified = match (&db, opts.screen.as_deref()) {
-        (Some(pool), Some(screen)) => reclassify_all(pool, screen).await?,
+        (Some(pool), Some(screen)) => persist::reclassify_all(pool, screen, None).await?,
         _ => ReclassifyOutcome::default(),
     };
     // Tests replace the bootstrap list (and open the loopback seam) here.
@@ -1361,36 +1361,6 @@ pub async fn run(
         rep.persist.stored
     );
     Ok(rep)
-}
-
-/// Re-classify every row of an older classifier version, 500 per transaction (D69).
-pub async fn reclassify_all(
-    pool: &PgPool,
-    screen: &dyn Screen,
-) -> anyhow::Result<ReclassifyOutcome> {
-    let mut total = ReclassifyOutcome::default();
-    let mut after = String::new();
-    loop {
-        let o = persist::reclassify_batch(pool, screen, &after, 500, magnetar_core::now())
-            .await
-            .map_err(|e| anyhow::anyhow!("DHT reclassify: {}", persist::error_class(&e)))?;
-        total.rows += o.rows;
-        total.changed += o.changed;
-        total.blocked += o.blocked;
-        match o.last {
-            Some(last) if o.rows == 500 => after = last,
-            _ => break,
-        }
-    }
-    if total.rows > 0 {
-        tracing::info!(
-            "DHT: re-classified {} rows ({} with a category, {} blocked)",
-            total.rows,
-            total.changed,
-            total.blocked
-        );
-    }
-    Ok(total)
 }
 
 /// Wait before restarting the crawler after its `n`-th consecutive failure (30 s doubling,

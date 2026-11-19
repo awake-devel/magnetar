@@ -38,6 +38,13 @@ under a name. If one exits or panics while the server runs, the log says which o
 and `GET /health` answers `"status": "degraded"` instead of `"ok"`. Nothing is restarted
 automatically, and the Docker healthcheck still looks only at the database.
 
+### DHT torrents are re-sorted after a classifier update (D155)
+
+Torrents found through the DHT are classified and screened again when the classifier changes.
+This used to run only when the server crawled the DHT itself, so a server that leaves crawling
+to workers never did it. It now runs once at each server start, in the background. The first
+start after this update reads every DHT torrent once.
+
 ### Searches no longer hang while the search index rebuilds (D148)
 
 When the search index is off or still building, searches fall back to Postgres. Those queries
