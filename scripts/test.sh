@@ -43,10 +43,15 @@ ensure_postgres() {
     docker start "$name" >/dev/null
     echo "started $name"
   else
-    docker run -d --name "$name" -p 127.0.0.1:54329:5432 \
+    # Throwaway data: no fsync. MAGNETAR_TEST_PG_DIR puts it on a fast disk (a bind mount)
+    # instead of a docker volume under /var/lib/docker.
+    local data=()
+    [ -n "${MAGNETAR_TEST_PG_DIR:-}" ] && mkdir -p "$MAGNETAR_TEST_PG_DIR" \
+      && data=(-v "$MAGNETAR_TEST_PG_DIR:/var/lib/postgresql")
+    docker run -d --name "$name" -p 127.0.0.1:54329:5432 "${data[@]}" \
       -e POSTGRES_USER=magnetar -e POSTGRES_PASSWORD=magnetar -e POSTGRES_DB=magnetar \
-      postgres:18 >/dev/null
-    echo "created $name (postgres:18 on 127.0.0.1:54329)"
+      postgres:18 -c fsync=off -c synchronous_commit=off -c full_page_writes=off >/dev/null
+    echo "created $name (postgres:18 on 127.0.0.1:54329${MAGNETAR_TEST_PG_DIR:+, data in $MAGNETAR_TEST_PG_DIR})"
   fi
   for _ in $(seq 60); do
     docker exec "$name" pg_isready -q -U magnetar -d magnetar && break
