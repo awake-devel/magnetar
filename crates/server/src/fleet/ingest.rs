@@ -2,7 +2,7 @@
 //! uploads of what workers fetched. Nothing a worker says about a torrent's content is
 //! trusted: an uploaded info dict is hashed again against the infohash it was triaged under,
 //! then classified and screened by the server's own classifier and blocklist (exactly
-//! `dht::persist::persist_batch`, the server crawler's writer). The protocol has no field for
+//! `dht::persist::persist_batch`, the one writer of fetched dicts). The protocol has no field for
 //! a category or a verdict on a dict. Nothing here logs a name.
 //!
 //! D113: every upload item (dict or status report) must be for a hash the uploading worker

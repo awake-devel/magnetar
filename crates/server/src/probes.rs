@@ -115,18 +115,6 @@ fn platform_of(text: &str) -> Option<sniff::Platform> {
         .find(|p| enum_text(p).as_deref() == Some(text))
 }
 
-/// The warning for `MAGNETAR_PROBE=true` on any command but `worker`: probes are a crawl
-/// worker setting and nothing else builds a prober (D117). None when there is nothing to say.
-pub fn not_here(
-    cfg: &crate::config::Config,
-    command: &crate::config::Command,
-) -> Option<&'static str> {
-    (cfg.probe && !matches!(command, crate::config::Command::Worker { .. })).then_some(
-        "MAGNETAR_PROBE is a crawl-worker setting (docs/PROBES.md): this command never runs \
-         header probes; ignored",
-    )
-}
-
 // ---------------------------------------------------------------- worker side
 
 /// Printable text: control characters dropped, cut to `max` bytes on a character boundary.

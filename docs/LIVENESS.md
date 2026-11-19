@@ -71,10 +71,10 @@ learns, and `MAGNETAR_OWN_ADDRS`. Any IPv4 spelling a resolver accepts (`127.1`,
 A refused tracker fails like an unreachable one (`Error::Refused`) and backs off. There is no
 setting to allow private targets; only in-process tests use a loopback seam.
 
-The server container on the Docker bridge has only private interface addresses and, with
-`MAGNETAR_DHT=off`, no DHT vote: it knows the line's WAN address only from UPnP or from
-`MAGNETAR_OWN_ADDRS` (set it to the WAN IPv4 to close the hairpin case). Workers learn it from
-their crawler's vote once it settles.
+The server container on the Docker bridge has only private interface addresses and, since
+`serve` runs no DHT crawler (D156), neither a DHT vote nor a UPnP answer: it knows the line's
+WAN address only from `MAGNETAR_OWN_ADDRS` (set it to the WAN IPv4 to close the hairpin case).
+Workers learn it from their crawler's vote once it settles.
 
 ### Node farms on the DHT
 

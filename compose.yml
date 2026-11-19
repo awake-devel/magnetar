@@ -101,8 +101,12 @@ services:
       MAGNETAR_WORKER_TOKENS:
       MAGNETAR_WORKER_LEASE_SECS:
       MAGNETAR_WORKER_TRIAGE_NEW_PER_HOUR:
-      # DHT crawler (docs/DHT.md, off by default). Its UDP ports are published only by the
-      # overlay docker/compose.dht.yml, which also turns it on.
+      # The server does not crawl the DHT (D156): crawling is done by workers
+      # (docker/compose.worker.yml, docs/WORKERS.md), and no DHT port is published here.
+      # MAGNETAR_DHT has no effect on the server: it is passed through only so that a leftover
+      # value in .env shows as a warning in the log. Of the settings below the server reads
+      # only MAGNETAR_DHT_PROBE (its router health probe) and MAGNETAR_BLOCKLIST_FILE; the
+      # rest are worker settings and do nothing here.
       MAGNETAR_DHT:
       MAGNETAR_DHT_PORT:
       MAGNETAR_DHT_NODES:

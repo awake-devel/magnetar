@@ -9,6 +9,44 @@ binary refuses to start (sqlx reports the migration as missing). Take a `pg_dump
 with `pg_restore -l` before the first start, and roll back only by restoring that dump or to a
 build of this version.
 
+### The server no longer crawls the DHT: run a worker (D156)
+
+The main server (`serve`) is now the index only. DHT crawling is done by crawl workers
+(`magnetar-server worker`, docs/WORKERS.md), which already did it on every deployment of ours.
+
+What stops working:
+
+- `MAGNETAR_DHT=polite` or `aggressive` on the server starts no crawler. The server logs a
+  warning at start ("MAGNETAR_DHT=… has no effect on `serve` since D156 …") and runs as with
+  `off`. It no longer changes the pace of the server's seed checks either: that is always
+  `MAGNETAR_LIVENESS_DHT_QPS`.
+- The command `magnetar-server dht` (`--seconds`, `--mode`, `--dry-run`) is gone. For a bounded
+  run use `magnetar-server worker --seconds N` against a server; it prints a JSON report when
+  it stops. There is no run without a database behind it any more.
+- `docker/compose.dht.yml` is gone. A start command that names it fails: remove
+  `-f docker/compose.dht.yml` from it.
+
+What to do instead: give a worker a token in `MAGNETAR_WORKER_TOKENS` and run it with
+`MAGNETAR_DHT=aggressive` (or `polite`), on another machine or next to the server
+(`docker/compose.worker.yml`, docs/WORKERS.md §2–§4). Running the worker file on the same host
+as `compose.yml` is **UNVERIFIED**.
+
+Nothing changes for a server that already ran `MAGNETAR_DHT=off` with workers. There is no
+database migration and no data is removed. Two `settings` rows the server's crawler kept
+(`dht.identity`, `dht.nodes`) are no longer used; a worker keeps its identity in its state
+directory. A torrent whose metadata fetch failed is tried again when a worker sees its hash
+again, not on a timer.
+
+Known limitation: the app and the web page offer the DHT activity charts and the DHT crawler
+lines only when the server itself crawls, so they are never shown now (as before on a server
+with `MAGNETAR_DHT=off`). `/health` never lists the feature `dht`, and `dht` in
+`/api/v1/stats` and `/api/v1/stats/health` is always null. Each worker's DHT counters are in the
+worker lines of the stats. Of the activity series only "DHT torrents added" is still recorded.
+
+The same start-up check now warns about other settings on the wrong side: `MAGNETAR_PROBE` on
+anything but a worker (as before), `MAGNETAR_WORKER_SERVER` / `MAGNETAR_WORKER_TOKEN` on the
+server, `MAGNETAR_WORKER_TOKENS` on a worker. These are warnings, never errors.
+
 ### One limit on outbound connections for the whole process (D150)
 
 Every outbound connection other than the DHT (Nostr relays, tracker scrapes, TMDB, IMDb,

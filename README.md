@@ -4,7 +4,7 @@ Magnetar is a torrent index. It finds torrents in two places:
 
 - **Nostr** ([nostr.com](https://nostr.com)): it crawls relays for NIP-35 torrent events
   (kind 2003) and checks every signature.
-- **The BitTorrent DHT**: a native crawler, which normally runs on separate crawl workers.
+- **The BitTorrent DHT**: a native crawler, which runs on crawl workers (D156: the main server does not crawl it).
 
 It stores and indexes the results in Postgres. It also:
 
@@ -60,9 +60,9 @@ It has three parts:
                                                +-------------------------------------+
 ```
 
-The main server can run the DHT crawler itself (`MAGNETAR_DHT`), but it is off by default.
-On a fragile home router, keep it off and leave the DHT to workers on other lines (read
-"Network load" below).
+The main server does not crawl the DHT (D156): it is the index. DHT crawling is done by
+workers (`magnetar-server worker`, `MAGNETAR_DHT`). On a fragile home router, run the workers
+on other lines (read "Network load" below).
 
 The crates are:
 
@@ -89,7 +89,7 @@ Android 17 (API 37) x86_64 emulator against a live server crawling real relays. 
 | Lenient NIP-35 parser (btih alias, `name;size` files, proxy tags, YGG/Nyaa/TPB bridge quirks) | core | Tested on 112 real fixture events |
 | Relay discovery (seed list, NIP-65, kind 3 maps, tag hints) | core | Tested |
 | Full-text search: Postgres `tsvector` + `pg_trgm` and an in-memory search index with facets (docs/SEARCH.md) | server | Tested. The phone's offline SQLite FTS5 search is **Removed** (D79) |
-| Native DHT crawler (docs/DHT.md, D49–D75): KRPC node with BEP 42 ids, BEP 51 sampling, passive capture, BEP 9 metadata fetches, a paced query and TCP budget with a network watchdog, a fail-closed content screen (hard blocklist, adult classifier) | server, worker | Runs on the crawl workers. Off on the main server by default (`MAGNETAR_DHT=off`). Read "Network load" below before turning it on at home |
+| Native DHT crawler (docs/DHT.md, D49–D75): KRPC node with BEP 42 ids, BEP 51 sampling, passive capture, BEP 9 metadata fetches, a paced query and TCP budget with a network watchdog, a fail-closed content screen (hard blocklist, adult classifier) | worker | Runs on the crawl workers only: the main server no longer crawls the DHT (D156; `MAGNETAR_DHT` on `serve` only logs a warning). Read "Network load" below before running a worker at home |
 | Crawl workers (docs/WORKERS.md, D96–D100, D110–D113): seed checks and DHT crawling from other machines over the API with per-worker tokens, leases, hourly caps and tracing | worker, server | Running on two workers (an x86_64 netbook and a Raspberry Pi 3B) since 2026-10-31 |
 | IMDb and TMDB enrichment (docs/ENRICHMENT.md, ENRICHMENT-ANIME.md, ENRICHMENT-TMDB.md, D40–D42): titles, years, ratings, episodes, posters and overviews linked to each infohash, never republished. Due infohashes come from a trigger-filled queue (D144) instead of a 2.6 s anti-join per batch | server | Tested. Queue speed-up on production **UNVERIFIED** until measured after deploy |
 | Filters (category, size, date, seeders, hide dead, trust) and sorts (relevance, date, size, seeders) | both | Tested (hide dead: no dead torrent was available to observe) |
@@ -140,10 +140,11 @@ server URL (`https://<machine>.<tailnet>.ts.net`) and the API token.
   Nightly dumps to another machine: `scripts/backup.sh` (DOCKER.md "Backups")
 - Without Docker, with the static binary and your own Postgres: [docs/LINUX.md](docs/LINUX.md)
 - Share the crawling with other machines (seed checks and DHT, no database on them): [docs/WORKERS.md](docs/WORKERS.md)
-- The DHT crawler on the main server needs the overlay that publishes its UDP ports:
-  `docker compose -f compose.yml -f docker/compose.dht.yml up -d`. A plain `up -d` runs
-  without it. The overlay defaults to `MAGNETAR_DHT=aggressive`, and aggressive mode turns
-  UPnP on unless `MAGNETAR_DHT_UPNP=false`: read "Network load" first.
+- The main server does not crawl the DHT (D156; `docker/compose.dht.yml` is gone). To crawl
+  the DHT from the server's machine, run a worker next to it with
+  `docker/compose.worker.yml` (docs/WORKERS.md); running both on one host is **UNVERIFIED**.
+  That file defaults to `MAGNETAR_DHT=aggressive` and publishes UDP 6891–6894: read
+  "Network load" first.
 - Nothing installs systemd units, timers or udev rules by itself. Docker's restart policy
   keeps the containers up; `packaging/` has optional units (a crawl worker, the nightly
   backup) with their install steps, and LINUX.md has examples for starting the binary at boot.
@@ -168,9 +169,9 @@ took a whole LAN down in about 20 s (D109). On 2026-10-31, 12 queries/s filled t
 router's route cache in 15 min, while the loss-based watchdog stayed quiet. On a consumer
 router:
 
-- Leave the main server at `MAGNETAR_DHT=off`. Run the DHT on workers on other lines, or set
-  a low `MAGNETAR_DHT_QPS` and watch the router.
-- Set `MAGNETAR_DHT_UPNP=false`.
+- Run the DHT workers on other lines. A worker behind this router needs a low
+  `MAGNETAR_DHT_QPS` and someone watching the router.
+- Leave `MAGNETAR_DHT_UPNP` off on workers (it is off unless set to `true`).
 - Set `MAGNETAR_DOWNLOADS=false`: librqbit runs its own DHT, which is not paced.
 - Consider `MAGNETAR_LIVENESS_DHT=false`, or keep `MAGNETAR_LIVENESS_DHT_QPS` low.
 
@@ -197,8 +198,8 @@ The most used variables. Docker reads them from `.env`; the native binary from i
 | `MAGNETAR_SEED_RELAYS` | built-in list (ARCHITECTURE.md §9) | Comma-separated relay URLs |
 | `MAGNETAR_NIP66` | `true` | NIP-66 relay discovery every 6 h |
 | `MAGNETAR_DB_POOL` | `10` | Postgres connections the server may open |
-| `MAGNETAR_DHT` | `off` | Native DHT crawler: `off`, `polite` or `aggressive` (docs/DHT.md) |
-| `MAGNETAR_DHT_UPNP` | on in `aggressive`, off in `polite` | Map the crawler's UDP ports on the router with UPnP |
+| `MAGNETAR_DHT` | `off` | Worker only (D156): native DHT crawler, `off`, `polite` or `aggressive` (docs/DHT.md). On the main server a value other than `off` only logs a warning |
+| `MAGNETAR_DHT_UPNP` | off unless `true` | Worker only: map the crawler's UDP ports on the router with UPnP (aggressive mode) |
 | `MAGNETAR_LIVENESS_DHT` | `true` | DHT (BEP 33) fallback for seed checks no tracker answered |
 | `MAGNETAR_WEB_UI` | `true` | Serve the browser client (docs/WEB.md) |
 | `MAGNETAR_TMDB_TOKEN` | unset | TMDB read token for posters and overviews. IMDb datasets need no key (`MAGNETAR_IMDB`, default `true`) |

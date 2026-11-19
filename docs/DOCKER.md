@@ -297,21 +297,28 @@ it has not been run against a real tailnet.
 
 ## DHT crawler
 
-The DHT crawler (docs/DHT.md) is off by default (`MAGNETAR_DHT=off`) and the default
-`compose.yml` publishes nothing for it; `compose.yml` only passes the `MAGNETAR_DHT*`
-variables through when `.env` sets them. The overlay `docker/compose.dht.yml` turns it on
-(`MAGNETAR_DHT=aggressive` unless `.env` says otherwise) and publishes its UDP ports
-6891–6894:
+The server container does not crawl the DHT (D156): the crawler (docs/DHT.md) runs in crawl
+workers only, and `compose.yml` publishes nothing for it. `compose.yml` still passes the
+`MAGNETAR_DHT*` variables through when `.env` sets them, but `MAGNETAR_DHT` has no effect on
+the server: a value other than `off` only logs a warning at start. The overlay
+`docker/compose.dht.yml`, which turned the crawler on inside the server container, is gone.
+
+To crawl the DHT from the server's machine, run a worker next to it (docs/WORKERS.md §2 and
+§4): give it a token in the server's `MAGNETAR_WORKER_TOKENS`, then
 
 ```sh
-docker compose -f compose.yml -f docker/compose.dht.yml up -d
+docker compose -f docker/compose.worker.yml --env-file docker/worker.env up -d
 ```
 
-Crawling shows this host's IP address in BitTorrent swarms: opt in deliberately. With other
-values of `MAGNETAR_DHT_PORT` or `MAGNETAR_DHT_NODES`, change both sides of the overlay's
-port range (`MAGNETAR_DHT_PUBLISH` sets the host side).
+`docker/compose.worker.yml` sets `MAGNETAR_DHT=aggressive` and publishes UDP ports 6891–6894.
+**UNVERIFIED**: it has not been run on the same host as `compose.yml`.
 
-**UPnP from inside a container** needs two variables in `.env`, because SSDP multicast does
+Crawling shows this host's IP address in BitTorrent swarms: opt in deliberately.
+`MAGNETAR_DHT_PORT` and `MAGNETAR_DHT_NODES` are fixed in that file (they must match its
+`ports:`); `MAGNETAR_DHT_PUBLISH` sets the host side of the port range.
+
+**UPnP from inside a container** (off on a worker unless `MAGNETAR_DHT_UPNP=true`) needs two
+variables in `docker/worker.env`, because SSDP multicast does
 not leave Docker's bridge network and the container only knows its bridge address:
 
 ```sh
@@ -319,18 +326,19 @@ MAGNETAR_DHT_UPNP_GATEWAY=192.168.1.1     # the router's LAN address
 MAGNETAR_DHT_UPNP_LOCAL_IP=192.168.1.20   # this host's LAN address
 ```
 
-The server logs a warning when it runs in a container without them. Otherwise set
-`MAGNETAR_DHT_UPNP=false` and forward UDP 6891–6894 on the router by hand, or not at all: the
+The worker logs a warning when it runs in a container without them. Otherwise leave
+`MAGNETAR_DHT_UPNP` off and forward UDP 6891–6894 on the router by hand, or not at all: the
 crawler still works, answers to its own queries come back through the NAT, it only captures
 less passively. Only UDP is mapped: the crawler never accepts incoming TCP connections (the
 metadata fetch only opens outgoing ones, which need no published port). Outbound UDP is
 masqueraded by Docker with the source port kept when it is free (the Linux default), so remote
 nodes see the published port. UNVERIFIED on a real router from a container.
 
-**Watching it**: the app's Stats tab (health card) and Status screen show the crawler
-(discovery rate, queue, metadata success, stored and adult counts, router ports);
-`curl -H "Authorization: Bearer $MAGNETAR_API_TOKEN" http://127.0.0.1:8787/api/v1/stats | jq .dht`
-gives the same numbers. Disk use grows without a cap (user decision), roughly 5–6 KB per stored
+**Watching it**: each worker's counters are in
+`curl -H "Authorization: Bearer $MAGNETAR_API_TOKEN" http://127.0.0.1:8787/api/v1/stats | jq .workers`
+(docs/WORKERS.md "Stats"). `.dht` in that answer is always null since D156, so the crawler
+lines of the app's Stats health card and Status screen and the DHT activity charts are not
+shown (known limitation, docs/ROADMAP.md). Disk use grows without a cap (user decision), roughly 5–6 KB per stored
 DHT torrent (docs/DHT.md §16); the `db_size` chart in Stats follows it.
 
 Extra illegal-content blocklist terms (`MAGNETAR_BLOCKLIST_FILE`, docs/CONFIG.md) are read from

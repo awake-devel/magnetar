@@ -18,7 +18,7 @@ and shows it in the detail API (`TorrentDetail.probe`, docs/API.md).
 
 - **Crawl workers only** (`magnetar-server worker`, docs/WORKERS.md), with `MAGNETAR_PROBE=true`
   and the DHT crawler on (`MAGNETAR_DHT`). Off by default everywhere.
-- **Never the main server.** `serve`, `dht` and every other command never build a prober; with
+- **Never the main server.** `serve` and every other command never build a prober; with
   `MAGNETAR_PROBE=true` they log a warning and ignore it. `compose.yml` pins `MAGNETAR_PROBE`
   and `MAGNETAR_PROBE_UPLOAD` to `false`. Test: `probes::tests::only_the_worker_crawler_builds_a_prober`.
 - **Never on a torrent the worker's blocklist stops, or with no blocklist loaded** (the

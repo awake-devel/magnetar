@@ -10,7 +10,6 @@ use tokio::sync::watch;
 use crate::api::{self, AppState};
 use crate::config::Config;
 use crate::crawlmap::{self, CrawlMap};
-use crate::geo::GeoMode;
 use crate::liveness::{self, LivenessService};
 use crate::search_index::{self, SearchIndex};
 use crate::store::PgStore;
@@ -143,12 +142,12 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
             crate::netbudget::report_loop(b, stop_rx.clone()),
         );
     }
-    // One DHT pace for the whole process (D109): the crawler's queries and the seed checker's
-    // walks share it, so MAGNETAR_DHT_QPS is what the router sees, and the health probe slows
-    // both. Its refill task runs here, outliving crawler restarts.
-    let dht_pacer = crate::dht::shared_pacer(&cfg, cfg.dht != crate::config::DhtMode::Off, true);
-    // One router health probe for the process too: it brakes the walks from the start and
-    // through crawler restarts; a running crawler attaches its engine and fetcher to it.
+    // One DHT pace for the whole process (D109, D146): the seed checker's walks and its
+    // tracker contacts share it, so MAGNETAR_LIVENESS_DHT_QPS is what the router sees, and the
+    // health probe slows them. `serve` never crawls the DHT (D156), so MAGNETAR_DHT and
+    // MAGNETAR_DHT_QPS never set this pace (`crawler = false`).
+    let dht_pacer = crate::dht::shared_pacer(&cfg, false, true);
+    // One router health probe for the process too: it brakes the walks from the start.
     let dht_health = dht_pacer
         .clone()
         .map(|p| crate::dht::health::HealthHub::new(Some(p)));
@@ -174,16 +173,7 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
         .with_liveness(Arc::new(LivenessService::new(liveness::liveness_config(
             &cfg,
             dht_pacer.clone(),
-        ))))
-        .with_dht(match cfg.dht {
-            crate::config::DhtMode::Off => None,
-            crate::config::DhtMode::Polite => Some(crate::dht::status::DhtService::new(
-                magnetar_core::dht::Mode::Polite,
-            )),
-            crate::config::DhtMode::Aggressive => Some(crate::dht::status::DhtService::new(
-                magnetar_core::dht::Mode::Aggressive,
-            )),
-        });
+        ))));
     let cfg = Arc::new(cfg);
     // D118: with MAGNETAR_NOSTR_CRAWL=false no relay is contacted (crawl, indexer metadata,
     // NIP-66 discovery); the saved-search notifier, which lives in the crawl loop, runs alone.
@@ -246,20 +236,6 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
         "anime",
         enrich_anime::anime_loop(store.pool().clone(), cfg.clone(), stop_rx.clone()),
     );
-    if let Some(svc) = &state.dht {
-        daemons.spawn(
-            "dht-crawler",
-            crate::dht::dht_loop(
-                store.pool().clone(),
-                cfg.clone(),
-                svc.clone(),
-                (geo_cfg.mode != GeoMode::Off).then(|| crawlmap.clone()),
-                dht_pacer.clone(),
-                dht_health.clone(),
-                stop_rx.clone(),
-            ),
-        );
-    }
     if let Some(hub) = dht_health.clone() {
         daemons.spawn_job(
             "router-health",
@@ -275,19 +251,13 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
         crawlmap::refresh_loop(crawlmap.clone(), geo_cfg.clone(), stop_rx.clone()),
     );
     {
-        let (dht, liveness, fleet) = (
-            state.dht.clone(),
-            state.liveness.clone(),
-            state.fleet.clone(),
-        );
+        let (liveness, fleet) = (state.liveness.clone(), state.fleet.clone());
         daemons.spawn(
             "crawlmap-server",
             crawlmap::server_loop(
                 crawlmap.clone(),
                 store.pool().clone(),
-                move || {
-                    api::crawl_machines(dht.as_deref(), &liveness, &fleet, magnetar_core::now())
-                },
+                move || api::crawl_machines(&liveness, &fleet, magnetar_core::now()),
                 stop_rx.clone(),
             ),
         );

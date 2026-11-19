@@ -2,7 +2,8 @@
 
 Other machines can share the crawling with the main server: each runs
 `magnetar-server worker` from its own internet line, takes a share of the **seed checks**
-and runs its own **DHT crawler** (nodes, peer lookups, BEP 9 metadata fetches). The main
+and runs its own **DHT crawler** (nodes, peer lookups, BEP 9 metadata fetches). Workers are
+the only DHT crawlers: since D156 the main server does not crawl the DHT. The main
 server stays the single source of truth: Postgres, the search index and the API live only
 there; a worker has no database and talks to the server over its HTTPS API with a worker
 token. Decisions: ARCHITECTURE.md D96–D100.
@@ -10,7 +11,7 @@ token. Decisions: ARCHITECTURE.md D96–D100.
 ```
    phone ──API token──▶ ┌─────────────── main server ───────────────┐
                         │ Postgres · search index · API             │
-                        │ own Nostr crawler, seed checks, (DHT)     │
+                        │ own Nostr crawler, seed checks            │
                         │ /api/v1/worker/* (worker tokens)          │
                         └──────▲──────────────────────▲─────────────┘
               lease / results  │  triage / uploads    │  (HTTPS, e.g. Tailscale)
@@ -106,10 +107,10 @@ apply to it), from its own line: trackers see another IP, so the per-tracker rat
 2. New hashes pass the worker's in-memory seen filter, then go to the server in batches
    (≤ 1000 / 1 s). The server runs **its own** triage (`dht::store::triage`): blocked → drop,
    already known → drop, in `dht_seen` and not due → drop, else `queued` with a 1 h lease. The
-   answer lists what this worker may fetch. A second worker (or the server's crawler) asking
+   answer lists what this worker may fetch. A second worker asking
    about the same hash during that hour gets nothing: the whole fleet fetches each hash once.
-   A worker that dies leaves leased rows that the server's retry loop takes back after 1 h
-   (when the server's own crawler runs; else they wait for a later sighting).
+   A worker that dies leaves leased rows that wait for a later sighting: the server has no
+   retry loop since D156, a due row comes back when a worker's triage sights the hash again.
 3. The worker collects peers and fetches the info dict, keeps the **raw bytes**, classifies
    it and runs the hard blocklist (D53) on every name/path variant **before anything leaves
    the machine**: a blocked torrent is reported as `blocked` with its hash (and a hybrid's
@@ -120,7 +121,7 @@ apply to it), from its own line: trackers see another IP, so the per-tracker rat
 4. Otherwise the raw dict is uploaded. The server **verifies it again**
    (`metainfo::outcome_from_raw`: size ≤ its `MAGNETAR_DHT_METADATA_MAX`, SHA-1 or truncated
    SHA-256 of the exact bytes = the infohash, value count before decoding, parse), then hands
-   it to its crawler's own writer (`persist_batch`): **its** classifier (adult category, D52,
+   it to its own batched writer (`persist_batch`): **its** classifier (adult category, D52,
    D69) and **its** blocklist run, then the row is stored. A mismatching dict is `rejected`
    and logged by hash; the row keeps its lease. The wire format has no field for a category or
    a verdict on a dict: nothing a worker says about content is trusted.
@@ -130,13 +131,13 @@ apply to it), from its own line: trackers see another IP, so the per-tracker rat
    torrent to someone with room (normal backoff). A worker without a hello on record (a
    restarted server, D146) has an unknown limit and counts as smaller.
 6. **Holders (D113).** Triage records the worker it queued a hash for in `dht_seen.holder`
-   (NULL = the server's own crawler; its retry loop takes a row back by clearing it). Every
+   (NULL = rows queued by the server's own crawler before D156). Every
    item of an upload, dict or status, is for a hash this worker holds, or it is `ignored`
    before anything is decoded: a worker cannot upload a dict or a status for a hash another
-   worker or the server holds. A due row another worker holds (an expired lease, or a
+   worker holds. A due row another worker holds (an expired lease, or a
    failure's backoff over) is handed to a second worker only once it is 1 h past due
-   (`TAKEOVER_GRACE_SECS`), also when the server's retry loop never runs (DHT off on the
-   server); the holder itself and the server's own crawler may take it at once. Within one
+   (`TAKEOVER_GRACE_SECS`); the holder itself may take it at once, and so may any worker
+   for a row without a holder. Within one
    upload each hash counts once: its first item that decodes and verifies (a malformed or
    forged copy does not shadow a good one after it).
 
@@ -146,7 +147,8 @@ apply to it), from its own line: trackers see another IP, so the per-tracker rat
    `MAGNETAR_WORKER_TRIAGE_NEW_PER_HOUR` new hashes an hour (default 100 000; re-queued
    hashes do not count, the triage answer's `capped` says how many were left out), and every
    row stored from a worker's dict records it in `dht_torrents.supplied_by` (NULL = the
-   server's own crawler and every row stored before migration `20261104120000`), so what one
+   server's own crawler, removed in D156, and every row stored before migration
+   `20261104120000`), so what one
    token added can be removed (§7). The server's own classifier and blocklist still run on
    every such dict.
 7. **Upload slots (D113).** `dht/results` and `liveness/results` take a slot before their body
@@ -264,8 +266,14 @@ services:
 ```
 
 Restart the server. It logs `crawl workers: 2 token(s) configured`, and `GET /health` lists
-`workers`. The server's own crawler, seed checks and DHT keep running; the workers add to
-them. Workers reach the server the way the phone does (Tailscale serve, reverse proxy, LAN).
+`workers`. The server's own Nostr crawler and seed checks keep running; the workers add
+their seed checks and do all the DHT crawling (D156). Workers reach the server the way the
+phone does (Tailscale serve, reverse proxy, LAN).
+
+To crawl the DHT from the server's own machine, run a worker next to it (§4,
+`docker/compose.worker.yml`, with `MAGNETAR_WORKER_SERVER` pointing at the server); the
+overlay `docker/compose.dht.yml` that turned the crawler on inside the server container is
+gone. **UNVERIFIED**: `compose.worker.yml` has not been run on the same host as `compose.yml`.
 
 ## 3. Worker configuration
 
@@ -279,15 +287,17 @@ them. Workers reach the server the way the phone does (Tailscale serve, reverse 
 | `MAGNETAR_WORKER_MIN_FREE_MB` | `250` | governor floor, 0 = off |
 | `MAGNETAR_WORKER_RSS_MAX_MB` | `0` (off) | governor ceiling for the worker's own RSS |
 | `MAGNETAR_WORKER_UPLOAD_BUFFER_MB` | `16` | results waiting for upload |
-| `MAGNETAR_DHT` | `off` | `aggressive` (4 nodes on open UDP ports, passive capture) or `polite`; off = seed checks only |
+| `MAGNETAR_DHT` | `off` | `aggressive` (4 nodes on open UDP ports, passive capture) or `polite`; off = seed checks only. A worker setting: on `serve` it only logs a warning (D156) |
 | `MAGNETAR_DHT_PORT`, `_NODES`, `_QPS`, `_TCP_RATE`, `_TCP_MAX`, `_PROBE`, `_POOL`, `_FETCH_CONCURRENCY`, `_METADATA_MAX`, `_PEER_LOOKUPS`, `_LOOKUP_TIMEOUT_MS`, `_PEERS_PER_HASH`, `_SAMPLE_PRIORITY` | as the server (docs/CONFIG.md), except pool 200 000 and fetches 64 | |
 | `MAGNETAR_DHT_UPNP` | **off** for workers | `true` maps the UDP ports on the router (it is somebody else's router: ask first) |
 | `MAGNETAR_LIVENESS_TRACKER_RPS`, `_TRACKER_CONCURRENCY`, `_DHT`, `_DHT_CONCURRENCY`, `_DHT_QPS` | as the server | the worker's seed checker (its walks share the worker's DHT pace, D109) |
 | `MAGNETAR_BLOCKLIST_FILE` | unset | extra blocklist terms, as on the server (the server screens again anyway) |
 | `MAGNETAR_GEOIP` | `on` | crawl map (docs/CRAWLMAP.md, D105): resolve DHT nodes to country / AS number here (database downloaded into `<state dir>/geoip`, ~18 MB in memory; `country` ~8 MB; `off` = items carry no codes). Only codes are sent, never an address |
 
-`DATABASE_URL` and `MAGNETAR_API_TOKEN` are not used. `magnetar-server worker --seconds N`
-runs for N seconds; either way it prints a JSON report (seed checks, DHT counters, what the
+`DATABASE_URL` and `MAGNETAR_API_TOKEN` are not used; `MAGNETAR_WORKER_TOKENS` (the server's
+list) set on a worker only logs a warning. `magnetar-server worker --seconds N`
+runs for N seconds (the bounded run that replaces the removed `dht` command, D156); either
+way it prints a JSON report (seed checks, DHT counters, what the
 server answered, RSS, CPU) when it stops. Exit status 2 = refused by the server (token,
 version), 1 = other error (e.g. UDP port taken), 0 = stopped.
 
@@ -473,9 +483,10 @@ health probe are the safeguards.
   **UNVERIFIED** (docs/PROBES.md §9). The probe backfill (D118) is built and tested on
   loopback fake peers only: its share of reachable swarms, probes per hour and line load on
   eee and the Pi are **UNVERIFIED** (docs/PROBES.md §10).
-- Hashes leased to a worker that dies come back through the server's DHT retry loop only when
-  the server's own DHT crawler runs; otherwise they wait until sighted again, by another worker
-  at least 1 h after the lease's end (D113), or by the same worker at once.
+- Hashes leased to a worker that dies are not taken back on a timer (the server's DHT retry
+  loop was removed with its crawler in D156): they wait until sighted again, by another worker
+  at least 1 h after the lease's end (D113), or by the same worker at once. The same holds
+  for failed fetches whose backoff is over.
 - A worker trusts the server it is pointed at (TLS checks the name); the server trusts a
   worker's seed-check numbers and failure statuses (they only move schedules), never its
   content claims, and only for hashes it holds (D113).

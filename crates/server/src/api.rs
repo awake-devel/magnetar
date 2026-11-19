@@ -24,7 +24,6 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::dht::status::DhtService;
 use crate::liveness::{LivenessService, PRIO_SEARCH, PRIO_VIEWED};
 use crate::stats::StatsService;
 use crate::store::{PgStore, json_u8};
@@ -56,8 +55,6 @@ pub struct AppState {
     pub tmdb: Option<Arc<Tmdb>>,
     /// Cached chart and graph answers (D47).
     pub stats: Arc<StatsService>,
-    /// The DHT crawler's live state (D58); None when `MAGNETAR_DHT` is off.
-    pub dht: Option<Arc<DhtService>>,
     /// Crawl workers (D96): tokens, limits, per-worker counters. No tokens = disabled.
     pub fleet: Arc<crate::fleet::Fleet>,
     /// Crawl map counters and geo database (D101–D105).
@@ -82,7 +79,6 @@ impl AppState {
             shutdown: rx,
             tmdb: None,
             stats: Arc::default(),
-            dht: None,
             fleet: Arc::default(),
             crawlmap: Arc::default(),
             web: None,
@@ -107,11 +103,6 @@ impl AppState {
 
     pub fn with_daemon_health(mut self, h: crate::supervise::DaemonHealth) -> Self {
         self.daemons = h;
-        self
-    }
-
-    pub fn with_dht(mut self, d: Option<Arc<DhtService>>) -> Self {
-        self.dht = d;
         self
     }
 
@@ -444,11 +435,6 @@ async fn health(State(st): State<AppState>) -> Json<Health> {
         features: magnetar_core::api::features::ALL
             .iter()
             .copied()
-            .chain(
-                st.dht
-                    .is_some()
-                    .then_some(magnetar_core::api::features::DHT),
-            )
             .chain(
                 st.fleet
                     .enabled()
@@ -984,10 +970,6 @@ async fn stats(State(st): State<AppState>) -> ApiResult<Json<StatsResponse>> {
             None
         }
     };
-    let dht = match &st.dht {
-        Some(d) => Some(d.stats(st.store.pool()).await),
-        None => None,
-    };
     let workers = st.fleet.stats(st.store.pool(), magnetar_core::now()).await;
     let probe_backfill = st
         .fleet
@@ -1007,7 +989,7 @@ async fn stats(State(st): State<AppState>) -> ApiResult<Json<StatsResponse>> {
         crawler,
         search_index,
         liveness,
-        dht,
+        dht: None,
         workers,
         probe_backfill,
         probe_corrections,
@@ -1091,27 +1073,22 @@ async fn stats_health(State(st): State<AppState>) -> ApiResult<Json<StatsHealth>
         magnetar_core::now(),
     )
     .await?;
-    let mut h = (*h).clone();
-    // Live (the health answer is cached for a minute; the crawler's totals have their own).
-    if let Some(d) = &st.dht {
-        h.dht = Some(d.stats(st.store.pool()).await);
-    }
-    Ok(Json(h))
+    Ok(Json((*h).clone()))
 }
 
-/// The server itself, then each crawl worker (D102). Live counters since the start.
+/// The server itself (seed checks only: it does not crawl the DHT, D156), then each crawl
+/// worker (D102). Live counters since the start.
 pub fn crawl_machines(
-    dht: Option<&DhtService>,
     liveness: &LivenessService,
     fleet: &crate::fleet::Fleet,
     now: i64,
 ) -> Vec<MachineSources> {
-    let mut server = dht.and_then(|d| d.machine(now)).unwrap_or(MachineSources {
+    let server = MachineSources {
         name: "server".into(),
         kind: "server".into(),
+        seed_checks: liveness.checked_total(),
         ..Default::default()
-    });
-    server.seed_checks = liveness.checked_total();
+    };
     let mut out = vec![server];
     out.extend(fleet.machines(now));
     out
@@ -1128,7 +1105,7 @@ fn store_error(e: sqlx::Error) -> ApiError {
 /// `GET /api/v1/stats/sources` (D102).
 async fn stats_sources(State(st): State<AppState>) -> ApiResult<Json<CrawlSources>> {
     let now = magnetar_core::now();
-    let machines = crawl_machines(st.dht.as_deref(), &st.liveness, &st.fleet, now);
+    let machines = crawl_machines(&st.liveness, &st.fleet, now);
     let s = st
         .crawlmap
         .sources(st.store.pool(), machines, now)

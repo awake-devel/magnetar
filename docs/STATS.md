@@ -24,7 +24,9 @@ releases only. **Long-press** a value to open Search with it (plus the active fi
 
 **Activity.** Pick a metric and hours or days; pinch to zoom, drag sideways to pan, tap or
 press for a value. Counters are columns (one per hour or day, UTC buckets), gauges a line. With
-the DHT crawler on, its metrics are offered too (`dht_blocked` is a count only).
+feature `dht`, the DHT metrics are offered too (`dht_blocked` is a count only). Since D156 the
+server never crawls the DHT and never lists that feature, so these metrics are not offered:
+a known limitation until they are derived from worker data (docs/ROADMAP.md).
 
 **Health.** Seed checks are one bar of the latest result of the torrents checked at least once
 (seeded / dead / no answer); *not checked yet* is a separate line, since it is not a result.
@@ -71,9 +73,12 @@ series 1 min, health 30 s, graphs 5 min, the swarm graph 30 s since a seed check
 Fields: `language`, `subtitles`, `resolution`, `source`, `codec`, `hdr`, `audio`, `channels`,
 `category`, `subcategory` (the publisher's `tcat` path), `genre`, `year`, `media_kind`,
 `edition`, `format`, `group`, `file_group`, `file_kind` (D139, below), `origin` (Nostr / DHT,
-D73; a torrent known from both counts under each). `top` default 10, max 50. Timeseries metrics also include the DHT crawler's
+D73; a torrent known from both counts under each). `top` default 10, max 50. Timeseries metrics also include the DHT series
 `dht_torrents_added`, `dht_hashes_seen`, `dht_fetch_ok`, `dht_fetch_fail`, `dht_blocked`
-(D74); `/api/v1/stats/health` carries `dht` (`DhtStats`) when the crawler runs.
+(D74). Since D156 only `dht_torrents_added` is still written (by the insert trigger); the
+other four were written by the server's own crawler, which is removed, and keep only their
+history. `dht` (`DhtStats`) in `/api/v1/stats/health` and `/api/v1/stats` is always null:
+workers report their DHT counters in `workers[].dht`.
 
 ```json
 {"total": 501522, "computed_at": 1793000000,

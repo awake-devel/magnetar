@@ -1,11 +1,9 @@
-//! Postgres side of the DHT pipeline (docs/DHT.md §3.7, D55): triage of sighted hashes against
-//! `blocked_infohashes`, `torrent_infohashes` and `dht_seen`, the persisted queue (`dht_seen`
-//! leases and retries), and the node identity / saved contacts in `settings`.
+//! Postgres side of DHT triage (docs/DHT.md §3.7, D55): sighted hashes against
+//! `blocked_infohashes`, `torrent_infohashes` and `dht_seen`, and the persisted queue (`dht_seen`
+//! leases and retries). The fleet ingest calls it for the crawl workers (D113, D156).
 
-use std::net::{Ipv4Addr, SocketAddrV4};
-
-use magnetar_core::dht::{CompactNode, Identity, Via};
-use serde::{Deserialize, Serialize};
+use magnetar_core::dht::Via;
+use serde::Serialize;
 use sqlx::PgPool;
 
 /// A queued row's lease: a fetch that never ran comes due again after this.
@@ -14,11 +12,8 @@ pub const LEASE_SECS: i64 = 3600;
 pub const ANNOUNCE_RETRY_SECS: i64 = 600;
 /// Backoff after the 1st, 2nd, 3rd failed fetch; the 4th is final.
 pub const BACKOFF_SECS: [i64; 3] = [3600, 6 * 3600, 24 * 3600];
-pub const RETRY_BATCH: i64 = 1000;
 
 pub const STATUS_QUEUED: i16 = 0;
-pub const STATUS_FAILED: i16 = 2;
-pub const STATUS_SKIPPED_KNOWN: i16 = 7;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct TriageOutcome {
@@ -65,11 +60,11 @@ pub const TAKEOVER_GRACE_SECS: i64 = LEASE_SECS;
 
 /// [`triage_geo`] on behalf of `holder` (D113): the rows it queues (new, or due again) record
 /// that crawl worker as their holder, so only it may upload a dict or a status for them. None =
-/// the server's own crawler.
+/// no holder (the server's own crawler before D156; tests).
 ///
 /// A due row held by another worker is re-queued for `holder` only once it is
 /// [`TAKEOVER_GRACE_SECS`] past due (its holder is gone); NULL-holder rows, the holder's own
-/// rows and the server's own triage (`holder` None) are not held back. `new_limit` caps the
+/// rows and a triage without a holder (`holder` None) are not held back. `new_limit` caps the
 /// rows this call may create (the hourly per-worker cap, D113; None = no cap); re-queued rows
 /// do not count.
 pub async fn triage_for(
@@ -168,227 +163,4 @@ pub async fn triage_for(
         fresh,
         capped,
     })
-}
-
-/// Rows due again (expired lease or failure backoff), at most `limit`: known/blocked ones are
-/// settled (known → final `skipped_known`, blocked → deleted), the rest get a new lease and are
-/// returned with their `via` code. The server's crawler takes them over: a worker that held one
-/// no longer does (D113).
-pub async fn take_due(pool: &PgPool, now: i64, limit: i64) -> sqlx::Result<Vec<([u8; 20], i16)>> {
-    let rows: Vec<(Vec<u8>, i16)> = sqlx::query_as(
-        r#"
-        WITH due AS (
-            SELECT infohash FROM dht_seen
-            WHERE next_attempt_at IS NOT NULL AND next_attempt_at <= $1
-            ORDER BY next_attempt_at LIMIT $2
-            FOR UPDATE SKIP LOCKED
-        ), cls AS (
-            SELECT d.infohash,
-                   EXISTS (SELECT 1 FROM blocked_infohashes b
-                           WHERE b.infohash = encode(d.infohash, 'hex') COLLATE "C") AS blocked,
-                   EXISTS (SELECT 1 FROM torrent_infohashes t
-                           WHERE t.infohash = encode(d.infohash, 'hex') COLLATE "C") AS known
-            FROM due d
-        ), gone AS (
-            DELETE FROM dht_seen s USING cls WHERE s.infohash = cls.infohash AND cls.blocked
-        ), settled AS (
-            UPDATE dht_seen s SET status = 7, next_attempt_at = NULL
-            FROM cls WHERE s.infohash = cls.infohash AND cls.known AND NOT cls.blocked
-        )
-        UPDATE dht_seen s SET status = 0, last_seen = $1, next_attempt_at = $1 + $3,
-            holder = NULL
-        FROM cls WHERE s.infohash = cls.infohash AND NOT cls.known AND NOT cls.blocked
-        RETURNING s.infohash, s.via
-        "#,
-    )
-    .bind(now)
-    .bind(limit)
-    .bind(LEASE_SECS)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|(h, v)| Some((<[u8; 20]>::try_from(h.as_slice()).ok()?, v)))
-        .collect())
-}
-
-/// A fetch failed (`error` is a short code: no_peers, connect, timeout, …): back off 1 h, 6 h,
-/// 24 h, then never again (4 attempts).
-pub async fn mark_failed(
-    pool: &PgPool,
-    info_hash: &[u8; 20],
-    error: &str,
-    now: i64,
-) -> sqlx::Result<()> {
-    mark_failed_batch(pool, &[(*info_hash, error.to_string(), now)]).await?;
-    Ok(())
-}
-
-/// [`mark_failed`] for many hashes in one statement (D93: the collectors hand their outcomes to
-/// a writer task instead of waiting ~1 s each on a single-row UPDATE). A hash listed `n` times
-/// ends exactly as after `n` single calls in order: `attempts + n`, the backoff of that attempt
-/// counted from its last time, its last error. Returns the rows updated.
-pub async fn mark_failed_batch(
-    pool: &PgPool,
-    items: &[([u8; 20], String, i64)],
-) -> sqlx::Result<u64> {
-    if items.is_empty() {
-        return Ok(0);
-    }
-    let mut by: std::collections::BTreeMap<[u8; 20], (i32, &str, i64)> = Default::default();
-    for (h, err, at) in items {
-        let e = by.entry(*h).or_insert((0, err, *at));
-        e.0 += 1;
-        e.1 = err;
-        e.2 = *at;
-    }
-    let hashes: Vec<Vec<u8>> = by.keys().map(|h| h.to_vec()).collect();
-    let errs: Vec<&str> = by.values().map(|v| v.1).collect();
-    let ats: Vec<i64> = by.values().map(|v| v.2).collect();
-    let ns: Vec<i32> = by.values().map(|v| v.0).collect();
-    let r = sqlx::query(
-        r#"
-        UPDATE dht_seen s SET status = 2, attempts = s.attempts + u.n,
-            last_error = left(u.err, 32),
-            next_attempt_at = CASE s.attempts + u.n WHEN 1 THEN u.at + $5 WHEN 2 THEN u.at + $6
-                                                    WHEN 3 THEN u.at + $7 ELSE NULL END
-        FROM unnest($1::bytea[], $2::text[], $3::int8[], $4::int4[]) AS u(h, err, at, n)
-        WHERE s.infohash = u.h
-        "#,
-    )
-    .bind(&hashes)
-    .bind(&errs)
-    .bind(&ats)
-    .bind(&ns)
-    .bind(BACKOFF_SECS[0])
-    .bind(BACKOFF_SECS[1])
-    .bind(BACKOFF_SECS[2])
-    .execute(pool)
-    .await?;
-    Ok(r.rows_affected())
-}
-
-/// Hashes an announce reached after the seen filter (D93): their `dht_seen` row says so, so a
-/// retry comes back as an announce (whatever the row's status: the fetch may already have
-/// finished when this is written).
-pub async fn set_via_announce(pool: &PgPool, hashes: &[[u8; 20]]) -> sqlx::Result<u64> {
-    if hashes.is_empty() {
-        return Ok(0);
-    }
-    let v: Vec<Vec<u8>> = hashes.iter().map(|h| h.to_vec()).collect();
-    let r = sqlx::query("UPDATE dht_seen SET via = 1 WHERE infohash = ANY($1) AND via <> 1")
-        .bind(&v)
-        .execute(pool)
-        .await?;
-    Ok(r.rows_affected())
-}
-
-pub fn via_from_code(code: i16) -> Via {
-    match code {
-        1 => Via::Announce,
-        2 => Via::GetPeers,
-        _ => Via::Sample,
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct IdentityJson {
-    external_ip: String,
-    ids: Vec<String>,
-    ports: Vec<u16>,
-}
-
-pub const IDENTITY_KEY: &str = "dht.identity";
-pub const NODES_KEY: &str = "dht.nodes";
-
-async fn get_setting(pool: &PgPool, key: &str) -> sqlx::Result<Option<String>> {
-    sqlx::query_scalar("SELECT value FROM settings WHERE key = $1")
-        .bind(key)
-        .fetch_optional(pool)
-        .await
-}
-
-async fn put_setting(pool: &PgPool, key: &str, value: &str) -> sqlx::Result<()> {
-    sqlx::query(
-        "INSERT INTO settings (key, value) VALUES ($1, $2)
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-    )
-    .bind(key)
-    .bind(value)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// The saved identity, only when it was made for the same ports (another port set means
-/// another deployment of virtual nodes; the ids are derived again).
-pub async fn load_identity(pool: &PgPool, ports: &[u16]) -> sqlx::Result<Option<Identity>> {
-    let Some(raw) = get_setting(pool, IDENTITY_KEY).await? else {
-        return Ok(None);
-    };
-    let Ok(j) = serde_json::from_str::<IdentityJson>(&raw) else {
-        return Ok(None);
-    };
-    let Ok(ip) = j.external_ip.parse::<Ipv4Addr>() else {
-        return Ok(None);
-    };
-    if j.ports != ports {
-        return Ok(None);
-    }
-    let ids: Vec<[u8; 20]> = j
-        .ids
-        .iter()
-        .filter_map(|h| hex::decode(h).ok()?.try_into().ok())
-        .collect();
-    Ok(Some(Identity {
-        external_ip: ip,
-        ids,
-    }))
-}
-
-pub async fn save_identity(pool: &PgPool, id: &Identity, ports: &[u16]) -> sqlx::Result<()> {
-    let j = IdentityJson {
-        external_ip: id.external_ip.to_string(),
-        ids: id.ids.iter().map(hex::encode).collect(),
-        ports: ports.to_vec(),
-    };
-    put_setting(
-        pool,
-        IDENTITY_KEY,
-        &serde_json::to_string(&j).expect("json"),
-    )
-    .await
-}
-
-/// Saved contacts as `"<hex id>@<ip>:<port>"`.
-pub async fn load_nodes(pool: &PgPool) -> sqlx::Result<Vec<CompactNode>> {
-    let Some(raw) = get_setting(pool, NODES_KEY).await? else {
-        return Ok(Vec::new());
-    };
-    let list: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
-    Ok(list
-        .iter()
-        .filter_map(|s| {
-            let (id, addr) = s.split_once('@')?;
-            Some(CompactNode {
-                id: hex::decode(id).ok()?.try_into().ok()?,
-                addr: addr.parse::<SocketAddrV4>().ok()?,
-            })
-        })
-        .take(1000)
-        .collect())
-}
-
-pub async fn save_nodes(pool: &PgPool, nodes: &[CompactNode]) -> sqlx::Result<()> {
-    let list: Vec<String> = nodes
-        .iter()
-        .take(1000)
-        .map(|n| format!("{}@{}", hex::encode(n.id), n.addr))
-        .collect();
-    put_setting(
-        pool,
-        NODES_KEY,
-        &serde_json::to_string(&list).expect("json"),
-    )
-    .await
 }

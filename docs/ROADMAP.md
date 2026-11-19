@@ -102,6 +102,14 @@ dub, …) from bytes a probe already fetches (docs/PROBES.md §11). Deferred, wi
   offers as a filter).
 - Kinds of files the probe did not target: the filter sees probed files only (up to 8 targets).
 
+### DHT activity charts from worker data
+Since D156 the server does not crawl the DHT, so it never lists feature `dht` and `stats.dht`
+is always null: web and Android no longer offer the DHT activity charts or the crawler lines,
+and the series `dht_hashes_seen`, `dht_fetch_ok`, `dht_fetch_fail` and `dht_blocked` have no
+writer (`dht_torrents_added` is still fed by the insert trigger). To do: advertise the feature
+when workers feed DHT torrents, and derive the series from the server's acks to workers.
+Not designed yet.
+
 ### DHT engine: collapse at extreme settings
 At 8 nodes, 10,000 q/s and 8,192 lookups, both the D106 engine and the code before it sometimes
 fall to about 20 % of their query cap, with the transaction map full (`busy`). Production runs far

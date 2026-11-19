@@ -17,7 +17,8 @@ enums in `snake_case`). Checked for the app rebuild in 2026-10 (D77).
   hides what the server does not list. Since this stage: `saved_search_poll` (D77) and
   `browse_checked_dht` (D76), next to `filters`, `facet_set`, `media_releases`,
   `liveness_history`, `stats`, `graphs`, `adult_filter`, `origin`, `crawl_sources`, `crawl_map`
-  (D102, D103), and `dht` (crawler on).
+  (D102, D103), and `dht` (the server's own DHT crawler on: never listed since D156, which
+  removed that crawler; `dht` in the stats answers is then always null).
 - `status` is `"ok"`, or `"degraded"` when a background loop (crawler, seed checker, router
   health probe, …) exited or panicked while the server runs (D147). Which one is only in the
   server log: `/health` needs no token. `db` stays the database check.

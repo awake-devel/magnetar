@@ -1,7 +1,7 @@
 //! Fetch results → Postgres (docs/DHT.md §2.4, D50, D53): verified torrents into `dht_torrents`
 //! and `torrent_attrs`, final statuses and backoff into `dht_seen`, blocked hashes into
-//! `blocked_infohashes`. One transaction per batch (at most [`BATCH_MAX`] results or
-//! [`BATCH_WAIT`]), one savepoint per result: a row the database refuses is skipped and its
+//! `blocked_infohashes`. One transaction per batch (at most [`BATCH_MAX`] results), one
+//! savepoint per result: a row the database refuses is skipped and its
 //! hash closed as invalid (`store_error`), the rest of the batch is written (D110).
 //!
 //! Order per verified torrent (D53): the content screen runs **before** any statement that
@@ -9,7 +9,6 @@
 //! (fail closed, `screen.rs`). Nothing here logs a name or path.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use magnetar_core::classify::{CLASSIFIER_VERSION, Classification};
 use magnetar_core::dht::Via;
@@ -26,7 +25,6 @@ use super::screen::{Screen, UNSCREENED_RETRY_SECS, Verdict};
 use super::store::BACKOFF_SECS;
 
 pub const BATCH_MAX: usize = 500;
-pub const BATCH_WAIT: Duration = Duration::from_secs(1);
 /// `dht_torrents.files` keeps the first this many files (`file_count` has the real count).
 pub const FILES_MAX: usize = 5000;
 /// `dht_torrents.files_text` keeps the first this many bytes of the paths.
@@ -157,7 +155,7 @@ async fn set_final(
     Ok(())
 }
 
-/// Same backoff as `store::mark_failed` (1 h, 6 h, 24 h, then never), inside the batch.
+/// A failed fetch backs off 1 h, 6 h, 24 h, then never again (4 attempts), inside the batch.
 async fn set_failed(
     tx: &mut Transaction<'_, Postgres>,
     h: &[u8; 20],
@@ -443,7 +441,8 @@ pub async fn persist_batch(
 }
 
 /// [`persist_batch`] for dicts a crawl worker supplied (D113): each new `dht_torrents` row
-/// records it in `supplied_by` (None = the server's own crawler), so what one worker token
+/// records it in `supplied_by` (None = no worker: rows of the server's own crawler before
+/// D156), so what one worker token
 /// added can be found and removed.
 pub async fn persist_batch_from(
     pool: &PgPool,

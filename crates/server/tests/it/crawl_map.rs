@@ -670,7 +670,6 @@ async fn worker_triage_codes() {
     let old: TriageRequest =
         serde_json::from_str(r#"{"items":[{"h":"00","via":"sample"}]}"#).unwrap();
     assert!(old.geo_nodes.is_empty() && old.items[0].cc.is_none());
-    let machines =
-        magnetar_server::api::crawl_machines(None, &Default::default(), &Fleet::default(), 0);
+    let machines = magnetar_server::api::crawl_machines(&Default::default(), &Fleet::default(), 0);
     assert_eq!(machines.len(), 1);
 }

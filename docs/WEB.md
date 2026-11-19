@@ -360,7 +360,7 @@ bucket, `stats/sources`, `stats/fleet`) and shown offline with its age.
   bar, slice or year adds a cross-filter chip and recounts every other chart (a newer click aborts
   the older request); "Search these" and "Clear". The secondary "Search for X" is a search button
   on each value (shown on hover or focus) and a 500 ms long press on touch; a publisher category
-  becomes the search text. Activity: metric chips (DHT ones with `dht`, "Probe backfill DHT rows"
+  becomes the search text. Activity: metric chips (DHT ones with `dht`, a feature the server never lists since D156; "Probe backfill DHT rows"
   when the server sends probe backfill counts), Days / Hours (remembered), an SVG line (gauges) or
   columns (counters), the axis ends naming the day in Hours and on the 48 h columns ("Mon 17:00"); click or arrow keys read a value, the wheel zooms, a drag pans, double-click
   resets. "Where discoveries come from" (`sources-card.js`, `crawl_sources`): DHT routes with seen /
