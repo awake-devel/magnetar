@@ -840,3 +840,47 @@ async fn continuous_crawl_rotates_through_new_and_idle_relays() {
     assert_eq!(conns(&late), 1);
     assert_eq!(idle.iter().map(conns).sum::<usize>(), 5);
 }
+
+/// D151: one second holding more events than the relay's page size. The page after it
+/// (`until` inclusive) is the same page again, with nothing new; the sweep must step below
+/// that second and go on, not call the history done with everything older unread.
+#[tokio::test]
+async fn a_full_page_in_one_second_does_not_end_the_backfill() {
+    let publisher = Keys::generate();
+    let t0 = now();
+    let burst_at = t0 - 1000;
+    // 150 torrents in one second (the fake relay returns 100 per page), then 50 older ones.
+    let burst: Vec<RawEvent> = (0..150).map(|i| torrent(&publisher, i, burst_at)).collect();
+    let older: Vec<RawEvent> = (0..50)
+        .map(|i| torrent(&publisher, 1000 + i, burst_at - 100 - i64::from(i)))
+        .collect();
+    let mut events = burst.clone();
+    events.extend(older.iter().cloned());
+    let relay = FakeRelay::start(events, Behaviour::default()).await;
+    let store = MemStore::default();
+    let mut c = cfg(&[&relay.url]);
+    c.max_backfill_pages = 10;
+    let r = crawl_once(&store, &c).await.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let stored: HashSet<String> = store.with(|i| i.torrents.keys().cloned().collect());
+    let missing = older.iter().filter(|e| !stored.contains(&e.id)).count();
+    assert_eq!(missing, 0, "older history was skipped: {r:?}");
+    // The first page of the burst is stored; the 50 beyond the relay's page size in that
+    // second cannot be reached by time paging.
+    assert_eq!(store.torrent_count(), 100 + 50);
+    assert!(
+        store
+            .cursor(&relay.url, KIND_TORRENT)
+            .unwrap()
+            .backfill_done
+    );
+    // And the paging still ends: a second run adds nothing and asks only a few pages.
+    let before = relay.reqs().len();
+    let r2 = crawl_once(&store, &c).await.unwrap();
+    assert_eq!(r2.inserted, 0, "{r2:?}");
+    assert!(
+        relay.reqs().len() - before <= 8,
+        "{} REQs",
+        relay.reqs().len() - before
+    );
+}
