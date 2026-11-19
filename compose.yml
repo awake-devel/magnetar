@@ -19,7 +19,9 @@ services:
     volumes:
       # postgres:18 keeps PGDATA in /var/lib/postgresql/18/docker: mount the parent so a
       # future major upgrade (pg_upgrade --link) sees both versions on one volume.
-      - db-data:/var/lib/postgresql
+      # MAGNETAR_DB_DIR=/absolute/path keeps the data in that host directory instead of the
+      # named volume (e.g. a fast internal disk when /var/lib/docker is on a slow one, D149).
+      - ${MAGNETAR_DB_DIR:-db-data}:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 10s

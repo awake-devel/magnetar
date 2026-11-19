@@ -81,7 +81,7 @@ services:
 
 | Data | Where | Back it up? |
 |---|---|---|
-| Postgres (events, torrents, trust, settings) | volume `<project>_db-data` → `/var/lib/postgresql` | yes, with `pg_dump` (below) |
+| Postgres (events, torrents, trust, settings) | volume `<project>_db-data` → `/var/lib/postgresql`, or the host directory `MAGNETAR_DB_DIR` (D149) | yes, with `pg_dump` (below) |
 | Downloads | `/data/downloads` in volume `<project>_magnetar-data`, or `MAGNETAR_DATA` | your call |
 | librqbit session (resumes downloads) | `/data/state/magnetar/downloads` (`XDG_STATE_HOME=/data/state`) | no, it is rebuilt |
 | Search index (D43, docs/SEARCH.md) | `/data/state/magnetar/search-index` | no, rebuilt from Postgres in the background when missing (searches use Postgres meanwhile) |
@@ -201,6 +201,29 @@ ssh (`MAGNETAR_BACKUP_DEST=host:/dir`), written as a `.part` file and renamed on
 file). Measured on 2026-11-01: a 9.5 GB database (446 k torrents) dumps to 1.7 GB in 4.5 min
 over ssh; `pg_restore -l` on the copy lists all 48 tables. Keep the dumps on another machine
 than the one running the stack.
+
+## Moving the database to another disk
+
+`MAGNETAR_DB_DIR` (D149) puts the Postgres files in a host directory instead of the `db-data`
+volume, for instance on an internal SSD when `/var/lib/docker` sits on a slower USB disk. With
+the database stopped, copy the volume, check the copy, then switch:
+
+```sh
+sudo docker compose stop magnetar db
+sudo mkdir -p /fast/magnetar-db
+sudo rsync -aHAX --numeric-ids /var/lib/docker/volumes/<project>_db-data/_data/ /fast/magnetar-db/
+# No output = identical (checksums of every file):
+sudo rsync -anc --itemize-changes --numeric-ids \
+  /var/lib/docker/volumes/<project>_db-data/_data/ /fast/magnetar-db/ | grep -v '^\.d'
+echo 'MAGNETAR_DB_DIR=/fast/magnetar-db' >> .env
+sudo docker compose up -d db      # then check a row count before starting magnetar
+sudo docker compose up -d magnetar
+```
+
+Keep the old volume until the new copy has run for a while; remove it with
+`sudo docker volume rm <project>_db-data`. Removing `MAGNETAR_DB_DIR` goes back to the volume
+as it was at the copy. On a filesystem without POSIX permissions (exFAT, most network
+shares) Postgres refuses to start.
 
 ## Using an existing Postgres container or volume
 
