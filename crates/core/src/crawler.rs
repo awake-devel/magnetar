@@ -109,16 +109,6 @@ impl CrawlConfig {
             root: None,
         }
     }
-    pub fn phone_default() -> Self {
-        Self {
-            max_relays: 8,
-            explore_relays: 2,
-            budget: Duration::from_secs(120),
-            max_backfill_pages: 10,
-            concurrency: 3,
-            ..Self::server_default()
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]

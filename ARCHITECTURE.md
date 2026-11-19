@@ -169,6 +169,7 @@ fix one of them in the same change.
 | D151 | **A full page in one second no longer ends a sweep** (bug review 2026-11-18, `crawler.rs` pager, D8). Found by reading, reproduced with the fake relay: `until` is inclusive, so when one second holds at least a page of events the next page is the same page again, with nothing new, and the pager called the sweep exhausted; the backfill was then marked done with all older history unread (150 events in one second on a 100-per-page relay: the 50 older torrents were never fetched). Now a page with nothing new that is as long as the previous page and lies in a single second is treated as possibly cut: `until` steps below that second and the pager asks again; any other all-seen page still ends the sweep, so the usual end costs no extra request. Events of that second beyond the relay's page size stay unreachable by time paging (NIP-01 has no cursor). Test: `crawler::a_full_page_in_one_second_does_not_end_the_backfill` (fails on the old pager: 50 older torrents missing). |
 | D152 | **Clients treat an unknown origin as "other", not Nostr** (plan P1, ahead of the provenance work that adds sources). Found by reading: both clients fell through to Nostr for any `origin` they did not know (the web page's `default:` branches; Android's `coerceInputValues` turning an unknown enum value into the field default `NOSTR`), so a torrent from a future source would have shown a trust badge and a publisher card it does not have. Web: `hasPublisher(origin)` (none, `nostr`, `both`) gates the trust badge and card, `sourceLabel` answers "Other source", the result row shows a neutral "Other" chip. Android: `Origin.OTHER` with `OriginSerializer` (unknown string → `OTHER`, absent → `NOSTR` as before), `Origin.hasPublisher`, a neutral `SourceChip`. No server change: the server still sends `nostr`, `dht` or `both`. Shipped before the server can send anything else because the app is the slow client to update. Tests: `labels.test.js` (sourceLabel, hasPublisher), `MagnetarApiTest.unknownOriginIsOtherNotNostr`. |
 | D153 | **The web cookie opens a list of routes, not "everything but a few"** (plan P1). Found by reading: `web_auth::cookie_allowed` (D133) accepted any `/api/v1/` path except the worker routes, `events/batch` and `downloads*`, so every route added later was reachable with the cookie unless someone remembered to exclude it; the public edge (P1.5) adds routes. It is now two lists, exact paths (`search`, `facets`, `probe/file-kinds`, `stats`, `settings/trust`, `saved-searches`) and prefixes (`torrents/`, `media/`, `stats/`, `graphs/`, `saved-searches/`): exactly what `crates/server/web/js` calls. Behaviour change: the cookie no longer opens `GET`/`PUT /api/v1/relays`, `GET /api/v1/trust/{pubkey}` and `PUT /api/v1/overrides/{pubkey}` (401 without a bearer token); the web UI calls none of them, the Android app uses the bearer token. A new web feature must add its route to the list. | `web_auth::tests::cookie_values_and_paths` (every web route allowed; relays, trust, overrides, an unlisted route and near-miss names refused), `it::web::cookie_sessions_and_csrf` (relays, trust and overrides answer 401 with a valid cookie); both fail on 74e9f0a |
+| D154 | **Phone-era code with no caller is deleted** (plan P1). Since D79 no phone crawls, syncs or checks seeds, but `crates/core` still carried the client side. Checked with a search of every crate and the Android sources: each item below was called only by its own tests. Deleted: `sync::{sync_up, SyncSource, SyncReport}` with its private WebSocket client and `tests/it/sync_up.rs`; `CrawlConfig::phone_default` (the rotation test now sets 8 slots / 2 exploration itself); `liveness::run_due` and the test-only `FakeStore` it needed. Kept: `sync::NegResponder` (the server's `/relay` uses it), `ApiClient` (server tests use it), the `Store` trait. Not decided here: `/relay` and `POST /api/v1/events/batch` have no client of ours left; removing them is an API change and is left to the public-edge work. About 1,130 lines removed. No behaviour change. | the workspace builds with clippy `-D warnings` (dead code is an error); `it::crawler::seeds_beyond_the_cap_are_rotated_in_not_cut`, `it::sync_negentropy::*` unchanged in what they check |
 ---
 
 ## 1. Repository layout
@@ -220,7 +221,7 @@ core/src/
   release.rs        release attributes from names + files, no deps (D44, docs/FILTERS.md)
   wot.rs            follow/mute/report extraction from kinds 3/10000/30007/1984/10002 [trust-sync]
   trust.rs          score computation (pure) + TrustEngine<S>                  [trust-sync]
-  sync.rs           negentropy initiator (Up) + batch fallback, SyncSource trait [trust-sync]
+  sync.rs           negentropy responder for the server's /relay (client deleted, D154)
   notify.rs         ntfy publisher + SavedSearch evaluation helpers            [trust-sync]
   liveness/mod.rs   check_batch + Scraper (per-tracker state, D45), next_check, aggregation [liveness]
   liveness/bencode.rs  lenient decoder                                         [liveness]
@@ -463,8 +464,7 @@ pub struct PublisherStats { pub first_seen: Option<i64>, pub torrent_count: u64,
 pub struct StoreStats { pub torrents: u64, pub events: u64, pub publishers: u64, pub comments: u64,
     pub relays: u64, pub unsynced: u64, pub db_bytes: u64 }
 ```
-`SqliteStore` adds phone-only inherent methods (not in the trait): pin/hide flags, `sync_ids`,
-`unsynced_ids`, `mark_synced`, `cleanup(cap_bytes)`, `touch(infohash)` for LRU.
+The phone store (`SqliteStore`) and its phone-only methods went with the ffi crate (D79).
 
 Setting keys: `trust.root` (hex), `trust.threshold` (int, default 20), `crawl.seed_relays` (JSON array),
 `liveness.enabled` (bool), `ntfy.url`, `ntfy.topic`.
@@ -572,24 +572,12 @@ standard prefixes (`duplicate:`, `invalid:`, `blocked:`).
 
 ---
 
-## 7. Sync (phone → server), `core::sync` — no phone client since D79 (the app no longer crawls)
+## 7. Sync (phone → server), `core::sync` — client deleted (D79, D154)
 
-```rust
-#[async_trait::async_trait]
-pub trait SyncSource: Send + Sync {
-    async fn neg_items(&self) -> Result<Vec<(u64, [u8; 32])>>;   // from sync_ids (all, incl. evicted bodies)
-    async fn load_events(&self, ids: &[String]) -> Result<Vec<RawEvent>>;
-    async fn unsynced(&self, limit: usize) -> Result<Vec<RawEvent>>;
-    async fn mark_synced(&self, ids: &[String]) -> Result<()>;
-    async fn record_failure(&self, id: &str, reason: &str) -> Result<()>;
-}
-pub struct SyncReport { pub method: String /* "negentropy"|"batch" */, pub have: u64, pub uploaded: u64,
-                        pub duplicates: u64, pub failed: u64, pub need_ignored: u64, pub error: Option<String> }
-pub async fn sync_up<S: SyncSource>(src: &S, relay_ws_url: &str, api: &ApiClient) -> Result<SyncReport>;
-```
-Flow per D13–D15. Filter `{"kinds":[2003,2004,1111]}`. Upload window 50. Then the phone store's
-`cleanup(cap_bytes)` evicts **only** `synced=1 AND pinned=0` torrent bodies by LRU (`last_access`)
-until under cap; `sync_ids` rows are kept. Unsynced rows are never deleted (unit-tested invariant).
+The phone-side client (`SyncSource`, `SyncReport`, `sync_up`) is gone: no phone has crawled
+since D79, and D154 deleted the code. `core::sync` keeps `NegResponder` and `FRAME_SIZE_LIMIT`,
+which the server's `/relay` endpoint uses to answer NIP-77 (D13–D15). `/relay` and
+`POST /api/v1/events/batch` still exist on the server and have no client of ours.
 
 ---
 

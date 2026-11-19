@@ -426,7 +426,9 @@ async fn metadata_hints_and_discovery() {
 async fn live_crawl_oxtr_and_nos_lol() {
     magnetar_core::http::install_crypto_provider();
     let store = MemStore::default();
-    let mut c = CrawlConfig::phone_default();
+    let mut c = CrawlConfig::server_default();
+    c.max_backfill_pages = 10;
+    c.concurrency = 3;
     c.seed_relays = vec!["wss://nostr.oxtr.dev".into(), "wss://nos.lol".into()];
     c.max_relays = 2;
     c.budget = Duration::from_secs(60);
@@ -500,9 +502,11 @@ async fn select_caps_dedups_and_clamps_explore() {
 
 #[tokio::test]
 async fn seeds_beyond_the_cap_are_rotated_in_not_cut() {
-    // The phone shape: 12 default seeds, 8 slots, 2 of them for exploration.
+    // More seeds than slots: 12 default seeds, 8 slots, 2 of them for exploration.
     let store = MemStore::default();
-    let c = CrawlConfig::phone_default();
+    let mut c = CrawlConfig::server_default();
+    c.max_relays = 8;
+    c.explore_relays = 2;
     assert!(c.seed_relays.len() > c.max_relays);
     let first = select_relays(&store, &c, 1000).await.unwrap();
     assert_eq!(
