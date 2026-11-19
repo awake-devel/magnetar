@@ -16,6 +16,11 @@ under a name. If one exits or panics while the server runs, the log says which o
 and `GET /health` answers `"status": "degraded"` instead of `"ok"`. Nothing is restarted
 automatically, and the Docker healthcheck still looks only at the database.
 
+### Searches no longer hang while the search index rebuilds (D148)
+
+When the search index is off or still building, searches fall back to Postgres. Those queries
+now stop after 15 s and answer `timeout` (504), so a slow search cannot hold the database.
+
 ### Seed checks are always paced and braked (D146)
 
 With the DHT crawler off and `MAGNETAR_LIVENESS_DHT=false`, the seed checker used to scrape

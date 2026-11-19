@@ -36,10 +36,26 @@ pub struct PgStore {
     live: broadcast::Sender<RawEvent>,
     /// Tantivy index used by `search` once built (D43); attached by `serve`.
     search_index: Arc<OnceLock<Arc<SearchIndex>>>,
+    /// Statement timeout of the Postgres search fallback, ms (D148).
+    fallback_timeout_ms: u64,
 }
 
 pub(crate) fn db(e: sqlx::Error) -> Error {
     Error::Store(e.to_string())
+}
+
+/// Statement timeout of the Postgres search fallback (D148).
+pub const FALLBACK_SEARCH_TIMEOUT_MS: u64 = 15_000;
+
+/// A search fallback query cancelled by its statement timeout (SQLSTATE 57014) is a timeout,
+/// not a store failure.
+fn fallback_err(e: sqlx::Error, ms: u64) -> Error {
+    match &e {
+        sqlx::Error::Database(d) if d.code().as_deref() == Some("57014") => Error::Timeout(
+            format!("search fallback took over {ms} ms (the search index is not ready)"),
+        ),
+        _ => db(e),
+    }
 }
 
 /// Postgres text cannot hold NUL; everything else is kept verbatim.
@@ -357,7 +373,14 @@ impl PgStore {
             pool,
             live,
             search_index: Arc::default(),
+            fallback_timeout_ms: FALLBACK_SEARCH_TIMEOUT_MS,
         }
+    }
+
+    /// Another statement timeout for the Postgres search fallback (tests).
+    pub fn with_fallback_timeout_ms(mut self, ms: u64) -> Self {
+        self.fallback_timeout_ms = ms.max(1);
+        self
     }
 
     /// Route searches through `idx` once its first build is complete (D43). Only the first
@@ -1497,20 +1520,30 @@ impl Store for PgStore {
             }
         }
         // Postgres fallback (index disabled or still building): the count stops at a cap.
+        // Both queries run under a statement timeout (D148): while the index rebuilds every
+        // search lands here, and an unbounded scan of 2.4 M rows would hold a connection and
+        // the USB disk for minutes. A cancelled query answers `timeout` (504).
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .bind(self.fallback_timeout_ms.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
         let mut count = search::count_query(q, now, min_trust);
         let counted: i64 = count
             .build_query_scalar()
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await
-            .map_err(db)?;
+            .map_err(|e| fallback_err(e, self.fallback_timeout_ms))?;
         let lower_bound = counted > search::COUNT_CAP;
         let total = counted.min(search::COUNT_CAP);
         let mut rows = search::hits_query(q, now, min_trust);
         let hits: Vec<search::HitRow> = rows
             .build_query_as()
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await
-            .map_err(db)?;
+            .map_err(|e| fallback_err(e, self.fallback_timeout_ms))?;
+        tx.commit().await.map_err(db)?;
         let mut hits: Vec<TorrentSummary> = hits.into_iter().map(|h| h.into_summary(now)).collect();
         self.refine_origins(&mut hits).await?;
         Ok(SearchPage {

@@ -1035,3 +1035,28 @@ async fn adult_hidden_by_default_on_both_paths() {
     assert!(parsed.include_adult);
     drop(ix);
 }
+
+/// D148: the Postgres fallback runs under a statement timeout. A query stuck behind a lock (or
+/// a full scan while the index rebuilds) is cancelled and answers Timeout, not a long wait.
+#[tokio::test]
+async fn postgres_fallback_search_times_out() {
+    let Some(db) = test_db().await else { return };
+    let store = db.store.clone().with_fallback_timeout_ms(300);
+    // Hold an exclusive lock on the table the fallback reads, so its first query must wait.
+    let mut lock = db.store.pool().begin().await.unwrap();
+    sqlx::query("LOCK TABLE torrents IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let t = Instant::now();
+    let r = tokio::time::timeout(Duration::from_secs(10), store.search(&q("x"), 0)).await;
+    lock.rollback().await.unwrap();
+    let r = r.expect("the fallback search waited past the statement timeout");
+    assert!(
+        matches!(r, Err(magnetar_core::Error::Timeout(_))),
+        "want Timeout, got {r:?}"
+    );
+    assert!(t.elapsed() < Duration::from_secs(5));
+    // Once the lock is gone the same store searches normally.
+    assert_eq!(store.search(&q("x"), 0).await.unwrap().total, 0);
+}

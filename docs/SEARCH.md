@@ -82,7 +82,8 @@ lowest id (D6). Fields:
   infohashes in flight, documents added on blocking threads (`spawn_blocking`), never on the
   async runtime. Every 200 000 infohashes it commits with the keyset cursor in the commit
   payload, so a restart resumes instead of starting over. Searches use Postgres until the build
-  is complete; `/api/v1/stats` shows `search_index.build_done` / `build_total`.
+  is complete, each under a 15 s statement timeout (a slower one answers `timeout`, 504, D148);
+  `/api/v1/stats` shows `search_index.build_done` / `build_total`.
 - **Updates**: statement-level triggers append the infohashes touched by any write to
   `torrents`, `liveness`, `torrent_media`, `media` (only when kind, title, year, rating or genres
   change) and `local_overrides` to `search_changes`, an append-only log. The index loop reads up
