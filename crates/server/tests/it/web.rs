@@ -647,8 +647,13 @@ async fn cookie_sessions_and_csrf() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
 
-    // Routes the cookie never opens: workers, sync, downloads, the relay.
+    // Routes the cookie never opens: workers, sync, downloads, the relay, and the routes the
+    // web UI does not call (D153).
     for (m, path) in [
+        (Method::GET, "/api/v1/relays"),
+        (Method::PUT, "/api/v1/relays"),
+        (Method::GET, "/api/v1/trust/abc"),
+        (Method::PUT, "/api/v1/overrides/abc"),
         (Method::POST, "/api/v1/worker/heartbeat"),
         (Method::GET, "/api/v1/downloads"),
         (Method::POST, "/api/v1/downloads"),

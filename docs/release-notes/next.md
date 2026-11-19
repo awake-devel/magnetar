@@ -77,3 +77,6 @@ load.
 - docs/DOCKER.md recommends `tailscale serve --https=8443` and checking `tailscale serve
   status` first: serving on a used port replaces what was there (D146).
 - README brought up to date with v0.3.2 (workers, DHT crawler, enrichment, D137–D145).
+- The web session cookie now opens only the routes the web page uses. `/api/v1/relays`,
+  `/api/v1/trust/*` and `/api/v1/overrides/*` need the bearer token, like any route added
+  later (D153).

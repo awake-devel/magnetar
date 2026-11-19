@@ -349,9 +349,14 @@ unchanged: the app and the workers keep sending `Authorization: Bearer`.
   expiry, on sign-out, or when `MAGNETAR_API_TOKEN` changes.
 - `ntfy`: whether a topic is configured (the `ntfy.topic` setting or `MAGNETAR_NTFY_TOPIC`), so
   the UI can say whether saved-search alerts go out. The web UI uses no browser push.
-- The cookie is accepted only on `/api/v1/…` routes, never on `/relay`, `/api/v1/worker/*`,
-  `/api/v1/events/batch` or `/api/v1/downloads*` (those need the bearer token), and only when
-  no `Authorization` header is sent (a wrong bearer token is not rescued by a cookie).
+- The cookie is accepted only on the routes the web UI calls (D153): `/api/v1/search`,
+  `/api/v1/facets`, `/api/v1/probe/file-kinds`, `/api/v1/stats` and `/api/v1/stats/*`,
+  `/api/v1/torrents/*`, `/api/v1/media/*`, `/api/v1/graphs/*`, `/api/v1/settings/trust`,
+  `/api/v1/saved-searches` and `/api/v1/saved-searches/*`. Every other route needs the bearer
+  token: `/relay`, `/api/v1/worker/*`, `/api/v1/events/batch`, `/api/v1/downloads*`,
+  `/api/v1/relays`, `/api/v1/trust/*`, `/api/v1/overrides/*`, and any route added later until
+  it is put on the list (`web_auth::cookie_allowed`). The cookie counts only when no
+  `Authorization` header is sent (a wrong bearer token is not rescued by a cookie).
 - CSRF: with the cookie, every method other than GET, HEAD and OPTIONS needs
   `X-CSRF-Token: <csrf>` and a `Sec-Fetch-Site` that is absent, `same-origin` or `none`;
   otherwise 403 `{"error": "forbidden", "message": "missing or bad CSRF token"}`.
