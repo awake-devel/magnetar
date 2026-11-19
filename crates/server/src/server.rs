@@ -131,6 +131,9 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
     };
 
     let (stop_tx, stop_rx) = watch::channel(false);
+    // Every background loop is named and watched (D147): one that exits or panics before
+    // shutdown is logged and makes /health answer "degraded".
+    let mut daemons = crate::supervise::Daemons::new(stop_rx.clone());
     // One DHT pace for the whole process (D109): the crawler's queries and the seed checker's
     // walks share it, so MAGNETAR_DHT_QPS is what the router sees, and the health probe slows
     // both. Its refill task runs here, outliving crawler restarts.
@@ -142,7 +145,7 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
         .map(|p| crate::dht::health::HealthHub::new(Some(p)));
     if let Some(p) = dht_pacer.clone() {
         let stop = stop_rx.clone();
-        tokio::spawn(async move { p.run(stop).await });
+        daemons.spawn("dht-pacer", async move { p.run(stop).await });
     }
     // Crawl map (D101–D105): counters by country / network; the database loads in the
     // background (download on first start), the map says "missing" meanwhile.
@@ -154,6 +157,7 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
         .with_downloader(downloader.clone())
         .with_tmdb(tmdb.clone())
         .with_fleet(fleet)
+        .with_daemon_health(daemons.health())
         .with_web(
             cfg.web_ui
                 .then(|| Arc::new(crate::web::WebState::from_config(&cfg))),
@@ -175,102 +179,122 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
     // D118: with MAGNETAR_NOSTR_CRAWL=false no relay is contacted (crawl, indexer metadata,
     // NIP-66 discovery); the saved-search notifier, which lives in the crawl loop, runs alone.
     let nostr = daemons::nostr_loops(&cfg);
-    let mut daemons = Vec::new();
     if nostr.crawl {
-        daemons.push(tokio::spawn(daemons::crawler_loop(
-            store.clone(),
-            cfg.clone(),
-            state.crawler.clone(),
-            stop_rx.clone(),
-        )));
+        daemons.spawn(
+            "nostr-crawler",
+            daemons::crawler_loop(
+                store.clone(),
+                cfg.clone(),
+                state.crawler.clone(),
+                stop_rx.clone(),
+            ),
+        );
     }
     if nostr.discovery {
-        daemons.push(tokio::spawn(discovery::discovery_loop(
-            store.clone(),
-            cfg.clone(),
-            stop_rx.clone(),
-        )));
+        daemons.spawn(
+            "nip66-discovery",
+            discovery::discovery_loop(store.clone(), cfg.clone(), stop_rx.clone()),
+        );
     }
     if nostr.notify_alone {
         tracing::info!(
             "Nostr relay crawl off (MAGNETAR_NOSTR_CRAWL=false): no relay crawl, indexer \
              metadata or NIP-66 discovery; saved-search notifications still run"
         );
-        daemons.push(tokio::spawn(daemons::notify_loop(
-            store.clone(),
-            cfg.clone(),
-            stop_rx.clone(),
-        )));
+        daemons.spawn(
+            "notify",
+            daemons::notify_loop(store.clone(), cfg.clone(), stop_rx.clone()),
+        );
     }
-    daemons.extend([
-        tokio::spawn(liveness::liveness_loop(
+    daemons.spawn(
+        "liveness",
+        liveness::liveness_loop(
             store.clone(),
             state.liveness.clone(),
             cfg.liveness_batch_size(),
             cfg.liveness_interval(),
             stop_rx.clone(),
-        )),
-        tokio::spawn(daemons::trust_loop(store.clone(), stop_rx.clone())),
-        tokio::spawn(enrich::enrich_loop(
-            store.clone(),
-            cfg.clone(),
-            stop_rx.clone(),
-        )),
-        tokio::spawn(attrs::backfill_loop(store.pool().clone(), stop_rx.clone())),
-        tokio::spawn(stats::stats_loop(store.pool().clone(), stop_rx.clone())),
-        tokio::spawn(enrich_anime::anime_loop(
-            store.pool().clone(),
-            cfg.clone(),
-            stop_rx.clone(),
-        )),
-    ]);
+        ),
+    );
+    daemons.spawn("trust", daemons::trust_loop(store.clone(), stop_rx.clone()));
+    daemons.spawn(
+        "enrich",
+        enrich::enrich_loop(store.clone(), cfg.clone(), stop_rx.clone()),
+    );
+    daemons.spawn(
+        "attrs-backfill",
+        attrs::backfill_loop(store.pool().clone(), stop_rx.clone()),
+    );
+    daemons.spawn(
+        "stats",
+        stats::stats_loop(store.pool().clone(), stop_rx.clone()),
+    );
+    daemons.spawn(
+        "anime",
+        enrich_anime::anime_loop(store.pool().clone(), cfg.clone(), stop_rx.clone()),
+    );
     if let Some(svc) = &state.dht {
-        daemons.push(tokio::spawn(crate::dht::dht_loop(
-            store.pool().clone(),
-            cfg.clone(),
-            svc.clone(),
-            (geo_cfg.mode != GeoMode::Off).then(|| crawlmap.clone()),
-            dht_pacer.clone(),
-            dht_health.clone(),
-            stop_rx.clone(),
-        )));
+        daemons.spawn(
+            "dht-crawler",
+            crate::dht::dht_loop(
+                store.pool().clone(),
+                cfg.clone(),
+                svc.clone(),
+                (geo_cfg.mode != GeoMode::Off).then(|| crawlmap.clone()),
+                dht_pacer.clone(),
+                dht_health.clone(),
+                stop_rx.clone(),
+            ),
+        );
     }
     if let Some(hub) = dht_health.clone() {
-        daemons.push(tokio::spawn(crate::dht::health::health_loop(
-            crate::dht::health::parse_targets(&cfg.dht_probe),
-            hub,
-            stop_rx.clone(),
-        )));
+        daemons.spawn(
+            "router-health",
+            crate::dht::health::health_loop(
+                crate::dht::health::parse_targets(&cfg.dht_probe),
+                hub,
+                stop_rx.clone(),
+            ),
+        );
     }
-    daemons.push(tokio::spawn(crawlmap::refresh_loop(
-        crawlmap.clone(),
-        geo_cfg.clone(),
-        stop_rx.clone(),
-    )));
+    daemons.spawn(
+        "crawlmap-refresh",
+        crawlmap::refresh_loop(crawlmap.clone(), geo_cfg.clone(), stop_rx.clone()),
+    );
     {
         let (dht, liveness, fleet) = (
             state.dht.clone(),
             state.liveness.clone(),
             state.fleet.clone(),
         );
-        daemons.push(tokio::spawn(crawlmap::server_loop(
-            crawlmap.clone(),
-            store.pool().clone(),
-            move || api::crawl_machines(dht.as_deref(), &liveness, &fleet, magnetar_core::now()),
-            stop_rx.clone(),
-        )));
+        daemons.spawn(
+            "crawlmap-server",
+            crawlmap::server_loop(
+                crawlmap.clone(),
+                store.pool().clone(),
+                move || {
+                    api::crawl_machines(dht.as_deref(), &liveness, &fleet, magnetar_core::now())
+                },
+                stop_rx.clone(),
+            ),
+        );
     }
-    daemons.push(start_search_index(&store, &cfg, stop_rx.clone()).await);
+    daemons.adopt(
+        "search-index",
+        start_search_index(&store, &cfg, stop_rx.clone()).await,
+    );
     if let Some(t) = &tmdb {
-        daemons.extend(t.spawn_workers(stop_rx.clone()));
-        daemons.push(tokio::spawn(tmdb::prefetch_loop(
-            t.clone(),
-            stop_rx.clone(),
-        )));
-        daemons.push(tokio::spawn(tmdb::backfill_loop(
-            t.clone(),
-            stop_rx.clone(),
-        )));
+        for w in t.spawn_workers(stop_rx.clone()) {
+            daemons.adopt("tmdb-worker", w);
+        }
+        daemons.spawn(
+            "tmdb-prefetch",
+            tmdb::prefetch_loop(t.clone(), stop_rx.clone()),
+        );
+        daemons.spawn(
+            "tmdb-backfill",
+            tmdb::backfill_loop(t.clone(), stop_rx.clone()),
+        );
     }
 
     let listener = tokio::net::TcpListener::bind(cfg.bind)
@@ -291,11 +315,7 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
         .with_graceful_shutdown(async move { daemons::stop_requested(&mut wait).await })
         .await?;
 
-    for d in daemons {
-        if tokio::time::timeout(DAEMON_GRACE, d).await.is_err() {
-            tracing::warn!("a daemon did not stop in time");
-        }
-    }
+    daemons.join(DAEMON_GRACE).await;
     // Downloads are not paused here: librqbit persists them as running and resumes on start.
     drop(downloader);
     store.pool().close().await;

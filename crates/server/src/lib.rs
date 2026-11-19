@@ -25,6 +25,7 @@ pub mod selftest;
 pub mod server;
 pub mod stats;
 pub mod store;
+pub mod supervise;
 pub mod tmdb;
 pub mod web;
 pub mod web_auth;

@@ -1,4 +1,4 @@
-Changes since v0.3.2 (not released yet; pre-release `v0.3.2-redeploy1` carries all of it).
+Changes since v0.3.2 (not released yet; pre-release `v0.3.2-redeploy1` carries everything up to D146).
 
 ## What's new
 
@@ -8,6 +8,13 @@ The first start applies migration `20261112000000_enrich_due`. After it, an olde
 binary refuses to start (sqlx reports the migration as missing). Take a `pg_dump` and check it
 with `pg_restore -l` before the first start, and roll back only by restoring that dump or to a
 build of this version.
+
+### A background loop that stops is reported (D147)
+
+Every background loop (crawler, seed checker, router health probe, enrichment, …) now runs
+under a name. If one exits or panics while the server runs, the log says which one, at ERROR,
+and `GET /health` answers `"status": "degraded"` instead of `"ok"`. Nothing is restarted
+automatically, and the Docker healthcheck still looks only at the database.
 
 ### Seed checks are always paced and braked (D146)
 

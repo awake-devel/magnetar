@@ -65,6 +65,8 @@ pub struct AppState {
     /// The web UI and its sessions (D132, D133); None when `MAGNETAR_WEB_UI=false` (and in
     /// `AppState::new`): no web routes, cookies ignored.
     pub web: Option<Arc<crate::web::WebState>>,
+    /// Background loops that died before shutdown (D147); any makes `/health` "degraded".
+    pub daemons: crate::supervise::DaemonHealth,
 }
 
 impl AppState {
@@ -84,6 +86,7 @@ impl AppState {
             fleet: Arc::default(),
             crawlmap: Arc::default(),
             web: None,
+            daemons: Default::default(),
         }
     }
 
@@ -99,6 +102,11 @@ impl AppState {
 
     pub fn with_fleet(mut self, f: Arc<crate::fleet::Fleet>) -> Self {
         self.fleet = f;
+        self
+    }
+
+    pub fn with_daemon_health(mut self, h: crate::supervise::DaemonHealth) -> Self {
+        self.daemons = h;
         self
     }
 
@@ -421,8 +429,15 @@ fn request_span<B>(req: &axum::http::Request<B>) -> tracing::Span {
 }
 
 async fn health(State(st): State<AppState>) -> Json<Health> {
+    // D147: a dead daemon makes the server "degraded" (names only in the log: /health is
+    // unauthenticated). The Docker healthcheck only reads "db", so this restarts nothing.
+    let status = if st.daemons.dead().is_empty() {
+        "ok"
+    } else {
+        "degraded"
+    };
     Json(Health {
-        status: "ok".into(),
+        status: status.into(),
         version: magnetar_core::VERSION.into(),
         db: st.store.ping().await,
         features: magnetar_core::api::features::ALL
