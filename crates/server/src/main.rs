@@ -27,6 +27,9 @@ async fn main() -> anyhow::Result<()> {
     // D112: our own addresses are refused like private ones; a bad entry stops the process.
     magnetar_core::netaddr::OWN
         .configure(magnetar_core::netaddr::parse_nets(&cli.config.own_addrs)?);
+    // D150: one destination budget per process, for every subcommand that reaches the network
+    // (serve, worker, crawl-once, liveness, enrich, enrich-anime…); serve and worker reuse it.
+    magnetar_server::netbudget::install(&cli.config);
     // D117: header probes run on crawl workers only; the main server never probes.
     if let Some(w) = magnetar_server::probes::not_here(&cli.config, &cli.command) {
         tracing::warn!("{w}");

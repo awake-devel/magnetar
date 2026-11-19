@@ -529,6 +529,18 @@ impl RelayConn {
         let deadline = Instant::now() + timeout;
         let ws = match policy {
             None => {
+                // Trusted URL: tungstenite resolves it; ask the budget first (D150). The checked
+                // path below admits inside `AddrPolicy::resolve`.
+                if let Some(host) = request.uri().host() {
+                    let port = request.uri().port_u16().unwrap_or(
+                        if request.uri().scheme_str() == Some("ws") {
+                            80
+                        } else {
+                            443
+                        },
+                    );
+                    crate::netbudget::admit_host(url, host, port, timeout).await?;
+                }
                 let connect = tokio_tungstenite::connect_async_tls_with_config(
                     request,
                     Some(config),

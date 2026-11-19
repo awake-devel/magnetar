@@ -232,6 +232,10 @@ impl HealthHub {
         if let Some(p) = &self.pacer {
             p.set_level(level);
         }
+        // The destination budget (D150) brakes with the same level.
+        if let Some(b) = magnetar_core::netbudget::global() {
+            b.set_level(level);
+        }
         if let Some((d, f)) = &*self.attached.lock().unwrap() {
             d.set_brake_level(level);
             f.set_brake_level(level);
@@ -332,6 +336,22 @@ pub async fn health_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D150: the router health level brakes the process destination budget too. The budget is
+    /// process-wide; it is installed here with limits no unit test can reach.
+    #[test]
+    fn health_level_brakes_the_destination_budget() {
+        use magnetar_core::netbudget::{self, BudgetConfig, DestBudget};
+        netbudget::install(Arc::new(DestBudget::new(BudgetConfig::new(
+            1_000_000, 100_000.0,
+        ))));
+        let b = netbudget::global().unwrap();
+        let hub = HealthHub::new(None);
+        hub.set_level(2);
+        assert_eq!(b.level(), 2);
+        hub.set_level(0);
+        assert_eq!(b.level(), 0);
+    }
 
     fn ms(n: u64) -> Sample {
         Some(Duration::from_millis(n))

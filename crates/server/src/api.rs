@@ -169,6 +169,7 @@ impl From<Error> for ApiError {
             }
             Error::Refused(_) => (StatusCode::BAD_GATEWAY, "refused"),
             Error::Timeout(_) => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
+            Error::Budget(_) => (StatusCode::SERVICE_UNAVAILABLE, "budget"),
             Error::Store(_) => (StatusCode::INTERNAL_SERVER_ERROR, "store"),
             Error::Other(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         };

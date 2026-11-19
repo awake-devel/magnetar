@@ -487,6 +487,13 @@ impl<'a, S: Store + ?Sized> Ctx<'a, S> {
                 run.conn = Some(c);
                 run.connected = true;
             }
+            // D150: the destination budget had no room; nothing was sent. Not a visit: no
+            // failure recorded, no backoff, the relay comes up again next pass.
+            Err(crate::Error::Budget(e)) => {
+                tracing::debug!(relay = %run.url, "connect deferred: {e}");
+                run.attempted = false;
+                return;
+            }
             Err(e) => {
                 let msg = e.to_string();
                 self.error(&run.url, &msg);

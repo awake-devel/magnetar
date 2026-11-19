@@ -12,7 +12,7 @@ enums in `snake_case`). Checked for the app rebuild in 2026-10 (D77).
   poster images included (an image loader needs the header, e.g. an OkHttp interceptor).
 - Errors: `{"error": "<code>", "message": "…"}` with 4xx/5xx. Codes: `unauthorized`, `invalid`,
   `invalid_body`, `not_found`, `search_index_unavailable` (503 while the index builds), `downloads_unavailable` (503),
-  `upstream` (502), `timeout`, `store`, `internal`.
+  `upstream` (502), `budget` (503: the process destination budget had no room, D150), `timeout`, `store`, `internal`.
 - Feature detection: `GET /health` → `{"status","version","db","features":[…]}`. A client
   hides what the server does not list. Since this stage: `saved_search_poll` (D77) and
   `browse_checked_dht` (D76), next to `filters`, `facet_set`, `media_releases`,

@@ -561,6 +561,9 @@ pub async fn run(
 /// `magnetar-server worker [--seconds N]`: run, print the JSON report, fail on a fatal error.
 pub async fn run_from_config(cfg: &Config, seconds: Option<u64>) -> anyhow::Result<()> {
     let opts = WorkerOptions::from_config(cfg)?;
+    // The worker's trackers, DB-IP and other first-party calls share one destination budget
+    // (D150); its DHT engine and BEP 9 fetcher keep their own paces and the governor.
+    let budget = crate::netbudget::install(cfg);
     if cfg.dht != DhtMode::Off && opts.dht.is_none() {
         anyhow::bail!("worker: DHT options did not resolve");
     }
@@ -570,6 +573,9 @@ pub async fn run_from_config(cfg: &Config, seconds: Option<u64>) -> anyhow::Resu
         tracing::info!("worker: stopping");
         let _ = stop_tx.send(true);
     });
+    if let Some(b) = budget {
+        tokio::spawn(crate::netbudget::report_loop(b, stop_rx.clone()));
+    }
     let report = run(opts, stop_rx, seconds.map(Duration::from_secs), |_| {}).await?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     if let Some(e) = report.error {

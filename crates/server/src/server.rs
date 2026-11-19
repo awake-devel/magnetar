@@ -134,6 +134,14 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
     // Every background loop is named and watched (D147): one that exits or panics before
     // shutdown is logged and makes /health answer "degraded".
     let mut daemons = crate::supervise::Daemons::new(stop_rx.clone());
+    // One destination budget for every non-DHT connection of the process (D150), braked by
+    // the router health probe like the DHT pacer.
+    if let Some(b) = crate::netbudget::install(&cfg) {
+        daemons.spawn(
+            "net-budget-report",
+            crate::netbudget::report_loop(b, stop_rx.clone()),
+        );
+    }
     // One DHT pace for the whole process (D109): the crawler's queries and the seed checker's
     // walks share it, so MAGNETAR_DHT_QPS is what the router sees, and the health probe slows
     // both. Its refill task runs here, outliving crawler restarts.

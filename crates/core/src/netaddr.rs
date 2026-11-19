@@ -423,6 +423,7 @@ impl AddrPolicy {
     ) -> Result<Vec<SocketAddr>> {
         if let Some(ip) = literal_ip(host) {
             self.check(what, ip)?;
+            crate::netbudget::admit_until(what, ip, crate::netbudget::wait_share(timeout)).await?;
             return Ok(vec![SocketAddr::new(ip, port)]);
         }
         let found: Vec<SocketAddr> =
@@ -434,13 +435,24 @@ impl AddrPolicy {
         let Some(&first) = found.first() else {
             return Err(Error::Network(format!("{what}: no address")));
         };
-        let ok: Vec<SocketAddr> = found.into_iter().filter(|a| self.allows(a.ip())).collect();
+        let mut ok: Vec<SocketAddr> = found.into_iter().filter(|a| self.allows(a.ip())).collect();
         match ok.is_empty() {
             true => Err(self
                 .check(what, first.ip())
                 .err()
                 .unwrap_or_else(|| refused(what, first.ip(), "was refused"))),
-            false => Ok(ok),
+            false => {
+                // D150: the address callers dial first goes first and is the one admitted.
+                if let Some(a) = crate::netbudget::dial_first(&mut ok) {
+                    crate::netbudget::admit_until(
+                        what,
+                        a.ip(),
+                        crate::netbudget::wait_share(timeout),
+                    )
+                    .await?;
+                }
+                Ok(ok)
+            }
         }
     }
 }

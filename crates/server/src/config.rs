@@ -248,6 +248,14 @@ pub struct Config {
     /// on, walks share `MAGNETAR_DHT_QPS` with it instead.
     #[arg(long, env = "MAGNETAR_LIVENESS_DHT_QPS", default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=20_000))]
     pub liveness_dht_qps: u32,
+    /// Destination budget (D150, docs/CONFIG.md): distinct public destination IPs this process
+    /// may contact in any 300 s (Nostr relays, trackers, TMDB, IMDb, DB-IP, ntfy…; not the DHT,
+    /// which has its own pace). 0 turns the budget off.
+    #[arg(long, env = "MAGNETAR_NET_DESTS", default_value_t = 1024, value_parser = clap::value_parser!(u32).range(0..=1_000_000))]
+    pub net_dests: u32,
+    /// Destination budget: new outbound connections per second (D150).
+    #[arg(long, env = "MAGNETAR_NET_FLOWS", default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=100_000))]
+    pub net_flows: u32,
     /// Native DHT crawler (docs/DHT.md): off, polite or aggressive.
     #[arg(long, env = "MAGNETAR_DHT", value_enum, default_value = "off")]
     pub dht: DhtMode,

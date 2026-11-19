@@ -300,6 +300,13 @@ impl Scraper {
             };
             match res {
                 Ok(stats) => ans.stats.extend(stats),
+                // D150: the destination budget had no room; nothing was sent. Not the tracker's
+                // fault: unanswered this pass, no backoff, retried on the next one.
+                Err(crate::Error::Budget(e)) => {
+                    tracing::debug!(tracker = t.url(), "scrape deferred: {e}");
+                    ans.failed = true;
+                    break;
+                }
                 Err(e) => {
                     slot.failures = slot.failures.saturating_add(1);
                     let wait = backoff(slot.failures);

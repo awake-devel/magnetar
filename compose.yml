@@ -95,6 +95,8 @@ services:
       MAGNETAR_LIVENESS_FALLBACK_TRACKERS:
       MAGNETAR_LIVENESS_DHT_CONCURRENCY:
       MAGNETAR_LIVENESS_DHT_QPS:
+      MAGNETAR_NET_DESTS:
+      MAGNETAR_NET_FLOWS:
       # Crawl workers on other machines (docs/WORKERS.md): name:token,... ; unset = no workers.
       MAGNETAR_WORKER_TOKENS:
       MAGNETAR_WORKER_LEASE_SECS:

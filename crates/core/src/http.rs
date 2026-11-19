@@ -22,9 +22,12 @@ pub fn tls_config() -> rustls::ClientConfig {
         .with_no_client_auth()
 }
 
-/// Builder with our user agent, TLS config and timeouts.
+/// Builder with our user agent, TLS config and timeouts. Its resolver admits every new
+/// connection on the process destination budget (D150); a client that sets its own resolver
+/// (the tracker client) admits through [`crate::netaddr::AddrPolicy::resolve`] instead.
 pub fn builder(timeout: Duration) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
+        .dns_resolver(Arc::new(crate::netbudget::BudgetResolver))
         .user_agent(crate::identity::USER_AGENT)
         .timeout(timeout)
         .connect_timeout(Duration::from_secs(10))

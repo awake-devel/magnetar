@@ -9,6 +9,16 @@ binary refuses to start (sqlx reports the migration as missing). Take a `pg_dump
 with `pg_restore -l` before the first start, and roll back only by restoring that dump or to a
 build of this version.
 
+### One limit on outbound connections for the whole process (D150)
+
+Every outbound connection other than the DHT (Nostr relays, tracker scrapes, TMDB, IMDb,
+DB-IP, ntfy) now goes through one destination budget: at most `MAGNETAR_NET_DESTS` (1024)
+distinct public addresses per 5 minutes and `MAGNETAR_NET_FLOWS` (20) new connections per
+second, halved by the router health brake when the line degrades. Over the limit a connection
+waits briefly, then is skipped (error `budget`) without counting as a tracker or relay failure;
+the log summarises waits and refusals every 10 minutes. LAN and
+tailnet addresses are not counted. `MAGNETAR_NET_DESTS=0` turns it off.
+
 ### A background loop that stops is reported (D147)
 
 Every background loop (crawler, seed checker, router health probe, enrichment, …) now runs

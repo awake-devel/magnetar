@@ -138,8 +138,17 @@ pub async fn scrape_chunk(
     }
     let parsed =
         url::Url::parse(&url).map_err(|e| Error::Invalid(format!("tracker {tracker}: {e}")))?;
-    // IP literals never reach the resolver: check them here.
+    // IP literals never reach the resolver: check them here, and admit them on the
+    // destination budget the resolver would have asked (D150).
     netaddr::check_url_host(client.policy, tracker, &parsed)?;
+    if let Some(ip) = netaddr::url_ip(&parsed) {
+        crate::netbudget::admit_until(
+            tracker,
+            ip,
+            Some(tokio::time::Instant::now() + crate::netbudget::RESOLVER_WAIT),
+        )
+        .await?;
+    }
     let resp = client
         .http
         .get(parsed)
@@ -169,6 +178,7 @@ fn send_error(tracker: &str, e: reqwest::Error) -> Error {
     while let Some(s) = src {
         match s.downcast_ref::<Error>() {
             Some(Error::Refused(msg)) => return Error::Refused(format!("{tracker}: {msg}")),
+            Some(Error::Budget(msg)) => return Error::Budget(format!("{tracker}: {msg}")),
             Some(Error::Network(msg)) => return Error::Network(format!("{tracker}: {msg}")),
             Some(Error::Invalid(msg)) => return Error::Invalid(format!("{tracker}: {msg}")),
             _ => {}
