@@ -1,4 +1,4 @@
-//! Storage abstraction implemented by `PgStore` (server) and `SqliteStore` (ffi). ARCHITECTURE.md §4.
+//! Storage abstraction implemented by `PgStore` (server). ARCHITECTURE.md §4.
 
 use crate::error::Result;
 use crate::model::*;

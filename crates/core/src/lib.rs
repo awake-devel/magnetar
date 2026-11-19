@@ -22,6 +22,7 @@ pub mod magnet;
 pub mod metainfo;
 pub mod model;
 pub mod netaddr;
+pub mod netbudget;
 pub mod nip35;
 pub mod nip66;
 pub mod notify;

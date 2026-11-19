@@ -25,7 +25,6 @@ mod probe_hostile;
 mod relay;
 mod release_sample;
 mod sync_negentropy;
-mod sync_up;
 mod trust_compute;
 mod trust_store;
 mod wot_parsers;

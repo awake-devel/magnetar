@@ -40,7 +40,8 @@ negatives.
 
 **Not covered by this rule (older, operational state):** the DHT crawler saves its node
 identity and up to 1000 routing contacts (addresses) so it can rejoin the network after a
-restart (`settings` row on the server, `dht.json` on workers, D55/D100), and the seed checker
+restart (`dht.json` in a worker's state dir, D55/D100; the server's own crawler, which kept
+them in `settings` rows, was removed in D156 and those rows are no longer read or written), and the seed checker
 talks to trackers by address. These are needed for the crawler to work, predate D101 and are
 not part of the crawl map; whether to drop or shorten them is the user's call.
 
@@ -155,8 +156,8 @@ the Pi itself.
 - `hourly`: the last 48 hours of the new `stats_series` counters `dht_seen_<via>` (new
   `dht_seen` rows, statement trigger) and `dht_stored_<via>` (new `dht_torrents` rows), also
   available from `/stats/timeseries`. They start at the migration (`hourly_since`).
-- `machines`: the server first (its crawler's counters since it started; seed checks of its
-  own batches), then every configured worker (the server's per-worker counters, D99).
+- `machines`: the server first (seed checks of its own batches only: it does not crawl the
+  DHT since D156, so its DHT counters stay 0), then every configured worker (the server's per-worker counters, D99).
   `stored_per_min` over the last ~10 minutes. Counters reset when the server restarts.
 
 ### `GET /api/v1/stats/map?layer=dht|nostr&window=day|all` → `CrawlMap`

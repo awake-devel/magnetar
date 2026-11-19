@@ -3,7 +3,7 @@
 //! state-changing calls made with the cookie, and a server-wide limit on failed sign-ins.
 //!
 //! The bearer API is untouched: `api::auth` checks the bearer token first and falls back to the
-//! cookie only on `/api/v1/` paths that are not worker, sync, downloads or `/relay` routes.
+//! cookie only on the listed `/api/v1/` paths the web UI calls (`cookie_allowed`, D153).
 //! The token never reaches the browser's storage: it is sent once to `POST
 //! /api/v1/web/login` and only a random session id comes back.
 
@@ -169,15 +169,31 @@ pub fn csrf_ok(headers: &HeaderMap, s: &WebSession) -> bool {
             .is_some_and(|t| ct_eq(t.trim().as_bytes(), s.csrf.as_bytes()))
 }
 
-/// Paths where the cookie stands in for the bearer token: the `/api/v1/` routes except the
-/// worker endpoints, phone sync (`events/batch`) and downloads. Never `/relay` (no cross-site
-/// WebSocket hijacking), never anything outside `/api/v1/`.
+/// Exact paths the web UI calls with its cookie (D153).
+const COOKIE_PATHS: &[&str] = &[
+    "/api/v1/search",
+    "/api/v1/facets",
+    "/api/v1/probe/file-kinds",
+    "/api/v1/stats",
+    "/api/v1/settings/trust",
+    "/api/v1/saved-searches",
+];
+/// Path prefixes the web UI calls with its cookie (D153).
+const COOKIE_PREFIXES: &[&str] = &[
+    "/api/v1/torrents/",
+    "/api/v1/media/",
+    "/api/v1/stats/",
+    "/api/v1/graphs/",
+    "/api/v1/saved-searches/",
+];
+
+/// Paths where the cookie stands in for the bearer token: only the routes the web UI calls
+/// (D153). It is a list of what is allowed, so a new route stays bearer-only until it is added
+/// here. Not on it: the worker endpoints, phone sync (`events/batch`), downloads, `/relay` (no
+/// cross-site WebSocket hijacking), and the relay, trust and override routes the web UI does
+/// not use.
 pub fn cookie_allowed(path: &str) -> bool {
-    path.starts_with("/api/v1/")
-        && !path.starts_with("/api/v1/worker/")
-        && path != "/api/v1/events/batch"
-        && path != "/api/v1/downloads"
-        && !path.starts_with("/api/v1/downloads/")
+    COOKIE_PATHS.contains(&path) || COOKIE_PREFIXES.iter().any(|p| path.starts_with(p))
 }
 
 pub fn forbidden_csrf() -> ApiError {
@@ -514,14 +530,48 @@ mod tests {
         assert!(cookie_id_hash(&v).is_some());
         assert!(cookie_id_hash("short").is_none());
         assert!(cookie_id_hash(&data_encoding::BASE64URL_NOPAD.encode(&[7u8; 31])).is_none());
-        assert!(cookie_allowed("/api/v1/search"));
-        assert!(cookie_allowed("/api/v1/torrents/x/probe/corrections"));
+        // Every route the web UI calls (crates/server/web/js).
+        for yes in [
+            "/api/v1/search",
+            "/api/v1/facets",
+            "/api/v1/probe/file-kinds",
+            "/api/v1/torrents/x",
+            "/api/v1/torrents/x/liveness",
+            "/api/v1/torrents/x/liveness-history",
+            "/api/v1/torrents/x/probe/corrections",
+            "/api/v1/torrents/x/probe/corrections/3",
+            "/api/v1/media/7/poster",
+            "/api/v1/media/7/torrents",
+            "/api/v1/media/7/releases",
+            "/api/v1/stats",
+            "/api/v1/stats/breakdown",
+            "/api/v1/stats/timeseries",
+            "/api/v1/stats/health",
+            "/api/v1/stats/sources",
+            "/api/v1/stats/map",
+            "/api/v1/graphs/wot",
+            "/api/v1/graphs/swarm/x",
+            "/api/v1/settings/trust",
+            "/api/v1/saved-searches",
+            "/api/v1/saved-searches/poll",
+            "/api/v1/saved-searches/3",
+        ] {
+            assert!(cookie_allowed(yes), "{yes}");
+        }
+        // Everything else is bearer-only, a route nobody listed included (D153).
         for no in [
             "/relay",
             "/api/v1/events/batch",
             "/api/v1/downloads",
             "/api/v1/downloads/3/pause",
             "/api/v1/worker/heartbeat",
+            "/api/v1/relays",
+            "/api/v1/trust/abc",
+            "/api/v1/overrides/abc",
+            "/api/v1/settings/other",
+            "/api/v1/searchx",
+            "/api/v1/some-new-route",
+            "/api/v1/",
             "/health",
         ] {
             assert!(!cookie_allowed(no), "{no}");

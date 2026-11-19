@@ -22,6 +22,10 @@ pub enum Error {
     Refused(String),
     #[error("timeout: {0}")]
     Timeout(String),
+    /// The process destination budget had no room in time (D150, `netbudget`): nothing was
+    /// sent. Not the target's fault, so callers retry later without counting a failure.
+    #[error("over the destination budget: {0}")]
+    Budget(String),
     #[error("{0}")]
     Other(String),
 }

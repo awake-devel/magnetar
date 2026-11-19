@@ -12,12 +12,16 @@ enums in `snake_case`). Checked for the app rebuild in 2026-10 (D77).
   poster images included (an image loader needs the header, e.g. an OkHttp interceptor).
 - Errors: `{"error": "<code>", "message": "…"}` with 4xx/5xx. Codes: `unauthorized`, `invalid`,
   `invalid_body`, `not_found`, `search_index_unavailable` (503 while the index builds), `downloads_unavailable` (503),
-  `upstream` (502), `timeout`, `store`, `internal`.
+  `upstream` (502), `budget` (503: the process destination budget had no room, D150), `timeout`, `store`, `internal`.
 - Feature detection: `GET /health` → `{"status","version","db","features":[…]}`. A client
   hides what the server does not list. Since this stage: `saved_search_poll` (D77) and
   `browse_checked_dht` (D76), next to `filters`, `facet_set`, `media_releases`,
   `liveness_history`, `stats`, `graphs`, `adult_filter`, `origin`, `crawl_sources`, `crawl_map`
-  (D102, D103), and `dht` (crawler on).
+  (D102, D103), and `dht` (the server's own DHT crawler on: never listed since D156, which
+  removed that crawler; `dht` in the stats answers is then always null).
+- `status` is `"ok"`, or `"degraded"` when a background loop (crawler, seed checker, router
+  health probe, …) exited or panicked while the server runs (D147). Which one is only in the
+  server log: `/health` needs no token. `db` stays the database check.
 - Unknown query parameters are ignored; unknown JSON fields are ignored; every newer field has
   a default, so an older server's answers still parse.
 
@@ -346,9 +350,14 @@ unchanged: the app and the workers keep sending `Authorization: Bearer`.
   expiry, on sign-out, or when `MAGNETAR_API_TOKEN` changes.
 - `ntfy`: whether a topic is configured (the `ntfy.topic` setting or `MAGNETAR_NTFY_TOPIC`), so
   the UI can say whether saved-search alerts go out. The web UI uses no browser push.
-- The cookie is accepted only on `/api/v1/…` routes, never on `/relay`, `/api/v1/worker/*`,
-  `/api/v1/events/batch` or `/api/v1/downloads*` (those need the bearer token), and only when
-  no `Authorization` header is sent (a wrong bearer token is not rescued by a cookie).
+- The cookie is accepted only on the routes the web UI calls (D153): `/api/v1/search`,
+  `/api/v1/facets`, `/api/v1/probe/file-kinds`, `/api/v1/stats` and `/api/v1/stats/*`,
+  `/api/v1/torrents/*`, `/api/v1/media/*`, `/api/v1/graphs/*`, `/api/v1/settings/trust`,
+  `/api/v1/saved-searches` and `/api/v1/saved-searches/*`. Every other route needs the bearer
+  token: `/relay`, `/api/v1/worker/*`, `/api/v1/events/batch`, `/api/v1/downloads*`,
+  `/api/v1/relays`, `/api/v1/trust/*`, `/api/v1/overrides/*`, and any route added later until
+  it is put on the list (`web_auth::cookie_allowed`). The cookie counts only when no
+  `Authorization` header is sent (a wrong bearer token is not rescued by a cookie).
 - CSRF: with the cookie, every method other than GET, HEAD and OPTIONS needs
   `X-CSRF-Token: <csrf>` and a `Sec-Fetch-Site` that is absent, `same-origin` or `none`;
   otherwise 403 `{"error": "forbidden", "message": "missing or bad CSRF token"}`.

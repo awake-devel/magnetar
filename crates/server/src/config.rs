@@ -24,7 +24,8 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// API + relay endpoint + crawler, liveness, trust and notifier daemons.
+    /// API + relay endpoint + Nostr crawler, liveness, trust and notifier daemons. The index
+    /// only: DHT crawling is done by `worker` (D156).
     Serve,
     /// Apply database migrations and exit.
     Migrate,
@@ -64,18 +65,6 @@ pub enum Command {
         #[arg(long)]
         seconds: Option<u64>,
     },
-    /// Run the DHT crawler for a bounded time and print a JSON report (docs/DHT.md §8, D58).
-    Dht {
-        /// Wall-clock budget in seconds.
-        #[arg(long, default_value_t = 300)]
-        seconds: u64,
-        /// Mode for this run (default: `MAGNETAR_DHT`, or `polite` when that is `off`).
-        #[arg(long, value_enum)]
-        mode: Option<DhtMode>,
-        /// No database at all: dedupe in memory only, nothing written (live tests).
-        #[arg(long)]
-        dry_run: bool,
-    },
     /// Parse the release attributes (D44) of every torrent without current ones, print a report.
     Attrs {
         /// Re-parse every torrent, also those already parsed by this version.
@@ -84,7 +73,25 @@ pub enum Command {
     },
 }
 
-/// `MAGNETAR_DHT` (D49): off by default, crawling exposes the host's IP in swarms.
+impl Command {
+    /// The subcommand as typed on the command line.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Command::Serve => "serve",
+            Command::Migrate => "migrate",
+            Command::CrawlOnce { .. } => "crawl-once",
+            Command::Selftest => "selftest",
+            Command::Enrich { .. } => "enrich",
+            Command::EnrichAnime { .. } => "enrich-anime",
+            Command::Liveness { .. } => "liveness",
+            Command::Worker { .. } => "worker",
+            Command::Attrs { .. } => "attrs",
+        }
+    }
+}
+
+/// `MAGNETAR_DHT` (D49): off by default, crawling exposes the host's IP in swarms. A `worker`
+/// setting: `serve` does not crawl the DHT (D156).
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum DhtMode {
     #[default]
@@ -248,7 +255,16 @@ pub struct Config {
     /// on, walks share `MAGNETAR_DHT_QPS` with it instead.
     #[arg(long, env = "MAGNETAR_LIVENESS_DHT_QPS", default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=20_000))]
     pub liveness_dht_qps: u32,
-    /// Native DHT crawler (docs/DHT.md): off, polite or aggressive.
+    /// Destination budget (D150, docs/CONFIG.md): distinct public destination IPs this process
+    /// may contact in any 300 s (Nostr relays, trackers, TMDB, IMDb, DB-IP, ntfy…; not the DHT,
+    /// which has its own pace). 0 turns the budget off.
+    #[arg(long, env = "MAGNETAR_NET_DESTS", default_value_t = 1024, value_parser = clap::value_parser!(u32).range(0..=1_000_000))]
+    pub net_dests: u32,
+    /// Destination budget: new outbound connections per second (D150).
+    #[arg(long, env = "MAGNETAR_NET_FLOWS", default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=100_000))]
+    pub net_flows: u32,
+    /// Worker: native DHT crawler (docs/DHT.md): off, polite or aggressive. No effect on
+    /// `serve` (D156; a warning says so).
     #[arg(long, env = "MAGNETAR_DHT", value_enum, default_value = "off")]
     pub dht: DhtMode,
     /// Worker: find new torrents in the DHT (D118): BEP 51 sampling and the triage of hashes
@@ -378,7 +394,7 @@ pub struct Config {
     // --- Header probes (docs/PROBES.md, D117): crawl workers only ---
     /// Worker: after a metadata fetch, read the few blocks of the torrent's files that sniff
     /// needs (real file types, console ids, video/audio quality) and upload the results. Off
-    /// by default; ignored (logged) by `serve` and `dht`: the main server never probes.
+    /// by default; ignored (logged) by every other command: the main server never probes.
     #[arg(long, env = "MAGNETAR_PROBE", default_value_t = false, action = clap::ArgAction::Set)]
     pub probe: bool,
     /// Worker: announce and serve the whole hash-checked pieces a probe holds, to that probe's
@@ -410,6 +426,59 @@ pub struct Config {
 }
 
 impl Config {
+    /// Warnings for settings that have no effect on the subcommand being run (logged at start,
+    /// never an error): a leftover or misplaced setting should be seen, not silently ignored.
+    /// A setting at its default (or blank) never warns.
+    pub fn misplaced(&self, cmd: &Command) -> Vec<String> {
+        let set = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
+        let worker = matches!(cmd, Command::Worker { .. });
+        let serve = matches!(cmd, Command::Serve);
+        let mut out = Vec::new();
+        // D156: only a worker crawls the DHT.
+        if !worker && self.dht != DhtMode::Off {
+            let mode = match self.dht {
+                DhtMode::Off => "off",
+                DhtMode::Polite => "polite",
+                DhtMode::Aggressive => "aggressive",
+            };
+            out.push(format!(
+                "MAGNETAR_DHT={mode} has no effect on `{}` since D156: the server no longer \
+                 crawls the DHT; run a `worker` (docs/WORKERS.md)",
+                cmd.name()
+            ));
+        }
+        // D117: header probes run on crawl workers only; nothing else builds a prober.
+        if !worker && self.probe {
+            out.push(
+                "MAGNETAR_PROBE is a crawl-worker setting (docs/PROBES.md): this command never \
+                 runs header probes; ignored"
+                    .into(),
+            );
+        }
+        if serve {
+            for (name, v) in [
+                ("MAGNETAR_WORKER_SERVER", &self.worker_server),
+                ("MAGNETAR_WORKER_TOKEN", &self.worker_token),
+            ] {
+                if set(v) {
+                    out.push(format!(
+                        "{name} is a crawl-worker setting (docs/WORKERS.md): it has no effect \
+                         on `serve`; ignored"
+                    ));
+                }
+            }
+        }
+        if worker && set(&self.worker_tokens) {
+            out.push(
+                "MAGNETAR_WORKER_TOKENS is the main server's list of worker tokens \
+                 (docs/WORKERS.md): it has no effect on `worker`, which sends its own \
+                 MAGNETAR_WORKER_TOKEN; ignored"
+                    .into(),
+            );
+        }
+        out
+    }
+
     pub fn database_url(&self) -> anyhow::Result<&str> {
         self.database_url
             .as_deref()
@@ -567,24 +636,14 @@ mod tests {
             "aggressive",
             "--dht-nodes",
             "2",
-            "dht",
-            "--seconds",
-            "60",
-            "--mode",
-            "polite",
-            "--dry-run",
+            "worker",
         ])
         .unwrap();
         assert_eq!(cli.config.dht, DhtMode::Aggressive);
         assert_eq!(cli.config.dht_nodes, Some(2));
-        assert!(matches!(
-            cli.command,
-            Command::Dht {
-                seconds: 60,
-                mode: Some(DhtMode::Polite),
-                dry_run: true
-            }
-        ));
+        assert!(matches!(cli.command, Command::Worker { seconds: None }));
+        // D156: the bounded `dht` command is gone.
+        assert!(Cli::try_parse_from(["magnetar-server", "dht", "--seconds", "60"]).is_err());
         let default = Cli::try_parse_from(["magnetar-server", "serve"]).unwrap();
         assert_eq!(default.config.dht, DhtMode::Off);
         for bad in [
@@ -666,10 +725,94 @@ mod tests {
             args.push("worker");
             assert!(Cli::try_parse_from(args).is_err(), "{bad:?}");
         }
-        let serve = Cli::try_parse_from(["magnetar-server", "--probe", "true", "serve"]).unwrap();
-        assert!(crate::probes::not_here(&serve.config, &serve.command).is_some());
-        let worker = Cli::try_parse_from(["magnetar-server", "--probe", "true", "worker"]).unwrap();
-        assert!(crate::probes::not_here(&worker.config, &worker.command).is_none());
+    }
+
+    /// D156: a setting that does nothing on the subcommand being run is named in a warning;
+    /// a default configuration says nothing.
+    #[test]
+    fn misplaced_settings_warn() {
+        let warn = |args: &[&str], cmd: &str| {
+            let mut v = vec!["magnetar-server"];
+            v.extend(args);
+            v.push(cmd);
+            let cli = Cli::try_parse_from(v).unwrap();
+            cli.config.misplaced(&cli.command)
+        };
+        for cmd in ["serve", "worker", "migrate", "liveness"] {
+            assert!(warn(&[], cmd).is_empty(), "{cmd}: {:?}", warn(&[], cmd));
+        }
+        // Explicit defaults and blank values (an empty compose variable) are not "set".
+        let blank = [
+            "--dht",
+            "off",
+            "--probe",
+            "false",
+            "--worker-server",
+            " ",
+            "--worker-token",
+            "",
+            "--worker-tokens",
+            "",
+        ];
+        assert!(warn(&blank, "serve").is_empty());
+        assert!(warn(&blank, "worker").is_empty());
+
+        // MAGNETAR_DHT: every command but `worker`.
+        let w = warn(&["--dht", "aggressive"], "serve");
+        assert_eq!(
+            w,
+            [
+                "MAGNETAR_DHT=aggressive has no effect on `serve` since D156: the server no \
+              longer crawls the DHT; run a `worker` (docs/WORKERS.md)"
+            ]
+        );
+        let w = warn(&["--dht", "polite"], "liveness");
+        assert_eq!(w.len(), 1);
+        assert!(w[0].starts_with("MAGNETAR_DHT=polite has no effect on `liveness`"));
+        assert!(warn(&["--dht", "aggressive"], "worker").is_empty());
+
+        // MAGNETAR_PROBE (D117): every command but `worker`, in its old words.
+        let w = warn(&["--probe", "true"], "serve");
+        assert_eq!(
+            w,
+            [
+                "MAGNETAR_PROBE is a crawl-worker setting (docs/PROBES.md): this command never \
+              runs header probes; ignored"
+            ]
+        );
+        assert_eq!(warn(&["--probe", "true"], "migrate").len(), 1);
+        assert!(warn(&["--probe", "true"], "worker").is_empty());
+
+        // The worker's client settings on `serve`, one warning each; the values stay out.
+        let client = [
+            "--worker-server",
+            "https://main.example",
+            "--worker-token",
+            "secret-worker-token",
+        ];
+        let w = warn(&client, "serve");
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[0].starts_with("MAGNETAR_WORKER_SERVER is a crawl-worker setting"));
+        assert!(w[1].starts_with("MAGNETAR_WORKER_TOKEN is a crawl-worker setting"));
+        assert!(
+            w.iter()
+                .all(|m| !m.contains("secret") && !m.contains("main.example"))
+        );
+        assert!(warn(&client, "worker").is_empty());
+        assert!(warn(&client, "migrate").is_empty(), "serve only");
+
+        // The server's token list on `worker`.
+        let list = ["--worker-tokens", "w1:secret-list-token"];
+        let w = warn(&list, "worker");
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].starts_with("MAGNETAR_WORKER_TOKENS is the main server's list"));
+        assert!(!w[0].contains("secret"));
+        assert!(warn(&list, "serve").is_empty());
+
+        // Everything at once on `serve`: one line per setting.
+        let mut all = vec!["--dht", "polite", "--probe", "true"];
+        all.extend(client);
+        assert_eq!(warn(&all, "serve").len(), 4);
     }
 
     #[test]

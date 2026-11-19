@@ -966,21 +966,20 @@ async fn uploads_apply_only_to_hashes_the_worker_holds() {
     let a = upload(&c1, vec![meta(h, &plain)]).await;
     assert_eq!((a.stored, a.ignored), (1, 0));
 
-    // A lease the server's retry loop took back is no longer the worker's.
+    // A queued row with no holder (as the server's own crawler left them before D156) is
+    // not the worker's.
     let late = info("Late.Film.2024.1080p", "0");
     let hl = sha1(&late);
     triage_one(&c1, hl).await;
-    sqlx::query("UPDATE dht_seen SET next_attempt_at = 0 WHERE infohash = $1")
+    let n = sqlx::query("UPDATE dht_seen SET holder = NULL WHERE infohash = $1")
         .bind(hl.as_slice())
         .execute(s.pool())
         .await
-        .unwrap();
-    let taken = magnetar_server::dht::store::take_due(s.pool(), magnetar_core::now(), 10)
-        .await
-        .unwrap();
-    assert!(taken.iter().any(|(t, _)| *t == hl));
+        .unwrap()
+        .rows_affected();
+    assert_eq!(n, 1);
     let a = upload(&c1, vec![meta(hl, &late)]).await;
-    assert_eq!((a.stored, a.ignored), (0, 1), "the server holds it now");
+    assert_eq!((a.stored, a.ignored), (0, 1), "no longer held by w1");
 }
 
 async fn triage_many(c: &Client, hs: &[[u8; 20]], via: &str) -> TriageResponse {
@@ -1077,7 +1076,7 @@ async fn self_triaged_dicts_are_capped_and_traced_to_their_worker() {
             .await
             .unwrap();
     assert_eq!(left, 0, "no seed checks left for the removed fakes");
-    // The server's own crawler records no supplier.
+    // A dict written without a worker (no holder) records no supplier.
     let own = info("Server.Own.2024.1080p", "0");
     let ho = sha1(&own);
     magnetar_server::dht::store::triage(s.pool(), &[(ho, Via::Sample)], NOW, false)
@@ -1300,12 +1299,10 @@ pub(crate) fn worker_dht(ports: Vec<u16>) -> DhtOptions {
         ports,
         qps: 400,
         pool_cap: 10_000,
-        fetch_known: false,
         peer_lookups: 8,
         lookup_timeout: Duration::from_millis(1500),
         peers_per_hash: 12,
         sample_priority: 0.0,
-        dry_run: false,
         bloom_bits: 1 << 20,
         queue_cap: 1000,
         fetch_concurrency: 8,
@@ -1315,7 +1312,6 @@ pub(crate) fn worker_dht(ports: Vec<u16>) -> DhtOptions {
         health_targets: Vec::new(),
         screen: screen::global_screen(),
         upnp: None,
-        service: None,
         geo: None,
         pacer: None,
         health: None,
@@ -1522,5 +1518,158 @@ async fn two_workers_share_seed_checks_and_the_dht() {
     let _ = names;
     for d in [d1, d2] {
         let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// Log capture for one test's own runtime (TRACE, every target).
+#[derive(Clone, Default)]
+struct Capture(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Capture {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+    type Writer = Capture;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Stage 3 (D53, D68, D69) on the path every dict now takes (D156: worker upload → fleet
+/// ingest): the real `core::blocklist` screen with neutral placeholder terms (`zorblax` hard,
+/// `wibblewob` context), the classifier deciding the context tier, at TRACE: blocked torrents
+/// leave only hashes, stored ones carry their category, and no torrent name or path ever
+/// appears in the server's logs or in the answer to the worker.
+///
+/// The capture covers every thread of this test's own runtime (workers and blocking pool)
+/// rather than the whole process: all integration tests share one process (D78), and a
+/// process-wide subscriber would also record the other tests' fixture names.
+#[test]
+fn ingest_blocklist_classifies_and_never_logs_names() {
+    let cap = Capture::default();
+    let sub = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(cap.clone())
+        .with_ansi(false)
+        .finish();
+    // tracing-core takes a fast path while one dispatcher exists: callsite interest then
+    // comes from the registering thread's default, which is none for a scoped dispatcher (and
+    // for the other tests' threads), and every callsite would be disabled. A second live
+    // dispatcher makes interest the union over all of them, checked per event.
+    let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let dispatch = tracing::Dispatch::new(sub);
+    let on_start = dispatch.clone();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .on_thread_start(move || {
+            // Kept for the thread's lifetime: the runtime's threads end with the runtime.
+            std::mem::forget(tracing::dispatcher::set_default(&on_start));
+        })
+        .build()
+        .unwrap();
+    let _main = tracing::dispatcher::set_default(&dispatch);
+    rt.block_on(ingest_blocklist_run(cap));
+}
+
+async fn ingest_blocklist_run(cap: Capture) {
+    let Some(db) = test_db().await else { return };
+    let s = &db.store;
+    let (base, _) = spawn(s, 900).await;
+    let c = Client::new(&base, W1).unwrap();
+    // (name, padding path, expected: Some(category) stored, None blocked)
+    let mut fixtures: Vec<(String, &str, Option<&str>)> = vec![
+        ("Plain.Show.2024.720p".into(), "zorblax", None), // hard, in a padding path
+        ("Studio.MILF.Scene.Wibblewob.1080p".into(), "0", None), // context, adult
+        ("Studio.XXX.Clip.12.yo".into(), "0", None),      // age rule, adult
+        (
+            "Wibblewob.Documentary.2020.1080p".into(),
+            "0",
+            Some("video"),
+        ), // context, not adult
+        ("Studio.XXX.Scene.2024.1080p".into(), "0", Some("porn")),
+        ("[Grp] Some Show - 05 (1080p)".into(), "0", Some("anime")),
+    ];
+    for k in 0..6 {
+        fixtures.push((format!("Filler.Torrent.{k}.2024.720p"), "0", Some("video")));
+    }
+    let mut expect = HashMap::new();
+    let mut items = Vec::new();
+    for (name, pad, want) in &fixtures {
+        let raw = info(name, pad);
+        let h = sha1(&raw);
+        expect.insert(hex::encode(h), *want);
+        triage_one(&c, h).await;
+        items.push(meta(h, &raw));
+    }
+    let ack = upload(&c, items).await;
+    let answer = serde_json::to_string(&ack).unwrap();
+    assert_eq!(
+        (ack.stored, ack.blocked, ack.rejected, ack.ignored),
+        (9, 3, 0, 0),
+        "{answer}"
+    );
+    let stored: HashMap<String, (String, i16)> = sqlx::query_as::<_, (String, String, i16)>(
+        "SELECT infohash, category, classifier_version FROM dht_torrents",
+    )
+    .fetch_all(s.pool())
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|(h, c, v)| (h, (c, v)))
+    .collect();
+    let blocked: Vec<String> = sqlx::query_scalar("SELECT infohash FROM blocked_infohashes")
+        .fetch_all(s.pool())
+        .await
+        .unwrap();
+    assert_eq!(blocked.len(), 3);
+    for (h, want) in &expect {
+        match want {
+            Some(cat) => {
+                let got = stored.get(h).expect("stored");
+                assert_eq!(
+                    (got.0.as_str(), got.1),
+                    (*cat, magnetar_core::classify::CLASSIFIER_VERSION)
+                );
+            }
+            None => {
+                assert!(!stored.contains_key(h));
+                assert!(blocked.contains(h));
+            }
+        }
+    }
+    // Nothing named in the logs (this test's runtime, TRACE) or in the answer.
+    let logs = String::from_utf8_lossy(&cap.0.lock().unwrap()).to_lowercase();
+    assert!(
+        logs.len() > 1000,
+        "the capture saw the run ({} bytes)",
+        logs.len()
+    );
+    assert!(
+        logs.contains("/api/v1/worker/dht/"),
+        "the capture saw the upload requests"
+    );
+    for needle in [
+        "zorblax",
+        "wibblewob",
+        "studio",
+        "plain.show",
+        "filler",
+        "some show",
+        "documentary",
+        ".mkv",
+    ] {
+        assert!(!logs.contains(needle), "{needle:?} logged");
+        assert!(
+            !answer.to_lowercase().contains(needle),
+            "{needle:?} in the answer"
+        );
     }
 }

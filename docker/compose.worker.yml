@@ -54,6 +54,8 @@ services:
       MAGNETAR_DHT_UPNP: ${MAGNETAR_DHT_UPNP:-false}
       MAGNETAR_LIVENESS_DHT_CONCURRENCY: ${MAGNETAR_LIVENESS_DHT_CONCURRENCY:-32}
       MAGNETAR_LIVENESS_DHT_QPS: ${MAGNETAR_LIVENESS_DHT_QPS:-20}
+      MAGNETAR_NET_DESTS: ${MAGNETAR_NET_DESTS:-1024}
+      MAGNETAR_NET_FLOWS: ${MAGNETAR_NET_FLOWS:-20}
       # Header probes (docs/PROBES.md, D117): off unless set in worker.env. They connect to
       # torrent peers from this host and download parts of files; MAGNETAR_PROBE_UPLOAD=true
       # also SHARES the verified pieces a probe holds (README "Legal"). Defaults: EEE profile.

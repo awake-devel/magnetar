@@ -1041,3 +1041,37 @@ async fn saved_searches_for_a_thin_client() {
     api.delete_saved_search(fedora.id).await.unwrap();
     assert!(api.saved_search(fedora.id).await.is_err());
 }
+
+/// D147: a background loop that exits before shutdown makes /health "degraded" (the database
+/// can still be fine, and the Docker healthcheck, which reads only "db", stays healthy).
+#[tokio::test]
+async fn health_is_degraded_when_a_daemon_died() {
+    let Some(db) = test_db().await else { return };
+    let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let mut daemons = magnetar_server::supervise::Daemons::new(stop_rx);
+    let state = magnetar_server::AppState::new(std::sync::Arc::new(db.store.clone()), TOKEN)
+        .with_daemon_health(daemons.health());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, magnetar_server::router(state))
+            .await
+            .unwrap();
+    });
+    let health = || async {
+        http()
+            .get(format!("{base}/health"))
+            .send()
+            .await
+            .unwrap()
+            .json::<Health>()
+            .await
+            .unwrap()
+    };
+    assert_eq!(health().await.status, "ok");
+    daemons.spawn("quits-early", async {});
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let h = health().await;
+    assert_eq!(h.status, "degraded");
+    assert!(h.db);
+}

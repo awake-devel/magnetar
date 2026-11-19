@@ -67,9 +67,9 @@ real hardware are marked **UNVERIFIED**.
   to public addresses, and there is no setting to change that. Configured relays (seeds,
   indexers, monitors) may still be local. [D112]
 - **Our own public address is refused only once it is known**: interface addresses (and the
-  /64 of each public IPv6 one) always, the WAN IPv4 only after the DHT crawler's vote, a UPnP
-  answer or `MAGNETAR_OWN_ADDRS`. The server container with `MAGNETAR_DHT=off` needs the
-  setting. Interface reads on Android are **UNVERIFIED**. [D112]
+  /64 of each public IPv6 one) always, the WAN IPv4 only after a worker's DHT crawler's vote,
+  its UPnP answer or `MAGNETAR_OWN_ADDRS`. The main server never crawls the DHT (D156), so
+  it needs the setting. Interface reads on Android are **UNVERIFIED**. [D112]
 - **Tracker scrapes ignore `HTTP_PROXY`/`HTTPS_PROXY`**: a proxy would resolve tracker names
   itself, past the address check. [D112]
 - **Downloads only partly follow the address policy.** librqbit gets a peer blocklist of the

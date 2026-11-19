@@ -19,7 +19,6 @@ use tokio::time::Instant;
 
 use crate::model::{Liveness, LivenessSource};
 pub use crate::netaddr::AddrPolicy;
-use crate::store::Store;
 use udp::ScrapeStats;
 
 pub const TTL_ALIVE: i64 = 6 * 3600;
@@ -300,6 +299,13 @@ impl Scraper {
             };
             match res {
                 Ok(stats) => ans.stats.extend(stats),
+                // D150: the destination budget had no room; nothing was sent. Not the tracker's
+                // fault: unanswered this pass, no backoff, retried on the next one.
+                Err(crate::Error::Budget(e)) => {
+                    tracing::debug!(tracker = t.url(), "scrape deferred: {e}");
+                    ans.failed = true;
+                    break;
+                }
                 Err(e) => {
                     slot.failures = slot.failures.saturating_add(1);
                     let wait = backoff(slot.failures);
@@ -492,24 +498,6 @@ impl Scraper {
         report.ms = started.elapsed().as_millis() as u64;
         (out, report)
     }
-}
-
-/// Pull due infohashes from the store, check them, store results. Returns the number checked.
-pub async fn run_due<S: Store + ?Sized>(
-    store: &S,
-    cfg: &LivenessConfig,
-    now: i64,
-    limit: usize,
-) -> crate::Result<usize> {
-    let due = store.liveness_due(now, limit).await?;
-    if due.is_empty() {
-        return Ok(0);
-    }
-    let results = check_batch(&due, cfg, now).await;
-    for l in &results {
-        store.put_liveness(l).await?;
-    }
-    Ok(results.len())
 }
 
 /// Dead / error streaks carried from one check to the next (D45).

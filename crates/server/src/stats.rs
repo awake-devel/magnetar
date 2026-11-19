@@ -24,6 +24,13 @@ use crate::store::{PgStore, db};
 
 /// Counters (events per hour).
 pub const TORRENTS_ADDED: &str = "torrents_added";
+/// DHT crawl counters. `dht_torrents_added` comes from the insert trigger; the other four were
+/// written by the server's own crawler until D156 and stay as series names (history, API).
+pub const DHT_TORRENTS_ADDED: &str = "dht_torrents_added";
+pub const DHT_HASHES_SEEN: &str = "dht_hashes_seen";
+pub const DHT_FETCH_OK: &str = "dht_fetch_ok";
+pub const DHT_FETCH_FAIL: &str = "dht_fetch_fail";
+pub const DHT_BLOCKED: &str = "dht_blocked";
 pub const RELAYS_DISCOVERED: &str = "relays_discovered";
 pub const CRAWL_EVENTS: &str = "crawl_events";
 pub const LIVENESS_CHECKS: &str = "liveness_checks";
@@ -36,11 +43,11 @@ pub const TORRENTS_TOTAL: &str = "torrents_total";
 
 pub const METRICS: &[&str] = &[
     TORRENTS_ADDED,
-    crate::dht::status::DHT_TORRENTS_ADDED,
-    crate::dht::status::DHT_HASHES_SEEN,
-    crate::dht::status::DHT_FETCH_OK,
-    crate::dht::status::DHT_FETCH_FAIL,
-    crate::dht::status::DHT_BLOCKED,
+    DHT_TORRENTS_ADDED,
+    DHT_HASHES_SEEN,
+    DHT_FETCH_OK,
+    DHT_FETCH_FAIL,
+    DHT_BLOCKED,
     // Per DHT route (D102): hashes first triaged, torrents stored.
     crate::crawlmap::ROUTE_SERIES[0],
     crate::crawlmap::ROUTE_SERIES[1],

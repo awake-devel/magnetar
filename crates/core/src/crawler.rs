@@ -109,16 +109,6 @@ impl CrawlConfig {
             root: None,
         }
     }
-    pub fn phone_default() -> Self {
-        Self {
-            max_relays: 8,
-            explore_relays: 2,
-            budget: Duration::from_secs(120),
-            max_backfill_pages: 10,
-            concurrency: 3,
-            ..Self::server_default()
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -486,6 +476,13 @@ impl<'a, S: Store + ?Sized> Ctx<'a, S> {
             Ok(c) => {
                 run.conn = Some(c);
                 run.connected = true;
+            }
+            // D150: the destination budget had no room; nothing was sent. Not a visit: no
+            // failure recorded, no backoff, the relay comes up again next pass.
+            Err(crate::Error::Budget(e)) => {
+                tracing::debug!(relay = %run.url, "connect deferred: {e}");
+                run.attempted = false;
+                return;
             }
             Err(e) => {
                 let msg = e.to_string();
@@ -936,6 +933,8 @@ struct Pager {
     pages: usize,
     max_pages: usize,
     finished: bool,
+    /// Events in the previous page (0 before the first): what this relay returns per page.
+    last_len: usize,
 }
 
 impl Pager {
@@ -961,6 +960,7 @@ impl Pager {
             pages: 0,
             max_pages,
             finished: false,
+            last_len: 0,
         }
     }
 
@@ -992,8 +992,19 @@ impl Pager {
         if self.finished {
             return Ok(Step::Exhausted);
         }
+        // Normally one round; a second one only when a page held nothing new but may have
+        // been cut (D151, below).
+        loop {
+            if let Some(step) = self.round(run, deadline).await? {
+                return Ok(step);
+            }
+        }
+    }
+
+    /// One page. None: nothing new in it, `until` was stepped down, ask again.
+    async fn round(&mut self, run: &mut RelayRun, deadline: Instant) -> Result<Option<Step>, Halt> {
         if self.pages >= self.max_pages {
-            return Ok(Step::Stopped("page cap".into(), Vec::new()));
+            return Ok(Some(Step::Stopped("page cap".into(), Vec::new())));
         }
         let Some(conn) = run.conn.as_mut() else {
             return Err(Halt::Hard("not connected".into()));
@@ -1002,7 +1013,7 @@ impl Pager {
         let page = loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left < Duration::from_secs(1) {
-                return Ok(Step::Stopped("budget".into(), Vec::new()));
+                return Ok(Some(Step::Stopped("budget".into(), Vec::new())));
             }
             let wait = left.min(PAGE_TIMEOUT);
             let page = conn
@@ -1013,7 +1024,7 @@ impl Pager {
                 if !conn.is_open() {
                     let events = self.fresh(page.events);
                     run.conn = None;
-                    return Ok(Step::Stopped(format!("closed: {msg}"), events));
+                    return Ok(Some(Step::Stopped(format!("closed: {msg}"), events)));
                 }
                 // One retry: relays CLOSE on transient rate limits.
                 if !retried && left > CLOSED_RETRY_DELAY + Duration::from_secs(1) {
@@ -1022,7 +1033,7 @@ impl Pager {
                     continue;
                 }
                 let msg = format!("closed: {msg}");
-                return Ok(Step::Stopped(msg, self.fresh(page.events)));
+                return Ok(Some(Step::Stopped(msg, self.fresh(page.events))));
             }
             if page.timed_out {
                 // A wait cut short by the crawl deadline says nothing about the relay.
@@ -1031,7 +1042,7 @@ impl Pager {
                 } else {
                     "timeout"
                 };
-                return Ok(Step::Stopped(reason.into(), self.fresh(page.events)));
+                return Ok(Some(Step::Stopped(reason.into(), self.fresh(page.events))));
             }
             break page;
         };
@@ -1041,13 +1052,27 @@ impl Pager {
             page.events.iter().map(|e| e.created_at).max(),
         ) else {
             self.finished = true;
-            return Ok(Step::Exhausted);
+            return Ok(Some(Step::Exhausted));
         };
+        let len = page.events.len();
         let events = self.fresh(page.events);
         if events.is_empty() {
-            self.finished = true;
-            return Ok(Step::Exhausted);
+            // Nothing new. Usually the end: the relay answered `until` (inclusive) with the
+            // boundary events we already hold. But when one second holds a full page of
+            // events, the relay returns that same page again and everything older is still
+            // unseen (D151): a page as long as the previous one, all in one second, may have
+            // been cut, so step below that second and ask again instead of calling the sweep
+            // done. Events of that second beyond the relay's page size cannot be reached.
+            let maybe_cut = min == max && self.last_len > 0 && len >= self.last_len;
+            let below = min - 1;
+            if !maybe_cut || self.since.is_some_and(|s| below < s) {
+                self.finished = true;
+                return Ok(Some(Step::Exhausted));
+            }
+            self.until = Some(below);
+            return Ok(None);
         }
+        self.last_len = len;
         // Inclusive until, strictly decreasing: more than a page of events in one second would
         // otherwise loop forever.
         let next = match self.until {
@@ -1058,10 +1083,10 @@ impl Pager {
         if self.since.is_some_and(|s| next < s) {
             self.finished = true;
         }
-        Ok(Step::Page {
+        Ok(Some(Step::Page {
             events,
             max_created: max,
-        })
+        }))
     }
 }
 

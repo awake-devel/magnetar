@@ -1,4 +1,4 @@
-Changes since v0.3.2 (not released yet; pre-release `v0.3.2-redeploy1` carries all of it).
+Changes since v0.3.2 (not released yet; pre-release `v0.3.2-redeploy1` carries everything up to D146).
 
 ## What's new
 
@@ -8,6 +8,85 @@ The first start applies migration `20261112000000_enrich_due`. After it, an olde
 binary refuses to start (sqlx reports the migration as missing). Take a `pg_dump` and check it
 with `pg_restore -l` before the first start, and roll back only by restoring that dump or to a
 build of this version.
+
+### The server no longer crawls the DHT: run a worker (D156)
+
+The main server (`serve`) is now the index only. DHT crawling is done by crawl workers
+(`magnetar-server worker`, docs/WORKERS.md), which already did it on every deployment of ours.
+
+What stops working:
+
+- `MAGNETAR_DHT=polite` or `aggressive` on the server starts no crawler. The server logs a
+  warning at start ("MAGNETAR_DHT=… has no effect on `serve` since D156 …") and runs as with
+  `off`. It no longer changes the pace of the server's seed checks either: that is always
+  `MAGNETAR_LIVENESS_DHT_QPS`.
+- The command `magnetar-server dht` (`--seconds`, `--mode`, `--dry-run`) is gone. For a bounded
+  run use `magnetar-server worker --seconds N` against a server; it prints a JSON report when
+  it stops. There is no run without a database behind it any more.
+- `docker/compose.dht.yml` is gone. A start command that names it fails: remove
+  `-f docker/compose.dht.yml` from it.
+
+What to do instead: give a worker a token in `MAGNETAR_WORKER_TOKENS` and run it with
+`MAGNETAR_DHT=aggressive` (or `polite`), on another machine or next to the server
+(`docker/compose.worker.yml`, docs/WORKERS.md §2–§4). Running the worker file on the same host
+as `compose.yml` is **UNVERIFIED**.
+
+Nothing changes for a server that already ran `MAGNETAR_DHT=off` with workers. There is no
+database migration and no data is removed. Two `settings` rows the server's crawler kept
+(`dht.identity`, `dht.nodes`) are no longer used; a worker keeps its identity in its state
+directory. A torrent whose metadata fetch failed is tried again when a worker sees its hash
+again, not on a timer.
+
+Known limitation: the app and the web page offer the DHT activity charts and the DHT crawler
+lines only when the server itself crawls, so they are never shown now (as before on a server
+with `MAGNETAR_DHT=off`). `/health` never lists the feature `dht`, and `dht` in
+`/api/v1/stats` and `/api/v1/stats/health` is always null. Each worker's DHT counters are in the
+worker lines of the stats. Of the activity series only "DHT torrents added" is still recorded.
+
+The same start-up check now warns about other settings on the wrong side: `MAGNETAR_PROBE` on
+anything but a worker (as before), `MAGNETAR_WORKER_SERVER` / `MAGNETAR_WORKER_TOKEN` on the
+server, `MAGNETAR_WORKER_TOKENS` on a worker. These are warnings, never errors.
+
+### One limit on outbound connections for the whole process (D150)
+
+Every outbound connection other than the DHT (Nostr relays, tracker scrapes, TMDB, IMDb,
+DB-IP, ntfy) now goes through one destination budget: at most `MAGNETAR_NET_DESTS` (1024)
+distinct public addresses per 5 minutes and `MAGNETAR_NET_FLOWS` (20) new connections per
+second, halved by the router health brake when the line degrades. Over the limit a connection
+waits briefly, then is skipped (error `budget`) without counting as a tracker or relay failure;
+the log summarises waits and refusals every 10 minutes. LAN and
+tailnet addresses are not counted. `MAGNETAR_NET_DESTS=0` turns it off.
+
+### Nostr backfill no longer stops at a burst (D151)
+
+When a relay held more torrents in one second than it returns per page, the crawler took the
+repeated page for the end of the history and marked the backfill done, leaving everything
+older unread. It now steps past that second and continues.
+
+### The app and the web page are ready for new sources (D152)
+
+A torrent whose source the client does not know yet is shown as "Other source", with no trust
+badge and no publisher card, instead of being presented as a Nostr torrent. Nothing changes
+for today's Nostr and DHT results.
+
+### A background loop that stops is reported (D147)
+
+Every background loop (crawler, seed checker, router health probe, enrichment, …) now runs
+under a name. If one exits or panics while the server runs, the log says which one, at ERROR,
+and `GET /health` answers `"status": "degraded"` instead of `"ok"`. Nothing is restarted
+automatically, and the Docker healthcheck still looks only at the database.
+
+### DHT torrents are re-sorted after a classifier update (D155)
+
+Torrents found through the DHT are classified and screened again when the classifier changes.
+This used to run only when the server crawled the DHT itself, so a server that leaves crawling
+to workers never did it. It now runs once at each server start, in the background. The first
+start after this update reads every DHT torrent once.
+
+### Searches no longer hang while the search index rebuilds (D148)
+
+When the search index is off or still building, searches fall back to Postgres. Those queries
+now stop after 15 s and answer `timeout` (504), so a slow search cannot hold the database.
 
 ### Seed checks are always paced and braked (D146)
 
@@ -43,3 +122,6 @@ load.
 - docs/DOCKER.md recommends `tailscale serve --https=8443` and checking `tailscale serve
   status` first: serving on a used port replaces what was there (D146).
 - README brought up to date with v0.3.2 (workers, DHT crawler, enrichment, D137–D145).
+- The web session cookie now opens only the routes the web page uses. `/api/v1/relays`,
+  `/api/v1/trust/*` and `/api/v1/overrides/*` need the bearer token, like any route added
+  later (D153).

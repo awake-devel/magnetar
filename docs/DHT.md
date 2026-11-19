@@ -1,4 +1,13 @@
-# DHT crawler (ARCHITECTURE.md D49–D75, D93, D95)
+# DHT crawler (ARCHITECTURE.md D49–D75, D93, D95, D156)
+
+**Since D156 (2026-11-19) the crawler runs in `magnetar-server worker` only**
+(docs/WORKERS.md). The server-side crawler was removed in D156: `serve` no longer crawls the
+DHT, the `dht` command, `docker/compose.dht.yml`, `DhtService` and the identity rows in
+`settings` are gone, and `MAGNETAR_DHT` on `serve` only logs a warning. The engine
+(`core::dht`), the metadata fetcher, the screen, the classifier, the `dht_seen` triage and the
+batched writer described here are what a worker and the server's fleet ingest use. Sections
+13–20 are the record of how the crawler was built and measured; their runs used the
+server-side crawler (`magnetar-server dht` or `serve`) that D156 removed.
 
 Design document for the native Mainline DHT crawler. Status: **stages 1 (discovery), 2
 (metadata fetch) and 3 (classification and safety) built**: KRPC node, BEP 42 ids, routing,
@@ -335,7 +344,8 @@ server/src/dht/        daemon: mod.rs (pipeline, report), seen.rs (Bloom), queue
 
 ### 3.2 Modes (D49)
 
-`MAGNETAR_DHT` = `off` (default) | `polite` | `aggressive`. The default stays off: crawling
+`MAGNETAR_DHT` = `off` (default) | `polite` | `aggressive`, a `worker` setting since D156
+(`serve` ignores it with a warning). The default stays off: crawling
 the DHT makes the host's IP visible in swarms (dht-crawling.md §4 "Legal"), which every
 deployment must opt into. The user's laptop runs `aggressive`.
 
@@ -372,8 +382,9 @@ Both modes honour every rule of §3.4 (interval, per-IP rate, honest ids, no fak
   of responses (≥ 8 agreeing responders from ≥ 4 distinct /16s; once an address is known, a
   new one must also have more responders than the known one in the same 10-minute window, D63).
   Ids are regenerated only when
-  the external IP changes; ids, the external IP and the port are persisted in `settings`
-  (`dht.identity`, JSON). Until an IP is known the node uses a random id and `ro=1`.
+  the external IP changes; ids, the external IP and the ports are persisted in `dht.json` in
+  the worker's state dir (D100; the server-side crawler kept them in `settings` as
+  `dht.identity`, a row no longer read or written since D156). Until an IP is known the node uses a random id and `ro=1`.
 - Each virtual node is a separate UDP socket on its own port: queries carry no recipient id, so
   a remote node identifies "us" by (IP, port). Remote libtorrent nodes keep one routing slot per
   IP (`restrict_routing_ips`, dht-crawling.md §1.2), so more than a few virtual nodes add little.
@@ -445,7 +456,8 @@ Both modes honour every rule of §3.4 (interval, per-IP rate, honest ids, no fak
   within 15 min, questionable after, bad after 2 failures; bucket refresh after 15 min with a
   `find_node` to a random id in the bucket. Serves `find_node`/`get_peers` answers.
 - Bootstrap: `core::liveness::dht::BOOTSTRAP` routers + the last 1000 good nodes persisted in
-  `settings.dht.nodes` every 10 min (BEP 5: "The routing table should be saved between
+  the worker's `dht.json` (D100; `settings.dht.nodes` on the server-side crawler removed in
+  D156) every 10 min (BEP 5: "The routing table should be saved between
   invocations"). Then `find_node` towards each own id.
 - **Crawl pool** (separate from routing tables): nodes learnt from any response's
   `nodes`/sample responses and (aggressive) from incoming queries, keyed by (IP, port): id,
@@ -516,8 +528,11 @@ samples / announces / get_peers ──► seen filter (2 × Bloom) ──► bat
   collection blocks while every fetcher is busy) to `MAGNETAR_DHT_FETCH_CONCURRENCY` fetch
   workers (stage 2); results are written by one persister in batches (§2.4, §14). A fetch cut
   short by a stop keeps its lease and comes back through the retry loop.
-- **Retry loop**: every minute, ≤ 1000 `dht_seen` rows with `next_attempt_at <= now` re-enter at
-  priority 0. Backoff after a failed fetch: 1 h, 6 h, 24 h, then `next_attempt_at = NULL` (4
+- **Retry loop** (server-side crawler only, removed in D156): every minute, ≤ 1000 `dht_seen`
+  rows with `next_attempt_at <= now` re-entered at priority 0. Since D156 nothing takes due rows
+  up on a timer: wherever this section says a row "comes back through the retry loop", it now
+  comes back when a worker's triage sights the hash again after `next_attempt_at` (the
+  `ON CONFLICT` clause of `triage_for`). Backoff after a failed fetch: 1 h, 6 h, 24 h, then `next_attempt_at = NULL` (4
   attempts). `invalid`, `private`, `v2_only`, `oversize`, `alias` are final. Measured size:
   ~160 B per `dht_seen` row with its indexes (§13), not the ~70 B estimated in §10.
 
@@ -713,7 +728,8 @@ user's "mixed equally, not hidden by min_trust".
     `trackers` empty (the magnet gets `magnet::DEFAULT_TRACKERS`, as for tracker-less Nostr
     torrents), `trust` = `TrustScore { pubkey: "", score: 0, factors: [{code: "dht", delta: 0,
     detail: "Found on the DHT: name and files verified against the infohash; no publisher"}] }`.
-  - `Health.features` gains `dht` when the crawler runs.
+  - `Health.features` gains `dht` when the server's own crawler runs: never since D156 (the
+    feature name stays defined; clients hide their crawler lines and DHT activity series).
 - **App**: a "DHT" badge (outlined, neutral colour) **in place of** the trust star for `Dht`;
   `Both` shows the trust star plus a small "DHT" chip; detail screen "Source: DHT (verified
   metadata)" with first-seen date; filter sheet chip "Source: Nostr / DHT"; Stats gains an
@@ -789,9 +805,9 @@ App: Settings → "Show adult content" (off), stored with the app's search prefe
   runs **before** the blocklist decision: the fetcher, the info-dict parser, `core::classify`
   and `core::release` must not log names or paths at any level (a `debug!` with the name in the
   fetcher would leak exactly what is about to be blocked); a test with a capturing `tracing`
-  subscriber feeds a blocked fixture through the whole pipeline at `TRACE` and asserts the
-  fixture's terms never appear. The `dht --dry-run` report likewise shows names only of
-  torrents that passed the blocklist.
+  subscriber feeds a blocked fixture through the whole path at `TRACE` and asserts the
+  fixture's terms never appear (since D156 on the worker → ingest path:
+  `it::workers::ingest_blocklist_classifies_and_never_logs_names`).
 - Order on the DHT path: verify hash → parse info dict → classify (pure, needed by the context
   tier) → blocklist → only then anything that writes, logs a name or leaves the process.
 
@@ -839,7 +855,8 @@ is checked against the hard tier only; public CSAM hash lists
 
 ## 8. Ops: configuration (D58)
 
-Server variables. **Built in stage 1**: `MAGNETAR_DHT`, `_PORT`, `_NODES`, `_QPS`, `_POOL`,
+Crawler variables, read by `worker` since D156 (docs/CONFIG.md says which ones `serve` still
+reads). **Built in stage 1**: `MAGNETAR_DHT`, `_PORT`, `_NODES`, `_QPS`, `_POOL`,
 `_FETCH_KNOWN`, `_PEER_LOOKUPS`; **stage 2**: `_FETCH_CONCURRENCY` (1–2048), `_METADATA_MAX`
 (16 KiB–64 MiB), `_TCP_RATE`, `_TCP_MAX`, `_PROBE`; **stage 3**: `MAGNETAR_BLOCKLIST_FILE`; the
 others are still planned (their stage in brackets).
@@ -866,13 +883,12 @@ others are still planned (their stage in brackets).
 | `MAGNETAR_DHT_UPNP_LOCAL_IP` | the address the SOAP connection leaves from | LAN address to map to; **required in Docker** (the container sees its bridge address) |
 | `MAGNETAR_BLOCKLIST_FILE` | unset | extra plain-text terms, one per line (1–3 words, or one 2–4-character CJK term), `context:` prefix for the context tier; additive only; read at the start of every command, a file that does not load stops it (stage 3) |
 
-CLI (built in stage 1): `magnetar-server dht [--seconds N] [--mode polite|aggressive] [--dry-run]`
-runs the crawler for a bounded time (default 300 s; Ctrl-C/SIGTERM stop it early, cleanly) and
-prints a JSON report on stdout: sightings, unique hashes/min, triage outcome, queue, peers per
-hash, the engine counters, CPU seconds and RSS. `--mode` defaults to `MAGNETAR_DHT`, or polite
-when that is off. `--dry-run`: no database at all (dedupe in memory). `serve` starts it when
-`MAGNETAR_DHT` ≠ `off`, after migrations (the blocklist sweep joins in stage 3); it stops within
-`serve`'s 10 s daemon grace, saving the identity and 1000 contacts.
+CLI: `magnetar-server worker [--seconds N]` runs the crawler against a main server, for a
+bounded time with `--seconds` (Ctrl-C/SIGTERM stop it early, cleanly), and prints a JSON
+report (`WorkerReport`) on stdout when it stops (docs/WORKERS.md §3). The mode is
+`MAGNETAR_DHT`. The server-side crawler was removed in D156: the `dht` command with `--mode`
+and `--dry-run` no longer exists (there is no database-free run), and `serve` starts no
+crawler whatever `MAGNETAR_DHT` says.
 
 ## 9. UPnP, ports, Docker (D57, as built in stage 4: D72, §16)
 
@@ -900,9 +916,10 @@ when that is off. `--dry-run`: no database at all (dedupe in memory). `serve` st
   gateway is the bridge. So in Docker set `MAGNETAR_DHT_UPNP_GATEWAY=<router ip>` and
   `MAGNETAR_DHT_UPNP_LOCAL_IP=<host LAN ip>` (MiniUPnPd's secure mode only maps to the
   requester's own address, which is the host's after masquerading), and publish the UDP ports.
-  Ports come from an overlay so a default `compose.yml` publishes nothing new:
-  `docker/compose.dht.yml` with `ports: ["${MAGNETAR_DHT_PUBLISH:-6891-6894}:6891-6894/udp"]` and
-  the DHT variables, used as `docker compose -f compose.yml -f docker/compose.dht.yml up -d`.
+  `compose.yml` publishes nothing for the DHT; the ports are published by the worker's file,
+  `docker/compose.worker.yml` (`ports: ["${MAGNETAR_DHT_PUBLISH:-6891-6894}:6891-6894/udp"]`,
+  UPnP off unless `MAGNETAR_DHT_UPNP=true`). The overlay `docker/compose.dht.yml`, which
+  turned the crawler on inside the server container, was deleted in D156.
   Outbound UDP from the container is masqueraded with the source port kept when free (Linux
   default), so remote nodes see the same port they can reach. UNVERIFIED on the real router until
   stage 8.
@@ -911,21 +928,19 @@ when that is off. `--dry-run`: no database at all (dedupe in memory). `serve` st
 
 ## 10. Stats, health, resources (D58, as built in stage 4: D74, §16)
 
-- `/api/v1/stats.dht` (`DhtStats`, serde default): mode, virtual nodes (id prefix, port, mapped),
-  external IP class (public / private / CGNAT, never the address itself), routing-table sizes,
-  pool size and BEP 51 share, queries out/s and answered share, brake active, incoming queries/min
-  (aggressive), samples/h, new unique hashes/h, queue length by priority, fetches in flight,
-  fetch ok/fail per hour by error code, hit rate, stored total, blocked total, adult share,
-  `v2_only`/`private` counts, UPnP state (mapped ports, lease expiry, last error).
-- D93 adds (serde default, older servers leave them 0): `collected`, `from_source`, `looked_up`,
-  `announce_fetches`, `announce_upgraded`, `incoming_*` per query type, `fake_peers_skipped` /
-  `_banned` / `_tracked`, `lookup_mean_ms`, `queries_per_lookup`, `lookup_slow_share`, and the
-  answer share by node age `answered_share_young` / `_old` / `_unpooled` / `_repeat` (§18).
-- D95 adds (serde default): `lookup_answered_share`, `lookup_seeds_fresh_share`,
-  `queries_per_stored` (rate window), `pool_dropped_dead`, `lookup_dead_skipped` (since the
-  start) (§19).
-- `stats_series` metrics: `dht_torrents_added`, `dht_hashes_seen`, `dht_fetch_ok`,
-  `dht_fetch_fail`, `dht_blocked`; breakdown field `origin`.
+- The server-side crawler was removed in D156, and its live status (`DhtService`, the
+  per-minute sampler) with it. `dht` in `/api/v1/stats` and `/api/v1/stats/health` is always
+  null and `/health` never lists feature `dht`. The type `DhtStats` stays in the API (serde
+  default; fields in `crates/core/src/api.rs`, the D93 and D95 additions of §18 and §19
+  included) so clients and older servers interoperate.
+- A worker reports its crawler in its heartbeat: `workers[].dht` in `/api/v1/stats`
+  (docs/WORKERS.md "Stats"), and its line in `/api/v1/stats/sources`. The "server" line there
+  carries seed checks only.
+- `stats_series` metrics: `dht_torrents_added` (insert trigger, still written). `dht_hashes_seen`,
+  `dht_fetch_ok`, `dht_fetch_fail` and `dht_blocked` were written by the removed sampler and
+  have no writer any more (history is kept). The clients offer the DHT activity charts only
+  with feature `dht`, so they are not offered: known limitation, docs/ROADMAP.md "DHT activity
+  charts from worker data". Breakdown field `origin`: unchanged.
 - Targets on the laptop (to be measured in stage 8): ≤ 25 % of one core, ≤ 400 MB RSS for the
   crawler, ≤ 8 Mbit/s down, ≤ 150 new TCP connections/s (D66), ~10 k UDP conntrack entries at
   200 q/s (30 s unreplied timeout × rate + flows to answering nodes).
@@ -940,11 +955,10 @@ when that is off. `--dry-run`: no database at all (dedupe in memory). `serve` st
 
 ## 10.1 Crawl workers
 
-Other machines can run the same crawler and report to this server (D96–D100,
-docs/WORKERS.md): their sightings are triaged here against `dht_seen` (one fetch per hash for
+Workers are the only crawlers since D156: they run this crawler and report to the server
+(D96–D100, docs/WORKERS.md). Their sightings are triaged here against `dht_seen` (one fetch per hash for
 the whole fleet), and every info dict they upload is verified against its infohash,
-classified and screened here, then written by `persist::persist_batch` like this crawler's
-own results. A worker's blocklist runs before upload; a blocked torrent arrives as a hash only.
+classified and screened here, then written by `persist::persist_batch`. A worker's blocklist runs before upload; a blocked torrent arrives as a hash only.
 
 ## 11. What is deliberately not done
 
@@ -964,12 +978,14 @@ blocked names anywhere; nothing from the DHT is published to Nostr.
 | final (§17) | no new features | merge onto `main`, migrations from scratch and on a production copy, gates, debug APK + app unit tests, Docker image, 10-min live run on a production copy with every DHT API surface smoke-tested |
 | 5 (open) | the Nostr **sweep** of §7.1 (stored events re-screened when the blocklist version moves, vacuum + index merge) | not built yet |
 | 8 | live tuning on the laptop | rates, hit rate, resources, disk per torrent |
+| D156 (2026-11-19) | removes what stages 1–4 built on the server side: the `serve` daemon and pipeline, the `dht` CLI, `DhtService`, identity in `settings`, `docker/compose.dht.yml`. The crawler runs in `worker` only | `config::tests::misplaced_settings_warn`, `config::tests::parses_dht_options`, `it::workers::ingest_blocklist_classifies_and_never_logs_names` |
 
 ## 13. Stage 1: built and measured (2026-10-26)
 
 **Code.** `crates/core/src/dht/` (krpc, id, addr, routing, pool, limiter, peerstore, engine,
 lookup), `crates/server/src/dht/` (mod, seen, queue, store), migration
-`20261101000000_dht.sql`, `magnetar-server dht`, `MAGNETAR_DHT*` options in `config.rs`.
+`20261101000000_dht.sql`, `magnetar-server dht` (removed in D156 with the server-side
+pipeline), `MAGNETAR_DHT*` options in `config.rs`.
 New dependency: `proptest` 1.12.0 (MIT/Apache-2.0), dev only. CRC32C is in-house (D59).
 
 **Tests.** KRPC codec against the BEP 5 example packets, BEP 51 round trip, BEP 42 `ip` and
@@ -1268,10 +1284,10 @@ original info dict. A hostile 16 MiB info dict costs up to ~9 s of one core to s
 detail, origin refinement of fallback pages; `stats.rs` (`origin` breakdown, DHT metrics,
 `recompute_published` Nostr-only); `api.rs` (`origin=` parameter, features `origin` / `dht`,
 `StatsResponse.dht`, `StatsHealth.dht`); `dht/status.rs` (`DhtService`, `DhtStats`, the
-per-minute sampler), `dht/upnp.rs` (D72); core types `Origin`, `DhtInfo`, `DhtStats`,
+per-minute sampler; the file was deleted in D156), `dht/upnp.rs` (D72); core types `Origin`, `DhtInfo`, `DhtStats`,
 `UpnpStatus`, `SearchQuery.origins`; ffi `FfiOrigin`, `FfiDhtInfo`, `FfiDhtStats`,
 `Magnetar::server_dht`; app (badge, Source chips, detail card, Stats, Status, `DhtFormat.kt`);
-`docker/compose.dht.yml`, `compose.yml` pass-through, `.env.example`. New dependency:
+`docker/compose.dht.yml` (deleted in D156), `compose.yml` pass-through, `.env.example`. New dependency:
 `igd-next` 0.18.0 (+ `xml-rs`, `xmltree`, all MIT), server feature `upnp`.
 
 **Trust treatment as built (D51/D73)**: a document with a DHT row passes every `min_trust`
@@ -1297,7 +1313,7 @@ stop; after a renewal round in which every mapping fails, the lease-0 mappings o
 are still removed at stop (within one 2 s budget); a port lost to another host (718 at renewal)
 is not removed; no gateway → `failed`, softly; the crawler (fake DHT, 2 virtual nodes) maps exactly its
 bound UDP ports, shows in `/health` (`dht`, `origin`) and `/api/v1/stats.dht`, and unmaps at
-stop. Android `DhtTest` (chip ↔ query, breakdown fields per feature, labels, crawler lines,
+stop (this last test was removed with the server-side crawler in D156). Android `DhtTest` (chip ↔ query, breakdown fields per feature, labels, crawler lines,
 uptime) with the existing unit tests, `assembleDebug`.
 
 **Live run** (D75; release build, home IP, aggressive, 4 virtual nodes, `MAGNETAR_DHT_UPNP=false`,
@@ -1342,30 +1358,30 @@ hidden); `origin=dht&min_trust=50` returned the 683 DHT documents with trust 0 a
 
 ### 16.1 Ops
 
-- **Turn it on**: `MAGNETAR_DHT=aggressive` (or `polite`) and restart `serve`; in Docker
-  `docker compose -f compose.yml -f docker/compose.dht.yml up -d` (docs/DOCKER.md). The first
-  start after the upgrade runs the DHT migration (61 ms on the production copy) and rebuilds the
-  search index once (`SCHEMA_VERSION` 4, 48 s).
-- **Ports**: UDP `MAGNETAR_DHT_PORT`…`+NODES-1` (6891–6894). `serve` maps them with UPnP in
-  aggressive mode (`MAGNETAR_DHT_UPNP=false` to forward by hand or not at all); in Docker set
+The server-side crawler was removed in D156; this is what holds for a worker.
+
+- **Turn it on**: run a worker with `MAGNETAR_DHT=aggressive` (or `polite`): docs/WORKERS.md
+  §3–§5, in Docker `docker/compose.worker.yml`. `MAGNETAR_DHT` on `serve` only logs a warning.
+  (Stage 4 measured the first start after its upgrade on the production copy: DHT migration
+  61 ms, one search index rebuild for `SCHEMA_VERSION` 4, 48 s.)
+- **Ports**: UDP `MAGNETAR_DHT_PORT`…`+NODES-1` (6891–6894). A worker maps them with UPnP only
+  with `MAGNETAR_DHT_UPNP=true` (aggressive mode); in Docker set
   `MAGNETAR_DHT_UPNP_GATEWAY` and `MAGNETAR_DHT_UPNP_LOCAL_IP`. No TCP port: the crawler never
   listens on TCP (D72).
-- **Watch**: `/health` lists `dht`; `/api/v1/stats` and `/api/v1/stats/health` carry `dht`
-  (`running`, `last_error`, `hashes_per_min`, `queue_len`, `metadata_per_min`,
-  `fetch_success_rate`, `stored_total`, `adult_total`, `blocked_total`, `brake`,
-  `incoming_per_min`, `upnp.state` / `mappings` / `last_error`); the app shows them on the Stats
-  health card and the Status screen; the activity chart has "DHT torrents added" and "DHT hashes
-  found". `incoming_per_min` near zero for 10 min with `upnp.state = mapped` means the router or
-  a firewall drops unsolicited UDP. `brake = true` for long stretches means the D66 probe sees a
-  slow or lossy line (it did for the whole stage 4 run).
-- **Stop**: SIGTERM/Ctrl-C; within `serve`'s grace the crawler saves its identity and 1000
-  contacts and removes its UPnP mappings.
+- **Watch**: each worker's line in `/api/v1/stats` (`workers[].dht`: mode, nodes, ports, qps,
+  answered share, brake, queue, rates; docs/WORKERS.md "Stats") and in
+  `/api/v1/stats/sources`. `/health` never lists `dht` and the server's `stats.dht` is always
+  null, so the clients' crawler lines and DHT activity charts are not shown (known limitation,
+  §10).
+- **Stop**: SIGTERM/Ctrl-C; the worker saves its identity and contacts to `dht.json` in its
+  state dir and removes its UPnP mappings.
 - **Disk**: no cap (user decision). Measured ~6 KB per stored torrent in `dht_torrents`, ~10 KB
   per stored torrent for the whole database including the `dht_seen` queue of hashes not
   (yet) fetched, plus ~3 KB of index. At the stage 4 rate (~80 stored/min ≈ 115 k/day) that is
   roughly 1 GB a day; `db_size` in Stats shows it.
-- **Bounded measurement**: `magnetar-server dht --seconds N` never maps router ports unless
-  `MAGNETAR_DHT_UPNP=true` is set explicitly.
+- **Bounded measurement**: `magnetar-server worker --seconds N`, against a main server; like
+  every worker run it never maps router ports unless `MAGNETAR_DHT_UPNP=true` is set
+  explicitly. Follow the network rules of the line it runs on first (D109).
 
 **Not verified in stage 4.** UPnP against the real router (only the fake gateway; the router was
 not touched) and from a container; inbound reachability and passive capture with mapped ports;
@@ -1378,6 +1394,9 @@ at a time, 5 s statement timeout after which the last value is kept) at millions
 (not built).
 
 ## 17. Final integration check (2026-10-26, no new features)
+
+Run with the crawler inside `serve`, which D156 removed: feature `dht`, `stats.dht` and the
+saved `dht.identity` / `dht.nodes` rows below describe that crawler.
 
 - **Merge**: `main` (`cb5dd61`) is an ancestor of `dht/crawler`; `git merge-tree` is clean (the
   merge is a fast-forward).
@@ -1498,12 +1517,13 @@ announces lost after the announcer's own `get_peers`, and "accept-all" fake peer
   `_banned` / `_tracked`, `lookup_mean_ms`, `queries_per_lookup`, `lookup_slow_share` (over the
   rate window), and **answer share by node age**: queries to pool nodes < 5 min old, older ones,
   nodes not in the pool, and pool nodes asked again after answering a sample (`repeat`). The
-  `dht` command's report has the same plus triage timings, and logs one line a minute with
-  these rates.
+  `dht` command's report had the same plus triage timings, and logged one line a minute with
+  these rates (the command and the server's live `DhtStats` were removed in D156).
 
 ### 18.2 Measured (laptop on the same fiber line, production crawler running alongside)
 
-Release builds, `magnetar-server dht --mode aggressive --seconds 600`, fresh scratch database
+Release builds, `magnetar-server dht --mode aggressive --seconds 600` (the bounded command
+D156 removed), fresh scratch database
 each (bootstrap from the routers), UDP 17891–17894 (before) / 18891–18894 (after),
 `QPS 1000`, `PEER_LOOKUPS 1024`, `FETCH_CONCURRENCY 2048`, `TCP_RATE 1000`, `TCP_MAX 4000`,
 `PROBE off`, no UPnP. Runs are sequential, so DHT conditions differ between them by a few
@@ -1604,8 +1624,9 @@ lookup asks.
   pool `dropped_dead` / `dead_known`. `DhtStats` (serde default) gains
   `lookup_answered_share`, `lookup_seeds_fresh_share` and `queries_per_stored` (`get_peers`
   sent per torrent stored) over the rate window, plus `pool_dropped_dead` and
-  `lookup_dead_skipped`. The `dht` report has the same in `peers`, and the minute log line shows
-  the lookup answer share and the fresh-seed share.
+  `lookup_dead_skipped`. The `dht` report had the same in `peers`, and the minute log line showed
+  the lookup answer share and the fresh-seed share (report and server-side `DhtStats` removed in
+  D156).
 
 **Rejected after measuring: "fresh first."** The first build ordered seeds and the walk's
 queries by tier (fresh, unknown, struck). Live, against `main` in the same hour on the ONT, it
@@ -1618,7 +1639,8 @@ lookups asked the same few nodes, and our own 1 q/s limit refused 3.2 queries pe
 
 ### 19.2 Measured (laptop on the ONT, production crawler running alongside)
 
-Release `dht --mode aggressive --seconds 600`, a fresh scratch database each on `magnetar-pg`,
+Release `dht --mode aggressive --seconds 600` (the command D156 removed), a fresh scratch
+database each on `magnetar-pg`,
 UDP 17891–17894 (`main` at `3bdde50`) / 18891–18894 (branch), `QPS 1000`, `PEER_LOOKUPS 1024`,
 `FETCH_CONCURRENCY 2048`, `TCP_RATE 1000`, `TCP_MAX 4000`, `PROBE off`, no UPnP. Runs are
 interleaved, 10:03–11:18 local, all after the laptop moved to the ONT and the production
@@ -1761,7 +1783,8 @@ crawler; no thread of the crawler ever passed 0.3 core.
 
 ### 20.4 Live ramp on the direct fiber line (2026-10-28, 01:12–04:04)
 
-Release `dht --mode aggressive --seconds 600`, a fresh scratch database each on `magnetar-pg`, UDP
+Release `dht --mode aggressive --seconds 600` (the command D156 removed), a fresh scratch
+database each on `magnetar-pg`, UDP
 47891+ (`main` = `b519486`) / 48891+ and 49891+ (this build: `6bafe50`, from 02:23 `3f50861`,
 the same engine plus the sampler priority option), probe on, no UPnP, `FETCH_CONCURRENCY 2048`,
 `TCP_MAX 4000` (8000 with `TCP_RATE 2000`). `ip route get 1.1.1.1` showed the fiber source

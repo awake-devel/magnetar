@@ -50,6 +50,8 @@ magnetar-server --version
 | `MAGNETAR_LIVENESS_FALLBACK_TRACKERS` | `true` | Torrents that list no tracker (DHT-only ones) are scraped on the default public trackers their magnet links get. `false`: only the DHT asks for them (if on), so no public tracker is contacted; `scripts/webcheck.sh` sets it (D136) |
 | `MAGNETAR_LIVENESS_DHT_CONCURRENCY` | `32` | DHT walks at the same time (~25–50 nodes asked per walk). 32 cleared ~29 k torrents an hour on a home line in the measurement; lower it on a weak connection. Every walk query waits for the process's shared DHT pace, and no more walks run at once than that pace can feed (rate × 10 s ÷ 40 queries, at least 1; D109) |
 | `MAGNETAR_LIVENESS_DHT_QPS` | `20` | the seed checker's shared pace while the DHT crawler is off (1–20000): its DHT walks and each tracker contact (D113) take a permit, and the router health probe brakes it. It applies with `MAGNETAR_LIVENESS_DHT=false` too, then to tracker contacts only (D146). With the crawler on, walks and crawler share `MAGNETAR_DHT_QPS` instead (D109) |
+| `MAGNETAR_NET_DESTS` | `1024` | Destination budget (D150, serve and worker): distinct public destination IPs this process may contact in any 300 s, the home router's route-cache lifetime (4 096 entries on the neufbox, shared with the whole LAN). Covers Nostr relays, tracker scrapes, TMDB, IMDb, DB-IP, ntfy and the anime lists; not the DHT engine, the BEP 9 fetcher or header probes (their own paces), nor librqbit downloads (no hook). Loopback, LAN, tailnet (100.64/10, ULA) and link-local addresses are not counted. A connection over the budget waits (at most 30 s and at most half its own connect timeout), then fails with the error `budget` without sending anything; trackers and relays deferred this way get no failure and no backoff. Waits and refusals are logged every 10 min. Every subcommand installs it (serve, worker, crawl-once, liveness, enrich…). The router health brake divides it by 2^level. `0` turns the budget off |
+| `MAGNETAR_NET_FLOWS` | `20` | Destination budget: new outbound connections per second (burst of one second); braked like `MAGNETAR_NET_DESTS` |
 | `RUST_LOG` | `info` | tracing `EnvFilter` syntax, e.g. `info,magnetar_core=debug` |
 | `MAGNETAR_IMDB` | `true` | Offline IMDb identification (D40, docs/ENRICHMENT.md): downloads the IMDb non-commercial datasets (~293 MB: title.basics, title.ratings, title.episode) and imports them (~585 MB in Postgres). `false` keeps strong-ID linking (i tags, description links) and skips all downloads |
 | `MAGNETAR_IMDB_AKAS` | `false` | Also import `title.akas` (+519 MB download, +~300 MB in Postgres, import ~4.5 min instead of ~1.5): localised titles, +2.8 points correct on French YGG releases |
@@ -95,6 +97,7 @@ variables above it passes to the server. Two more are used by compose itself:
 | `MAGNETAR_VERSION` | `latest` | image tag of `ghcr.io/awake-devel/magnetar`: `latest` (newest non-prerelease), `X.Y.Z`, `X.Y.Z-rc1`, or `edge` (newest `main`) |
 | `MAGNETAR_PUBLISH` | `127.0.0.1:8787` | where the host publishes the API (exact format in docs/DOCKER.md). Change it only to put it on a LAN or Tailscale address |
 | `POSTGRES_MAX_WAL_SIZE` | `8GB` | `db` service: disk space the write-ahead log may use between checkpoints (docs/DOCKER.md "Postgres settings", D145) |
+| `MAGNETAR_DB_DIR` | (volume `db-data`) | `db` service: an absolute host path keeps the Postgres files there (bind mount) instead of the named volume, e.g. on a fast internal disk when `/var/lib/docker` is on a slow one (docs/DOCKER.md "Moving the database to another disk", D149). The directory must hold the volume's contents or be empty (a new database) |
 | `POSTGRES_SHARED_BUFFERS` | `1GB` | `db` service: memory for Postgres's page cache; keep the service's `mem_limit` at least twice this |
 
 The Postgres credentials and volumes are described in docs/DOCKER.md.
@@ -117,13 +120,21 @@ verifies each torrent's metadata from its peers (BEP 9, TCP); stage 3 classifies
 adult tag) and passes every name through the hard illegal-content blocklist before anything
 is stored (D68, D69). Stored DHT torrents get release attributes, seed checks and IMDb/anime
 links. Since stage 4 they are search results mixed equally with Nostr ones (D51, D73: they
-pass any trust threshold, carry `origin` `dht` or `both`, and have a Source filter chip), the
-crawler shows up in `/api/v1/stats`, `/api/v1/stats/health` and `/health` (feature `dht`), and
-`serve` maps its UDP ports with UPnP (D72).
+pass any trust threshold, carry `origin` `dht` or `both`, and have a Source filter chip).
+
+**Since D156 the crawler runs in `magnetar-server worker` only** (docs/WORKERS.md): `serve` is
+the index and never crawls. The settings below are read by `worker`; on `serve` and every other
+command a `MAGNETAR_DHT` other than `off` only logs a warning at start
+("MAGNETAR_DHT=<mode> has no effect on `serve` since D156 …") and changes nothing, the pace of
+the server's seed checks included (that is always `MAGNETAR_LIVENESS_DHT_QPS`). `serve` still
+reads `MAGNETAR_DHT_PROBE` (its router health probe), `MAGNETAR_DHT_FETCH_KNOWN` and
+`MAGNETAR_DHT_METADATA_MAX` (for what workers triage and upload) and `MAGNETAR_BLOCKLIST_FILE`.
+`/health` never lists feature `dht`, and `dht` in `/api/v1/stats` and `/api/v1/stats/health` is
+always null; workers report their DHT counters in the worker lines.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `MAGNETAR_DHT` | `off` | `off`, `polite` (BEP 51 sampling only, read-only node) or `aggressive` (sampling + passive listening on open UDP ports, UPnP). Crawling shows the host's IP in swarms: opt in deliberately |
+| `MAGNETAR_DHT` | `off` | worker only (D156; `docker/compose.worker.yml` sets `aggressive`): `off`, `polite` (BEP 51 sampling only, read-only node) or `aggressive` (sampling + passive listening on open UDP ports, UPnP when asked). Crawling shows the host's IP in swarms: opt in deliberately. On `serve` a value other than `off` only logs a warning |
 | `MAGNETAR_DHT_PORT` | `6891` | first UDP port (aggressive, 1–65504); virtual node *i* uses `PORT + i` |
 | `MAGNETAR_DHT_NODES` | `4` aggressive, `1` polite | 1–32. Each virtual node has its own UDP socket, receive task and lock (D106). BEP 42 gives 8 node-id prefixes per IPv4 address: from the 9th node on, prefixes repeat (still valid ids). Measured on the fiber line: docs/DHT.md §20 |
 | `MAGNETAR_DHT_QPS` | `200` / `50` | outbound DHT queries per second, all kinds, over every virtual node **and the seed checker's DHT walks** (D109) (1–20000; the engine sends ≥ 93 % of 20 000 on loopback, docs/DHT.md §20). Router benchmark: 300 safe, 400 breaks the neufbox; with UPnP and seed checks running, 75 already filled its 16 384-entry NAT table (D109) |
@@ -138,15 +149,16 @@ crawler shows up in `/api/v1/stats`, `/api/v1/stats/health` and `/health` (featu
 | `MAGNETAR_DHT_TCP_MAX` | `350` | TCP connections open at once (1–10000); the same router held ~440 |
 | `MAGNETAR_DHT_PROBE` | `1.1.1.1:443,9.9.9.9:443` | router health probe: a TCP connect to every target every 2 s (a failure = all of them failed), one probe per process; when latency triples (or ≥ 40 ms more) or 3 of the last 6 fail, the brake level rises by one (at most every 12 s, up to 3) and DHT queries (crawler and seed-check walks) and TCP attempts run at 1/2^level; after 5 calm minutes it drops by one, then one per calm minute (D109). Also runs with only seed checks on, `MAGNETAR_LIVENESS_DHT=false` included: tracker scrapes are braked too (D113, D146). `off` disables it. ICMP is not used: blocked or rate-limited on that line |
 | `MAGNETAR_DHT_METADATA_MAX` | `16777216` | largest info dictionary accepted, bytes (16384–67108864); larger torrents are marked `oversize` and not retried. The decode budget is 6 × this per decode slot (4 slots on the server, 2 on a crawl worker: 384 MiB and 192 MiB at the default). One decode of a dict of `size` bytes holding `values` bencode values reserves `3 × size + 112 B × values + min(3 × this, 8 × size + 1 MiB)` (the last term bounds the strings the parse builds, D110), at most the whole budget: ~20 × this for a dict of this size at the `this / 8` value limit, so such a dict decodes alone |
-| `MAGNETAR_DHT_UPNP` | `true` in aggressive (`serve`) | map the crawler's UDP ports on the router with UPnP IGD (external = internal port, 1 h lease renewed every 30 min, removed at a clean stop; D57, D72). Polite mode has nothing to map. The bounded `dht` command maps only with an explicit `true`. Only UDP: the crawler never listens on TCP. Builds without the `upnp` cargo feature ignore it |
+| `MAGNETAR_DHT_UPNP` | off unless `true` | worker, aggressive mode: map the crawler's UDP ports on the router with UPnP IGD (external = internal port, 1 h lease renewed every 30 min, removed at a clean stop; D57, D72). A worker maps only with an explicit `true` (it may sit behind another person's router); polite mode has nothing to map. Only UDP: the crawler never listens on TCP. Builds without the `upnp` cargo feature ignore it |
 | `MAGNETAR_DHT_UPNP_GATEWAY` | the default gateway (`/proc/net/route`) | `host[:port]` (port 1900) for a unicast SSDP M-SEARCH, tried before the multicast one (the user's MiniUPnPd answers unicast only); required in Docker |
 | `MAGNETAR_DHT_UPNP_LOCAL_IP` | the address the route to the gateway leaves from | LAN address the router forwards to; required in Docker (the host's LAN address) |
 | `MAGNETAR_BLOCKLIST_FILE` | unset | extra illegal-content terms, one per line, 1–3 words each (`context:` prefix = only for adult torrents, `#` comments). Adds to the built-in list, for the DHT crawler and Nostr ingest alike; nothing can disable the list. A file that cannot be read or has a malformed line stops the server at start (the error names the line number, never its text) |
 
 Each option also exists as a flag (`--dht aggressive`, `--dht-nodes 2`, …). Bounded run with a
-JSON report: `magnetar-server dht --seconds 270 [--mode aggressive] [--dry-run]`. Measured on
-the laptop (aggressive, no port opened, 270 s): ~1.6 % of one core, 47 MB RSS; see
-docs/DHT.md §13.
+JSON report: `magnetar-server worker --seconds 270`, against a main server (the `dht` command
+and its `--dry-run` were removed in D156; there is no database-free run any more). Measured on
+the laptop with the removed `dht` command (aggressive, no port opened, 270 s): ~1.6 % of one
+core, 47 MB RSS; see docs/DHT.md §13.
 
 ### Crawl map (docs/CRAWLMAP.md, ARCHITECTURE.md D101–D105)
 
@@ -180,7 +192,7 @@ and RPI lines: docs/WORKERS.md §3.
 
 ### Header probes (docs/PROBES.md, ARCHITECTURE.md D117)
 
-**Worker settings only.** `serve`, `dht` and every other command never build a prober: with
+**Worker settings only.** `serve` and every other command never build a prober: with
 `MAGNETAR_PROBE=true` they log a warning and ignore it (`compose.yml` pins it to `false`). Probes
 follow the worker crawler's metadata fetches, so they also need `MAGNETAR_DHT`.
 

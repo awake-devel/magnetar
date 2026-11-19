@@ -2,8 +2,14 @@ package app.magnetar.api
 
 import kotlinx.serialization.EncodeDefault
 import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.descriptors.PrimitiveKind
+import kotlinx.serialization.descriptors.PrimitiveSerialDescriptor
+import kotlinx.serialization.descriptors.SerialDescriptor
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
 
 /*
  * Mirrors of the server's JSON (magnetar_core::{api, model, query}; docs/API.md). Field names
@@ -80,12 +86,33 @@ enum class MediaKind {
     @SerialName("anime") ANIME,
 }
 
-/** Where an infohash is known from (D51). Older servers send none (= Nostr). */
-@Serializable
+/**
+ * Where an infohash is known from (D51). Older servers send none (= Nostr). A value this app
+ * does not know is a source added by a newer server (D152): [OTHER], never Nostr, so it gets no
+ * trust badge and no publisher card.
+ */
+@Serializable(with = OriginSerializer::class)
 enum class Origin {
-    @SerialName("nostr") NOSTR,
-    @SerialName("dht") DHT,
-    @SerialName("both") BOTH,
+    NOSTR,
+    DHT,
+    BOTH,
+    OTHER;
+
+    /** A Nostr publisher exists: trust score and publisher card apply. */
+    val hasPublisher: Boolean get() = this == NOSTR || this == BOTH
+}
+
+object OriginSerializer : KSerializer<Origin> {
+    override val descriptor: SerialDescriptor = PrimitiveSerialDescriptor("Origin", PrimitiveKind.STRING)
+
+    override fun deserialize(decoder: Decoder): Origin = when (decoder.decodeString()) {
+        "nostr" -> Origin.NOSTR
+        "dht" -> Origin.DHT
+        "both" -> Origin.BOTH
+        else -> Origin.OTHER
+    }
+
+    override fun serialize(encoder: Encoder, value: Origin) = encoder.encodeString(value.name.lowercase())
 }
 
 @Serializable

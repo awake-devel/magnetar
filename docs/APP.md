@@ -507,7 +507,9 @@ bundled `fake_server.py`; `--production URL` adds read-only flows and the timing
   counts in flight. The adult switch goes into every breakdown body. Activity: one metric at a
   time (`GET /stats/timeseries`), days or hours, the DHT metrics (`dht_torrents_added`,
   `dht_hashes_seen`, `dht_fetch_ok`, `dht_fetch_fail`, `dht_blocked` as a count) when the server
-  runs the crawler.
+  lists feature `dht`. Since D156 the server never crawls the DHT and never lists it, so the
+  DHT metrics and the health card's DHT crawler lines are not shown (known limitation,
+  docs/ROADMAP.md "DHT activity charts from worker data").
   **File kinds** (D139, with `probe_file_kinds`; tag `breakdown_file_group`): one more
   `POST /stats/breakdown {query, fields: ["file_group"], top: 50}` in a flow of its own (cached
   like the others, a newer request cancels it), bars per group (`bar_file_group_{g}`, catalogue
