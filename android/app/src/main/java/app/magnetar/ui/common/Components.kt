@@ -85,20 +85,27 @@ fun SourceBadge(origin: Origin, score: Int, threshold: Int, modifier: Modifier =
             Spacer(Modifier.height(2.dp))
             DhtChip(small = true)
         }
+        // A source this app does not know (D152): no publisher to score.
+        Origin.OTHER -> SourceChip("Other", "Other source", modifier)
     }
 }
 
 /** Neutral outlined "DHT" label (not a score: no colour of the trust scale). */
 @Composable
-fun DhtChip(modifier: Modifier = Modifier, small: Boolean = false) {
+fun DhtChip(modifier: Modifier = Modifier, small: Boolean = false) =
+    SourceChip("DHT", "Found on the DHT", modifier, small)
+
+/** Neutral outlined source label. */
+@Composable
+fun SourceChip(text: String, description: String, modifier: Modifier = Modifier, small: Boolean = false) {
     Box(
         modifier
             .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(8.dp))
             .padding(horizontal = if (small) 6.dp else 8.dp, vertical = if (small) 0.dp else 2.dp)
-            .semantics { contentDescription = "Found on the DHT" },
+            .semantics { contentDescription = description },
     ) {
         Text(
-            "DHT",
+            text,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = if (small) MaterialTheme.typography.labelSmall else MaterialTheme.typography.labelMedium,
             fontWeight = FontWeight.Bold,

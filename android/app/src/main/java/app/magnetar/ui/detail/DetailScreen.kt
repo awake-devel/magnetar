@@ -57,7 +57,6 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.magnetar.api.DhtInfo
 import app.magnetar.api.Liveness
 import app.magnetar.api.LivenessHistory
-import app.magnetar.api.Origin
 import app.magnetar.api.TorrentDetail
 import app.magnetar.api.TrustScore
 import app.magnetar.ui.common.AppIcons
@@ -241,7 +240,7 @@ private fun DetailBody(
 
         // DHT-only: no publisher, so no trust score; the card says why it is listed (D74).
         detail.dht?.let { d -> item { DhtCard(d, s.title) } }
-        if (s.origin != Origin.DHT) {
+        if (s.origin.hasPublisher) {
             item { TrustCard(detail.trust, threshold, trustOpen) { trustOpen = !trustOpen } }
         }
 
@@ -255,7 +254,7 @@ private fun DetailBody(
             CopyRow(s.infohash) { onCopy("Infohash", s.infohash) }
             SectionTitle("Source")
             Text(sourceLabel(s.origin), style = MaterialTheme.typography.bodyMedium)
-            if (s.origin != Origin.DHT && s.npub.isNotEmpty()) {
+            if (s.origin.hasPublisher && s.npub.isNotEmpty()) {
                 SectionTitle("Publisher")
                 CopyRow(s.npub) { onCopy("npub", s.npub) }
                 if (s.publisherCount > 1) Text("${s.publisherCount} publishers announced this torrent")

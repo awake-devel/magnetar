@@ -298,6 +298,7 @@ fun sourceLabel(origin: Origin): String = when (origin) {
     Origin.NOSTR -> "Nostr"
     Origin.DHT -> "DHT (verified metadata, no publisher)"
     Origin.BOTH -> "Nostr and DHT"
+    Origin.OTHER -> "Other source"
 }
 
 /** "Title (2011)" or "Title (2011–2019)". */

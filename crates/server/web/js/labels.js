@@ -343,6 +343,16 @@ export function mediaKindLabel(kind) {
 }
 
 /**
+ * Whether a torrent has a Nostr publisher (a trust score, a publisher card). Servers older
+ * than D51 send no origin: Nostr. A value this page does not know is a newer source (D152),
+ * not Nostr.
+ * @param {string | undefined | null} origin
+ */
+export function hasPublisher(origin) {
+  return origin == null || origin === "nostr" || origin === "both";
+}
+
+/**
  * Where a torrent is known from, for the detail (D51).
  * @param {string | undefined} origin
  */
@@ -352,8 +362,12 @@ export function sourceLabel(origin) {
       return "DHT (verified metadata, no publisher)";
     case "both":
       return "Nostr and DHT";
-    default:
+    case undefined:
+    case null:
+    case "nostr":
       return "Nostr";
+    default:
+      return "Other source";
   }
 }
 

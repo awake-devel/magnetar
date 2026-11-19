@@ -8,7 +8,7 @@ import { ApiError, ihSegment, isAborted, isOffline, userMessage } from "../api.j
 import { h, magnetLink, untrusted } from "../dom.js";
 import { cachedAgo, formatAge, formatBytes, formatTimestamp, peersText, shortKey, stripHtml } from "../format.js";
 import { icon } from "../icons.js";
-import { attrDetails, categoryLabel, sourceLabel } from "../labels.js";
+import { attrDetails, categoryLabel, hasPublisher, sourceLabel } from "../labels.js";
 import { npub } from "../nip19.js";
 import { probeViews } from "../probe-format.js";
 import { banner, centered, progressBar } from "../ui/banner.js";
@@ -335,7 +335,7 @@ export function mount(el, { params, ctx }) {
       onCheck: () => void checkNow(),
     }));
     if (d.dht) out.push(dhtCard(d.dht, s.title ?? ""));
-    if (s.origin !== "dht") {
+    if (hasPublisher(s.origin)) {
       out.push(trustCard({
         detail: d,
         threshold: threshold(),

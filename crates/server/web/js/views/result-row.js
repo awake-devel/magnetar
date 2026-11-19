@@ -4,7 +4,7 @@
 
 import { h, link, routeLink, untrusted } from "../dom.js";
 import { fileName, trustLevel } from "../format.js";
-import { attrBadges, categoryLabel, mediaLineParts, statsLine } from "../labels.js";
+import { attrBadges, categoryLabel, hasPublisher, mediaLineParts, statsLine } from "../labels.js";
 
 /**
  * The trust star: "★ 42", tinted by level, with the level in words for screen readers.
@@ -36,6 +36,10 @@ export function dhtChip(small = false) {
 export function sourceBadge(origin, score, threshold) {
   if (origin === "dht") return h("span", { class: "source-badge" }, dhtChip());
   if (origin === "both") return h("span", { class: "source-badge both" }, trustBadge(score, threshold), dhtChip(true));
+  // A source this page does not know (D152): no publisher, so no trust badge.
+  if (!hasPublisher(origin)) {
+    return h("span", { class: "source-badge" }, h("span", { class: "badge-dht", title: "Other source", "aria-label": "Other source", text: "Other" }));
+  }
   return h("span", { class: "source-badge" }, trustBadge(score, threshold));
 }
 

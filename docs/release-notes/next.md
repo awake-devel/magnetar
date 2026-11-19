@@ -19,6 +19,18 @@ waits briefly, then is skipped (error `budget`) without counting as a tracker or
 the log summarises waits and refusals every 10 minutes. LAN and
 tailnet addresses are not counted. `MAGNETAR_NET_DESTS=0` turns it off.
 
+### Nostr backfill no longer stops at a burst (D151)
+
+When a relay held more torrents in one second than it returns per page, the crawler took the
+repeated page for the end of the history and marked the backfill done, leaving everything
+older unread. It now steps past that second and continues.
+
+### The app and the web page are ready for new sources (D152)
+
+A torrent whose source the client does not know yet is shown as "Other source", with no trust
+badge and no publisher card, instead of being presented as a Nostr torrent. Nothing changes
+for today's Nostr and DHT results.
+
 ### A background loop that stops is reported (D147)
 
 Every background loop (crawler, seed checker, router health probe, enrichment, …) now runs

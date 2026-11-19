@@ -9,6 +9,7 @@ import {
   mediaHeadline,
   mediaLine,
   seasonEpisodeText,
+  hasPublisher,
   sourceLabel,
   statsLine,
 } from "../js/labels.js";
@@ -219,4 +220,12 @@ Deno.test("media lines, facts and source labels", () => {
   assert.equal(sourceLabel("dht"), "DHT (verified metadata, no publisher)");
   assert.equal(sourceLabel("both"), "Nostr and DHT");
   assert.equal(sourceLabel(undefined), "Nostr");
+  assert.equal(sourceLabel("nostr"), "Nostr");
+  // D152: a source this page does not know is not Nostr and has no publisher.
+  assert.equal(sourceLabel("feed"), "Other source");
+  assert.equal(hasPublisher(undefined), true);
+  assert.equal(hasPublisher("nostr"), true);
+  assert.equal(hasPublisher("both"), true);
+  assert.equal(hasPublisher("dht"), false);
+  assert.equal(hasPublisher("feed"), false);
 });

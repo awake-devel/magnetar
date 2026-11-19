@@ -8,6 +8,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.decodeFromString
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
 import okhttp3.OkHttpClient
@@ -107,6 +108,18 @@ class MagnetarApiTest {
         assertEquals(b.mediaKind, MediaKind.MOVIE)
         assertEquals(b.attrs?.resolution, "1080p")
         assertEquals(b.attrs?.languages, listOf("fr"))
+    }
+
+    /** D152: an origin from a newer server is OTHER (no publisher), not Nostr; none is Nostr. */
+    @Test
+    fun unknownOriginIsOtherNotNostr() {
+        fun origin(json: String) = MagnetarApi.JSON.decodeFromString<TorrentSummary>(json).origin
+        assertEquals(origin("""{"infohash":"aa","origin":"feed"}"""), Origin.OTHER)
+        assertEquals(origin("""{"infohash":"aa","origin":"nostr"}"""), Origin.NOSTR)
+        assertEquals(origin("""{"infohash":"aa","origin":"both"}"""), Origin.BOTH)
+        assertEquals(origin("""{"infohash":"aa"}"""), Origin.NOSTR)
+        assertTrue(Origin.BOTH.hasPublisher && Origin.NOSTR.hasPublisher)
+        assertTrue(!Origin.OTHER.hasPublisher && !Origin.DHT.hasPublisher)
     }
 
     @Test
